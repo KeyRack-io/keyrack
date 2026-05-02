@@ -1,0 +1,28 @@
+services:
+  e2e:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.e2e
+    environment:
+      - RUST_BACKTRACE=1
+      - KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
+      - KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
+      - KMS_PKCS11_PIN=1234
+
+  # Quick mode: skip property tests for faster CI feedback
+  e2e-quick:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.e2e
+    command: ["cargo", "test", "--workspace", "--lib", "--test", "e2e_smoke", "--", "--nocapture"]
+    environment:
+      - RUST_BACKTRACE=1
+      - KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
+      - KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
+      - KMS_PKCS11_PIN=1234
+
+  clippy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.e2e
+    command: ["cargo", "clippy", "--workspace", "--", "-D", "warnings"]

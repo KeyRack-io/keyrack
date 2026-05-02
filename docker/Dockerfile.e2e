@@ -1,0 +1,33 @@
+FROM rust:1-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        softhsm2 \
+        libsofthsm2 \
+        opensc \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /keyrack
+
+# Cache dependencies: copy manifests first, build a dummy, then copy source
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+
+# Build workspace (tests are built in the test stage)
+RUN cargo build --workspace --tests --quiet
+
+# ---- SoftHSM token setup ----
+RUN mkdir -p /var/lib/softhsm/tokens \
+    && echo "directories.tokendir = /var/lib/softhsm/tokens" > /etc/softhsm/softhsm2.conf \
+    && softhsm2-util --init-token --slot 0 \
+        --label "keyrack-e2e" \
+        --pin 1234 \
+        --so-pin 5678
+ENV SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf
+
+# Expose SoftHSM config to tests via env vars
+ENV KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
+ENV KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
+ENV KMS_PKCS11_PIN=1234
+
+CMD ["cargo", "test", "--workspace", "--", "--nocapture"]
