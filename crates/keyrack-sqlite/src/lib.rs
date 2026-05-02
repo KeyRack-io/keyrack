@@ -13,8 +13,8 @@
 //! `SQLite` storage backend for single-node `KeyRack` deployments.
 //!
 //! Uses `rusqlite` with the `bundled` feature (zero system dependencies).
-//! All database calls are wrapped in `spawn_blocking` because `rusqlite`
-//! is synchronous.
+//! `rusqlite` is synchronous; operations acquire a `Mutex`-guarded
+//! connection. For high-concurrency deployments, use `PostgreSQL`.
 
 #![forbid(unsafe_code)]
 
@@ -148,6 +148,11 @@ impl StorageBackend for SqliteStorage {
     }
 
     async fn update_key(&self, record: &KeyRecord) -> Result<()> {
+        if record.occ_version == 0 {
+            return Err(KeyRackError::Other(
+                "occ_version must be > 0 for updates".into(),
+            ));
+        }
         let lid_str = record.lid.to_string();
         let json = serde_json::to_string(record)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;

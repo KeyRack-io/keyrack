@@ -139,6 +139,11 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn update_key(&self, record: &KeyRecord) -> Result<()> {
+        if record.occ_version == 0 {
+            return Err(KeyRackError::Other(
+                "occ_version must be > 0 for updates".into(),
+            ));
+        }
         let lid_str = record.lid.to_string();
         let json = serde_json::to_value(record)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;

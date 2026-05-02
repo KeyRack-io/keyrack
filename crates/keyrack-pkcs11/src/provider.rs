@@ -26,6 +26,7 @@ use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{CryptoProvider, EncryptOutput, KeyHandle, SigningAlgorithm};
 use keyrack_core::sensitive::Sensitive;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
 const P256_OID_DER: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
@@ -56,7 +57,7 @@ pub struct Pkcs11ProviderConfig {
 pub struct Pkcs11Provider {
     ctx: Pkcs11,
     slot: cryptoki::slot::Slot,
-    pin: String,
+    pin: Zeroizing<String>,
 }
 
 impl Pkcs11Provider {
@@ -88,7 +89,7 @@ impl Pkcs11Provider {
         Ok(Self {
             ctx,
             slot,
-            pin: config.pin.clone(),
+            pin: Zeroizing::new(config.pin.clone()),
         })
     }
 
@@ -100,7 +101,7 @@ impl Pkcs11Provider {
     {
         let ctx = self.ctx.clone();
         let slot = self.slot;
-        let pin = self.pin.clone();
+        let pin = Zeroizing::new(self.pin.as_str().to_owned());
 
         tokio::task::spawn_blocking(move || {
             let session = ctx
