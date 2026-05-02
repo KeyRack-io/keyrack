@@ -20,6 +20,9 @@ tracing = { workspace = true }
 unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 
+# YAML parsing for rule/namespace config
+serde_yaml = "0.9"
+
 # Crypto primitives for software/in-memory providers
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

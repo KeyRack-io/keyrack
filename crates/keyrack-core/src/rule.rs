@@ -250,6 +250,12 @@ pub struct RuleMatch<'a> {
     pub bindings: BTreeMap<String, String>,
 }
 
+/// YAML document structure: `namespaces` is a list of [`Namespace`].
+#[derive(Debug, Deserialize)]
+struct NamespaceConfig {
+    namespaces: Vec<Namespace>,
+}
+
 impl RuleRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -258,9 +264,95 @@ impl RuleRegistry {
         }
     }
 
+    /// Load namespaces from a YAML string and validate them.
+    ///
+    /// Validation checks:
+    /// - No duplicate namespace names.
+    /// - No duplicate rules within a namespace (same match pattern).
+    /// - No cycles detectable from static parent patterns.
+    /// - `max_depth` within `[1, 256]`.
+    pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
+        let config: NamespaceConfig = serde_yaml::from_str(yaml)
+            .map_err(|e| crate::error::KeyRackError::Other(format!("YAML parse: {e}")))?;
+
+        let mut registry = Self::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for ns in config.namespaces {
+            if !seen_names.insert(ns.name.clone()) {
+                return Err(crate::error::KeyRackError::Other(format!(
+                    "duplicate namespace: {}", ns.name
+                )));
+            }
+
+            if !(1..=256).contains(&ns.max_depth) {
+                return Err(crate::error::KeyRackError::Other(format!(
+                    "namespace {}: max_depth must be 1–256, got {}",
+                    ns.name, ns.max_depth
+                )));
+            }
+
+            let mut seen_patterns = std::collections::HashSet::new();
+            for rule in &ns.routing_rules {
+                let key: Vec<_> = rule.match_pattern.iter().collect();
+                let pattern_key = format!("{key:?}");
+                if !seen_patterns.insert(pattern_key) {
+                    return Err(crate::error::KeyRackError::Other(format!(
+                        "namespace {}: duplicate rule with pattern {:?}",
+                        ns.name, rule.match_pattern
+                    )));
+                }
+            }
+
+            registry.register(ns);
+        }
+
+        // Static cycle detection: for each rule whose parent is a
+        // Pattern, check if following parent patterns loops back.
+        registry.detect_static_cycles()?;
+
+        Ok(registry)
+    }
+
     /// Register a namespace.
     pub fn register(&mut self, namespace: Namespace) {
         self.namespaces.push(namespace);
+    }
+
+    /// Detect cycles reachable from static parent patterns alone.
+    fn detect_static_cycles(&self) -> crate::error::Result<()> {
+        for ns in &self.namespaces {
+            for rule in &ns.routing_rules {
+                if let ParentRef::Pattern(ref parent_pattern) = rule.parent {
+                    let mut visited = std::collections::HashSet::new();
+                    let start_key = format!("{:?}", rule.match_pattern);
+                    visited.insert(start_key);
+
+                    let mut current = parent_pattern.clone();
+                    for _ in 0..256 {
+                        let key = format!("{current:?}");
+                        if !visited.insert(key) {
+                            return Err(crate::error::KeyRackError::Other(format!(
+                                "static cycle detected in namespace {}: pattern {:?} loops",
+                                ns.name, rule.match_pattern
+                            )));
+                        }
+                        if let Some(m) = self.match_rule(&current) {
+                            match &m.rule.parent {
+                                ParentRef::Pattern(next) => {
+                                    current = m.rule.resolve_parent(&m.bindings)
+                                        .unwrap_or_else(|| next.clone());
+                                }
+                                _ => break,
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Find the best-matching rule for the given attributes.
@@ -624,5 +716,98 @@ mod tests {
         assert_eq!(reg.namespaces().len(), 1);
         assert!(reg.get_namespace("_infrastructure_").is_some());
         assert!(reg.get_namespace("nonexistent").is_none());
+    }
+
+    #[test]
+    fn from_yaml_basic() {
+        let yaml = r#"
+namespaces:
+  - name: infra
+    routing_rules:
+      - match_pattern:
+          kind: root
+        parent: null
+        priority: 0
+      - match_pattern:
+          kind: tenant-root
+          tenant: "$T"
+        parent:
+          kind: root
+        priority: 0
+"#;
+        let reg = RuleRegistry::from_yaml(yaml).unwrap();
+        assert_eq!(reg.namespaces().len(), 1);
+        assert_eq!(reg.namespaces()[0].routing_rules.len(), 2);
+    }
+
+    #[test]
+    fn from_yaml_duplicate_namespace_rejected() {
+        let yaml = r#"
+namespaces:
+  - name: dup
+    routing_rules: []
+  - name: dup
+    routing_rules: []
+"#;
+        let err = RuleRegistry::from_yaml(yaml);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("duplicate namespace"));
+    }
+
+    #[test]
+    fn from_yaml_bad_max_depth() {
+        let yaml = r#"
+namespaces:
+  - name: test
+    max_depth: 0
+    routing_rules: []
+"#;
+        let err = RuleRegistry::from_yaml(yaml);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("max_depth"));
+    }
+
+    #[test]
+    fn from_yaml_duplicate_rule_rejected() {
+        let yaml = r#"
+namespaces:
+  - name: test
+    routing_rules:
+      - match_pattern:
+          kind: root
+        parent: null
+      - match_pattern:
+          kind: root
+        parent: null
+"#;
+        let err = RuleRegistry::from_yaml(yaml);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("duplicate rule"));
+    }
+
+    #[test]
+    fn from_yaml_with_attachment() {
+        let yaml = r#"
+namespaces:
+  - name: infra
+    routing_rules:
+      - match_pattern:
+          kind: root
+        parent: null
+  - name: app
+    attachment:
+      tenant: acme
+    routing_rules:
+      - match_pattern:
+          kind: app-root
+        parent: "_attachment_"
+"#;
+        let reg = RuleRegistry::from_yaml(yaml).unwrap();
+        assert_eq!(reg.namespaces().len(), 2);
+        let app = reg.get_namespace("app").unwrap();
+        assert!(app.attachment.is_some());
     }
 }

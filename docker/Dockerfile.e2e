@@ -30,4 +30,4 @@ ENV KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
 ENV KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
 ENV KMS_PKCS11_PIN=1234
 
-CMD ["cargo", "test", "--workspace", "--", "--nocapture"]
+CMD ["cargo", "test", "--workspace", "--features", "keyrack-pkcs11/softhsm-tests", "--", "--nocapture"]

@@ -1,28 +1,50 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: keyrack
+      POSTGRES_PASSWORD: keyrack_test
+      POSTGRES_DB: keyrack_test
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keyrack"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
   e2e:
     build:
       context: .
       dockerfile: docker/Dockerfile.e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       - RUST_BACKTRACE=1
       - KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
       - KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
       - KMS_PKCS11_PIN=1234
+      - DATABASE_URL=postgres://keyrack:keyrack_test@postgres:5432/keyrack_test
 
   # Quick mode: skip property tests for faster CI feedback
   e2e-quick:
     build:
       context: .
       dockerfile: docker/Dockerfile.e2e
-    command: ["cargo", "test", "--workspace", "--lib", "--test", "e2e_smoke", "--", "--nocapture"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["cargo", "test", "--workspace", "--features", "keyrack-pkcs11/softhsm-tests,keyrack-postgres/live-tests", "--lib", "--test", "e2e_smoke", "--test", "conformance", "--", "--nocapture"]
     environment:
       - RUST_BACKTRACE=1
       - KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
       - KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
       - KMS_PKCS11_PIN=1234
+      - DATABASE_URL=postgres://keyrack:keyrack_test@postgres:5432/keyrack_test
 
   clippy:
     build:
       context: .
       dockerfile: docker/Dockerfile.e2e
-    command: ["cargo", "clippy", "--workspace", "--", "-D", "warnings"]
+    command: ["cargo", "clippy", "--workspace", "--features", "keyrack-pkcs11/softhsm-tests", "--", "-D", "warnings"]
