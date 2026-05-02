@@ -1,6 +1,12 @@
 # KeyRack: Target API Usage Samples
 
-These files are **not runnable code**. They are syntactically valid samples showing how a consuming application would use the KeyRack library once built. Their purpose is to validate the developer experience and API surface before implementation begins.
+> **These files predate the implementation.** They are design-time API sketches
+> written during the integration cycle to validate developer experience. They
+> reference crate names and types (`keyrack`, `@keyrack/client`) that don't
+> exist yet — the actual library is `keyrack-core` and will evolve to match
+> (or diverge from) these sketches as the implementation proceeds.
+>
+> They are **not runnable code** and are not compiled as part of the workspace.
 
 ## What these samples demonstrate
 

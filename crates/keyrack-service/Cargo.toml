@@ -1,0 +1,14 @@
+[package]
+name = "keyrack-service"
+version = "0.1.0"
+description = "KeyRack gRPC + REST service binary (Workstream 2)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyrack-core = { workspace = true }
+
+[lints]
+workspace = true

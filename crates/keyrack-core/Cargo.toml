@@ -1,0 +1,28 @@
+[package]
+name = "keyrack-core"
+version = "0.1.0"
+description = "KeyRack core library: types, traits, canonicalization, LID, rule engine, resolver"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+unicode-normalization = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
