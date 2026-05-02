@@ -19,6 +19,7 @@
 
 pub mod attr;
 pub mod audit;
+pub mod authn;
 pub mod canon;
 pub mod cascade;
 pub mod encryption_context;

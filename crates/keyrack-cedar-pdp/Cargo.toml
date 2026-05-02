@@ -7,8 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "keyrack-cedar-pdp"
+path = "src/main.rs"
+
 [dependencies]
 keyrack-core = { workspace = true }
+cedar-policy = "4"
+axum = "0.7"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 
 [lints]
 workspace = true

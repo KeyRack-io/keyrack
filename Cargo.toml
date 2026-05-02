@@ -46,6 +46,7 @@ keyrack-postgres = { path = "crates/keyrack-postgres" }
 keyrack-sqlite = { path = "crates/keyrack-sqlite" }
 keyrack-nats = { path = "crates/keyrack-nats" }
 keyrack-test-support = { path = "crates/keyrack-test-support" }
+keyrack-service = { path = "crates/keyrack-service" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

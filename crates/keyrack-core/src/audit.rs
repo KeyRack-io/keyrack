@@ -70,31 +70,81 @@ pub enum AuditAction {
     #[serde(rename = "kms:RotateKey")]
     RotateKey,
 
-    // Key metadata
+    // Key metadata / queries
+    #[serde(rename = "kms:GetKey")]
+    GetKey,
     #[serde(rename = "kms:DescribeKey")]
     DescribeKey,
     #[serde(rename = "kms:UpdateKey")]
     UpdateKey,
+    #[serde(rename = "kms:ListKeys")]
+    ListKeys,
+
+    // Key versions
+    #[serde(rename = "kms:ListKeyVersions")]
+    ListKeyVersions,
+    #[serde(rename = "kms:GetKeyVersion")]
+    GetKeyVersion,
+
+    // Rotation control
+    #[serde(rename = "kms:EnableKeyRotation")]
+    EnableKeyRotation,
+    #[serde(rename = "kms:DisableKeyRotation")]
+    DisableKeyRotation,
+    #[serde(rename = "kms:GetKeyRotationStatus")]
+    GetKeyRotationStatus,
+    #[serde(rename = "kms:GetKeyRotationHistory")]
+    GetKeyRotationHistory,
+    #[serde(rename = "kms:GetKeyRotationPolicy")]
+    GetKeyRotationPolicy,
+    #[serde(rename = "kms:SetKeyRotationPolicy")]
+    SetKeyRotationPolicy,
+
+    // Hierarchy queries
+    #[serde(rename = "kms:GetKeyDependents")]
+    GetKeyDependents,
+    #[serde(rename = "kms:GetKeyAncestors")]
+    GetKeyAncestors,
 
     // Tags
     #[serde(rename = "kms:TagResource")]
     TagResource,
     #[serde(rename = "kms:UntagResource")]
     UntagResource,
+    #[serde(rename = "kms:ListResourceTags")]
+    ListResourceTags,
 
     // Aliases
     #[serde(rename = "kms:CreateAlias")]
     CreateAlias,
     #[serde(rename = "kms:DeleteAlias")]
     DeleteAlias,
+    #[serde(rename = "kms:ListAliases")]
+    ListAliases,
 
     // HSM connections
     #[serde(rename = "kms:CreateHsmConnection")]
     CreateHsmConnection,
+    #[serde(rename = "kms:GetHsmConnection")]
+    GetHsmConnection,
+    #[serde(rename = "kms:ListHsmConnections")]
+    ListHsmConnections,
     #[serde(rename = "kms:DeleteHsmConnection")]
     DeleteHsmConnection,
+    #[serde(rename = "kms:GetHsmConnectionStatus")]
+    GetHsmConnectionStatus,
+
+    // Namespaces
+    #[serde(rename = "kms:RegisterNamespace")]
+    RegisterNamespace,
+    #[serde(rename = "kms:ListNamespaces")]
+    ListNamespaces,
+    #[serde(rename = "kms:DescribeNamespace")]
+    DescribeNamespace,
 
     // Rotation jobs
+    #[serde(rename = "kms:ListRotationJobs")]
+    ListRotationJobs,
     #[serde(rename = "kms:AcknowledgeRotationJob")]
     AcknowledgeRotationJob,
     #[serde(rename = "kms:CompleteRotationJob")]
@@ -618,14 +668,35 @@ mod tests {
             AuditAction::ScheduleKeyDeletion,
             AuditAction::CancelKeyDeletion,
             AuditAction::RotateKey,
+            AuditAction::GetKey,
             AuditAction::DescribeKey,
             AuditAction::UpdateKey,
+            AuditAction::ListKeys,
+            AuditAction::ListKeyVersions,
+            AuditAction::GetKeyVersion,
+            AuditAction::EnableKeyRotation,
+            AuditAction::DisableKeyRotation,
+            AuditAction::GetKeyRotationStatus,
+            AuditAction::GetKeyRotationHistory,
+            AuditAction::GetKeyRotationPolicy,
+            AuditAction::SetKeyRotationPolicy,
+            AuditAction::GetKeyDependents,
+            AuditAction::GetKeyAncestors,
             AuditAction::TagResource,
             AuditAction::UntagResource,
+            AuditAction::ListResourceTags,
             AuditAction::CreateAlias,
             AuditAction::DeleteAlias,
+            AuditAction::ListAliases,
             AuditAction::CreateHsmConnection,
+            AuditAction::GetHsmConnection,
+            AuditAction::ListHsmConnections,
             AuditAction::DeleteHsmConnection,
+            AuditAction::GetHsmConnectionStatus,
+            AuditAction::RegisterNamespace,
+            AuditAction::ListNamespaces,
+            AuditAction::DescribeNamespace,
+            AuditAction::ListRotationJobs,
             AuditAction::AcknowledgeRotationJob,
             AuditAction::CompleteRotationJob,
             AuditAction::FailRotationJob,

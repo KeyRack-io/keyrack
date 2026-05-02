@@ -1,0 +1,152 @@
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: BUSL-1.1
+//
+// Licensed under the Business Source License 1.1 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://mariadb.com/bsl11/
+//
+// Change Date: 2030-01-01
+// Change License: Apache License, Version 2.0
+
+//! Conversions between proto types and `keyrack-core` domain types.
+
+use crate::proto;
+use keyrack_core::key::{KeyRecord, KeyState};
+use prost_types::Timestamp;
+
+pub fn key_state_to_proto(state: &KeyState) -> proto::KeyState {
+    match state {
+        KeyState::Creating => proto::KeyState::Creating,
+        KeyState::Enabled => proto::KeyState::Enabled,
+        KeyState::Disabled => proto::KeyState::Disabled,
+        KeyState::PendingDeletion => proto::KeyState::PendingDeletion,
+        KeyState::Destroyed => proto::KeyState::Destroyed,
+    }
+}
+
+pub fn proto_to_key_spec(spec: proto::KeySpec) -> Option<keyrack_core::key::KeySpec> {
+    match spec {
+        proto::KeySpec::Aes256 => Some(keyrack_core::key::KeySpec::Aes256),
+        proto::KeySpec::Ed25519 => Some(keyrack_core::key::KeySpec::Ed25519),
+        proto::KeySpec::Rsa2048 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
+            key_size: 2048,
+        }),
+        proto::KeySpec::Rsa3072 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
+            key_size: 3072,
+        }),
+        proto::KeySpec::Rsa4096 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
+            key_size: 4096,
+        }),
+        proto::KeySpec::EcdsaP256 => Some(keyrack_core::key::KeySpec::EcdsaP256Sha256),
+        proto::KeySpec::Unspecified => None,
+    }
+}
+
+pub fn key_spec_to_proto(spec: &keyrack_core::key::KeySpec) -> proto::KeySpec {
+    match spec {
+        keyrack_core::key::KeySpec::Aes256 => proto::KeySpec::Aes256,
+        keyrack_core::key::KeySpec::Ed25519 => proto::KeySpec::Ed25519,
+        keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size } => match key_size {
+            3072 => proto::KeySpec::Rsa3072,
+            4096 => proto::KeySpec::Rsa4096,
+            _ => proto::KeySpec::Rsa2048,
+        },
+        keyrack_core::key::KeySpec::EcdsaP256Sha256 => proto::KeySpec::EcdsaP256,
+    }
+}
+
+pub fn proto_to_signing_algorithm(
+    alg: proto::SigningAlgorithm,
+) -> Option<keyrack_core::provider::SigningAlgorithm> {
+    match alg {
+        proto::SigningAlgorithm::Ed25519Pure => {
+            Some(keyrack_core::provider::SigningAlgorithm::Ed25519)
+        }
+        proto::SigningAlgorithm::RsaPkcs1V15Sha256 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256)
+        }
+        proto::SigningAlgorithm::EcdsaP256Sha256 => {
+            Some(keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256)
+        }
+        proto::SigningAlgorithm::Unspecified => None,
+    }
+}
+
+pub fn signing_algorithm_to_proto(
+    alg: &keyrack_core::provider::SigningAlgorithm,
+) -> proto::SigningAlgorithm {
+    match alg {
+        keyrack_core::provider::SigningAlgorithm::Ed25519 => proto::SigningAlgorithm::Ed25519Pure,
+        keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256 => {
+            proto::SigningAlgorithm::RsaPkcs1V15Sha256
+        }
+        keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256 => {
+            proto::SigningAlgorithm::EcdsaP256Sha256
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_wrap)]
+pub fn datetime_to_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> Timestamp {
+    Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
+    let user_tags = record
+        .user_tags
+        .iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+
+    proto::KeyMetadata {
+        key_id: record.lid.to_string(),
+        key_spec: key_spec_to_proto(&record.key_spec).into(),
+        key_usage: match record.key_spec {
+            keyrack_core::key::KeySpec::Aes256 => proto::KeyUsage::EncryptDecrypt.into(),
+            _ => proto::KeyUsage::SignVerify.into(),
+        },
+        state: key_state_to_proto(&record.state).into(),
+        origin: match record.origin {
+            keyrack_core::key::KeyOrigin::KeyRack => proto::KeyOrigin::Keyrack.into(),
+            keyrack_core::key::KeyOrigin::External => proto::KeyOrigin::External.into(),
+        },
+        description: record.description.clone(),
+        created_at: Some(datetime_to_timestamp(&record.created_at)),
+        current_key_version: record.current_key_version as u32,
+        user_tags,
+        parent_key_id: record.parent_lid.map(|l| l.to_string()),
+        hsm_connection_id: None,
+        occ_version: record.occ_version,
+        scheduled_deletion_at: record
+            .scheduled_deletion_at
+            .as_ref()
+            .map(datetime_to_timestamp),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status {
+    use keyrack_core::error::KeyRackError;
+    let msg = err.to_string();
+    match err {
+        KeyRackError::KeyNotFound(_) => tonic::Status::not_found(msg),
+        KeyRackError::OptimisticConcurrencyConflict { .. } => tonic::Status::aborted(msg),
+        KeyRackError::InvalidStateTransition { .. }
+        | KeyRackError::OperationNotPermitted { .. }
+        | KeyRackError::ImmutableTag { .. }
+        | KeyRackError::DepthLimitExceeded { .. }
+        | KeyRackError::CycleDetected { .. } => tonic::Status::failed_precondition(msg),
+        KeyRackError::EncryptionContextMismatch => tonic::Status::invalid_argument(msg),
+        KeyRackError::AuthorizationDenied { .. } => tonic::Status::permission_denied(msg),
+        KeyRackError::CascadeDisableFailed { .. }
+        | KeyRackError::Provider(_)
+        | KeyRackError::Storage(_)
+        | KeyRackError::Other(_) => tonic::Status::internal(msg),
+    }
+}

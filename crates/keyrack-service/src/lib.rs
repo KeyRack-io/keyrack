@@ -10,4 +10,30 @@
 // Change Date: 2030-01-01
 // Change License: Apache License, Version 2.0
 
+//! `KeyRack` gRPC + REST service.
+//!
+//! Implements the full V1 API surface from `KEYRACK_SPEC.md` §3.1.
+//! The service delegates to `keyrack-core` traits for crypto, storage,
+//! authorization (PDP), and audit.
+
 #![forbid(unsafe_code)]
+
+pub mod config;
+pub mod convert;
+pub mod grpc;
+pub mod pdp_grpc;
+pub mod pdp_http;
+pub mod rest;
+pub mod state;
+
+pub mod proto {
+    #![allow(
+        clippy::doc_markdown,
+        clippy::default_trait_access,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::derive_partial_eq_without_eq,
+        clippy::result_large_err
+    )]
+    tonic::include_proto!("keyrack.v1");
+}

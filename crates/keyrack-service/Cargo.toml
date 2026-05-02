@@ -7,8 +7,37 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "keyrack-service"
+path = "src/main.rs"
+
 [dependencies]
 keyrack-core = { workspace = true }
+keyrack-sqlite = { workspace = true }
+keyrack-postgres = { workspace = true }
+keyrack-nats = { workspace = true }
+keyrack-pkcs11 = { workspace = true }
+keyrack-kmip = { workspace = true }
+
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+axum = "0.7"
+base64 = "0.22"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [lints]
 workspace = true

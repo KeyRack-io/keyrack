@@ -28,8 +28,8 @@ use crate::rotation::RotationJob;
 use async_trait::async_trait;
 
 /// Page of results for list operations.
-#[derive(Debug, Clone)]
-pub struct Page<T> {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Page<T: serde::Serialize> {
     pub items: Vec<T>,
     /// Opaque cursor for the next page. `None` when no more pages.
     pub next_cursor: Option<String>,
