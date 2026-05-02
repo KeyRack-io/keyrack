@@ -40,6 +40,13 @@ impl Lid {
         Self(*hash.as_bytes())
     }
 
+    /// Construct a LID from raw bytes (e.g. when decoding from a
+    /// ciphertext header or storage row).
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0

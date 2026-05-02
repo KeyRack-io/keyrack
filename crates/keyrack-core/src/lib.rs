@@ -19,7 +19,9 @@
 
 pub mod attr;
 pub mod canon;
+pub mod encryption_context;
 pub mod error;
+pub mod header;
 pub mod key;
 pub mod lid;
 pub mod provider;

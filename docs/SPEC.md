@@ -143,23 +143,56 @@ The following properties are tested with `proptest` (500 cases each):
 
 ## 4. Ciphertext Header Byte Layout
 
-**Status:** stub — to be locked during W1.
+**Status:** locked.
 
 The self-describing ciphertext header prepended to every ciphertext blob.
+Allows automatic key/version selection at decrypt time without out-of-band
+metadata.
 
 ### 4.1 Format
 
 | Offset | Length | Field |
 |---|---|---|
 | 0 | 4 | Magic bytes: `0x4B 0x52 0x43 0x4B` ("KRCK") |
-| 4 | 2 | Header version (LE u16) |
-| 6 | 32 | Key LID |
+| 4 | 2 | Header version (LE u16, currently `1`) |
+| 6 | 32 | Key LID (raw 32 bytes) |
 | 38 | 8 | Key version (LE u64) |
-| 46 | 32 | Encryption context hash (BLAKE3 of sorted AAD pairs, or zero if no AAD) |
-| 78 | 2 | Payload length prefix (LE u16, reserved for future variable-length fields) |
+| 46 | 32 | Encryption context hash (BLAKE3 of sorted AAD pairs, or `[0x00; 32]` if none) |
+| 78 | 2 | Reserved (LE u16, currently `0`; for future variable-length fields) |
 | 80 | ... | Ciphertext payload |
 
 Total fixed header: 80 bytes.
+
+### 4.2 Encryption context hashing
+
+The encryption context (AAD) is a set of key-value string pairs. The
+pre-image is **opaque** — KeyRack does not interpret the values. Only the
+BLAKE3 hash is persisted in the header.
+
+Canonical hash computation:
+
+1. Sort pairs by key (lexicographic byte order — guaranteed by `BTreeMap`).
+2. For each pair: encode `key_len_u32_le || key_bytes || value_len_u32_le || value_bytes`.
+3. Feed the concatenation to BLAKE3.
+
+Empty context → `[0x00; 32]` (not the BLAKE3 of empty input). This makes
+"no context supplied" distinguishable from "empty-map context" in storage.
+
+The same canonical encoding is used as the AES-GCM AAD, so the tag binds
+the same data the hash commits to.
+
+### 4.3 Decode rules
+
+1. Reject if buffer < 80 bytes.
+2. Reject if magic ≠ `KRCK`.
+3. Reject if header version ≠ `1` (future versions may extend the format).
+4. Extract LID, key version, context hash from fixed offsets.
+5. Payload starts at offset 80.
+
+### 4.4 Implementation
+
+`CiphertextHeader::encode()` → `[u8; 80]`, `CiphertextHeader::decode(&[u8])` → `Result`.
+`wrap_payload` / `unwrap_payload` combine header + ciphertext into a single blob.
 
 ---
 

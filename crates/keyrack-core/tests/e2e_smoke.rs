@@ -25,13 +25,16 @@
 //!   [x] Software provider encrypt/decrypt round-trip (AES-256-GCM)
 //!   [x] Software provider sign/verify round-trip (Ed25519, ECDSA P-256, RSA)
 //!   [x] InMemory provider parity
-//!   [ ] Ciphertext header encode/decode round-trip     (pending)
+//!   [x] Ciphertext header encode/decode round-trip
+//!   [x] Encryption context (AAD) hash determinism and binding
 //!   [ ] Cascade-disable propagation                    (pending)
 //!   [ ] Audit event emission                           (pending)
 
 use keyrack_core::attr::{AttributeSet, AttributeValue};
 use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
+use keyrack_core::encryption_context::{EncryptionContext, ZERO_CONTEXT_HASH};
 use keyrack_core::error::KeyRackError;
+use keyrack_core::header::{CiphertextHeader, HEADER_SIZE};
 use keyrack_core::key::{KeyRecord, KeySpec, KeyState, KeyUsage, ProviderClass};
 use keyrack_core::lid::Lid;
 use keyrack_core::provider::inmem::InMemoryProvider;
@@ -533,6 +536,141 @@ async fn provider_destroy_prevents_use() {
     provider.destroy_key(&handle).await.unwrap();
 
     assert!(provider.encrypt(&handle, b"test", b"").await.is_err());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ciphertext header + encryption context
+// ────────────────────────────────────────────────────────────────────
+
+/// Full pipeline: derive LID → build encryption context → create header
+/// → encode → decode → verify all fields survive the round-trip.
+#[test]
+fn ciphertext_header_round_trip() {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("acme".into()));
+    attrs.insert("kind", AttributeValue::String("dek".into()));
+    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+
+    let mut ctx = EncryptionContext::new();
+    ctx.insert("volume_id", "vol-123");
+    ctx.insert("tenant", "acme");
+    let ctx_hash = ctx.hash();
+
+    let header = CiphertextHeader::new(lid.clone(), 7, ctx_hash);
+    let encoded = header.encode();
+    assert_eq!(encoded.len(), HEADER_SIZE);
+
+    let decoded = CiphertextHeader::decode(&encoded).unwrap();
+    assert_eq!(decoded.lid, lid);
+    assert_eq!(decoded.key_version, 7);
+    assert_eq!(decoded.encryption_context_hash, ctx_hash);
+    assert!(decoded.has_encryption_context());
+}
+
+/// Header without encryption context uses the zero sentinel.
+#[test]
+fn ciphertext_header_no_context() {
+    let lid = {
+        let mut attrs = AttributeSet::new();
+        attrs.insert("t", AttributeValue::String("x".into()));
+        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        Lid::derive(CanonicalizationVersion::V1, &form)
+    };
+
+    let header = CiphertextHeader::new(lid, 1, ZERO_CONTEXT_HASH);
+    assert!(!header.has_encryption_context());
+
+    let decoded = CiphertextHeader::decode(&header.encode()).unwrap();
+    assert!(!decoded.has_encryption_context());
+    assert_eq!(decoded.encryption_context_hash, ZERO_CONTEXT_HASH);
+}
+
+/// wrap_payload / unwrap_payload: header + ciphertext survive the round-trip.
+#[test]
+fn ciphertext_header_wrap_unwrap_payload() {
+    let lid = {
+        let mut attrs = AttributeSet::new();
+        attrs.insert("t", AttributeValue::String("x".into()));
+        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        Lid::derive(CanonicalizationVersion::V1, &form)
+    };
+
+    let header = CiphertextHeader::new(lid, 1, ZERO_CONTEXT_HASH);
+    let payload = b"AES-GCM nonce || ciphertext || tag";
+
+    let blob = header.wrap_payload(payload);
+    let (decoded_header, decoded_payload) = CiphertextHeader::unwrap_payload(&blob).unwrap();
+
+    assert_eq!(decoded_header, header);
+    assert_eq!(decoded_payload, payload);
+}
+
+/// Encryption context hash is deterministic regardless of insertion order.
+#[test]
+fn encryption_context_hash_determinism() {
+    let mut a = EncryptionContext::new();
+    a.insert("z_key", "z_val");
+    a.insert("a_key", "a_val");
+
+    let mut b = EncryptionContext::new();
+    b.insert("a_key", "a_val");
+    b.insert("z_key", "z_val");
+
+    assert_eq!(a.hash(), b.hash());
+    assert_eq!(a.to_aad_bytes(), b.to_aad_bytes());
+}
+
+/// Different encryption contexts produce different hashes (collision check).
+#[test]
+fn encryption_context_different_values_different_hash() {
+    let mut a = EncryptionContext::new();
+    a.insert("tenant", "acme");
+
+    let mut b = EncryptionContext::new();
+    b.insert("tenant", "globex");
+
+    assert_ne!(a.hash(), b.hash());
+}
+
+/// Integrated test: encrypt with AAD from EncryptionContext, wrap in
+/// header, unwrap, verify context hash, decrypt with same AAD.
+#[tokio::test]
+async fn integrated_encrypt_with_header_and_context() {
+    let provider = SoftwareProvider::new();
+    let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("acme".into()));
+    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+
+    let mut ctx = EncryptionContext::new();
+    ctx.insert("volume_id", "vol-456");
+    let aad = ctx.to_aad_bytes();
+    let ctx_hash = ctx.hash();
+
+    let plaintext = b"secret volume DEK";
+    let ct = provider.encrypt(&handle, plaintext, &aad).await.unwrap();
+
+    let header = CiphertextHeader::new(lid.clone(), 1, ctx_hash);
+    let blob = header.wrap_payload(&ct.ciphertext);
+
+    // Simulate storage → retrieval → decrypt.
+    let (recovered_header, recovered_ct) = CiphertextHeader::unwrap_payload(&blob).unwrap();
+    assert_eq!(recovered_header.lid, lid);
+    assert_eq!(recovered_header.encryption_context_hash, ctx_hash);
+
+    // Verify context matches before decrypting.
+    let mut ctx_at_decrypt = EncryptionContext::new();
+    ctx_at_decrypt.insert("volume_id", "vol-456");
+    assert_eq!(ctx_at_decrypt.hash(), recovered_header.encryption_context_hash);
+
+    let pt = provider
+        .decrypt(&handle, recovered_ct, &ctx_at_decrypt.to_aad_bytes())
+        .await
+        .unwrap();
+    assert_eq!(pt.expose().as_slice(), plaintext);
 }
 
 // ────────────────────────────────────────────────────────────────────
