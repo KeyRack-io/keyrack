@@ -190,29 +190,55 @@ Versioned JSON schema for audit events emitted to all sinks.
 
 ## 6. Tags Model
 
-**Status:** stub — to be locked during W1.
+**Status:** locked.
 
-### 6.1 Identity tags
+Two tag categories live on every `KeyRecord`:
 
-Immutable, derived from the attribute set at key creation. Stored as a
-separate `identity_tags` field on `KeyRecord`. Visible in audit events
-and PDP requests only. Excluded from tenant-facing API responses.
+### 6.1 Identity tags (`IdentityTags`)
 
-### 6.2 User tags
+Immutable, derived from the `AttributeSet` at key creation. Stored as a
+separate `identity_tags` field (flat `BTreeMap<String, String>`) on
+`KeyRecord`.
 
-Mutable via `TagResource` / `UntagResource`. Stored as `user_tags` on
-`KeyRecord`. Visible in API responses.
+- Complex attribute values (`I64`, `Bool`, `ListOfString`, `Record`) are
+  serialized to their JSON string representation.
+- Visible in **audit events** and **PDP requests** only.
+- **Excluded from tenant-facing API responses** (`KEYRACK_SPEC.md` §5.14,
+  invariant 9).
+- Never modified after initial derivation.
+
+### 6.2 User tags (`UserTags`)
+
+Mutable via `TagResource` / `UntagResource`. Stored as `user_tags`
+(`BTreeMap<String, String>`) on `KeyRecord`. Visible in API responses.
+Tenants and operators manage these freely.
 
 ### 6.3 Mutability enforcement
 
-`TagResource` / `UntagResource` targeting an identity tag key returns
-`ImmutableTagError`.
+`validate_tag_mutation(identity_tags, tag_key)` is called before any
+`TagResource` / `UntagResource`. If `tag_key` exists in the identity
+tags, the operation returns `KeyRackError::ImmutableTag { key }`.
+
+This is a hard boundary — there is no override, admin flag, or bypass.
+
+### 6.4 PDP visibility
+
+Both identity and user tags are included in the `AuthzRequest` context
+sent to the PDP, so authorization policies can reference either.
+Only user tags are returned in the `DescribeKey` / `ListKeys` tenant API
+responses.
+
+### 6.5 Serialization
+
+Both tag types implement `Serialize` / `Deserialize` (serde). The wire
+format is `{"key": "value", ...}`. Identity tags and user tags are
+serialized as distinct fields, never merged.
 
 ---
 
 ## 7. Key State Machine
 
-**Status:** stub — to be locked during W1.
+**Status:** locked.
 
 ```
 creating ──► enabled ◄──► disabled
@@ -224,14 +250,59 @@ creating ──► enabled ◄──► disabled
            destroyed
 ```
 
-| Transition | API | Notes |
+### 7.1 States
+
+| State | `permits_encrypt` | `permits_decrypt` |
 |---|---|---|
-| → creating → enabled | CreateKey | Sync for software; async (TaskRef) for HSM |
-| enabled → disabled | DisableKey | Blocks encrypt/sign; decrypt allowed |
-| disabled → enabled | EnableKey | |
-| enabled/disabled → pending_deletion | ScheduleKeyDeletion | 7–30 day grace |
-| pending_deletion → disabled | CancelKeyDeletion | Returns to disabled |
-| pending_deletion → destroyed | Background worker | HSM material erased |
+| `creating` | no | no |
+| `enabled` | yes | yes |
+| `disabled` | no | yes (data recovery) |
+| `pending_deletion` | no | no |
+| `destroyed` | no | no |
+
+### 7.2 Valid transitions
+
+| From | To | API | Notes |
+|---|---|---|---|
+| `creating` | `enabled` | `CreateKey` | Sync for software; async (`TaskRef`) for HSM |
+| `enabled` | `disabled` | `DisableKey` | Blocks encrypt/sign; decrypt still allowed |
+| `disabled` | `enabled` | `EnableKey` | |
+| `enabled` | `pending_deletion` | `ScheduleKeyDeletion` | 7–30 day grace period |
+| `disabled` | `pending_deletion` | `ScheduleKeyDeletion` | |
+| `pending_deletion` | `disabled` | `CancelKeyDeletion` | Returns to disabled, not enabled |
+| `pending_deletion` | `destroyed` | Background worker | HSM material erased, terminal |
+
+`destroyed` is terminal — no transitions out.
+
+### 7.3 Implementation
+
+`KeyState::can_transition_to(target)` validates transitions. `KeyRecord::transition_to(target)` atomically:
+
+1. Validates the transition.
+2. Sets `self.state = target`.
+3. Increments `self.version` (feeds OCC in §9).
+4. Updates `self.updated_at`.
+
+Invalid transitions return `Err((from, to))` and leave the record unchanged.
+
+### 7.4 KeyRecord fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `lid` | `Lid` | Derived via §2 + §3 |
+| `canonicalization_version` | `CanonicalizationVersion` | Recorded at creation |
+| `parent_lid` | `Option<Lid>` | Stored, not recomputed (MIGRATION.md) |
+| `version` | `u64` | OCC counter |
+| `state` | `KeyState` | Current lifecycle state |
+| `key_usage` | `KeyUsage` | `EncryptDecrypt` or `SignVerify` |
+| `key_spec` | `KeySpec` | `Aes256`, `Ed25519`, `RsaPkcs1v15Sha256`, `EcdsaP256Sha256` |
+| `provider_class` | `ProviderClass` | `Software`, `Pkcs11`, `Kmip`, `InMemory` |
+| `identity_tags` | `IdentityTags` | See §6.1 |
+| `user_tags` | `UserTags` | See §6.2 |
+| `created_at` | `DateTime<Utc>` | |
+| `updated_at` | `DateTime<Utc>` | Bumped on every state/tag/version change |
+| `scheduled_deletion_at` | `Option<DateTime<Utc>>` | Set by `ScheduleKeyDeletion` |
+| `description` | `String` | Human-readable label |
 
 ---
 

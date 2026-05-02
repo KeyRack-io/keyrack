@@ -18,15 +18,22 @@
 //!
 //! Current coverage:
 //!   [x] Attribute model → canonicalization → LID derivation → display → parse
+//!   [x] Sensitive<T> redaction
+//!   [x] Key state machine transitions
+//!   [x] Tags model: identity immutability, user CRUD
+//!   [x] KeyRecord lifecycle (create → enable → disable → pending_deletion → destroy)
 //!   [ ] Ciphertext header encode/decode round-trip     (pending)
 //!   [ ] Software provider encrypt/decrypt round-trip   (pending)
-//!   [ ] Key state machine transitions                  (pending)
 //!   [ ] Cascade-disable propagation                    (pending)
 //!   [ ] Audit event emission                           (pending)
 
 use keyrack_core::attr::{AttributeSet, AttributeValue};
 use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
+use keyrack_core::error::KeyRackError;
+use keyrack_core::key::{KeyRecord, KeySpec, KeyState, KeyUsage, ProviderClass};
 use keyrack_core::lid::Lid;
+use keyrack_core::sensitive::Sensitive;
+use keyrack_core::tags::{validate_tag_mutation, IdentityTags, UserTags};
 use std::collections::BTreeMap;
 
 /// Full identity pipeline: attrs → canonical form → LID → string → parse → same LID.
@@ -176,4 +183,272 @@ fn identity_pipeline_distinct_keys() {
     assert_ne!(kek, root);
     assert_ne!(kek, signing);
     assert_ne!(root, signing);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Sensitive<T> redaction
+// ────────────────────────────────────────────────────────────────────
+
+/// Sensitive<T> must never leak plaintext through Debug or Display,
+/// but must allow controlled access via expose().
+#[test]
+fn sensitive_redaction_e2e() {
+    let secret_key = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let wrapped = Sensitive::new(secret_key.clone());
+
+    let debug = format!("{wrapped:?}");
+    let display = format!("{wrapped}");
+
+    assert_eq!(debug, "[REDACTED]");
+    assert_eq!(display, "[REDACTED]");
+    assert!(!debug.contains("222"));
+    assert!(!debug.contains("DEAD"));
+
+    assert_eq!(wrapped.expose(), &secret_key);
+
+    let cloned = wrapped.clone();
+    assert_eq!(cloned.expose(), wrapped.expose());
+
+    let v = wrapped.into_inner();
+    assert_eq!(v, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Key state machine
+// ────────────────────────────────────────────────────────────────────
+
+/// Walk the full happy-path lifecycle:
+///   creating → enabled → disabled → enabled → pending_deletion → destroyed
+#[test]
+fn key_state_machine_full_lifecycle() {
+    assert!(KeyState::Creating.can_transition_to(KeyState::Enabled));
+    assert!(KeyState::Enabled.can_transition_to(KeyState::Disabled));
+    assert!(KeyState::Disabled.can_transition_to(KeyState::Enabled));
+    assert!(KeyState::Enabled.can_transition_to(KeyState::PendingDeletion));
+    assert!(KeyState::PendingDeletion.can_transition_to(KeyState::Destroyed));
+    assert!(KeyState::Destroyed.valid_transitions().is_empty());
+}
+
+/// Cancel deletion: pending_deletion → disabled → enabled
+#[test]
+fn key_state_machine_cancel_deletion() {
+    assert!(KeyState::PendingDeletion.can_transition_to(KeyState::Disabled));
+    assert!(KeyState::Disabled.can_transition_to(KeyState::Enabled));
+}
+
+/// Encrypt/decrypt permissions track the spec:
+///   encrypt: enabled only; decrypt: enabled + disabled (data recovery)
+#[test]
+fn key_state_operation_permissions() {
+    for state in &[
+        KeyState::Creating,
+        KeyState::Disabled,
+        KeyState::PendingDeletion,
+        KeyState::Destroyed,
+    ] {
+        assert!(!state.permits_encrypt(), "{state:?} should not permit encrypt");
+    }
+    assert!(KeyState::Enabled.permits_encrypt());
+
+    assert!(KeyState::Enabled.permits_decrypt());
+    assert!(KeyState::Disabled.permits_decrypt());
+    assert!(!KeyState::PendingDeletion.permits_decrypt());
+    assert!(!KeyState::Destroyed.permits_decrypt());
+}
+
+/// KeyRecord transitions bump version and update timestamp.
+#[test]
+fn key_record_transition_bumps_version() {
+    let mut record = make_test_record(KeyState::Enabled);
+    let v0 = record.version;
+    let t0 = record.updated_at;
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    record.transition_to(KeyState::Disabled).unwrap();
+
+    assert_eq!(record.state, KeyState::Disabled);
+    assert_eq!(record.version, v0 + 1);
+    assert!(record.updated_at >= t0);
+}
+
+/// Invalid transitions return Err and leave state unchanged.
+#[test]
+fn key_record_invalid_transition_is_noop() {
+    let mut record = make_test_record(KeyState::Creating);
+    let snap = record.version;
+    assert!(record.transition_to(KeyState::Destroyed).is_err());
+    assert_eq!(record.state, KeyState::Creating);
+    assert_eq!(record.version, snap);
+}
+
+/// KeyState round-trips through JSON.
+#[test]
+fn key_state_serde_round_trip() {
+    for state in &[
+        KeyState::Creating,
+        KeyState::Enabled,
+        KeyState::Disabled,
+        KeyState::PendingDeletion,
+        KeyState::Destroyed,
+    ] {
+        let json = serde_json::to_string(state).unwrap();
+        let parsed: KeyState = serde_json::from_str(&json).unwrap();
+        assert_eq!(*state, parsed);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tags model
+// ────────────────────────────────────────────────────────────────────
+
+/// Identity tags are derived from the attribute set and are immutable.
+/// User tags are freely mutable. The two namespaces do not collide.
+#[test]
+fn tags_model_e2e() {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("acme".into()));
+    attrs.insert("kind", AttributeValue::String("dek".into()));
+    attrs.insert("priority", AttributeValue::I64(7));
+
+    let identity = IdentityTags::from_attribute_set(&attrs);
+    assert_eq!(identity.get("tenant"), Some("acme"));
+    assert_eq!(identity.get("kind"), Some("dek"));
+    assert_eq!(identity.get("priority"), Some("7"));
+    assert_eq!(identity.len(), 3);
+
+    // User tags: independent CRUD.
+    let mut user = UserTags::new();
+    user.set("env", "production");
+    user.set("team", "platform");
+    assert_eq!(user.get("env"), Some("production"));
+    assert_eq!(user.len(), 2);
+
+    user.set("env", "staging");
+    assert_eq!(user.get("env"), Some("staging"));
+
+    user.remove("team");
+    assert_eq!(user.len(), 1);
+
+    // Mutating an identity tag key via the tag API is an error.
+    let err = validate_tag_mutation(&identity, "tenant");
+    assert!(matches!(
+        err,
+        Err(KeyRackError::ImmutableTag { ref key }) if key == "tenant"
+    ));
+
+    // Non-identity keys are fine.
+    assert!(validate_tag_mutation(&identity, "env").is_ok());
+    assert!(validate_tag_mutation(&identity, "some-custom-tag").is_ok());
+}
+
+/// Both tag types round-trip through JSON (serde boundary).
+#[test]
+fn tags_serde_round_trip() {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("acme".into()));
+    let identity = IdentityTags::from_attribute_set(&attrs);
+    let json = serde_json::to_string(&identity).unwrap();
+    let parsed: IdentityTags = serde_json::from_str(&json).unwrap();
+    assert_eq!(identity, parsed);
+
+    let mut user = UserTags::new();
+    user.set("env", "prod");
+    let json = serde_json::to_string(&user).unwrap();
+    let parsed: UserTags = serde_json::from_str(&json).unwrap();
+    assert_eq!(user, parsed);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Integrated: full key lifecycle with tags
+// ────────────────────────────────────────────────────────────────────
+
+/// Full lifecycle: create attributes → derive LID → create KeyRecord →
+/// walk through state transitions → verify tag immutability along the way.
+#[test]
+fn full_key_lifecycle_with_tags() {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("globex".into()));
+    attrs.insert("kind", AttributeValue::String("dek".into()));
+
+    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let identity_tags = IdentityTags::from_attribute_set(&attrs);
+    let mut user_tags = UserTags::new();
+    user_tags.set("environment", "dev");
+
+    let mut record = KeyRecord {
+        lid: lid.clone(),
+        canonicalization_version: CanonicalizationVersion::V1,
+        parent_lid: None,
+        version: 1,
+        state: KeyState::Creating,
+        key_usage: KeyUsage::EncryptDecrypt,
+        key_spec: KeySpec::Aes256,
+        provider_class: ProviderClass::Software,
+        identity_tags: identity_tags.clone(),
+        user_tags,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        scheduled_deletion_at: None,
+        description: "E2E test key".into(),
+    };
+
+    // creating → enabled
+    assert!(record.transition_to(KeyState::Enabled).is_ok());
+    assert!(record.state.permits_encrypt());
+    assert!(record.state.permits_decrypt());
+
+    // Add user tags while enabled.
+    assert!(validate_tag_mutation(&record.identity_tags, "cost-center").is_ok());
+    record.user_tags.set("cost-center", "engineering");
+
+    // Cannot mutate identity tags.
+    assert!(validate_tag_mutation(&record.identity_tags, "tenant").is_err());
+    assert!(validate_tag_mutation(&record.identity_tags, "kind").is_err());
+
+    // enabled → disabled
+    assert!(record.transition_to(KeyState::Disabled).is_ok());
+    assert!(!record.state.permits_encrypt());
+    assert!(record.state.permits_decrypt()); // data recovery
+
+    // disabled → pending_deletion
+    assert!(record.transition_to(KeyState::PendingDeletion).is_ok());
+    assert!(!record.state.permits_encrypt());
+    assert!(!record.state.permits_decrypt());
+
+    // pending_deletion → destroyed (terminal)
+    assert!(record.transition_to(KeyState::Destroyed).is_ok());
+    assert!(record.state.valid_transitions().is_empty());
+
+    // LID is stable throughout.
+    assert_eq!(record.lid, lid);
+    assert_eq!(record.identity_tags.get("tenant"), Some("globex"));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test helpers
+// ────────────────────────────────────────────────────────────────────
+
+fn make_test_record(state: KeyState) -> KeyRecord {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("tenant", AttributeValue::String("test-tenant".into()));
+    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+
+    KeyRecord {
+        lid,
+        canonicalization_version: CanonicalizationVersion::V1,
+        parent_lid: None,
+        version: 1,
+        state,
+        key_usage: KeyUsage::EncryptDecrypt,
+        key_spec: KeySpec::Aes256,
+        provider_class: ProviderClass::Software,
+        identity_tags: IdentityTags::from_attribute_set(&attrs),
+        user_tags: UserTags::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        scheduled_deletion_at: None,
+        description: String::new(),
+    }
 }

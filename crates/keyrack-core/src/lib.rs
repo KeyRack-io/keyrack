@@ -19,4 +19,8 @@
 
 pub mod attr;
 pub mod canon;
+pub mod error;
+pub mod key;
 pub mod lid;
+pub mod sensitive;
+pub mod tags;
