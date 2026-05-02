@@ -22,8 +22,10 @@
 //!   [x] Key state machine transitions
 //!   [x] Tags model: identity immutability, user CRUD
 //!   [x] KeyRecord lifecycle (create → enable → disable → pending_deletion → destroy)
+//!   [x] Software provider encrypt/decrypt round-trip (AES-256-GCM)
+//!   [x] Software provider sign/verify round-trip (Ed25519, ECDSA P-256, RSA)
+//!   [x] InMemory provider parity
 //!   [ ] Ciphertext header encode/decode round-trip     (pending)
-//!   [ ] Software provider encrypt/decrypt round-trip   (pending)
 //!   [ ] Cascade-disable propagation                    (pending)
 //!   [ ] Audit event emission                           (pending)
 
@@ -32,6 +34,9 @@ use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
 use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{KeyRecord, KeySpec, KeyState, KeyUsage, ProviderClass};
 use keyrack_core::lid::Lid;
+use keyrack_core::provider::inmem::InMemoryProvider;
+use keyrack_core::provider::software::SoftwareProvider;
+use keyrack_core::provider::{CryptoProvider, SigningAlgorithm};
 use keyrack_core::sensitive::Sensitive;
 use keyrack_core::tags::{validate_tag_mutation, IdentityTags, UserTags};
 use std::collections::BTreeMap;
@@ -423,6 +428,111 @@ fn full_key_lifecycle_with_tags() {
     // LID is stable throughout.
     assert_eq!(record.lid, lid);
     assert_eq!(record.identity_tags.get("tenant"), Some("globex"));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Provider: encrypt/decrypt round-trips
+// ────────────────────────────────────────────────────────────────────
+
+/// AES-256-GCM encrypt → decrypt round-trip with AAD binding.
+#[tokio::test]
+async fn provider_aes256_gcm_round_trip() {
+    let provider = SoftwareProvider::new();
+    let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+    let plaintext = b"volume DEK material - 32 bytes!!";
+    let aad = b"tenant=acme,lid=lid_abc123";
+
+    let ct = provider.encrypt(&handle, plaintext, aad).await.unwrap();
+    assert_ne!(ct.ciphertext, plaintext, "ciphertext must differ from plaintext");
+
+    let pt = provider.decrypt(&handle, &ct.ciphertext, aad).await.unwrap();
+    assert_eq!(pt.expose().as_slice(), plaintext);
+}
+
+/// AAD mismatch must fail decryption (integrity guarantee).
+#[tokio::test]
+async fn provider_aes256_gcm_aad_mismatch_fails() {
+    let provider = SoftwareProvider::new();
+    let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+    let ct = provider.encrypt(&handle, b"secret", b"context-a").await.unwrap();
+    let result = provider.decrypt(&handle, &ct.ciphertext, b"context-b").await;
+    assert!(result.is_err(), "wrong AAD must fail decryption");
+}
+
+/// Each V1 signing algorithm: keygen → sign → verify → tampered-verify-fails.
+#[tokio::test]
+async fn provider_sign_verify_all_v1_algorithms() {
+    let provider = SoftwareProvider::new();
+    let message = b"backup manifest hash: sha256:abc123...";
+
+    let specs_and_algos = [
+        (KeySpec::Ed25519, SigningAlgorithm::Ed25519),
+        (KeySpec::EcdsaP256Sha256, SigningAlgorithm::EcdsaP256Sha256),
+        (
+            KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+            SigningAlgorithm::RsaPkcs1v15Sha256,
+        ),
+    ];
+
+    for (spec, algo) in &specs_and_algos {
+        let handle = provider.generate_key(spec).await.unwrap();
+
+        let sig = provider.sign(&handle, *algo, message).await.unwrap();
+        assert!(!sig.is_empty(), "{algo:?} signature must be non-empty");
+
+        let valid = provider.verify(&handle, *algo, message, &sig).await.unwrap();
+        assert!(valid, "{algo:?} valid signature must verify");
+
+        let invalid = provider
+            .verify(&handle, *algo, b"tampered message", &sig)
+            .await
+            .unwrap();
+        assert!(!invalid, "{algo:?} tampered message must fail verification");
+    }
+}
+
+/// InMemoryProvider produces the same results as SoftwareProvider.
+#[tokio::test]
+async fn provider_inmem_parity() {
+    let provider = InMemoryProvider::new();
+    let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+    let ct = provider.encrypt(&handle, b"parity test", b"aad").await.unwrap();
+    let pt = provider.decrypt(&handle, &ct.ciphertext, b"aad").await.unwrap();
+    assert_eq!(pt.expose().as_slice(), b"parity test");
+
+    let sign_handle = provider.generate_key(&KeySpec::Ed25519).await.unwrap();
+    let sig = provider
+        .sign(&sign_handle, SigningAlgorithm::Ed25519, b"msg")
+        .await
+        .unwrap();
+    assert!(provider
+        .verify(&sign_handle, SigningAlgorithm::Ed25519, b"msg", &sig)
+        .await
+        .unwrap());
+}
+
+/// generate_random produces the requested length, and two calls differ.
+#[tokio::test]
+async fn provider_generate_random() {
+    let provider = SoftwareProvider::new();
+    let a = provider.generate_random(32).await.unwrap();
+    let b = provider.generate_random(32).await.unwrap();
+
+    assert_eq!(a.expose().len(), 32);
+    assert_ne!(a.expose(), b.expose(), "two random calls must differ");
+}
+
+/// Destroyed keys cannot be used.
+#[tokio::test]
+async fn provider_destroy_prevents_use() {
+    let provider = SoftwareProvider::new();
+    let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+    provider.destroy_key(&handle).await.unwrap();
+
+    assert!(provider.encrypt(&handle, b"test", b"").await.is_err());
 }
 
 // ────────────────────────────────────────────────────────────────────

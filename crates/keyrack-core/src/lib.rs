@@ -22,5 +22,6 @@ pub mod canon;
 pub mod error;
 pub mod key;
 pub mod lid;
+pub mod provider;
 pub mod sensitive;
 pub mod tags;
