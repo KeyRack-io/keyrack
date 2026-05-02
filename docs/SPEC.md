@@ -198,26 +198,58 @@ the same data the hash commits to.
 
 ## 5. Audit Event Schema
 
-**Status:** stub — to be locked during W1.
+**Status:** locked.
 
 Versioned JSON schema for audit events emitted to all sinks.
+Implementation: `keyrack_core::audit`.
 
 ### 5.1 Envelope
 
 ```json
 {
   "schema_version": 1,
-  "event_id": "uuid",
-  "timestamp": "RFC 3339",
-  "event_type": "key.created | key.state_changed | key.rotated | ...",
-  "action": "kms:CreateKey | kms:Encrypt | ...",
+  "event_id": "uuid-v4",
+  "timestamp": "RFC 3339 (UTC)",
+  "event_type": "key_created | key_state_changed | key_rotated | key_deleted | crypto_operation | tag_mutation | alias_mutation | hsm_connection_mutation | rotation_job_state_changed | cascade_disable | authorization_denied",
+  "action": "kms:CreateKey | kms:Encrypt | kms:Decrypt | ... (full vocabulary below)",
   "principal": { "id": "opaque", "type": "opaque" },
   "resource": { "id": "lid_...", "type": "Key" },
   "result": "success | denied | error",
-  "encryption_context_hash": "hex or null",
-  "metadata": {}
+  "encryption_context_hash": "64-char hex | omitted",
+  "tenant": "optional",
+  "project": "optional",
+  "srn": "optional",
+  "metadata": { "key": "value" }
 }
 ```
+
+### 5.2 Action vocabulary
+
+All actions are prefixed `kms:` and match the `AuditAction` enum:
+
+| Category | Actions |
+|---|---|
+| Crypto | `Encrypt`, `Decrypt`, `GenerateDataKey`, `GenerateDataKeyWithoutPlaintext`, `ReEncrypt`, `Sign`, `Verify`, `GenerateRandom` |
+| Lifecycle | `CreateKey`, `EnableKey`, `DisableKey`, `ScheduleKeyDeletion`, `CancelKeyDeletion`, `RotateKey` |
+| Metadata | `DescribeKey`, `UpdateKey` |
+| Tags | `TagResource`, `UntagResource` |
+| Aliases | `CreateAlias`, `DeleteAlias` |
+| HSM | `CreateHsmConnection`, `DeleteHsmConnection` |
+| Rotation jobs | `AcknowledgeRotationJob`, `CompleteRotationJob`, `FailRotationJob` |
+| Cascade | `CascadeDisable` |
+
+### 5.3 Sinks
+
+- `StdoutSink` — JSON to stdout (dev/test).
+- `FileSink` — append-only JSON-lines file (compliance fallback).
+- NATS sink — `keyrack-nats` crate; publishes to `kms.audit.<event_id>` per §10.
+- `FanoutSink` — dispatches to multiple inner sinks.
+
+### 5.4 Optional fields
+
+`encryption_context_hash`, `tenant`, `project`, `srn`, and `metadata`
+are omitted from JSON when empty/absent. Populated by the service layer
+from authenticated request context.
 
 ---
 
@@ -371,20 +403,35 @@ Two distinct version concepts:
 
 ## 8. Authz Request Schema (PDP Contract)
 
-**Status:** stub — shape locked during W1; field details pending PDP team.
+**Status:** shape locked; field details pending PDP team.
 
 See `PDP_WIRE_FORMAT_REQS.md` for the full constraint set. The Rust
-representation of the request lives in `keyrack-core::pdp`.
+representation of the request lives in `keyrack_core::pdp`.
 
 ### 8.1 Rust types
 
 ```rust
 pub struct AuthzRequest {
     pub request_id: String,
-    pub action: Action,
+    pub action: AuditAction,       // shares vocabulary with audit
     pub principal: Principal,
     pub resource: Resource,
     pub context: RequestContext,
+}
+
+pub struct Principal {
+    pub id: String,                // opaque (e.g. SRN)
+    pub principal_type: String,    // "User", "Service", "Admin", "System"
+}
+
+pub struct Resource {
+    pub id: String,                // LID for keys, connection_id for HSM, etc.
+    pub resource_type: String,     // "Key", "Alias", "HsmConnection"
+    pub attributes: BTreeMap<String, Value>,  // identity+user tags, state
+}
+
+pub struct RequestContext {
+    pub entries: BTreeMap<String, Value>,  // free-form
 }
 
 pub struct AuthzResponse {
@@ -394,35 +441,70 @@ pub struct AuthzResponse {
     pub policy_version: Option<String>,
 }
 
-pub enum Decision {
-    Permit,
-    Forbid,
-    Indeterminate,
+pub enum Decision { Permit, Forbid, Indeterminate }
+```
+
+### 8.2 System principal
+
+`Principal::system()` returns `{ id: "keyrack:system", type: "System" }`
+for internal operations (cascade-disable, rotation-job expiry). PDPs
+honour it via their own policies.
+
+### 8.3 Test fixtures
+
+- `AlwaysAllow` — always returns `Permit`.
+- `AlwaysDeny` — always returns `Forbid`.
+
+Both are feature-gated for test use only.
+
+### 8.4 Trait
+
+```rust
+#[async_trait]
+pub trait PolicyDecisionPoint: Send + Sync {
+    async fn evaluate(&self, request: &AuthzRequest) -> Result<AuthzResponse>;
 }
 ```
+
+Out-of-tree implementations: `HttpPdpClient`, `GrpcPdpClient`,
+`EmbeddedCedarPdp` (W2 service layer).
 
 ---
 
 ## 9. Storage Schema with Optimistic Concurrency
 
-**Status:** stub — to be locked during W1.
+**Status:** trait locked; SQL DDL deferred to `keyrack-postgres`/`keyrack-sqlite`.
+
+Implementation: `keyrack_core::storage::StorageBackend` trait.
 
 ### 9.1 Core tables
 
-- `keys` — primary key record with `version` column for OCC
-- `key_versions` — per-rotation version records
-- `lid_alias` — canonicalization migration aliases
-- `aliases` — human-readable alias pointers
-- `hsm_connections` — HSM connection records
-- `rotation_jobs` — cooperative rotation job records
-- `migration_state` — migration checkpoint (for `keyrack migrate`)
-- `tags` — user tags (identity tags are on the `keys` row)
+| Table | Trait methods | Notes |
+|---|---|---|
+| `keys` | `create_key`, `get_key`, `update_key`, `list_keys` | `occ_version` column for OCC |
+| `key_versions` | (embedded in `KeyRecord.key_versions`) | Per-rotation version records |
+| `aliases` | `create_alias`, `resolve_alias`, `delete_alias`, `list_aliases` | Human-readable pointers |
+| `hsm_connections` | `create_hsm_connection`, `get_`, `update_`, `list_`, `delete_` | HSM/HYOK records |
+| `rotation_jobs` | `create_rotation_job`, `get_`, `update_`, `list_rotation_jobs` | Cooperative rotation protocol |
+| `lid_alias` | (future: migration aliases) | Canonicalization migration |
+| `migration_state` | (future: `keyrack migrate`) | Migration checkpoint |
 
 ### 9.2 Optimistic concurrency
 
-Every mutable operation on `keys` checks `WHERE version = $expected`
+Every mutable operation on `keys` checks `WHERE occ_version = $expected`
 and increments on success. A concurrent conflict returns
-`OptimisticConcurrencyError`; the caller retries.
+`OptimisticConcurrencyConflict`; the caller retries.
+
+### 9.3 Pagination
+
+`list_keys` returns `Page<KeyRecord>` with an opaque `next_cursor`.
+Callers pass `KeyFilter` with optional `user_tags` (AND), `limit`,
+and `cursor`.
+
+### 9.4 In-memory backend
+
+A `MemoryStorage` reference implementation exists in `storage.rs` tests.
+It validates the trait contract and is used for unit testing throughout.
 
 ---
 

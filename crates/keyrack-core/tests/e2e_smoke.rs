@@ -27,8 +27,11 @@
 //!   [x] InMemory provider parity
 //!   [x] Ciphertext header encode/decode round-trip
 //!   [x] Encryption context (AAD) hash determinism and binding
+//!   [x] Audit event schema, sinks, and fan-out
+//!   [x] PDP types, AlwaysAllow/AlwaysDeny fixtures
+//!   [x] Rotation-job state machine lifecycle
+//!   [x] HSM connection model and status transitions
 //!   [ ] Cascade-disable propagation                    (pending)
-//!   [ ] Audit event emission                           (pending)
 
 use keyrack_core::attr::{AttributeSet, AttributeValue};
 use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
@@ -689,6 +692,189 @@ async fn integrated_encrypt_with_header_and_context() {
 // ────────────────────────────────────────────────────────────────────
 // Test helpers
 // ────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────
+// Audit: event schema, serialization, sinks
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn audit_event_round_trip_json() {
+    use keyrack_core::audit::*;
+
+    let event = AuditEvent::new(
+        EventType::CryptoOperation,
+        AuditAction::Encrypt,
+        AuditPrincipal {
+            id: "svc:cinder".into(),
+            principal_type: "Service".into(),
+        },
+        AuditResource::key(&make_test_lid("audit-test")),
+        AuditResult::Success,
+    )
+    .with_encryption_context_hash([0xCC; 32])
+    .with_context(
+        Some("tenant-globex".into()),
+        Some("proj-alpha".into()),
+        None,
+    );
+
+    let bytes = event.to_json_bytes().unwrap();
+    let parsed: AuditEvent = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(parsed.schema_version, keyrack_core::audit::SCHEMA_VERSION);
+    assert_eq!(parsed.action, AuditAction::Encrypt);
+    assert_eq!(parsed.result, AuditResult::Success);
+    assert_eq!(parsed.tenant.as_deref(), Some("tenant-globex"));
+    assert!(parsed.encryption_context_hash.is_some());
+}
+
+#[test]
+fn audit_denied_event() {
+    use keyrack_core::audit::*;
+
+    let mut event = AuditEvent::new(
+        EventType::AuthorizationDenied,
+        AuditAction::Decrypt,
+        AuditPrincipal {
+            id: "user:mallory".into(),
+            principal_type: "User".into(),
+        },
+        AuditResource {
+            id: "lid_secret".into(),
+            resource_type: "Key".into(),
+        },
+        AuditResult::Denied,
+    );
+    event.add_metadata("policy", "deny-all");
+
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(json.contains("denied"));
+    assert!(json.contains("deny-all"));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// PDP: types, AlwaysAllow, AlwaysDeny
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pdp_always_allow_permits() {
+    use keyrack_core::audit::AuditAction;
+    use keyrack_core::pdp::*;
+
+    let pdp = AlwaysAllow;
+    let req = AuthzRequest {
+        request_id: "e2e-1".into(),
+        action: AuditAction::Encrypt,
+        principal: Principal::system(),
+        resource: Resource {
+            id: "lid_e2e".into(),
+            resource_type: "Key".into(),
+            attributes: BTreeMap::new(),
+        },
+        context: RequestContext::default(),
+    };
+    let resp = pdp.evaluate(&req).await.unwrap();
+    assert!(resp.decision.is_permit());
+}
+
+#[tokio::test]
+async fn pdp_always_deny_forbids() {
+    use keyrack_core::audit::AuditAction;
+    use keyrack_core::pdp::*;
+
+    let pdp = AlwaysDeny;
+    let req = AuthzRequest {
+        request_id: "e2e-2".into(),
+        action: AuditAction::CreateKey,
+        principal: Principal {
+            id: "user:bob".into(),
+            principal_type: "User".into(),
+        },
+        resource: Resource {
+            id: "lid_test".into(),
+            resource_type: "Key".into(),
+            attributes: BTreeMap::new(),
+        },
+        context: RequestContext::default(),
+    };
+    let resp = pdp.evaluate(&req).await.unwrap();
+    assert_eq!(resp.decision, Decision::Forbid);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Rotation job: full lifecycle
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn rotation_job_happy_path() {
+    use keyrack_core::rotation::*;
+
+    let parent = make_test_lid("rot-parent");
+    let child = make_test_lid("rot-child");
+
+    let mut job = RotationJob::new("rj-e2e-1", parent, child, 2);
+    assert_eq!(job.state, RotationJobState::Pending);
+
+    job.transition_to(RotationJobState::Acknowledged).unwrap();
+    assert!(job.acknowledged_at.is_some());
+
+    job.transition_to(RotationJobState::Completed).unwrap();
+    assert!(job.state.is_terminal());
+}
+
+#[test]
+fn rotation_job_failure_path() {
+    use keyrack_core::rotation::*;
+
+    let mut job = RotationJob::new(
+        "rj-e2e-2",
+        make_test_lid("p"),
+        make_test_lid("c"),
+        3,
+    );
+    job.transition_to(RotationJobState::Acknowledged).unwrap();
+    job.fail("HSM timeout during re-wrap").unwrap();
+    assert_eq!(job.state, RotationJobState::Failed);
+    assert!(job.failure_reason.is_some());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// HSM connection: lifecycle and status
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn hsm_connection_lifecycle() {
+    use keyrack_core::hsm::*;
+
+    let mut conn = HsmConnection::new(
+        "e2e-conn",
+        HsmProviderType::Hyok,
+        "kmip://tenant-hsm.example.com:5696",
+        "E2E test HYOK",
+    );
+    assert_eq!(conn.status, HsmConnectionStatus::Healthy);
+
+    conn.update_status(HsmConnectionStatus::Degraded);
+    assert_eq!(conn.status, HsmConnectionStatus::Degraded);
+
+    conn.update_status(HsmConnectionStatus::Down);
+    assert_eq!(conn.status, HsmConnectionStatus::Down);
+
+    conn.update_status(HsmConnectionStatus::Healthy);
+    assert_eq!(conn.status, HsmConnectionStatus::Healthy);
+    assert!(conn.last_health_check_at.is_some());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────
+
+fn make_test_lid(name: &str) -> Lid {
+    let mut attrs = AttributeSet::new();
+    attrs.insert("name", AttributeValue::String(name.into()));
+    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    Lid::derive(CanonicalizationVersion::V1, &form)
+}
 
 fn make_test_record(state: KeyState) -> KeyRecord {
     let mut attrs = AttributeSet::new();

@@ -18,12 +18,17 @@
 #![forbid(unsafe_code)]
 
 pub mod attr;
+pub mod audit;
 pub mod canon;
 pub mod encryption_context;
 pub mod error;
 pub mod header;
+pub mod hsm;
 pub mod key;
 pub mod lid;
+pub mod pdp;
 pub mod provider;
+pub mod rotation;
 pub mod sensitive;
+pub mod storage;
 pub mod tags;
