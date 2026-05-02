@@ -510,11 +510,32 @@ It validates the trait contract and is used for unit testing throughout.
 
 ## 10. Conformance Test Suite Scaffolding
 
-**Status:** stub — scaffolding lands during W1.
+**Status:** scaffolding locked.
 
-The conformance harness is a set of trait-level tests that any provider
-or storage implementation must pass. Phase 2 shim implementations
-(AWS KMS, Barbican) validate against this harness.
+The conformance harness is a set of trait-level test macros that any
+`CryptoProvider` or `StorageBackend` implementation must pass. Phase 2
+shim implementations (AWS KMS, Barbican) validate against this harness.
 
-The harness lives in `keyrack-test-support` and is consumed via
-`#[cfg(test)]` in backend crates.
+The harness lives in `keyrack-test-support` and is consumed via macros
+in backend crates.
+
+### 10.1 Provider conformance (`provider_conformance_tests!`)
+
+| Test | What it validates |
+|---|---|
+| `conformance_aes256_round_trip` | Encrypt → decrypt preserves plaintext with AAD |
+| `conformance_aad_mismatch_fails` | Wrong AAD fails decryption |
+| `conformance_ed25519_sign_verify` | Sign → verify; tampered message fails |
+| `conformance_generate_random` | 32-byte output, non-deterministic |
+| `conformance_destroy_key` | Post-destroy operations fail |
+| `conformance_generate_data_key` | DEK generation + round-trip via CMK |
+| `conformance_re_encrypt` | Decrypt-source + encrypt-dest preserves content |
+
+### 10.2 Storage conformance (`storage_conformance_tests!`)
+
+| Test | What it validates |
+|---|---|
+| `conformance_key_crud` | Create, get, update, list |
+| `conformance_occ_conflict` | Stale version rejected |
+| `conformance_alias_round_trip` | Create, resolve, delete alias |
+| `conformance_ping` | Liveness probe |

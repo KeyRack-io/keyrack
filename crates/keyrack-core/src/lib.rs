@@ -20,6 +20,7 @@
 pub mod attr;
 pub mod audit;
 pub mod canon;
+pub mod cascade;
 pub mod encryption_context;
 pub mod error;
 pub mod header;
@@ -28,7 +29,9 @@ pub mod key;
 pub mod lid;
 pub mod pdp;
 pub mod provider;
+pub mod resolver;
 pub mod rotation;
+pub mod rule;
 pub mod sensitive;
 pub mod storage;
 pub mod tags;

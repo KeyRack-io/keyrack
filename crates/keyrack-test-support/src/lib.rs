@@ -10,4 +10,18 @@
 // Change Date: 2030-01-01
 // Change License: Apache License, Version 2.0
 
+//! Shared test fixtures and conformance harness for `KeyRack`.
+//!
+//! This crate provides:
+//!
+//! - **Conformance test macros** that any `CryptoProvider` or
+//!   `StorageBackend` implementation must pass. Phase 2 shim
+//!   implementations (AWS KMS, Barbican) validate against this
+//!   harness.
+//! - **Shared test helpers** for constructing test records, LIDs,
+//!   and attribute sets.
+
 #![forbid(unsafe_code)]
+
+pub mod conformance;
+pub mod fixtures;
