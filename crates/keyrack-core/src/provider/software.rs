@@ -10,7 +10,7 @@
 // Change Date: 2030-01-01
 // Change License: Apache License, Version 2.0
 
-//! Pure-Rust software provider using RustCrypto primitives.
+//! Pure-Rust software provider using `RustCrypto` primitives.
 //!
 //! Suitable for development, testing, and single-node deployments
 //! without an HSM. Key material lives in process memory (zeroized

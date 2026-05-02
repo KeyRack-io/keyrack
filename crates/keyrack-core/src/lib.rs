@@ -10,7 +10,7 @@
 // Change Date: 2030-01-01
 // Change License: Apache License, Version 2.0
 
-//! KeyRack core library.
+//! `KeyRack` core library.
 //!
 //! Types, traits, canonicalization, LID derivation, rule engine, resolver,
 //! providers (software, in-memory), audit sinks, and `Sensitive<T>`.

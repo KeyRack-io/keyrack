@@ -67,7 +67,7 @@ pub fn canonicalize(
 /// Encoding: for each entry in the `BTreeMap` (which iterates in sorted key
 /// order):
 ///
-/// 1. Encode the key as a NFC-normalised UTF-8 string (TAG_STRING + u32 LE
+/// 1. Encode the key as a NFC-normalised UTF-8 string (`TAG_STRING` + u32 LE
 ///    length + bytes).
 /// 2. Encode the value per its type tag.
 ///
@@ -76,7 +76,7 @@ pub fn canonicalize(
 /// - Strings: NFC-normalised UTF-8 bytes.
 /// - I64: 8 bytes little-endian.
 /// - Bool: 1 byte (`0x01` true, `0x00` false).
-/// - ListOfString: u32 LE element count, then each element as (u32 LE length
+/// - `ListOfString`: u32 LE element count, then each element as (u32 LE length
 ///   + NFC UTF-8 bytes). No per-element tag — the list is homogeneous.
 /// - Record: recursive — canonicalize the inner `BTreeMap` as a nested
 ///   attribute set (same key+value encoding, sorted).
@@ -93,6 +93,7 @@ fn encode_map(buf: &mut Vec<u8>, map: &std::collections::BTreeMap<String, Attrib
     }
 }
 
+#[allow(clippy::cast_possible_truncation)] // attribute values bounded well under 4 GB
 fn encode_string_raw(buf: &mut Vec<u8>, s: &str) {
     let normalised: String = s.nfc().collect();
     let bytes = normalised.as_bytes();
@@ -101,6 +102,7 @@ fn encode_string_raw(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
+#[allow(clippy::cast_possible_truncation)] // attribute values bounded well under 4 GB
 fn encode_value(buf: &mut Vec<u8>, value: &AttributeValue) {
     match value {
         AttributeValue::String(s) => {

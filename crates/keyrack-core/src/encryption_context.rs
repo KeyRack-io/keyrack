@@ -13,11 +13,11 @@
 //! Encryption context (AAD) plumbing.
 //!
 //! An `EncryptionContext` is a set of key-value string pairs that callers
-//! supply at encrypt time. The pre-image is **opaque** — KeyRack does not
+//! supply at encrypt time. The pre-image is **opaque** — `KeyRack` does not
 //! interpret the values. Only the BLAKE3 hash is persisted in the
 //! ciphertext header (`KEYRACK_SPEC.md` §5.3, SPEC.md §4).
 //!
-//! At decrypt time the caller must supply the same context. KeyRack
+//! At decrypt time the caller must supply the same context. `KeyRack`
 //! re-hashes it and compares; mismatch → `EncryptionContextMismatch`.
 //!
 //! ## Canonical hashing
@@ -74,13 +74,13 @@ impl EncryptionContext {
     ///
     /// Returns `ZERO_CONTEXT_HASH` for an empty context.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // context keys/values bounded well under 4 GB
     pub fn hash(&self) -> [u8; 32] {
         if self.0.is_empty() {
             return ZERO_CONTEXT_HASH;
         }
 
         let mut hasher = blake3::Hasher::new();
-        // BTreeMap iteration is already sorted by key.
         for (k, v) in &self.0 {
             hasher.update(&(k.len() as u32).to_le_bytes());
             hasher.update(k.as_bytes());
@@ -95,6 +95,7 @@ impl EncryptionContext {
     /// This is the same canonical encoding fed to the hash, so the AAD
     /// binds the same data that the hash commits to.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // context keys/values bounded well under 4 GB
     pub fn to_aad_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for (k, v) in &self.0 {

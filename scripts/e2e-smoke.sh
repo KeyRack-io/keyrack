@@ -62,7 +62,7 @@ fi
 echo ""
 echo "Stage 3: E2E integration tests"
 if cargo test -p keyrack-core --test e2e_smoke --quiet 2>&1; then
-    pass "identity pipeline (canon → LID → round-trip)"
+    pass "E2E integration tests (identity, state machine, providers, header)"
 else
     fail "identity pipeline"
     FAILURES=$((FAILURES + 1))

@@ -12,7 +12,7 @@
 
 //! Cryptographic provider trait and key-handle types.
 //!
-//! A `CryptoProvider` is the boundary between KeyRack's key-management
+//! A `CryptoProvider` is the boundary between `KeyRack`'s key-management
 //! logic and the actual cryptographic backend. W1 ships two in-tree
 //! implementations:
 //!
@@ -45,8 +45,9 @@ use serde::{Deserialize, Serialize};
 /// Opaque handle to key material managed by a provider.
 ///
 /// The `key_id` is provider-internal (e.g. a UUID, HSM object label,
-/// PKCS#11 handle). KeyRack stores it alongside the `KeyRecord` so it
-/// can address the right material in the backend.
+/// PKCS#11 handle). `KeyRack` stores it alongside the
+/// `KeyVersionRecord` so it can address the right material in the
+/// backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyHandle {
     pub key_id: String,
@@ -131,6 +132,46 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Generate `length` bytes of cryptographically secure random data.
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>>;
+
+    /// Generate a data encryption key (DEK), encrypt it with the CMK
+    /// identified by `wrapping_handle`, and return both the plaintext
+    /// DEK and its encrypted form (§5.1 envelope encryption pattern).
+    ///
+    /// Default implementation composes `generate_random` + `encrypt`.
+    /// HSM providers should override for atomicity.
+    async fn generate_data_key(
+        &self,
+        wrapping_handle: &KeyHandle,
+        dek_length: usize,
+        aad: &[u8],
+    ) -> Result<GenerateDataKeyOutput> {
+        let plaintext_key = self.generate_random(dek_length).await?;
+        let encrypted = self
+            .encrypt(wrapping_handle, plaintext_key.expose(), aad)
+            .await?;
+        Ok(GenerateDataKeyOutput {
+            plaintext_key,
+            encrypted_key: encrypted.ciphertext,
+        })
+    }
+
+    /// Atomic decrypt + re-encrypt: decrypt `ciphertext` with
+    /// `source_handle` and re-encrypt with `dest_handle`. Plaintext
+    /// never leaves the provider boundary (§5.3).
+    ///
+    /// Default implementation composes `decrypt` + `encrypt`.
+    /// HSM providers should override to keep plaintext inside the HSM.
+    async fn re_encrypt(
+        &self,
+        source_handle: &KeyHandle,
+        ciphertext: &[u8],
+        source_aad: &[u8],
+        dest_handle: &KeyHandle,
+        dest_aad: &[u8],
+    ) -> Result<EncryptOutput> {
+        let plaintext = self.decrypt(source_handle, ciphertext, source_aad).await?;
+        self.encrypt(dest_handle, plaintext.expose(), dest_aad).await
+    }
 
     /// Destroy key material. After this call, the handle is invalid.
     ///

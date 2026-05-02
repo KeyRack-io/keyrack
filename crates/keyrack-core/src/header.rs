@@ -12,7 +12,7 @@
 
 //! Self-describing ciphertext header.
 //!
-//! Every ciphertext blob produced by KeyRack is prefixed with a fixed-size
+//! Every ciphertext blob produced by `KeyRack` is prefixed with a fixed-size
 //! header that identifies the key, version, and encryption context used.
 //! This allows automatic key/version selection at decrypt time without
 //! any out-of-band metadata.
@@ -135,7 +135,7 @@ impl CiphertextHeader {
         out
     }
 
-    /// Split a blob into (header, ciphertext_payload).
+    /// Split a blob into header + payload.
     pub fn unwrap_payload(blob: &[u8]) -> Result<(Self, &[u8]), KeyRackError> {
         let header = Self::decode(blob)?;
         Ok((header, &blob[HEADER_SIZE..]))

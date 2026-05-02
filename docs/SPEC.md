@@ -313,7 +313,7 @@ creating ──► enabled ◄──► disabled
 
 1. Validates the transition.
 2. Sets `self.state = target`.
-3. Increments `self.version` (feeds OCC in §9).
+3. Increments `self.occ_version` (feeds OCC in §9).
 4. Updates `self.updated_at`.
 
 Invalid transitions return `Err((from, to))` and leave the record unchanged.
@@ -325,10 +325,12 @@ Invalid transitions return `Err((from, to))` and leave the record unchanged.
 | `lid` | `Lid` | Derived via §2 + §3 |
 | `canonicalization_version` | `CanonicalizationVersion` | Recorded at creation |
 | `parent_lid` | `Option<Lid>` | Stored, not recomputed (MIGRATION.md) |
-| `version` | `u64` | OCC counter |
+| `occ_version` | `u64` | Optimistic concurrency counter (§9.2) |
+| `current_key_version` | `u64` | Active version number for encrypt/sign |
 | `state` | `KeyState` | Current lifecycle state |
 | `key_usage` | `KeyUsage` | `EncryptDecrypt` or `SignVerify` |
 | `key_spec` | `KeySpec` | `Aes256`, `Ed25519`, `RsaPkcs1v15Sha256`, `EcdsaP256Sha256` |
+| `origin` | `KeyOrigin` | `KeyRack` (generated internally) or `External` (imported) |
 | `provider_class` | `ProviderClass` | `Software`, `Pkcs11`, `Kmip`, `InMemory` |
 | `identity_tags` | `IdentityTags` | See §6.1 |
 | `user_tags` | `UserTags` | See §6.2 |
@@ -336,6 +338,34 @@ Invalid transitions return `Err((from, to))` and leave the record unchanged.
 | `updated_at` | `DateTime<Utc>` | Bumped on every state/tag/version change |
 | `scheduled_deletion_at` | `Option<DateTime<Utc>>` | Set by `ScheduleKeyDeletion` |
 | `description` | `String` | Human-readable label |
+| `key_versions` | `Vec<KeyVersionRecord>` | Rotation history; version 1 is original |
+
+### 7.5 KeyVersionRecord fields
+
+Each rotation creates a new `KeyVersionRecord`. Old versions are retained
+for decrypt/verify of existing ciphertext. The ciphertext header's
+`key_version` field (§4) references `version_number`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `version_number` | `u64` | Sequential (1, 2, 3, ...) |
+| `key_handle` | `KeyHandle` | Provider-side handle to material |
+| `created_at` | `DateTime<Utc>` | When this version was created |
+| `is_primary` | `bool` | `true` for the current encrypt/sign version |
+
+### 7.6 Version semantics
+
+Two distinct version concepts:
+
+- **`occ_version`** — monotonic storage counter. Bumped on every
+  mutation (state change, tag edit, rotation, metadata update). Used
+  by storage backends for optimistic concurrency (§9.2). Not related
+  to key material.
+- **`current_key_version` / `KeyVersionRecord.version_number`** — the
+  rotation version. Each `RotateKey` creates a new version with fresh
+  material. `current_key_version` on `KeyRecord` identifies the
+  active version for encrypt/sign. The ciphertext header stores
+  `key_version` so decrypt can select the right material.
 
 ---
 

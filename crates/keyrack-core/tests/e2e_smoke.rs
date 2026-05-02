@@ -35,7 +35,9 @@ use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
 use keyrack_core::encryption_context::{EncryptionContext, ZERO_CONTEXT_HASH};
 use keyrack_core::error::KeyRackError;
 use keyrack_core::header::{CiphertextHeader, HEADER_SIZE};
-use keyrack_core::key::{KeyRecord, KeySpec, KeyState, KeyUsage, ProviderClass};
+use keyrack_core::key::{
+    KeyOrigin, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord, ProviderClass,
+};
 use keyrack_core::lid::Lid;
 use keyrack_core::provider::inmem::InMemoryProvider;
 use keyrack_core::provider::software::SoftwareProvider;
@@ -268,14 +270,14 @@ fn key_state_operation_permissions() {
 #[test]
 fn key_record_transition_bumps_version() {
     let mut record = make_test_record(KeyState::Enabled);
-    let v0 = record.version;
+    let v0 = record.occ_version;
     let t0 = record.updated_at;
 
     std::thread::sleep(std::time::Duration::from_millis(10));
     record.transition_to(KeyState::Disabled).unwrap();
 
     assert_eq!(record.state, KeyState::Disabled);
-    assert_eq!(record.version, v0 + 1);
+    assert_eq!(record.occ_version, v0 + 1);
     assert!(record.updated_at >= t0);
 }
 
@@ -283,10 +285,10 @@ fn key_record_transition_bumps_version() {
 #[test]
 fn key_record_invalid_transition_is_noop() {
     let mut record = make_test_record(KeyState::Creating);
-    let snap = record.version;
+    let snap = record.occ_version;
     assert!(record.transition_to(KeyState::Destroyed).is_err());
     assert_eq!(record.state, KeyState::Creating);
-    assert_eq!(record.version, snap);
+    assert_eq!(record.occ_version, snap);
 }
 
 /// KeyState round-trips through JSON.
@@ -388,10 +390,12 @@ fn full_key_lifecycle_with_tags() {
         lid: lid.clone(),
         canonicalization_version: CanonicalizationVersion::V1,
         parent_lid: None,
-        version: 1,
+        occ_version: 1,
+        current_key_version: 1,
         state: KeyState::Creating,
         key_usage: KeyUsage::EncryptDecrypt,
         key_spec: KeySpec::Aes256,
+        origin: KeyOrigin::KeyRack,
         provider_class: ProviderClass::Software,
         identity_tags: identity_tags.clone(),
         user_tags,
@@ -399,6 +403,15 @@ fn full_key_lifecycle_with_tags() {
         updated_at: chrono::Utc::now(),
         scheduled_deletion_at: None,
         description: "E2E test key".into(),
+        key_versions: vec![KeyVersionRecord {
+            version_number: 1,
+            key_handle: keyrack_core::provider::KeyHandle {
+                key_id: "test".into(),
+                key_spec: KeySpec::Aes256,
+            },
+            created_at: chrono::Utc::now(),
+            is_primary: true,
+        }],
     };
 
     // creating → enabled
@@ -687,10 +700,12 @@ fn make_test_record(state: KeyState) -> KeyRecord {
         lid,
         canonicalization_version: CanonicalizationVersion::V1,
         parent_lid: None,
-        version: 1,
+        occ_version: 1,
+        current_key_version: 1,
         state,
         key_usage: KeyUsage::EncryptDecrypt,
         key_spec: KeySpec::Aes256,
+        origin: KeyOrigin::KeyRack,
         provider_class: ProviderClass::Software,
         identity_tags: IdentityTags::from_attribute_set(&attrs),
         user_tags: UserTags::new(),
@@ -698,5 +713,14 @@ fn make_test_record(state: KeyState) -> KeyRecord {
         updated_at: chrono::Utc::now(),
         scheduled_deletion_at: None,
         description: String::new(),
+        key_versions: vec![KeyVersionRecord {
+            version_number: 1,
+            key_handle: keyrack_core::provider::KeyHandle {
+                key_id: "test".into(),
+                key_spec: KeySpec::Aes256,
+            },
+            created_at: chrono::Utc::now(),
+            is_primary: true,
+        }],
     }
 }
