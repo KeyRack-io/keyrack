@@ -12,24 +12,21 @@
 
 //! REST gateway layer.
 //!
-//! Provides a JSON-over-HTTP surface for all `KeyService` operations.
-//! REST is mandatory for V1 per `KEYRACK_SPEC.md` §3.1 — the console,
-//! CLI, SDKs, and Terraform provider all consume REST.
-//!
-//! Route conventions:
-//! - Resource routes: `GET /v1/keys`, `POST /v1/keys`, `GET /v1/keys/:key_id`
-//! - Action endpoints: `POST /v1/keys/:key_id/actions-encrypt`
-//! - Sub-resource paths: `GET /v1/keys/:key_id/versions`
+//! Every handler uses [`ops::execute_rest`] to ensure PDP authorization
+//! and audit emission are structurally impossible to skip.
 
+use crate::ops::{self, OpContext};
 use crate::state::ServiceState;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use keyrack_core::audit::AuditAction;
 use std::sync::Arc;
 
 type AppState = Arc<ServiceState>;
+type RestError = (StatusCode, Json<serde_json::Value>);
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -41,28 +38,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/{key_id}/describe", get(describe_key))
         .route("/v1/keys/{key_id}/actions-enable", post(enable_key))
         .route("/v1/keys/{key_id}/actions-disable", post(disable_key))
-        .route(
-            "/v1/keys/{key_id}/actions-schedule-deletion",
-            post(schedule_key_deletion),
-        )
-        .route(
-            "/v1/keys/{key_id}/actions-cancel-deletion",
-            post(cancel_key_deletion),
-        )
+        .route("/v1/keys/{key_id}/actions-schedule-deletion", post(schedule_key_deletion))
+        .route("/v1/keys/{key_id}/actions-cancel-deletion", post(cancel_key_deletion))
         .route("/v1/keys/{key_id}/actions-rotate", post(rotate_key))
         // ── Crypto operations ───────────────────────────────
         .route("/v1/keys/{key_id}/actions-encrypt", post(encrypt))
         .route("/v1/keys/{key_id}/actions-decrypt", post(decrypt))
         .route("/v1/keys/{key_id}/actions-sign", post(sign))
         .route("/v1/keys/{key_id}/actions-verify", post(verify))
-        .route(
-            "/v1/keys/{key_id}/actions-generate-data-key",
-            post(generate_data_key),
-        )
-        .route(
-            "/v1/keys/{key_id}/actions-re-encrypt",
-            post(re_encrypt),
-        )
+        .route("/v1/keys/{key_id}/actions-generate-data-key", post(generate_data_key))
+        .route("/v1/keys/{key_id}/actions-re-encrypt", post(re_encrypt))
         .route("/v1/generate-random", post(generate_random))
         // ── Tags ────────────────────────────────────────────
         .route("/v1/keys/{key_id}/tags", get(list_resource_tags))
@@ -79,44 +64,44 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Map a `KeyRackError` into an HTTP response.
 #[allow(clippy::needless_pass_by_value)]
-fn map_err(err: keyrack_core::error::KeyRackError) -> (StatusCode, Json<ErrorBody>) {
+fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     use keyrack_core::error::KeyRackError;
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
-        KeyRackError::InvalidStateTransition { .. } => {
-            (StatusCode::CONFLICT, "InvalidStateTransition")
-        }
+        KeyRackError::InvalidStateTransition { .. } => (StatusCode::CONFLICT, "InvalidStateTransition"),
         KeyRackError::OperationNotPermitted { .. } => (StatusCode::FORBIDDEN, "OperationNotPermitted"),
         KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
-        KeyRackError::EncryptionContextMismatch => {
-            (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
-        }
+        KeyRackError::EncryptionContextMismatch => (StatusCode::BAD_REQUEST, "EncryptionContextMismatch"),
         KeyRackError::AuthorizationDenied { .. } => (StatusCode::FORBIDDEN, "AuthorizationDenied"),
-        KeyRackError::DepthLimitExceeded { .. } => {
-            (StatusCode::BAD_REQUEST, "DepthLimitExceeded")
-        }
+        KeyRackError::DepthLimitExceeded { .. } => (StatusCode::BAD_REQUEST, "DepthLimitExceeded"),
         KeyRackError::CycleDetected { .. } => (StatusCode::BAD_REQUEST, "CycleDetected"),
-        KeyRackError::CascadeDisableFailed { .. }
-        | KeyRackError::Provider(_)
-        | KeyRackError::Storage(_)
-        | KeyRackError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     };
-    (
-        code,
-        Json(ErrorBody {
-            error: kind.into(),
-            message: err.to_string(),
-        }),
-    )
+    ops::rest_error(code, kind, &err.to_string())
 }
 
-#[derive(serde::Serialize)]
-struct ErrorBody {
-    error: String,
-    message: String,
+fn transition_err(from: keyrack_core::key::KeyState, to: keyrack_core::key::KeyState) -> RestError {
+    ops::rest_error(StatusCode::CONFLICT, "InvalidStateTransition", &format!("cannot transition from {from} to {to}"))
+}
+
+/// Generate a unique LID (mirrors grpc.rs logic).
+fn generate_key_lid() -> (keyrack_core::lid::Lid, keyrack_core::attr::AttributeSet) {
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert("_keyrack_key_id", keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()));
+    let canonical = keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+    let lid = keyrack_core::lid::Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &canonical);
+    (lid, attrs)
+}
+
+fn build_ec(map: &serde_json::Map<String, serde_json::Value>) -> Option<keyrack_core::encryption_context::EncryptionContext> {
+    if map.is_empty() { return None; }
+    let mut ec = keyrack_core::encryption_context::EncryptionContext::new();
+    for (k, v) in map {
+        if let Some(s) = v.as_str() { ec.insert(k, s); }
+    }
+    Some(ec)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -124,267 +109,449 @@ struct ErrorBody {
 async fn create_key(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let spec_str = body.get("key_spec").and_then(|v| v.as_str()).unwrap_or("AES_256");
-    let spec = match spec_str {
-        "AES_256" => keyrack_core::key::KeySpec::Aes256,
-        "ED25519" => keyrack_core::key::KeySpec::Ed25519,
-        "ECDSA_P256" => keyrack_core::key::KeySpec::EcdsaP256Sha256,
-        "RSA_2048" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
-        "RSA_3072" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 },
-        "RSA_4096" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 },
-        _ => return Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error: "InvalidKeySpec".into(), message: format!("unknown key_spec: {spec_str}") }))),
-    };
-
-    let handle = state.provider.generate_key(&spec).await.map_err(map_err)?;
-    let attrs = keyrack_core::attr::AttributeSet::new();
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
-    let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &canonical,
-    );
-
-    let now = chrono::Utc::now();
-    let key_usage = match spec {
-        keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
-        _ => keyrack_core::key::KeyUsage::SignVerify,
-    };
-
-    let desc = body
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    let record = keyrack_core::key::KeyRecord {
-        lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
-        parent_lid: None,
-        occ_version: 1,
-        current_key_version: 1,
-        state: keyrack_core::key::KeyState::Enabled,
-        key_usage,
-        key_spec: spec,
-        origin: keyrack_core::key::KeyOrigin::KeyRack,
-        provider_class: keyrack_core::key::ProviderClass::Software,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
-        user_tags: keyrack_core::tags::UserTags::new(),
-        created_at: now,
-        updated_at: now,
-        scheduled_deletion_at: None,
-        description: desc,
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            created_at: now,
-            is_primary: true,
-        }],
-    };
-
-    state.storage.create_key(&record).await.map_err(map_err)?;
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(&record).unwrap_or_default())))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::CreateKey, ops::default_principal(), "(new)"),
+        |state| async move {
+            let spec_str = body.get("key_spec").and_then(|v| v.as_str()).unwrap_or("AES_256");
+            let spec = match spec_str {
+                "AES_256" => keyrack_core::key::KeySpec::Aes256,
+                "ED25519" => keyrack_core::key::KeySpec::Ed25519,
+                "ECDSA_P256" => keyrack_core::key::KeySpec::EcdsaP256Sha256,
+                "RSA_2048" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+                "RSA_3072" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 },
+                "RSA_4096" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 },
+                _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeySpec", &format!("unknown key_spec: {spec_str}"))),
+            };
+            let handle = state.provider.generate_key(&spec).await.map_err(map_core_err)?;
+            let (lid, attrs) = generate_key_lid();
+            let now = chrono::Utc::now();
+            let key_usage = match spec {
+                keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
+                _ => keyrack_core::key::KeyUsage::SignVerify,
+            };
+            let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let record = keyrack_core::key::KeyRecord {
+                lid,
+                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+                parent_lid: None,
+                occ_version: 1,
+                current_key_version: 1,
+                state: keyrack_core::key::KeyState::Enabled,
+                key_usage,
+                key_spec: spec,
+                origin: keyrack_core::key::KeyOrigin::KeyRack,
+                provider_class: keyrack_core::key::ProviderClass::Software,
+                identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+                user_tags: keyrack_core::tags::UserTags::new(),
+                created_at: now,
+                updated_at: now,
+                scheduled_deletion_at: None,
+                description: desc,
+                key_versions: vec![keyrack_core::key::KeyVersionRecord {
+                    version_number: 1,
+                    key_handle: handle,
+                    created_at: now,
+                    is_primary: true,
+                }],
+            };
+            state.storage.create_key(&record).await.map_err(map_core_err)?;
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(&record).unwrap_or_default())))
+        },
+    ).await
 }
 
 async fn get_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::GetKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn describe_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::DescribeKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn update_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-        desc.clone_into(&mut record.description);
-    }
-    record.occ_version += 1;
-    record.updated_at = chrono::Utc::now();
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::UpdateKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+                desc.clone_into(&mut record.description);
+            }
+            record.occ_version += 1;
+            record.updated_at = chrono::Utc::now();
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
-async fn list_keys(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let filter = keyrack_core::storage::KeyFilter {
-        user_tags: vec![],
-        limit: Some(100),
-        cursor: None,
-    };
-    let page = state.storage.list_keys(&filter).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&page).unwrap_or_default()))
+async fn list_keys(State(state): State<AppState>) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::system(AuditAction::ListKeys, "", "Key"),
+        |state| async move {
+            let filter = keyrack_core::storage::KeyFilter { user_tags: vec![], limit: Some(100), cursor: None };
+            let page = state.storage.list_keys(&filter).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&page).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn enable_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    record.transition_to(keyrack_core::key::KeyState::Enabled).map_err(|(from, to)| {
-        (StatusCode::CONFLICT, Json(ErrorBody { error: "InvalidStateTransition".into(), message: format!("cannot transition from {from} to {to}") }))
-    })?;
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::EnableKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            record.transition_to(keyrack_core::key::KeyState::Enabled).map_err(|(f, t)| transition_err(f, t))?;
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn disable_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(from, to)| {
-        (StatusCode::CONFLICT, Json(ErrorBody { error: "InvalidStateTransition".into(), message: format!("cannot transition from {from} to {to}") }))
-    })?;
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::DisableKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn schedule_key_deletion(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    let days = body.get("grace_period_days").and_then(serde_json::Value::as_u64).unwrap_or(7);
-    record.transition_to(keyrack_core::key::KeyState::PendingDeletion).map_err(|(from, to)| {
-        (StatusCode::CONFLICT, Json(ErrorBody { error: "InvalidStateTransition".into(), message: format!("cannot transition from {from} to {to}") }))
-    })?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        record.scheduled_deletion_at = Some(chrono::Utc::now() + chrono::Duration::days(days as i64));
-    }
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::ScheduleKeyDeletion, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            let days = body.get("grace_period_days").and_then(serde_json::Value::as_u64).unwrap_or(7);
+            record.transition_to(keyrack_core::key::KeyState::PendingDeletion).map_err(|(f, t)| transition_err(f, t))?;
+            #[allow(clippy::cast_possible_wrap)]
+            { record.scheduled_deletion_at = Some(chrono::Utc::now() + chrono::Duration::days(days as i64)); }
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn cancel_key_deletion(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    if record.state != keyrack_core::key::KeyState::PendingDeletion {
-        return Err((StatusCode::CONFLICT, Json(ErrorBody {
-            error: "InvalidStateTransition".into(),
-            message: "can only cancel deletion from PendingDeletion".into(),
-        })));
-    }
-    record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(from, to)| {
-        (StatusCode::CONFLICT, Json(ErrorBody { error: "InvalidStateTransition".into(), message: format!("cannot transition from {from} to {to}") }))
-    })?;
-    record.scheduled_deletion_at = None;
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::CancelKeyDeletion, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if record.state != keyrack_core::key::KeyState::PendingDeletion {
+                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidStateTransition", "can only cancel deletion from PendingDeletion"));
+            }
+            record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
+            record.scheduled_deletion_at = None;
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 async fn rotate_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    if record.state != keyrack_core::key::KeyState::Enabled {
-        return Err((StatusCode::CONFLICT, Json(ErrorBody { error: "InvalidState".into(), message: "key must be Enabled to rotate".into() })));
-    }
-    let handle = state.provider.generate_key(&record.key_spec).await.map_err(map_err)?;
-    let new_version = record.current_key_version + 1;
-    for v in &mut record.key_versions {
-        v.is_primary = false;
-    }
-    record.key_versions.push(keyrack_core::key::KeyVersionRecord {
-        version_number: new_version,
-        key_handle: handle,
-        created_at: chrono::Utc::now(),
-        is_primary: true,
-    });
-    record.current_key_version = new_version;
-    record.occ_version += 1;
-    record.updated_at = chrono::Utc::now();
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::RotateKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if record.state != keyrack_core::key::KeyState::Enabled {
+                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key must be Enabled to rotate"));
+            }
+            let handle = state.provider.generate_key(&record.key_spec).await.map_err(map_core_err)?;
+            let new_version = record.current_key_version + 1;
+            for v in &mut record.key_versions { v.is_primary = false; }
+            record.key_versions.push(keyrack_core::key::KeyVersionRecord {
+                version_number: new_version,
+                key_handle: handle,
+                created_at: chrono::Utc::now(),
+                is_primary: true,
+            });
+            record.current_key_version = new_version;
+            record.occ_version += 1;
+            record.updated_at = chrono::Utc::now();
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+        },
+    ).await
 }
 
 // ── Crypto action handlers ──────────────────────────────────────────
 
 async fn encrypt(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST encrypt not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::Encrypt, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if !record.state.permits_encrypt() {
+                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in Enabled state"));
+            }
+            let plaintext_b64 = body.get("plaintext").and_then(|v| v.as_str()).unwrap_or("");
+            let plaintext = base64_decode(plaintext_b64)?;
+            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
+            let primary = record.key_versions.iter().find(|v| v.is_primary)
+                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
+            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let output = state.provider.encrypt(&primary.key_handle, &plaintext, &aad).await.map_err(map_core_err)?;
+            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
+            let blob = header.wrap_payload(&output.ciphertext);
+            Ok(Json(serde_json::json!({
+                "ciphertext_blob": base64_encode(&blob),
+                "key_id": record.lid.to_string(),
+            })))
+        },
+    ).await
 }
 
 async fn decrypt(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST decrypt not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::Decrypt, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if !record.state.permits_decrypt() {
+                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in state for decrypt"));
+            }
+            let blob_b64 = body.get("ciphertext_blob").and_then(|v| v.as_str()).unwrap_or("");
+            let blob = base64_decode(blob_b64)?;
+            let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
+                .map_err(|e| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string()))?;
+            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
+            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+            if ec_hash != header.encryption_context_hash {
+                return Err(ops::rest_error(StatusCode::BAD_REQUEST, "EncryptionContextMismatch", "encryption context mismatch"));
+            }
+            let version_handle = record.key_versions.iter()
+                .find(|v| v.version_number == header.key_version)
+                .map(|v| &v.key_handle)
+                .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "key version not found"))?;
+            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let plaintext = state.provider.decrypt(version_handle, ciphertext, &aad).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::json!({
+                "plaintext": base64_encode(plaintext.expose()),
+                "key_id": record.lid.to_string(),
+            })))
+        },
+    ).await
 }
 
 async fn sign(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST sign not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::Sign, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            let alg_str = body.get("signing_algorithm").and_then(|v| v.as_str()).unwrap_or("");
+            let alg = match alg_str {
+                "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
+                "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
+                "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+                _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
+            };
+            let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let message = base64_decode(message_b64)?;
+            let primary = record.key_versions.iter().find(|v| v.is_primary)
+                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
+            let signature = state.provider.sign(&primary.key_handle, alg, &message).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::json!({
+                "signature": base64_encode(&signature),
+                "key_id": record.lid.to_string(),
+                "signing_algorithm": alg_str,
+            })))
+        },
+    ).await
 }
 
 async fn verify(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST verify not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::Verify, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            let alg_str = body.get("signing_algorithm").and_then(|v| v.as_str()).unwrap_or("");
+            let alg = match alg_str {
+                "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
+                "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
+                "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+                _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
+            };
+            let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
+            let signature = base64_decode(body.get("signature").and_then(|v| v.as_str()).unwrap_or(""))?;
+            let primary = record.key_versions.iter().find(|v| v.is_primary)
+                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
+            let valid = state.provider.verify(&primary.key_handle, alg, &message, &signature).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::json!({
+                "signature_valid": valid,
+                "key_id": record.lid.to_string(),
+            })))
+        },
+    ).await
 }
 
 async fn generate_data_key(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST generate_data_key not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::GenerateDataKey, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if !record.state.permits_encrypt() {
+                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in Enabled state"));
+            }
+            let primary = record.key_versions.iter().find(|v| v.is_primary)
+                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
+            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
+            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            #[allow(clippy::cast_possible_truncation)]
+            let dek_len = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
+            let output = state.provider.generate_data_key(&primary.key_handle, dek_len, &aad).await.map_err(map_core_err)?;
+            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
+            Ok(Json(serde_json::json!({
+                "plaintext_data_key": base64_encode(&output.plaintext_key.into_inner()),
+                "encrypted_data_key": base64_encode(&header.wrap_payload(&output.encrypted_key)),
+                "key_id": record.lid.to_string(),
+            })))
+        },
+    ).await
 }
 
 async fn re_encrypt(
-    State(_state): State<AppState>,
-    Path(_key_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(ErrorBody { error: "NotImplemented".into(), message: "REST re_encrypt not yet wired".into() }))
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    let dst_key_id = body.get("destination_key_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::ReEncrypt, ops::default_principal(), &key_id),
+        |state| async move {
+            let src_lid = parse_lid_rest(&key_id)?;
+            let dst_lid = parse_lid_rest(&dst_key_id)?;
+            let src_record = state.storage.get_key(&src_lid).await.map_err(map_core_err)?;
+            let dst_record = state.storage.get_key(&dst_lid).await.map_err(map_core_err)?;
+            let blob_b64 = body.get("ciphertext_blob").and_then(|v| v.as_str()).unwrap_or("");
+            let blob = base64_decode(blob_b64)?;
+            let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
+                .map_err(|e| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string()))?;
+            let src_ec = body.get("source_encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
+            let dst_ec = body.get("destination_encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
+            let src_version = src_record.key_versions.iter().find(|v| v.version_number == header.key_version)
+                .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "source key version not found"))?;
+            let src_aad = src_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let plaintext = state.provider.decrypt(&src_version.key_handle, ciphertext, &src_aad).await.map_err(map_core_err)?;
+            let dst_primary = dst_record.key_versions.iter().find(|v| v.is_primary)
+                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "dest has no primary"))?;
+            let dst_aad = dst_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let output = state.provider.encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad).await.map_err(map_core_err)?;
+            let dst_ec_hash = dst_ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+            let new_header = keyrack_core::header::CiphertextHeader::new(dst_record.lid, dst_record.current_key_version, dst_ec_hash);
+            Ok(Json(serde_json::json!({
+                "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
+                "source_key_id": src_record.lid.to_string(),
+                "destination_key_id": dst_record.lid.to_string(),
+            })))
+        },
+    ).await
 }
 
 async fn generate_random(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    #[allow(clippy::cast_possible_truncation)]
-    let n = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
-    let random = state.provider.generate_random(n).await.map_err(map_err)?;
-    let encoded = base64_encode(random.expose());
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::json!({ "random_bytes": encoded })))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::system(AuditAction::GenerateRandom, "", "System"),
+        |state| async move {
+            #[allow(clippy::cast_possible_truncation)]
+            let n = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
+            let random = state.provider.generate_random(n).await.map_err(map_core_err)?;
+            Ok(Json(serde_json::json!({ "random_bytes": base64_encode(random.expose()) })))
+        },
+    ).await
 }
 
 // ── Tags ────────────────────────────────────────────────────────────
@@ -392,51 +559,67 @@ async fn generate_random(
 async fn list_resource_tags(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    let tags: Vec<_> = record.user_tags.iter().map(|(k, v)| serde_json::json!({"key": k, "value": v})).collect();
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::json!({ "tags": tags })))
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::ListResourceTags, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            let tags: Vec<_> = record.user_tags.iter().map(|(k, v)| serde_json::json!({"key": k, "value": v})).collect();
+            Ok(Json(serde_json::json!({ "tags": tags })))
+        },
+    ).await
 }
 
 async fn tag_resource(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    if let Some(tags) = body.get("tags").and_then(|v| v.as_array()) {
-        for tag in tags {
-            if let (Some(k), Some(v)) = (tag.get("key").and_then(|v| v.as_str()), tag.get("value").and_then(|v| v.as_str())) {
-                record.user_tags.set(k, v);
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::TagResource, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if let Some(tags) = body.get("tags").and_then(|v| v.as_array()) {
+                for tag in tags {
+                    if let (Some(k), Some(v)) = (tag.get("key").and_then(|v| v.as_str()), tag.get("value").and_then(|v| v.as_str())) {
+                        record.user_tags.set(k, v);
+                    }
+                }
             }
-        }
-    }
-    record.occ_version += 1;
-    record.updated_at = chrono::Utc::now();
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(StatusCode::NO_CONTENT)
+            record.occ_version += 1;
+            record.updated_at = chrono::Utc::now();
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(StatusCode::NO_CONTENT)
+        },
+    ).await
 }
 
 async fn untag_resource(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let lid = parse_lid_rest(&key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(map_err)?;
-    if let Some(keys) = body.get("tag_keys").and_then(|v| v.as_array()) {
-        for key in keys {
-            if let Some(k) = key.as_str() {
-                record.user_tags.remove(k);
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::key(AuditAction::UntagResource, ops::default_principal(), &key_id),
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            if let Some(keys) = body.get("tag_keys").and_then(|v| v.as_array()) {
+                for key in keys {
+                    if let Some(k) = key.as_str() { record.user_tags.remove(k); }
+                }
             }
-        }
-    }
-    record.occ_version += 1;
-    record.updated_at = chrono::Utc::now();
-    state.storage.update_key(&record).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(StatusCode::NO_CONTENT)
+            record.occ_version += 1;
+            record.updated_at = chrono::Utc::now();
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(StatusCode::NO_CONTENT)
+        },
+    ).await
 }
 
 // ── Aliases ─────────────────────────────────────────────────────────
@@ -444,44 +627,52 @@ async fn untag_resource(
 async fn create_alias(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let alias_name = body.get("alias_name").and_then(|v| v.as_str()).unwrap_or("");
-    let target_key_id = body.get("target_key_id").and_then(|v| v.as_str()).unwrap_or("");
-    let lid = parse_lid_rest(target_key_id)?;
-    let alias = keyrack_core::storage::AliasRecord {
-        alias_name: alias_name.to_owned(),
-        target_lid: lid,
-        created_at: chrono::Utc::now(),
-    };
-    state.storage.create_alias(&alias).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>((StatusCode::CREATED, Json(serde_json::json!({
-        "alias_name": alias_name,
-        "target_key_id": target_key_id,
-    }))))
+) -> Result<impl IntoResponse, RestError> {
+    let alias_name = body.get("alias_name").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    ops::execute_rest(
+        &state,
+        OpContext::alias(AuditAction::CreateAlias, ops::default_principal(), &alias_name),
+        |state| async move {
+            let target_key_id = body.get("target_key_id").and_then(|v| v.as_str()).unwrap_or("");
+            let lid = parse_lid_rest(target_key_id)?;
+            let alias = keyrack_core::storage::AliasRecord {
+                alias_name: alias_name.clone(),
+                target_lid: lid,
+                created_at: chrono::Utc::now(),
+            };
+            state.storage.create_alias(&alias).await.map_err(map_core_err)?;
+            Ok((StatusCode::CREATED, Json(serde_json::json!({ "alias_name": alias_name, "target_key_id": target_key_id }))))
+        },
+    ).await
 }
 
-async fn list_aliases(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let aliases = state.storage.list_aliases().await.map_err(map_err)?;
-    let items: Vec<_> = aliases.iter().map(|a| serde_json::json!({
-        "alias_name": a.alias_name,
-        "target_key_id": a.target_lid.to_string(),
-    })).collect();
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(Json(serde_json::json!({ "aliases": items })))
+async fn list_aliases(State(state): State<AppState>) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::system(AuditAction::ListAliases, "", "Alias"),
+        |state| async move {
+            let aliases = state.storage.list_aliases().await.map_err(map_core_err)?;
+            let items: Vec<_> = aliases.iter().map(|a| serde_json::json!({ "alias_name": a.alias_name, "target_key_id": a.target_lid.to_string() })).collect();
+            Ok(Json(serde_json::json!({ "aliases": items })))
+        },
+    ).await
 }
 
 async fn delete_alias(
     State(state): State<AppState>,
     Path(alias_name): Path<String>,
-) -> impl IntoResponse {
-    state.storage.delete_alias(&alias_name).await.map_err(map_err)?;
-    Ok::<_, (StatusCode, Json<ErrorBody>)>(StatusCode::NO_CONTENT)
+) -> Result<impl IntoResponse, RestError> {
+    ops::execute_rest(
+        &state,
+        OpContext::alias(AuditAction::DeleteAlias, ops::default_principal(), &alias_name),
+        |state| async move {
+            state.storage.delete_alias(&alias_name).await.map_err(map_core_err)?;
+            Ok(StatusCode::NO_CONTENT)
+        },
+    ).await
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-// ── Health / Readiness / Metrics ─────────────────────────────────────
+// ── Health / Readiness / Metrics ────────────────────────────────────
 
 async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
@@ -500,19 +691,19 @@ async fn metrics_stub() -> impl IntoResponse {
     (StatusCode::OK, "# HELP keyrack_up KeyRack service is up\n# TYPE keyrack_up gauge\nkeyrack_up 1\n")
 }
 
-fn parse_lid_rest(s: &str) -> Result<keyrack_core::lid::Lid, (StatusCode, Json<ErrorBody>)> {
-    s.parse().map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: "InvalidKeyId".into(),
-                message: format!("invalid key_id: {s}"),
-            }),
-        )
-    })
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn parse_lid_rest(s: &str) -> Result<keyrack_core::lid::Lid, RestError> {
+    s.parse().map_err(|_| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeyId", &format!("invalid key_id: {s}")))
 }
 
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, RestError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s)
+        .map_err(|_| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidBase64", "invalid base64 encoding"))
 }

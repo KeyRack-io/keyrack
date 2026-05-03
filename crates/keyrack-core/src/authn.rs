@@ -168,7 +168,8 @@ impl Authenticator for BootstrapTokenAuthenticator {
         }
 
         let candidate_hash: [u8; 32] = blake3::hash(token.as_bytes()).into();
-        if candidate_hash != self.token_hash {
+        use subtle::ConstantTimeEq;
+        if candidate_hash.ct_eq(&self.token_hash).unwrap_u8() != 1 {
             return Err(AuthnError::InvalidCredential(
                 "bootstrap token mismatch".into(),
             ));

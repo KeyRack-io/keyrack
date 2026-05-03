@@ -36,6 +36,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 axum = "0.7"
 base64 = "0.22"
 
+[dev-dependencies]
+keyrack-test-support = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [build-dependencies]
 tonic-build = "0.12"
 
