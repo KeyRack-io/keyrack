@@ -1,0 +1,24 @@
+[package]
+name = "keyrack-ha"
+version = "0.1.0"
+description = "High-availability clustering for KeyRack: leader election, consensus, rolling upgrades"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyrack-core = { workspace = true }
+keyrack-nats = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true
