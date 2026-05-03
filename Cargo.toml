@@ -13,8 +13,6 @@ members = [
     "crates/keyrack-cli",
     "crates/keyrack-wasm",
     "crates/keyrack-pii",
-    "crates/keyrack-ha",
-    "crates/keyrack-pool",
 ]
 
 [workspace.package]
@@ -53,8 +51,6 @@ keyrack-sqlite = { path = "crates/keyrack-sqlite" }
 keyrack-nats = { path = "crates/keyrack-nats" }
 keyrack-test-support = { path = "crates/keyrack-test-support" }
 keyrack-service = { path = "crates/keyrack-service" }
-keyrack-ha = { path = "crates/keyrack-ha" }
-keyrack-pool = { path = "crates/keyrack-pool" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
