@@ -60,6 +60,47 @@ These invariants are enforced structurally in the codebase, not by convention:
 
 ---
 
+## Deployment modes and threat model scope
+
+`keyrack-service` supports two deployment modes controlled by the `crypto-endpoints` Cargo feature (default-on). Operators should select the mode that matches their threat model.
+
+### Orchestration mode (`--no-default-features`)
+
+The service manages key lifecycle (create, enable, disable, rotate, delete), dependency graphs, rotation scheduling, and audit. **No plaintext data transits through the service.** Applications use the `keyrack-core` library with direct HSM access for cryptographic operations.
+
+| Property | Value |
+|---|---|
+| Plaintext exposure | None |
+| Blast radius on compromise | Key metadata, state, hierarchy graph |
+| HSM session usage | Lifecycle only (create, destroy, rotate) |
+| Suitable for | Orchestration-only deployments where applications have direct HSM access |
+
+### Crypto mode (default, `crypto-endpoints` feature enabled)
+
+The service additionally exposes `Encrypt`, `Decrypt`, `GenerateDataKey`, `GenerateDataKeyWithoutPlaintext`, `ReEncrypt`, `Sign`, `Verify`, and `GenerateRandom`. Plaintext data transits through service memory during these operations.
+
+| Property | Value |
+|---|---|
+| Plaintext exposure | Transient (in-flight, not cached) |
+| Blast radius on compromise | Key metadata + plaintext data in flight + live HSM session |
+| HSM session usage | All operations (lifecycle + data-plane crypto) |
+| Suitable for | Centralized KMS deployments where applications call the service for crypto |
+
+### AWS KMS shim (commercial, separate binary)
+
+The shim adds a third deployment component with its own threat surface. It caches decrypted DEKs in-process (configurable TTL, default 60s, can be disabled).
+
+| Property | Value |
+|---|---|
+| Plaintext exposure | Cached (configurable TTL) |
+| Blast radius on compromise | Cached plaintext DEKs + gRPC-level access to core service |
+| HSM access | None (delegates to core via gRPC) |
+| Channel to core | Unix socket (monolith) or mTLS (cell mode) |
+
+The separate binary boundary means: a SigV4-parsing vulnerability in the shim does not grant direct HSM session access.
+
+---
+
 ## Cryptographic algorithms
 
 | Operation | Algorithm | Parameters |

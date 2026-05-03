@@ -29,7 +29,7 @@ type AppState = Arc<ServiceState>;
 type RestError = (StatusCode, Json<serde_json::Value>);
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let r = Router::new()
         // ── Key lifecycle ───────────────────────────────────
         .route("/v1/keys", post(create_key))
         .route("/v1/keys", get(list_keys))
@@ -40,15 +40,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/{key_id}/actions-disable", post(disable_key))
         .route("/v1/keys/{key_id}/actions-schedule-deletion", post(schedule_key_deletion))
         .route("/v1/keys/{key_id}/actions-cancel-deletion", post(cancel_key_deletion))
-        .route("/v1/keys/{key_id}/actions-rotate", post(rotate_key))
-        // ── Crypto operations ───────────────────────────────
+        .route("/v1/keys/{key_id}/actions-rotate", post(rotate_key));
+
+    // Crypto operation routes: gated behind the `crypto-endpoints` feature.
+    #[cfg(feature = "crypto-endpoints")]
+    let r = r
         .route("/v1/keys/{key_id}/actions-encrypt", post(encrypt))
         .route("/v1/keys/{key_id}/actions-decrypt", post(decrypt))
         .route("/v1/keys/{key_id}/actions-sign", post(sign))
         .route("/v1/keys/{key_id}/actions-verify", post(verify))
         .route("/v1/keys/{key_id}/actions-generate-data-key", post(generate_data_key))
         .route("/v1/keys/{key_id}/actions-re-encrypt", post(re_encrypt))
-        .route("/v1/generate-random", post(generate_random))
+        .route("/v1/generate-random", post(generate_random));
+
+    r
         // ── Tags ────────────────────────────────────────────
         .route("/v1/keys/{key_id}/tags", get(list_resource_tags))
         .route("/v1/keys/{key_id}/tags", post(tag_resource))
@@ -95,6 +100,7 @@ fn generate_key_lid() -> (keyrack_core::lid::Lid, keyrack_core::attr::AttributeS
     (lid, attrs)
 }
 
+#[cfg(feature = "crypto-endpoints")]
 fn build_ec(map: &serde_json::Map<String, serde_json::Value>) -> Option<keyrack_core::encryption_context::EncryptionContext> {
     if map.is_empty() { return None; }
     let mut ec = keyrack_core::encryption_context::EncryptionContext::new();
@@ -334,7 +340,9 @@ async fn rotate_key(
 }
 
 // ── Crypto action handlers ──────────────────────────────────────────
+// Gated behind the `crypto-endpoints` Cargo feature (default-on).
 
+#[cfg(feature = "crypto-endpoints")]
 async fn encrypt(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -367,6 +375,7 @@ async fn encrypt(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn decrypt(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -404,6 +413,7 @@ async fn decrypt(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn sign(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -436,6 +446,7 @@ async fn sign(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn verify(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -467,6 +478,7 @@ async fn verify(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn generate_data_key(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -499,6 +511,7 @@ async fn generate_data_key(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn re_encrypt(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
@@ -538,6 +551,7 @@ async fn re_encrypt(
     ).await
 }
 
+#[cfg(feature = "crypto-endpoints")]
 async fn generate_random(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -697,11 +711,13 @@ fn parse_lid_rest(s: &str) -> Result<keyrack_core::lid::Lid, RestError> {
     s.parse().map_err(|_| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeyId", &format!("invalid key_id: {s}")))
 }
 
+#[cfg(feature = "crypto-endpoints")]
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+#[cfg(feature = "crypto-endpoints")]
 fn base64_decode(s: &str) -> Result<Vec<u8>, RestError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s)

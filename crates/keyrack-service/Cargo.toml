@@ -11,6 +11,10 @@ repository.workspace = true
 name = "keyrack-service"
 path = "src/main.rs"
 
+[features]
+default = ["crypto-endpoints"]
+crypto-endpoints = []
+
 [dependencies]
 keyrack-core = { workspace = true }
 keyrack-sqlite = { workspace = true }

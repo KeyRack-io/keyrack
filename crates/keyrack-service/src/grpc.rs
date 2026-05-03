@@ -38,6 +38,14 @@ fn unimplemented(name: &str) -> Status {
     Status::unimplemented(format!("{name} not yet implemented"))
 }
 
+#[cfg(not(feature = "crypto-endpoints"))]
+fn crypto_disabled(name: &str) -> Status {
+    Status::unimplemented(format!(
+        "{name}: crypto endpoints disabled; use library mode or enable the `crypto-endpoints` feature"
+    ))
+}
+
+#[cfg(feature = "crypto-endpoints")]
 fn build_encryption_context(
     map: &std::collections::HashMap<String, String>,
 ) -> Option<keyrack_core::encryption_context::EncryptionContext> {
@@ -77,11 +85,20 @@ fn generate_key_lid() -> (
 #[tonic::async_trait]
 impl KeyService for KeyServiceImpl {
     // ── Cryptographic operations ────────────────────────────────────
+    //
+    // Gated behind the `crypto-endpoints` Cargo feature (default-on).
+    // When disabled, all crypto RPCs return UNIMPLEMENTED and the service
+    // operates as an orchestration-only coordinator.
 
     async fn encrypt(
         &self,
         request: Request<proto::EncryptRequest>,
     ) -> Result<Response<proto::EncryptResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("Encrypt")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -143,12 +160,18 @@ impl KeyService for KeyServiceImpl {
             },
         )
         .await
+        }
     }
 
     async fn decrypt(
         &self,
         request: Request<proto::DecryptRequest>,
     ) -> Result<Response<proto::DecryptResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("Decrypt")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -208,12 +231,18 @@ impl KeyService for KeyServiceImpl {
             },
         )
         .await
+        }
     }
 
     async fn re_encrypt(
         &self,
         request: Request<proto::ReEncryptRequest>,
     ) -> Result<Response<proto::ReEncryptResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("ReEncrypt")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let src_key_id = req.source_key_id.clone();
 
@@ -274,12 +303,18 @@ impl KeyService for KeyServiceImpl {
                 }))
             },
         ).await
+        }
     }
 
     async fn generate_data_key(
         &self,
         request: Request<proto::GenerateDataKeyRequest>,
     ) -> Result<Response<proto::GenerateDataKeyResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("GenerateDataKey")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -324,12 +359,18 @@ impl KeyService for KeyServiceImpl {
                 }))
             },
         ).await
+        }
     }
 
     async fn generate_data_key_without_plaintext(
         &self,
         request: Request<proto::GenerateDataKeyWithoutPlaintextRequest>,
     ) -> Result<Response<proto::GenerateDataKeyWithoutPlaintextResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("GenerateDataKeyWithoutPlaintext")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -360,12 +401,18 @@ impl KeyService for KeyServiceImpl {
                 }))
             },
         ).await
+        }
     }
 
     async fn generate_random(
         &self,
         request: Request<proto::GenerateRandomRequest>,
     ) -> Result<Response<proto::GenerateRandomResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("GenerateRandom")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
 
         ops::execute(
@@ -383,12 +430,18 @@ impl KeyService for KeyServiceImpl {
             },
         )
         .await
+        }
     }
 
     async fn sign(
         &self,
         request: Request<proto::SignRequest>,
     ) -> Result<Response<proto::SignResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("Sign")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -418,12 +471,18 @@ impl KeyService for KeyServiceImpl {
                 }))
             },
         ).await
+        }
     }
 
     async fn verify(
         &self,
         request: Request<proto::VerifyRequest>,
     ) -> Result<Response<proto::VerifyResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        { let _ = request; return Err(crypto_disabled("Verify")); }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
@@ -452,6 +511,7 @@ impl KeyService for KeyServiceImpl {
                 }))
             },
         ).await
+        }
     }
 
     // ── Key lifecycle ───────────────────────────────────────────────
@@ -894,6 +954,7 @@ impl KeyService for KeyServiceImpl {
     async fn fail_rotation_job(&self, _r: Request<proto::FailRotationJobRequest>) -> Result<Response<proto::FailRotationJobResponse>, Status> { Err(unimplemented("FailRotationJob")) }
 }
 
+#[cfg(feature = "crypto-endpoints")]
 fn dek_length_from_spec(spec: i32) -> usize {
     match proto::KeySpec::try_from(spec) {
         Ok(proto::KeySpec::Rsa2048) => 256,
