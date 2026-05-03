@@ -25,3 +25,4 @@
 
 pub mod conformance;
 pub mod fixtures;
+pub mod service_conformance;

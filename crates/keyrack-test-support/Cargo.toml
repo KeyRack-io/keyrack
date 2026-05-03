@@ -9,8 +9,11 @@ repository.workspace = true
 
 [dependencies]
 keyrack-core = { workspace = true }
+keyrack-service = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = "0.12"
+uuid = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]
