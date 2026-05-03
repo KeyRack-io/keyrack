@@ -7,8 +7,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "keyrack"
+path = "src/main.rs"
+
 [dependencies]
 keyrack-core = { workspace = true }
+keyrack-service = { workspace = true }
+keyrack-sqlite = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+chrono = { workspace = true }
+uuid = { workspace = true }
+csv = "1"
+tonic = "0.12"
+prost = "0.13"
 
 [lints]
 workspace = true
