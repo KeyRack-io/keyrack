@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 chrono = { workspace = true }
 uuid = { workspace = true }
+blake3 = { workspace = true }
 csv = "1"
 tonic = "0.12"
 prost = "0.13"

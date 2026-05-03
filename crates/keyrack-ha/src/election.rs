@@ -6,7 +6,6 @@
 //! - **etcd-backed** (production): uses etcd lease-based elections.
 //! - **Built-in Raft** (via `openraft`): self-contained, no external deps.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

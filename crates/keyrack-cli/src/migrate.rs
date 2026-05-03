@@ -452,43 +452,43 @@ async fn apply_rule_change(
     let mut errors = 0usize;
     let mut batch_count = 0usize;
 
-    for entry in &mut plan.entries {
-        if entry.applied || entry.action == RuleChangeAction::Skip {
+    for i in 0..plan.entries.len() {
+        if plan.entries[i].applied || plan.entries[i].action == RuleChangeAction::Skip {
             skipped += 1;
             continue;
         }
 
         if opt_out {
-            entry.action = RuleChangeAction::OptOut;
-            entry.applied = true;
+            plan.entries[i].action = RuleChangeAction::OptOut;
+            plan.entries[i].applied = true;
             opted_out += 1;
             continue;
         }
 
-        let key_lid: keyrack_core::lid::Lid = entry.key_lid.parse()
-            .map_err(|e| anyhow::anyhow!("invalid LID '{}': {e}", entry.key_lid))?;
+        let key_lid: keyrack_core::lid::Lid = plan.entries[i].key_lid.parse()
+            .map_err(|e| anyhow::anyhow!("invalid LID '{}': {e}", plan.entries[i].key_lid))?;
 
         let record = match db.get_key(&key_lid).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(lid = %entry.key_lid, error = %e, "key not found");
+                tracing::error!(lid = %plan.entries[i].key_lid, error = %e, "key not found");
                 errors += 1;
                 continue;
             }
         };
 
-        let new_parent_lid = entry.new_parent_lid.as_ref().and_then(|s| s.parse().ok());
+        let new_parent_lid = plan.entries[i].new_parent_lid.as_ref().and_then(|s| s.parse().ok());
         let mut updated = record.clone();
         updated.parent_lid = new_parent_lid;
         updated.occ_version += 1;
 
         if let Err(e) = db.update_key(&updated).await {
-            tracing::error!(lid = %entry.key_lid, error = %e, "failed to rewrap");
+            tracing::error!(lid = %plan.entries[i].key_lid, error = %e, "failed to rewrap");
             errors += 1;
             continue;
         }
 
-        entry.applied = true;
+        plan.entries[i].applied = true;
         applied += 1;
         batch_count += 1;
 

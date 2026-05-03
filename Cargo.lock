@@ -1897,6 +1897,7 @@ name = "keyrack-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "chrono",
  "clap",
  "csv",
@@ -1940,6 +1941,22 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "keyrack-ha"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "keyrack-core",
+ "keyrack-nats",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1994,6 +2011,20 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "keyrack-pool"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "keyrack-core",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
