@@ -1,0 +1,17 @@
+# Namespace hierarchy for E2E tests.
+# Mirrors the structure from test fixtures: an infrastructure root and an
+# application namespace deriving keys from it.
+
+namespaces:
+  - name: infrastructure
+    rules:
+      algorithm: AES-256-GCM
+      key_derivation: HKDF-SHA256
+      rotation_interval_days: 90
+
+  - name: app
+    parent: infrastructure
+    rules:
+      algorithm: AES-256-GCM
+      key_derivation: HKDF-SHA256
+      rotation_interval_days: 30

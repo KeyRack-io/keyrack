@@ -1,0 +1,23 @@
+# KeyRack service configuration for E2E testing.
+# This is NOT a production config -- it uses SQLite, software crypto, and
+# no authentication so the test binary can exercise the API without TLS setup.
+
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+provider:
+  type: software
+
+pdp:
+  type: http
+  endpoint: "http://cedar-pdp:8181/v1/authorize"
+  timeout_ms: 5000
+
+audit:
+  type: stdout
+
+authn:
+  type: insecure

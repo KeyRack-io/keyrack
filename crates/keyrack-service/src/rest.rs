@@ -20,7 +20,7 @@ use crate::state::ServiceState;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use keyrack_core::audit::AuditAction;
 use std::sync::Arc;
@@ -31,37 +31,32 @@ type RestError = (StatusCode, Json<serde_json::Value>);
 pub fn router(state: AppState) -> Router {
     let r = Router::new()
         // ── Key lifecycle ───────────────────────────────────
-        .route("/v1/keys", post(create_key))
-        .route("/v1/keys", get(list_keys))
-        .route("/v1/keys/{key_id}", get(get_key))
-        .route("/v1/keys/{key_id}", put(update_key))
-        .route("/v1/keys/{key_id}/describe", get(describe_key))
-        .route("/v1/keys/{key_id}/actions-enable", post(enable_key))
-        .route("/v1/keys/{key_id}/actions-disable", post(disable_key))
-        .route("/v1/keys/{key_id}/actions-schedule-deletion", post(schedule_key_deletion))
-        .route("/v1/keys/{key_id}/actions-cancel-deletion", post(cancel_key_deletion))
-        .route("/v1/keys/{key_id}/actions-rotate", post(rotate_key));
+        .route("/v1/keys", get(list_keys).post(create_key))
+        .route("/v1/keys/:key_id", get(get_key).put(update_key))
+        .route("/v1/keys/:key_id/describe", get(describe_key))
+        .route("/v1/keys/:key_id/actions-enable", post(enable_key))
+        .route("/v1/keys/:key_id/actions-disable", post(disable_key))
+        .route("/v1/keys/:key_id/actions-schedule-deletion", post(schedule_key_deletion))
+        .route("/v1/keys/:key_id/actions-cancel-deletion", post(cancel_key_deletion))
+        .route("/v1/keys/:key_id/actions-rotate", post(rotate_key));
 
     // Crypto operation routes: gated behind the `crypto-endpoints` feature.
     #[cfg(feature = "crypto-endpoints")]
     let r = r
-        .route("/v1/keys/{key_id}/actions-encrypt", post(encrypt))
-        .route("/v1/keys/{key_id}/actions-decrypt", post(decrypt))
-        .route("/v1/keys/{key_id}/actions-sign", post(sign))
-        .route("/v1/keys/{key_id}/actions-verify", post(verify))
-        .route("/v1/keys/{key_id}/actions-generate-data-key", post(generate_data_key))
-        .route("/v1/keys/{key_id}/actions-re-encrypt", post(re_encrypt))
+        .route("/v1/keys/:key_id/actions-encrypt", post(encrypt))
+        .route("/v1/keys/:key_id/actions-decrypt", post(decrypt))
+        .route("/v1/keys/:key_id/actions-sign", post(sign))
+        .route("/v1/keys/:key_id/actions-verify", post(verify))
+        .route("/v1/keys/:key_id/actions-generate-data-key", post(generate_data_key))
+        .route("/v1/keys/:key_id/actions-re-encrypt", post(re_encrypt))
         .route("/v1/generate-random", post(generate_random));
 
     r
         // ── Tags ────────────────────────────────────────────
-        .route("/v1/keys/{key_id}/tags", get(list_resource_tags))
-        .route("/v1/keys/{key_id}/tags", post(tag_resource))
-        .route("/v1/keys/{key_id}/tags", delete(untag_resource))
+        .route("/v1/keys/:key_id/tags", get(list_resource_tags).post(tag_resource).delete(untag_resource))
         // ── Aliases ─────────────────────────────────────────
-        .route("/v1/aliases", post(create_alias))
-        .route("/v1/aliases", get(list_aliases))
-        .route("/v1/aliases/{alias_name}", delete(delete_alias))
+        .route("/v1/aliases", get(list_aliases).post(create_alias))
+        .route("/v1/aliases/:alias_name", delete(delete_alias))
         // ── Health / ops ────────────────────────────────────
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))

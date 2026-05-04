@@ -13,6 +13,71 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---- Live service stack (for E2E and manual testing) ----
+
+  cedar-pdp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    entrypoint: ["keyrack-cedar-pdp"]
+    environment:
+      - CEDAR_POLICY_PATH=/config/cedar-policy.cedar
+      - CEDAR_PDP_ADDR=0.0.0.0:8181
+      - RUST_LOG=info
+    volumes:
+      - ./docker/config:/config:ro
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  keyrack-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    environment:
+      - KEYRACK_CONFIG=/config/keyrack.yaml
+      - RUST_LOG=info
+    volumes:
+      - ./docker/config:/config:ro
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    depends_on:
+      cedar-pdp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 15
+
+  e2e-test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.e2e
+    command:
+      - cargo
+      - run
+      - --manifest-path
+      - crates/keyrack-e2e/Cargo.toml
+      - --
+      - --grpc-endpoint
+      - http://keyrack-service:50051
+      - --rest-endpoint
+      - http://keyrack-service:8080
+    depends_on:
+      keyrack-service:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+
+  # ---- Existing in-process test services ----
+
   e2e:
     build:
       context: .

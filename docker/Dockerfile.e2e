@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsofthsm2 \
         opensc \
         pkg-config \
+        protobuf-compiler \
+        libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /keyrack
@@ -12,6 +14,7 @@ WORKDIR /keyrack
 # Cache dependencies: copy manifests first, build a dummy, then copy source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
+COPY proto/ proto/
 
 # Build workspace (tests are built in the test stage)
 RUN cargo build --workspace --tests --quiet
