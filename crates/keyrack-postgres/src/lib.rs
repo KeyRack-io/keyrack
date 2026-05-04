@@ -212,6 +212,27 @@ impl StorageBackend for PostgresStorage {
         })
     }
 
+    async fn list_children(&self, parent: &Lid) -> Result<Vec<KeyRecord>> {
+        let rows = sqlx::query("SELECT record_json FROM kr_keys")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| KeyRackError::Storage(format!("list_children: {e}")))?;
+
+        let parent_str = parent.to_string();
+        let mut children = Vec::new();
+        for row in &rows {
+            let json: serde_json::Value = row
+                .try_get("record_json")
+                .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
+            let record: KeyRecord = serde_json::from_value(json)
+                .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))?;
+            if record.parent_lid.as_ref().is_some_and(|p| p.to_string() == parent_str) {
+                children.push(record);
+            }
+        }
+        Ok(children)
+    }
+
     async fn create_alias(&self, alias: &AliasRecord) -> Result<()> {
         let lid_str = alias.target_lid.to_string();
         sqlx::query(

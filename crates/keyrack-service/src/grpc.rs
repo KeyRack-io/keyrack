@@ -696,6 +696,40 @@ impl KeyService for KeyServiceImpl {
                     Status::failed_precondition(format!("cannot transition from {from} to {to}"))
                 })?;
                 state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
+
+                // Cascade: disable all descendant keys recursively
+                let cascade_start = std::time::Instant::now();
+                let mut cascade_count = 0u64;
+                let mut queue = vec![lid];
+                while let Some(parent) = queue.pop() {
+                    let children = state.storage.list_children(&parent).await
+                        .map_err(convert::error_to_status)?;
+                    for mut child in children {
+                        if child.state == keyrack_core::key::KeyState::Enabled {
+                            if child.transition_to(keyrack_core::key::KeyState::Disabled).is_ok() {
+                                let _ = state.storage.update_key(&child).await;
+                                cascade_count += 1;
+                                queue.push(child.lid);
+                            }
+                        }
+                    }
+                }
+
+                if cascade_count > 0 {
+                    tracing::info!(
+                        root = %key_id,
+                        descendants_disabled = cascade_count,
+                        elapsed_ms = cascade_start.elapsed().as_millis(),
+                        "cascade disable completed"
+                    );
+                    // Emit NATS invalidation if event sink is configured
+                    state.emit_audit_event(
+                        "CascadeDisable",
+                        &key_id,
+                        &format!("disabled {cascade_count} descendant(s)"),
+                    ).await;
+                }
+
                 Ok(Response::new(proto::DisableKeyResponse {
                     metadata: Some(convert::key_record_to_metadata(&record)),
                 }))
@@ -782,6 +816,35 @@ impl KeyService for KeyServiceImpl {
                 record.occ_version += 1;
                 record.updated_at = chrono::Utc::now();
                 state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
+
+                // Create rotation jobs for dependent keys (§5.6)
+                let dependents = state.storage.list_children(&lid).await
+                    .map_err(convert::error_to_status)?;
+                for dep in &dependents {
+                    let job = keyrack_core::rotation::RotationJob::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        lid,
+                        dep.lid,
+                        new_version,
+                    );
+                    if let Err(e) = state.storage.create_rotation_job(&job).await {
+                        tracing::warn!(
+                            parent = %lid,
+                            dependent = %dep.lid,
+                            error = %e,
+                            "failed to create rotation job for dependent"
+                        );
+                    }
+                }
+                if !dependents.is_empty() {
+                    tracing::info!(
+                        key = %key_id,
+                        new_version,
+                        jobs_created = dependents.len(),
+                        "rotation jobs created for dependents"
+                    );
+                }
+
                 #[allow(clippy::cast_possible_truncation)]
                 Ok(Response::new(proto::RotateKeyResponse {
                     metadata: Some(convert::key_record_to_metadata(&record)),

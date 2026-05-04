@@ -74,6 +74,9 @@ pub trait StorageBackend: Send + Sync {
     /// List keys with optional filtering and pagination.
     async fn list_keys(&self, filter: &KeyFilter) -> Result<Page<KeyRecord>>;
 
+    /// List keys whose `parent_lid` matches the given LID (direct children).
+    async fn list_children(&self, parent: &Lid) -> Result<Vec<KeyRecord>>;
+
     // ── Aliases ───────────────────────────────────────────────────
 
     /// Create an alias. Fails if the name is already taken.
@@ -232,6 +235,14 @@ mod tests {
                 items,
                 next_cursor: None,
             })
+        }
+
+        async fn list_children(&self, parent: &Lid) -> Result<Vec<KeyRecord>> {
+            let keys = self.keys.lock().unwrap();
+            Ok(keys.values()
+                .filter(|r| r.parent_lid.as_ref() == Some(parent))
+                .cloned()
+                .collect())
         }
 
         async fn create_alias(&self, alias: &AliasRecord) -> Result<()> {

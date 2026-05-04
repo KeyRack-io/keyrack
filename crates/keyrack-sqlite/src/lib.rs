@@ -218,6 +218,32 @@ impl StorageBackend for SqliteStorage {
         })
     }
 
+    async fn list_children(&self, parent: &Lid) -> Result<Vec<KeyRecord>> {
+        let parent_str = parent.to_string();
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT record_json FROM keys")
+                .map_err(|e| map_sql(&e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let json: String = row.get(0)?;
+                    Ok(json)
+                })
+                .map_err(|e| map_sql(&e))?;
+
+            let mut children = Vec::new();
+            for row in rows {
+                let json = row.map_err(|e| map_sql(&e))?;
+                let record: KeyRecord = serde_json::from_str(&json)
+                    .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))?;
+                if record.parent_lid.as_ref().is_some_and(|p| p.to_string() == parent_str) {
+                    children.push(record);
+                }
+            }
+            Ok(children)
+        })
+    }
+
     async fn create_alias(&self, alias: &AliasRecord) -> Result<()> {
         let created = alias.created_at.to_rfc3339();
         let lid_str = alias.target_lid.to_string();

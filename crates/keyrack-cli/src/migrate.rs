@@ -79,6 +79,11 @@ pub enum MigrateCommand {
         /// Path to the rule-change plan JSON file.
         plan_file: std::path::PathBuf,
 
+        /// Path to the new namespace YAML file (used to resolve
+        /// new parent LIDs at apply time).
+        #[arg(long)]
+        new_rules: std::path::PathBuf,
+
         /// Database path for direct storage access.
         #[arg(long)]
         storage: String,
@@ -127,10 +132,11 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         } => plan_rule_change(&old_rules, &new_rules, &output, &storage).await,
         MigrateCommand::RuleChangeApply {
             plan_file,
+            new_rules,
             storage,
             batch_size,
             opt_out,
-        } => apply_rule_change(&plan_file, &storage, batch_size, opt_out).await,
+        } => apply_rule_change(&plan_file, &new_rules, &storage, batch_size, opt_out).await,
         MigrateCommand::RuleChangeRollback { plan_file, storage } => {
             rollback_rule_change(&plan_file, &storage).await
         }
@@ -436,6 +442,7 @@ async fn plan_rule_change(
 
 async fn apply_rule_change(
     plan_file: &std::path::Path,
+    new_rules_path: &std::path::Path,
     storage_path: &str,
     batch_size: usize,
     opt_out: bool,
@@ -443,6 +450,20 @@ async fn apply_rule_change(
     let plan_json = std::fs::read_to_string(plan_file)
         .map_err(|e| anyhow::anyhow!("cannot read plan file: {e}"))?;
     let mut plan: RuleChangePlan = serde_json::from_str(&plan_json)?;
+
+    let new_yaml = std::fs::read_to_string(new_rules_path)
+        .map_err(|e| anyhow::anyhow!("cannot read new rules: {e}"))?;
+    let new_hash = blake3::hash(new_yaml.as_bytes()).to_hex().to_string();
+    if new_hash != plan.new_rules_hash {
+        anyhow::bail!(
+            "new rules file hash ({new_hash}) does not match plan hash ({}); \
+             use the same YAML that was used to create this plan",
+            plan.new_rules_hash,
+        );
+    }
+    let new_registry = keyrack_core::rule::RuleRegistry::from_yaml(&new_yaml)
+        .map_err(|e| anyhow::anyhow!("invalid new rules YAML: {e}"))?;
+    let resolver_config = keyrack_core::resolver::ResolverConfig::default();
 
     let db = open_storage(storage_path)?;
 
@@ -477,7 +498,21 @@ async fn apply_rule_change(
             }
         };
 
-        let new_parent_lid = plan.entries[i].new_parent_lid.as_ref().and_then(|s| s.parse().ok());
+        // Resolve the new parent LID from the new rules
+        let attrs = record.identity_tags.as_map();
+        let new_parent_lid = match keyrack_core::resolver::resolve_chain(
+            &new_registry,
+            attrs,
+            &resolver_config,
+        ) {
+            Ok(chain) if chain.len() >= 2 => {
+                Some(chain[1].clone())
+            }
+            _ => None,
+        };
+
+        let new_parent_str = new_parent_lid.as_ref().map(|l| l.to_string());
+
         let mut updated = record.clone();
         updated.parent_lid = new_parent_lid;
         updated.occ_version += 1;
@@ -488,6 +523,7 @@ async fn apply_rule_change(
             continue;
         }
 
+        plan.entries[i].new_parent_lid = new_parent_str;
         plan.entries[i].applied = true;
         applied += 1;
         batch_count += 1;

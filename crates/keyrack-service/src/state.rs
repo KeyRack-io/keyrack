@@ -29,3 +29,40 @@ pub struct ServiceState {
     pub pdp: Arc<dyn PolicyDecisionPoint>,
     pub audit: Arc<dyn AuditSink>,
 }
+
+impl ServiceState {
+    /// Emit an audit event for internal operations (e.g. cascade disable).
+    pub async fn emit_audit_event(
+        &self,
+        action: &str,
+        resource_id: &str,
+        detail: &str,
+    ) {
+        use keyrack_core::audit::{
+            AuditAction, AuditEvent, AuditPrincipal, AuditResource,
+            AuditResult, EventType,
+        };
+
+        let mut event = AuditEvent::new(
+            EventType::CascadeDisable,
+            AuditAction::CascadeDisable,
+            AuditPrincipal {
+                id: "keyrack:system".to_string(),
+                principal_type: "system".to_string(),
+            },
+            AuditResource {
+                id: resource_id.to_string(),
+                resource_type: "key".to_string(),
+            },
+            AuditResult::Success,
+        );
+        event.metadata.insert(
+            "detail".to_string(),
+            serde_json::Value::String(detail.to_string()),
+        );
+        let _ = action;
+        if let Err(e) = self.audit.emit(&event).await {
+            tracing::warn!(resource_id, error = %e, "failed to emit cascade audit event");
+        }
+    }
+}
