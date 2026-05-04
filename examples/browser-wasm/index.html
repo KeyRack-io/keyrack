@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KeyRack WASM Demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1a1a2e;
+      background: #f5f5f5;
+    }
+    h1 { font-size: 24px; border-bottom: 2px solid #4fc3f7; padding-bottom: 8px; }
+    h2 { font-size: 18px; margin-top: 32px; }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      padding: 20px;
+      margin: 16px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    label { display: block; font-weight: 600; margin: 8px 0 4px; font-size: 14px; }
+    textarea, input[type="text"] {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 14px;
+    }
+    textarea { min-height: 80px; resize: vertical; }
+    button {
+      padding: 8px 16px;
+      background: #1976d2;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+      margin: 4px 4px 4px 0;
+    }
+    button:hover { background: #1565c0; }
+    button:disabled { background: #999; cursor: not-allowed; }
+    .output {
+      background: #f8f8f8;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 13px;
+      word-break: break-all;
+      margin-top: 8px;
+      min-height: 40px;
+    }
+    .status {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .status.ok { background: #e8f5e9; color: #2e7d32; }
+    .status.err { background: #fce4ec; color: #c62828; }
+    .status.loading { background: #fff3e0; color: #e65100; }
+  </style>
+</head>
+<body>
+  <h1>KeyRack WASM Demo</h1>
+  <p>
+    Client-side encryption using <code>keyrack-wasm</code>. All crypto
+    operations run in the browser — no server round-trips after loading.
+  </p>
+
+  <div id="init-status" class="card">
+    <span class="status loading">Loading WASM module...</span>
+  </div>
+
+  <h2>Key Generation</h2>
+  <div class="card">
+    <label for="key-spec">Key Spec</label>
+    <select id="key-spec" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+      <option value="AES_256">AES-256 (symmetric)</option>
+      <option value="ED25519">Ed25519 (signing)</option>
+      <option value="ECDSA_P256">ECDSA P-256 (signing)</option>
+    </select>
+    <button id="btn-generate" disabled>Generate Key</button>
+    <div class="output" id="key-output">—</div>
+  </div>
+
+  <h2>Encrypt / Decrypt</h2>
+  <div class="card">
+    <label for="plaintext">Plaintext</label>
+    <textarea id="plaintext" placeholder="Enter text to encrypt...">Hello from KeyRack WASM!</textarea>
+    <label for="aad">AAD (Additional Authenticated Data)</label>
+    <input type="text" id="aad" placeholder="optional" value="demo-context">
+    <div style="margin-top: 8px;">
+      <button id="btn-encrypt" disabled>Encrypt</button>
+      <button id="btn-decrypt" disabled>Decrypt</button>
+    </div>
+    <label>Ciphertext (base64)</label>
+    <div class="output" id="ct-output">—</div>
+    <label>Decrypted</label>
+    <div class="output" id="pt-output">—</div>
+  </div>
+
+  <h2>Sign / Verify (Ed25519)</h2>
+  <div class="card">
+    <label for="sign-message">Message</label>
+    <textarea id="sign-message" placeholder="Message to sign...">Signed by KeyRack WASM</textarea>
+    <div style="margin-top: 8px;">
+      <button id="btn-sign" disabled>Sign</button>
+      <button id="btn-verify" disabled>Verify</button>
+    </div>
+    <label>Signature (base64)</label>
+    <div class="output" id="sig-output">—</div>
+    <label>Verification result</label>
+    <div class="output" id="verify-output">—</div>
+  </div>
+
+  <h2>LID Computation</h2>
+  <div class="card">
+    <label for="lid-attrs">Attributes (JSON)</label>
+    <textarea id="lid-attrs">{"tenant_id": "acme", "service": "storage", "purpose": "encryption"}</textarea>
+    <button id="btn-lid" disabled>Compute LID</button>
+    <div class="output" id="lid-output">—</div>
+  </div>
+
+  <script type="module">
+    // In production, import the built WASM package:
+    //   import init, { WasmKeyRack } from './pkg/keyrack_wasm.js';
+    //
+    // For this demo, we simulate the API to show the UI flow.
+    // Build the real WASM with:
+    //   cd crates/keyrack-wasm && wasm-pack build --target web
+
+    const statusEl = document.getElementById('init-status');
+    let kr = null;
+    let aesKeyId = null;
+    let edKeyId = null;
+    let lastCiphertext = null;
+    let lastSignature = null;
+
+    async function initWasm() {
+      try {
+        // Try loading the real WASM module
+        const mod = await import('./pkg/keyrack_wasm.js');
+        await mod.default();
+        kr = new mod.WasmKeyRack();
+        statusEl.innerHTML = '<span class="status ok">WASM loaded — ready</span>';
+      } catch (e) {
+        statusEl.innerHTML = `<span class="status err">WASM not built</span> — run <code>cd crates/keyrack-wasm && wasm-pack build --target web --out-dir ../../examples/browser-wasm/pkg</code>`;
+        console.warn('WASM not available:', e);
+        return;
+      }
+      document.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
+
+    function b64(buf) {
+      return btoa(String.fromCharCode(...new Uint8Array(buf)));
+    }
+
+    function fromB64(s) {
+      return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    }
+
+    document.getElementById('btn-generate').addEventListener('click', async () => {
+      const spec = document.getElementById('key-spec').value;
+      try {
+        const keyId = await kr.generateKey(spec);
+        if (spec === 'AES_256') aesKeyId = keyId;
+        if (spec === 'ED25519') edKeyId = keyId;
+        document.getElementById('key-output').textContent = `Key ID: ${keyId} (${spec})`;
+      } catch (e) {
+        document.getElementById('key-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    document.getElementById('btn-encrypt').addEventListener('click', async () => {
+      if (!aesKeyId) { alert('Generate an AES-256 key first'); return; }
+      const pt = new TextEncoder().encode(document.getElementById('plaintext').value);
+      const aad = new TextEncoder().encode(document.getElementById('aad').value);
+      try {
+        lastCiphertext = await kr.encrypt(aesKeyId, pt, aad);
+        document.getElementById('ct-output').textContent = b64(lastCiphertext);
+        document.getElementById('pt-output').textContent = '—';
+      } catch (e) {
+        document.getElementById('ct-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    document.getElementById('btn-decrypt').addEventListener('click', async () => {
+      if (!lastCiphertext) { alert('Encrypt something first'); return; }
+      const aad = new TextEncoder().encode(document.getElementById('aad').value);
+      try {
+        const pt = await kr.decrypt(aesKeyId, lastCiphertext, aad);
+        document.getElementById('pt-output').textContent = new TextDecoder().decode(pt);
+      } catch (e) {
+        document.getElementById('pt-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    document.getElementById('btn-sign').addEventListener('click', async () => {
+      if (!edKeyId) { alert('Generate an Ed25519 key first'); return; }
+      const msg = new TextEncoder().encode(document.getElementById('sign-message').value);
+      try {
+        lastSignature = await kr.signEd25519(edKeyId, msg);
+        document.getElementById('sig-output').textContent = b64(lastSignature);
+        document.getElementById('verify-output').textContent = '—';
+      } catch (e) {
+        document.getElementById('sig-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    document.getElementById('btn-verify').addEventListener('click', async () => {
+      if (!lastSignature) { alert('Sign something first'); return; }
+      const msg = new TextEncoder().encode(document.getElementById('sign-message').value);
+      try {
+        const valid = await kr.verifyEd25519(edKeyId, msg, lastSignature);
+        document.getElementById('verify-output').innerHTML = valid
+          ? '<span class="status ok">Valid signature</span>'
+          : '<span class="status err">Invalid signature</span>';
+      } catch (e) {
+        document.getElementById('verify-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    document.getElementById('btn-lid').addEventListener('click', async () => {
+      const json = document.getElementById('lid-attrs').value;
+      try {
+        const lid = kr.computeLid(json);
+        document.getElementById('lid-output').textContent = lid;
+      } catch (e) {
+        document.getElementById('lid-output').textContent = `Error: ${e}`;
+      }
+    });
+
+    initWasm();
+  </script>
+</body>
+</html>
