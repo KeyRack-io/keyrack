@@ -43,6 +43,11 @@ base64 = "0.22"
 [dev-dependencies]
 keyrack-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "service_ops"
+harness = false
 
 [build-dependencies]
 tonic-build = "0.12"
