@@ -109,11 +109,13 @@ fn build_ec(map: &serde_json::Map<String, serde_json::Value>) -> Option<keyrack_
 
 async fn create_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::CreateKey, ops::default_principal(), "(new)"),
+        OpContext::key(AuditAction::CreateKey, principal, "(new)"),
         |state| async move {
             let spec_str = body.get("key_spec").and_then(|v| v.as_str()).unwrap_or("AES_256");
             let spec = match spec_str {
@@ -165,11 +167,13 @@ async fn create_key(
 
 async fn get_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::GetKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::GetKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -180,11 +184,13 @@ async fn get_key(
 
 async fn describe_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::DescribeKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::DescribeKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -195,12 +201,14 @@ async fn describe_key(
 
 async fn update_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::UpdateKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::UpdateKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -229,11 +237,13 @@ async fn list_keys(State(state): State<AppState>) -> Result<impl IntoResponse, R
 
 async fn enable_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::EnableKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::EnableKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -246,11 +256,13 @@ async fn enable_key(
 
 async fn disable_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::DisableKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::DisableKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -263,12 +275,14 @@ async fn disable_key(
 
 async fn schedule_key_deletion(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ScheduleKeyDeletion, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -284,11 +298,13 @@ async fn schedule_key_deletion(
 
 async fn cancel_key_deletion(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::CancelKeyDeletion, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -305,11 +321,13 @@ async fn cancel_key_deletion(
 
 async fn rotate_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::RotateKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::RotateKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -340,12 +358,14 @@ async fn rotate_key(
 #[cfg(feature = "crypto-endpoints")]
 async fn encrypt(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Encrypt, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::Encrypt, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -373,12 +393,14 @@ async fn encrypt(
 #[cfg(feature = "crypto-endpoints")]
 async fn decrypt(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Decrypt, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::Decrypt, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -411,12 +433,14 @@ async fn decrypt(
 #[cfg(feature = "crypto-endpoints")]
 async fn sign(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Sign, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::Sign, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -444,12 +468,14 @@ async fn sign(
 #[cfg(feature = "crypto-endpoints")]
 async fn verify(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Verify, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::Verify, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -476,12 +502,14 @@ async fn verify(
 #[cfg(feature = "crypto-endpoints")]
 async fn generate_data_key(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::GenerateDataKey, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::GenerateDataKey, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -509,13 +537,15 @@ async fn generate_data_key(
 #[cfg(feature = "crypto-endpoints")]
 async fn re_encrypt(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     let dst_key_id = body.get("destination_key_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ReEncrypt, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::ReEncrypt, principal, &key_id),
         |state| async move {
             let src_lid = parse_lid_rest(&key_id)?;
             let dst_lid = parse_lid_rest(&dst_key_id)?;
@@ -567,11 +597,13 @@ async fn generate_random(
 
 async fn list_resource_tags(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ListResourceTags, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::ListResourceTags, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -583,12 +615,14 @@ async fn list_resource_tags(
 
 async fn tag_resource(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::TagResource, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::TagResource, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -609,12 +643,14 @@ async fn tag_resource(
 
 async fn untag_resource(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::UntagResource, ops::default_principal(), &key_id),
+        OpContext::key(AuditAction::UntagResource, principal, &key_id),
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -635,12 +671,14 @@ async fn untag_resource(
 
 async fn create_alias(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     let alias_name = body.get("alias_name").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     ops::execute_rest(
         &state,
-        OpContext::alias(AuditAction::CreateAlias, ops::default_principal(), &alias_name),
+        OpContext::alias(AuditAction::CreateAlias, principal, &alias_name),
         |state| async move {
             let target_key_id = body.get("target_key_id").and_then(|v| v.as_str()).unwrap_or("");
             let lid = parse_lid_rest(target_key_id)?;
@@ -669,11 +707,13 @@ async fn list_aliases(State(state): State<AppState>) -> Result<impl IntoResponse
 
 async fn delete_alias(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(alias_name): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let principal = ops::extract_principal_rest(&state, &headers).await;
     ops::execute_rest(
         &state,
-        OpContext::alias(AuditAction::DeleteAlias, ops::default_principal(), &alias_name),
+        OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name),
         |state| async move {
             state.storage.delete_alias(&alias_name).await.map_err(map_core_err)?;
             Ok(StatusCode::NO_CONTENT)

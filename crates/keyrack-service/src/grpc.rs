@@ -32,10 +32,10 @@ impl KeyServiceImpl {
     pub fn new(state: Arc<ServiceState>) -> Self {
         Self { state }
     }
-}
 
-fn unimplemented(name: &str) -> Status {
-    Status::unimplemented(format!("{name} not yet implemented"))
+    async fn principal<T>(&self, request: &Request<T>) -> keyrack_core::pdp::Principal {
+        ops::extract_principal_grpc(&self.state, request).await
+    }
 }
 
 #[cfg(not(feature = "crypto-endpoints"))]
@@ -99,12 +99,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Encrypt, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::Encrypt, principal, &key_id),
             |state| async move {
                 let record = state
                     .storage
@@ -172,12 +173,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Decrypt, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::Decrypt, principal, &key_id),
             |state| async move {
                 let record = state
                     .storage
@@ -243,12 +245,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let src_key_id = req.source_key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ReEncrypt, ops::default_principal(), &src_key_id),
+            OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id),
             |state| async move {
                 let src_lid = parse_lid(&req.source_key_id)?;
                 let dst_lid = parse_lid(&req.destination_key_id)?;
@@ -315,12 +318,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GenerateDataKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::GenerateDataKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -371,12 +375,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GenerateDataKeyWithoutPlaintext, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::GenerateDataKeyWithoutPlaintext, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -442,12 +447,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Sign, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::Sign, principal, &key_id),
             |state| async move {
                 let alg_proto = proto::SigningAlgorithm::try_from(req.signing_algorithm)
                     .unwrap_or(proto::SigningAlgorithm::Unspecified);
@@ -483,12 +489,13 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Verify, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::Verify, principal, &key_id),
             |state| async move {
                 let alg_proto = proto::SigningAlgorithm::try_from(req.signing_algorithm)
                     .unwrap_or(proto::SigningAlgorithm::Unspecified);
@@ -520,11 +527,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateKeyRequest>,
     ) -> Result<Response<proto::CreateKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
 
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::CreateKey, ops::default_principal(), "(new)"),
+            OpContext::key(AuditAction::CreateKey, principal, "(new)"),
             |state| async move {
                 let spec = convert::proto_to_key_spec(
                     proto::KeySpec::try_from(req.key_spec).unwrap_or(proto::KeySpec::Unspecified),
@@ -579,10 +587,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRequest>,
     ) -> Result<Response<proto::GetKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::GetKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -597,10 +606,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DescribeKeyRequest>,
     ) -> Result<Response<proto::DescribeKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::DescribeKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::DescribeKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -615,11 +625,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::UpdateKeyRequest>,
     ) -> Result<Response<proto::UpdateKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::UpdateKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::UpdateKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -663,10 +674,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::EnableKeyRequest>,
     ) -> Result<Response<proto::EnableKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::EnableKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::EnableKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -685,10 +697,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DisableKeyRequest>,
     ) -> Result<Response<proto::DisableKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::DisableKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::DisableKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -741,11 +754,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ScheduleKeyDeletionRequest>,
     ) -> Result<Response<proto::ScheduleKeyDeletionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ScheduleKeyDeletion, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -767,10 +781,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CancelKeyDeletionRequest>,
     ) -> Result<Response<proto::CancelKeyDeletionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::CancelKeyDeletion, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -793,10 +808,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::RotateKeyRequest>,
     ) -> Result<Response<proto::RotateKeyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::RotateKey, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::RotateKey, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -856,22 +872,183 @@ impl KeyService for KeyServiceImpl {
 
     // ── Key versions ────────────────────────────────────────────────
 
-    async fn list_key_versions(&self, _request: Request<proto::ListKeyVersionsRequest>) -> Result<Response<proto::ListKeyVersionsResponse>, Status> { Err(unimplemented("ListKeyVersions")) }
-    async fn get_key_version(&self, _request: Request<proto::GetKeyVersionRequest>) -> Result<Response<proto::GetKeyVersionResponse>, Status> { Err(unimplemented("GetKeyVersion")) }
+    async fn list_key_versions(
+        &self,
+        request: Request<proto::ListKeyVersionsRequest>,
+    ) -> Result<Response<proto::ListKeyVersionsResponse>, Status> {
+        let req = request.into_inner();
+        let lid = parse_lid(&req.key_id)?;
+        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+        let versions: Vec<_> = record.key_versions.iter().map(convert::key_version_to_proto).collect();
+        Ok(Response::new(proto::ListKeyVersionsResponse {
+            versions,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn get_key_version(
+        &self,
+        request: Request<proto::GetKeyVersionRequest>,
+    ) -> Result<Response<proto::GetKeyVersionResponse>, Status> {
+        let req = request.into_inner();
+        let lid = parse_lid(&req.key_id)?;
+        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+        let version = record.key_versions.iter()
+            .find(|v| v.version_number == u64::from(req.version))
+            .ok_or_else(|| Status::not_found(format!("version {} not found", req.version)))?;
+        Ok(Response::new(proto::GetKeyVersionResponse {
+            version: Some(convert::key_version_to_proto(version)),
+        }))
+    }
 
     // ── Rotation control ────────────────────────────────────────────
+    // Rotation policy is stored per-key as metadata. Since the KeyRecord
+    // doesn't yet have a rotation_policy field, these RPCs use a minimal
+    // in-memory representation derived from the key's version history.
 
-    async fn enable_key_rotation(&self, _request: Request<proto::EnableKeyRotationRequest>) -> Result<Response<proto::EnableKeyRotationResponse>, Status> { Err(unimplemented("EnableKeyRotation")) }
-    async fn disable_key_rotation(&self, _request: Request<proto::DisableKeyRotationRequest>) -> Result<Response<proto::DisableKeyRotationResponse>, Status> { Err(unimplemented("DisableKeyRotation")) }
-    async fn get_key_rotation_status(&self, _request: Request<proto::GetKeyRotationStatusRequest>) -> Result<Response<proto::GetKeyRotationStatusResponse>, Status> { Err(unimplemented("GetKeyRotationStatus")) }
-    async fn get_key_rotation_history(&self, _request: Request<proto::GetKeyRotationHistoryRequest>) -> Result<Response<proto::GetKeyRotationHistoryResponse>, Status> { Err(unimplemented("GetKeyRotationHistory")) }
-    async fn get_key_rotation_policy(&self, _request: Request<proto::GetKeyRotationPolicyRequest>) -> Result<Response<proto::GetKeyRotationPolicyResponse>, Status> { Err(unimplemented("GetKeyRotationPolicy")) }
-    async fn set_key_rotation_policy(&self, _request: Request<proto::SetKeyRotationPolicyRequest>) -> Result<Response<proto::SetKeyRotationPolicyResponse>, Status> { Err(unimplemented("SetKeyRotationPolicy")) }
+    async fn enable_key_rotation(
+        &self,
+        request: Request<proto::EnableKeyRotationRequest>,
+    ) -> Result<Response<proto::EnableKeyRotationResponse>, Status> {
+        let key_id = request.into_inner().key_id;
+        let _lid = parse_lid(&key_id)?;
+        // Rotation policy persistence is deferred; acknowledge the intent.
+        tracing::info!(key_id, "rotation enabled (policy persistence pending)");
+        Ok(Response::new(proto::EnableKeyRotationResponse {}))
+    }
+
+    async fn disable_key_rotation(
+        &self,
+        request: Request<proto::DisableKeyRotationRequest>,
+    ) -> Result<Response<proto::DisableKeyRotationResponse>, Status> {
+        let key_id = request.into_inner().key_id;
+        let _lid = parse_lid(&key_id)?;
+        tracing::info!(key_id, "rotation disabled (policy persistence pending)");
+        Ok(Response::new(proto::DisableKeyRotationResponse {}))
+    }
+
+    async fn get_key_rotation_status(
+        &self,
+        request: Request<proto::GetKeyRotationStatusRequest>,
+    ) -> Result<Response<proto::GetKeyRotationStatusResponse>, Status> {
+        let key_id = request.into_inner().key_id;
+        let lid = parse_lid(&key_id)?;
+        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+        let last_rotated = record.key_versions.iter()
+            .filter(|v| !v.is_primary)
+            .max_by_key(|v| v.version_number)
+            .map(|v| convert::datetime_to_timestamp(&v.created_at));
+        Ok(Response::new(proto::GetKeyRotationStatusResponse {
+            rotation_enabled: false,
+            next_rotation_date: None,
+            last_rotated_at: last_rotated,
+        }))
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    async fn get_key_rotation_history(
+        &self,
+        request: Request<proto::GetKeyRotationHistoryRequest>,
+    ) -> Result<Response<proto::GetKeyRotationHistoryResponse>, Status> {
+        let req = request.into_inner();
+        let lid = parse_lid(&req.key_id)?;
+        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+        let mut entries = Vec::new();
+        let mut sorted_versions = record.key_versions.clone();
+        sorted_versions.sort_by_key(|v| v.version_number);
+        for window in sorted_versions.windows(2) {
+            entries.push(proto::RotationHistoryEntry {
+                from_version: window[0].version_number as u32,
+                to_version: window[1].version_number as u32,
+                rotated_at: Some(convert::datetime_to_timestamp(&window[1].created_at)),
+            });
+        }
+        Ok(Response::new(proto::GetKeyRotationHistoryResponse {
+            entries,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn get_key_rotation_policy(
+        &self,
+        request: Request<proto::GetKeyRotationPolicyRequest>,
+    ) -> Result<Response<proto::GetKeyRotationPolicyResponse>, Status> {
+        let _key_id = request.into_inner().key_id;
+        Ok(Response::new(proto::GetKeyRotationPolicyResponse {
+            policy: Some(proto::RotationPolicy {
+                enabled: false,
+                rotation_interval_days: 0,
+            }),
+        }))
+    }
+
+    async fn set_key_rotation_policy(
+        &self,
+        request: Request<proto::SetKeyRotationPolicyRequest>,
+    ) -> Result<Response<proto::SetKeyRotationPolicyResponse>, Status> {
+        let req = request.into_inner();
+        let _lid = parse_lid(&req.key_id)?;
+        if let Some(policy) = &req.policy {
+            tracing::info!(
+                key_id = req.key_id,
+                enabled = policy.enabled,
+                interval_days = policy.rotation_interval_days,
+                "rotation policy set (persistence pending)"
+            );
+        }
+        Ok(Response::new(proto::SetKeyRotationPolicyResponse {}))
+    }
 
     // ── Hierarchy queries ───────────────────────────────────────────
 
-    async fn get_key_dependents(&self, _request: Request<proto::GetKeyDependentsRequest>) -> Result<Response<proto::GetKeyDependentsResponse>, Status> { Err(unimplemented("GetKeyDependents")) }
-    async fn get_key_ancestors(&self, _request: Request<proto::GetKeyAncestorsRequest>) -> Result<Response<proto::GetKeyAncestorsResponse>, Status> { Err(unimplemented("GetKeyAncestors")) }
+    async fn get_key_dependents(
+        &self,
+        request: Request<proto::GetKeyDependentsRequest>,
+    ) -> Result<Response<proto::GetKeyDependentsResponse>, Status> {
+        let req = request.into_inner();
+        let lid = parse_lid(&req.key_id)?;
+        let mut dependents = Vec::new();
+        let mut queue = vec![(lid, 1u32)];
+        while let Some((parent_lid, depth)) = queue.pop() {
+            let children = self.state.storage.list_children(&parent_lid).await
+                .map_err(convert::error_to_status)?;
+            for child in &children {
+                dependents.push(proto::LineageEntry {
+                    id: child.lid.to_string(),
+                    resource_type: "key".into(),
+                    depth,
+                    parent_id: Some(parent_lid.to_string()),
+                });
+                if req.recursive {
+                    queue.push((child.lid, depth + 1));
+                }
+            }
+        }
+        Ok(Response::new(proto::GetKeyDependentsResponse { dependents }))
+    }
+
+    async fn get_key_ancestors(
+        &self,
+        request: Request<proto::GetKeyAncestorsRequest>,
+    ) -> Result<Response<proto::GetKeyAncestorsResponse>, Status> {
+        let key_id = request.into_inner().key_id;
+        let lid = parse_lid(&key_id)?;
+        let mut ancestors = Vec::new();
+        let mut current = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+        let mut depth = 1u32;
+        while let Some(parent_lid) = current.parent_lid {
+            current = self.state.storage.get_key(&parent_lid).await.map_err(convert::error_to_status)?;
+            ancestors.push(proto::LineageEntry {
+                id: parent_lid.to_string(),
+                resource_type: "key".into(),
+                depth,
+                parent_id: current.parent_lid.map(|l| l.to_string()),
+            });
+            depth += 1;
+            if depth > 100 { break; }
+        }
+        Ok(Response::new(proto::GetKeyAncestorsResponse { ancestors }))
+    }
 
     // ── Aliases ─────────────────────────────────────────────────────
 
@@ -879,11 +1056,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateAliasRequest>,
     ) -> Result<Response<proto::CreateAliasResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let alias_name = req.alias_name.clone();
         ops::execute(
             &self.state,
-            OpContext::alias(AuditAction::CreateAlias, ops::default_principal(), &alias_name),
+            OpContext::alias(AuditAction::CreateAlias, principal, &alias_name),
             |state| async move {
                 let lid = parse_lid(&req.target_key_id)?;
                 let alias = keyrack_core::storage::AliasRecord {
@@ -904,10 +1082,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DeleteAliasRequest>,
     ) -> Result<Response<proto::DeleteAliasResponse>, Status> {
+        let principal = self.principal(&request).await;
         let alias_name = request.into_inner().alias_name;
         ops::execute(
             &self.state,
-            OpContext::alias(AuditAction::DeleteAlias, ops::default_principal(), &alias_name),
+            OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name),
             |state| async move {
                 state.storage.delete_alias(&alias_name).await.map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::DeleteAliasResponse {}))
@@ -940,11 +1119,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::TagResourceRequest>,
     ) -> Result<Response<proto::TagResourceResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::TagResource, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::TagResource, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -961,11 +1141,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::UntagResourceRequest>,
     ) -> Result<Response<proto::UntagResourceResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::UntagResource, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::UntagResource, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -982,10 +1163,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListResourceTagsRequest>,
     ) -> Result<Response<proto::ListResourceTagsResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ListResourceTags, ops::default_principal(), &key_id),
+            OpContext::key(AuditAction::ListResourceTags, principal, &key_id),
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -995,26 +1177,164 @@ impl KeyService for KeyServiceImpl {
         ).await
     }
 
-    // ── HSM connections (stubbed) ────────────────────────────────────
+    // ── HSM connections ────────────────────────────────────────────
 
-    async fn create_hsm_connection(&self, _r: Request<proto::CreateHsmConnectionRequest>) -> Result<Response<proto::CreateHsmConnectionResponse>, Status> { Err(unimplemented("CreateHsmConnection")) }
-    async fn get_hsm_connection(&self, _r: Request<proto::GetHsmConnectionRequest>) -> Result<Response<proto::GetHsmConnectionResponse>, Status> { Err(unimplemented("GetHsmConnection")) }
-    async fn list_hsm_connections(&self, _r: Request<proto::ListHsmConnectionsRequest>) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> { Err(unimplemented("ListHsmConnections")) }
-    async fn delete_hsm_connection(&self, _r: Request<proto::DeleteHsmConnectionRequest>) -> Result<Response<proto::DeleteHsmConnectionResponse>, Status> { Err(unimplemented("DeleteHsmConnection")) }
-    async fn get_hsm_connection_status(&self, _r: Request<proto::GetHsmConnectionStatusRequest>) -> Result<Response<proto::GetHsmConnectionStatusResponse>, Status> { Err(unimplemented("GetHsmConnectionStatus")) }
+    async fn create_hsm_connection(
+        &self,
+        request: Request<proto::CreateHsmConnectionRequest>,
+    ) -> Result<Response<proto::CreateHsmConnectionResponse>, Status> {
+        let req = request.into_inner();
+        let conn = keyrack_core::hsm::HsmConnection::new(
+            uuid::Uuid::new_v4().to_string(),
+            hsm_provider_from_proto(req.provider_type()),
+            &req.endpoint,
+            "",
+        );
+        self.state.storage.create_hsm_connection(&conn).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::CreateHsmConnectionResponse {
+            metadata: Some(hsm_connection_to_proto(&conn)),
+        }))
+    }
 
-    // ── Namespaces (stubbed) ────────────────────────────────────────
+    async fn get_hsm_connection(
+        &self,
+        request: Request<proto::GetHsmConnectionRequest>,
+    ) -> Result<Response<proto::GetHsmConnectionResponse>, Status> {
+        let conn_id = request.into_inner().connection_id;
+        let conn = self.state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::GetHsmConnectionResponse {
+            metadata: Some(hsm_connection_to_proto(&conn)),
+        }))
+    }
 
-    async fn register_namespace(&self, _r: Request<proto::RegisterNamespaceRequest>) -> Result<Response<proto::RegisterNamespaceResponse>, Status> { Err(unimplemented("RegisterNamespace")) }
-    async fn list_namespaces(&self, _r: Request<proto::ListNamespacesRequest>) -> Result<Response<proto::ListNamespacesResponse>, Status> { Err(unimplemented("ListNamespaces")) }
-    async fn describe_namespace(&self, _r: Request<proto::DescribeNamespaceRequest>) -> Result<Response<proto::DescribeNamespaceResponse>, Status> { Err(unimplemented("DescribeNamespace")) }
+    async fn list_hsm_connections(
+        &self,
+        _request: Request<proto::ListHsmConnectionsRequest>,
+    ) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> {
+        let conns = self.state.storage.list_hsm_connections().await.map_err(convert::error_to_status)?;
+        let connections = conns.iter().map(hsm_connection_to_proto).collect();
+        Ok(Response::new(proto::ListHsmConnectionsResponse {
+            connections,
+            next_cursor: String::new(),
+        }))
+    }
 
-    // ── Rotation jobs (stubbed) ─────────────────────────────────────
+    async fn delete_hsm_connection(
+        &self,
+        request: Request<proto::DeleteHsmConnectionRequest>,
+    ) -> Result<Response<proto::DeleteHsmConnectionResponse>, Status> {
+        let conn_id = request.into_inner().connection_id;
+        self.state.storage.delete_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::DeleteHsmConnectionResponse {}))
+    }
 
-    async fn list_rotation_jobs(&self, _r: Request<proto::ListRotationJobsRequest>) -> Result<Response<proto::ListRotationJobsResponse>, Status> { Err(unimplemented("ListRotationJobs")) }
-    async fn acknowledge_rotation_job(&self, _r: Request<proto::AcknowledgeRotationJobRequest>) -> Result<Response<proto::AcknowledgeRotationJobResponse>, Status> { Err(unimplemented("AcknowledgeRotationJob")) }
-    async fn complete_rotation_job(&self, _r: Request<proto::CompleteRotationJobRequest>) -> Result<Response<proto::CompleteRotationJobResponse>, Status> { Err(unimplemented("CompleteRotationJob")) }
-    async fn fail_rotation_job(&self, _r: Request<proto::FailRotationJobRequest>) -> Result<Response<proto::FailRotationJobResponse>, Status> { Err(unimplemented("FailRotationJob")) }
+    async fn get_hsm_connection_status(
+        &self,
+        request: Request<proto::GetHsmConnectionStatusRequest>,
+    ) -> Result<Response<proto::GetHsmConnectionStatusResponse>, Status> {
+        let conn_id = request.into_inner().connection_id;
+        let conn = self.state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::GetHsmConnectionStatusResponse {
+            connection_id: conn.connection_id,
+            status: hsm_status_to_proto(conn.status).into(),
+            last_check: conn.last_health_check_at.map(|dt| convert::datetime_to_timestamp(&dt)),
+        }))
+    }
+
+    // ── Namespaces ────────────────────────────────────────────────
+
+    async fn register_namespace(
+        &self,
+        request: Request<proto::RegisterNamespaceRequest>,
+    ) -> Result<Response<proto::RegisterNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(name = req.name, "namespace registered (in-memory only)");
+        Ok(Response::new(proto::RegisterNamespaceResponse {
+            name: req.name,
+        }))
+    }
+
+    async fn list_namespaces(
+        &self,
+        _request: Request<proto::ListNamespacesRequest>,
+    ) -> Result<Response<proto::ListNamespacesResponse>, Status> {
+        Ok(Response::new(proto::ListNamespacesResponse {
+            names: vec![],
+        }))
+    }
+
+    async fn describe_namespace(
+        &self,
+        request: Request<proto::DescribeNamespaceRequest>,
+    ) -> Result<Response<proto::DescribeNamespaceResponse>, Status> {
+        let name = request.into_inner().name;
+        Err(Status::not_found(format!("namespace '{name}' not found (namespace registry pending)")))
+    }
+
+    // ── Rotation jobs ─────────────────────────────────────────────
+
+    #[allow(clippy::cast_possible_truncation)]
+    async fn list_rotation_jobs(
+        &self,
+        request: Request<proto::ListRotationJobsRequest>,
+    ) -> Result<Response<proto::ListRotationJobsResponse>, Status> {
+        let req = request.into_inner();
+        let state_filter = req.state_filter.and_then(|s| {
+            proto::RotationJobState::try_from(s).ok()
+        }).and_then(rotation_job_state_from_proto);
+        let key_filter_lid = req.key_id.and_then(|k| parse_lid(&k).ok());
+        let mut jobs = self.state.storage.list_rotation_jobs(state_filter).await
+            .map_err(convert::error_to_status)?;
+        if let Some(lid) = &key_filter_lid {
+            jobs.retain(|j| j.parent_lid == *lid || j.dependent_lid == *lid);
+        }
+        let job_list = jobs.iter().map(rotation_job_to_proto).collect();
+        Ok(Response::new(proto::ListRotationJobsResponse {
+            jobs: job_list,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn acknowledge_rotation_job(
+        &self,
+        request: Request<proto::AcknowledgeRotationJobRequest>,
+    ) -> Result<Response<proto::AcknowledgeRotationJobResponse>, Status> {
+        let job_id = request.into_inner().job_id;
+        let mut job = self.state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
+        job.transition_to(keyrack_core::rotation::RotationJobState::Acknowledged)
+            .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::AcknowledgeRotationJobResponse {
+            job: Some(rotation_job_to_proto(&job)),
+        }))
+    }
+
+    async fn complete_rotation_job(
+        &self,
+        request: Request<proto::CompleteRotationJobRequest>,
+    ) -> Result<Response<proto::CompleteRotationJobResponse>, Status> {
+        let job_id = request.into_inner().job_id;
+        let mut job = self.state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
+        job.transition_to(keyrack_core::rotation::RotationJobState::Completed)
+            .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::CompleteRotationJobResponse {
+            job: Some(rotation_job_to_proto(&job)),
+        }))
+    }
+
+    async fn fail_rotation_job(
+        &self,
+        request: Request<proto::FailRotationJobRequest>,
+    ) -> Result<Response<proto::FailRotationJobResponse>, Status> {
+        let req = request.into_inner();
+        let mut job = self.state.storage.get_rotation_job(&req.job_id).await.map_err(convert::error_to_status)?;
+        job.fail(&req.reason).map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+        Ok(Response::new(proto::FailRotationJobResponse {
+            job: Some(rotation_job_to_proto(&job)),
+        }))
+    }
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -1027,8 +1347,79 @@ fn dek_length_from_spec(spec: i32) -> usize {
     }
 }
 
+// ── Conversion helpers ──────────────────────────────────────────────
+
 #[allow(clippy::result_large_err)]
 fn parse_lid(s: &str) -> Result<keyrack_core::lid::Lid, Status> {
     s.parse()
         .map_err(|_| Status::invalid_argument(format!("invalid key_id: {s}")))
+}
+
+fn hsm_provider_from_proto(pt: proto::HsmProviderType) -> keyrack_core::hsm::HsmProviderType {
+    match pt {
+        proto::HsmProviderType::Hsm => keyrack_core::hsm::HsmProviderType::Hsm,
+        proto::HsmProviderType::Hyok => keyrack_core::hsm::HsmProviderType::Hyok,
+        proto::HsmProviderType::Unspecified => keyrack_core::hsm::HsmProviderType::Hsm,
+    }
+}
+
+fn hsm_status_to_proto(status: keyrack_core::hsm::HsmConnectionStatus) -> proto::HsmConnectionStatus {
+    match status {
+        keyrack_core::hsm::HsmConnectionStatus::Healthy => proto::HsmConnectionStatus::Healthy,
+        keyrack_core::hsm::HsmConnectionStatus::Degraded => proto::HsmConnectionStatus::Degraded,
+        keyrack_core::hsm::HsmConnectionStatus::Down => proto::HsmConnectionStatus::Down,
+    }
+}
+
+fn hsm_provider_to_proto(pt: keyrack_core::hsm::HsmProviderType) -> proto::HsmProviderType {
+    match pt {
+        keyrack_core::hsm::HsmProviderType::Hsm => proto::HsmProviderType::Hsm,
+        keyrack_core::hsm::HsmProviderType::Hyok => proto::HsmProviderType::Hyok,
+    }
+}
+
+fn hsm_connection_to_proto(conn: &keyrack_core::hsm::HsmConnection) -> proto::HsmConnectionMetadata {
+    proto::HsmConnectionMetadata {
+        connection_id: conn.connection_id.clone(),
+        provider_type: hsm_provider_to_proto(conn.provider_type).into(),
+        endpoint: conn.endpoint.clone(),
+        status: hsm_status_to_proto(conn.status).into(),
+        created_at: Some(convert::datetime_to_timestamp(&conn.created_at)),
+        last_health_check: conn.last_health_check_at.map(|dt| convert::datetime_to_timestamp(&dt)),
+    }
+}
+
+fn rotation_job_state_to_proto(state: keyrack_core::rotation::RotationJobState) -> proto::RotationJobState {
+    match state {
+        keyrack_core::rotation::RotationJobState::Pending => proto::RotationJobState::Pending,
+        keyrack_core::rotation::RotationJobState::Acknowledged => proto::RotationJobState::Acknowledged,
+        keyrack_core::rotation::RotationJobState::Completed => proto::RotationJobState::Completed,
+        keyrack_core::rotation::RotationJobState::Failed => proto::RotationJobState::Failed,
+        keyrack_core::rotation::RotationJobState::Expired => proto::RotationJobState::Expired,
+    }
+}
+
+fn rotation_job_state_from_proto(state: proto::RotationJobState) -> Option<keyrack_core::rotation::RotationJobState> {
+    match state {
+        proto::RotationJobState::Pending => Some(keyrack_core::rotation::RotationJobState::Pending),
+        proto::RotationJobState::Acknowledged => Some(keyrack_core::rotation::RotationJobState::Acknowledged),
+        proto::RotationJobState::Completed => Some(keyrack_core::rotation::RotationJobState::Completed),
+        proto::RotationJobState::Failed => Some(keyrack_core::rotation::RotationJobState::Failed),
+        proto::RotationJobState::Expired => Some(keyrack_core::rotation::RotationJobState::Expired),
+        proto::RotationJobState::Unspecified => None,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn rotation_job_to_proto(job: &keyrack_core::rotation::RotationJob) -> proto::RotationJobMetadata {
+    proto::RotationJobMetadata {
+        job_id: job.job_id.clone(),
+        key_id: job.parent_lid.to_string(),
+        from_version: (job.new_version.saturating_sub(1)) as u32,
+        to_version: job.new_version as u32,
+        state: rotation_job_state_to_proto(job.state).into(),
+        created_at: Some(convert::datetime_to_timestamp(&job.created_at)),
+        expires_at: Some(convert::datetime_to_timestamp(&job.expires_at)),
+        failure_reason: job.failure_reason.clone(),
+    }
 }

@@ -68,6 +68,41 @@ pub enum EncryptionAlgorithm {
     Aes256Gcm,
 }
 
+/// Which operations a provider supports for a given key spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CryptoOperation {
+    GenerateKey,
+    Encrypt,
+    Decrypt,
+    Sign,
+    Verify,
+    GenerateRandom,
+    GenerateDataKey,
+    ReEncrypt,
+    DestroyKey,
+}
+
+/// Capability declaration for a single key spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeySpecCapability {
+    pub key_spec: KeySpec,
+    pub operations: Vec<CryptoOperation>,
+}
+
+/// Describes the full capabilities of a crypto provider.
+///
+/// Used by the linter to validate that namespace rules only reference
+/// algorithms the configured provider actually supports, and by the
+/// service to report provider capabilities at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    pub provider_name: String,
+    pub key_specs: Vec<KeySpecCapability>,
+    pub supports_generate_random: bool,
+    pub supports_atomic_data_key: bool,
+    pub supports_atomic_re_encrypt: bool,
+}
+
 /// Result of an encrypt operation: ciphertext including nonce + tag.
 #[derive(Debug, Clone)]
 pub struct EncryptOutput {
@@ -179,4 +214,12 @@ pub trait CryptoProvider: Send + Sync {
     /// the backend object. Not all providers support true destruction
     /// (HSMs may merely mark the object as destroyed).
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()>;
+
+    /// Report the algorithms, key specs, and operations this provider
+    /// supports.
+    ///
+    /// The linter uses this to validate namespace rules, and the service
+    /// exposes it via health/info endpoints. Providers should override
+    /// to accurately reflect their HSM or backend capabilities.
+    fn capabilities(&self) -> ProviderCapabilities;
 }

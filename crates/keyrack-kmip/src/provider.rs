@@ -12,16 +12,24 @@
 
 //! KMIP `CryptoProvider` implementation.
 //!
-//! W1 delivers the typed contract and configuration model.
-//! The actual TTLV wire protocol will be implemented when a KMIP
-//! test server (e.g. `PyKMIP`) is integrated into the CI environment.
+//! Delegates all cryptographic operations to a remote KMIP 2.1 server
+//! over TLS using TTLV wire encoding. Connections are established
+//! lazily and held behind a lock for serialized access; connection
+//! pooling is a future enhancement.
 
+use crate::connection::KmipConnection;
+use crate::messages;
+use crate::ttlv::{self, tag};
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
-use keyrack_core::provider::{CryptoProvider, EncryptOutput, KeyHandle, SigningAlgorithm};
+use keyrack_core::provider::{
+    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
+    ProviderCapabilities, SigningAlgorithm,
+};
 use keyrack_core::sensitive::Sensitive;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 /// Configuration for a KMIP connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,11 +64,12 @@ fn default_timeout() -> u64 {
 
 /// KMIP cryptographic provider.
 ///
-/// All operations delegate to the remote KMIP server. In W1, the
-/// implementation returns [`KeyRackError::Provider`] with an
-/// "unimplemented" message — the typed interface is the deliverable.
+/// All operations delegate to the remote KMIP server via the TTLV
+/// wire protocol over TLS. The connection is established lazily on
+/// first use.
 pub struct KmipProvider {
     config: KmipProviderConfig,
+    connection: Mutex<Option<KmipConnection>>,
 }
 
 impl KmipProvider {
@@ -70,9 +79,12 @@ impl KmipProvider {
     pub fn new(config: KmipProviderConfig) -> Self {
         tracing::info!(
             endpoint = %config.endpoint,
-            "KMIP provider configured (operations not yet wired)"
+            "KMIP provider configured"
         );
-        Self { config }
+        Self {
+            config,
+            connection: Mutex::new(None),
+        }
     }
 
     /// Return the configured endpoint.
@@ -80,100 +92,285 @@ impl KmipProvider {
         &self.config.endpoint
     }
 
-    fn not_yet(&self, op: &str) -> KeyRackError {
-        KeyRackError::Provider(format!(
-            "KMIP {op} not yet implemented (endpoint: {}). \
-             Full TTLV encoding lands in a follow-up.",
-            self.config.endpoint
-        ))
+    async fn get_connection(&self) -> Result<tokio::sync::MutexGuard<'_, Option<KmipConnection>>> {
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            let conn = KmipConnection::connect(&self.config).await?;
+            *guard = Some(conn);
+        }
+        Ok(guard)
+    }
+
+    async fn send_request(&self, request: &ttlv::TtlvItem) -> Result<messages::KmipResponse> {
+        let mut guard = self.get_connection().await?;
+        let conn = guard.as_mut().unwrap();
+
+        let response_item = match conn.round_trip(request).await {
+            Ok(item) => item,
+            Err(_) => {
+                // Connection may be stale; reconnect once.
+                tracing::debug!(endpoint = %self.config.endpoint, "reconnecting after error");
+                let new_conn = KmipConnection::connect(&self.config).await?;
+                *conn = new_conn;
+                conn.round_trip(request).await?
+            }
+        };
+
+        messages::parse_response(&response_item)
+            .map_err(|e| KeyRackError::Provider(format!("KMIP response parse error: {e}")))
+    }
+
+    fn check_response(&self, resp: &messages::KmipResponse) -> Result<()> {
+        if resp.result_status != ttlv::result_status::SUCCESS {
+            let msg = resp
+                .result_message
+                .as_deref()
+                .unwrap_or("unknown error");
+            return Err(KeyRackError::Provider(format!(
+                "KMIP operation failed (status=0x{:02X}): {msg}",
+                resp.result_status
+            )));
+        }
+        Ok(())
+    }
+
+    fn key_spec_to_kmip(spec: &KeySpec) -> (u32, i32, bool) {
+        match spec {
+            KeySpec::Aes256 => (ttlv::crypto_algorithm::AES, 256, true),
+            KeySpec::Ed25519 => (ttlv::crypto_algorithm::ED25519, 256, false),
+            KeySpec::EcdsaP256Sha256 => (ttlv::crypto_algorithm::ECDSA, 256, false),
+            KeySpec::RsaPkcs1v15Sha256 { key_size } => {
+                (ttlv::crypto_algorithm::RSA, *key_size as i32, false)
+            }
+        }
     }
 }
 
 #[async_trait]
 impl CryptoProvider for KmipProvider {
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
-        // KMIP Create operation: sends a Create request with the
-        // appropriate cryptographic algorithm and key length, receives
-        // a Unique Identifier.
-        tracing::debug!(
+        let (algorithm, key_length, is_symmetric) = Self::key_spec_to_kmip(spec);
+
+        let request = if is_symmetric {
+            messages::create_symmetric_key(algorithm, key_length)
+        } else {
+            messages::create_asymmetric_key(algorithm, key_length)
+        };
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        let unique_id = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.find(tag::UNIQUE_ID))
+            .and_then(|i| i.as_text())
+            .ok_or_else(|| {
+                KeyRackError::Provider("KMIP Create: no UniqueIdentifier in response".into())
+            })?;
+
+        tracing::info!(
+            key_id = unique_id,
             spec = ?spec,
             endpoint = %self.config.endpoint,
-            "KMIP Create (stubbed)"
+            "KMIP key created"
         );
-        Err(self.not_yet("Create"))
+
+        Ok(KeyHandle {
+            key_id: unique_id.to_string(),
+            key_spec: spec.clone(),
+        })
     }
 
     async fn encrypt(
         &self,
         handle: &KeyHandle,
-        _plaintext: &[u8],
+        plaintext: &[u8],
         _aad: &[u8],
     ) -> Result<EncryptOutput> {
-        tracing::debug!(
-            key_id = %handle.key_id,
-            "KMIP Encrypt (stubbed)"
+        let request = messages::encrypt_request(
+            &handle.key_id,
+            plaintext,
+            None,
+            Some(ttlv::block_cipher_mode::GCM),
         );
-        Err(self.not_yet("Encrypt"))
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        let payload = resp.payload.as_ref().ok_or_else(|| {
+            KeyRackError::Provider("KMIP Encrypt: no payload in response".into())
+        })?;
+
+        let ciphertext = payload
+            .find(tag::DATA)
+            .and_then(|i| i.as_bytes())
+            .ok_or_else(|| {
+                KeyRackError::Provider("KMIP Encrypt: no Data in response".into())
+            })?
+            .to_vec();
+
+        let iv = payload
+            .find(tag::IV_COUNTER_NONCE)
+            .and_then(|i| i.as_bytes())
+            .unwrap_or_default()
+            .to_vec();
+
+        let mut combined = iv;
+        combined.extend_from_slice(&ciphertext);
+
+        Ok(EncryptOutput {
+            ciphertext: combined,
+        })
     }
 
     async fn decrypt(
         &self,
         handle: &KeyHandle,
-        _ciphertext: &[u8],
+        ciphertext: &[u8],
         _aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
-        tracing::debug!(
-            key_id = %handle.key_id,
-            "KMIP Decrypt (stubbed)"
+        // For AES-GCM, the first 12 bytes are the IV.
+        let (iv, ct) = if matches!(handle.key_spec, KeySpec::Aes256) && ciphertext.len() > 12 {
+            (&ciphertext[..12], &ciphertext[12..])
+        } else {
+            (&[][..], ciphertext)
+        };
+
+        let request = messages::decrypt_request(
+            &handle.key_id,
+            ct,
+            if iv.is_empty() { None } else { Some(iv) },
+            Some(ttlv::block_cipher_mode::GCM),
         );
-        Err(self.not_yet("Decrypt"))
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        let data = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.find(tag::DATA))
+            .and_then(|i| i.as_bytes())
+            .ok_or_else(|| {
+                KeyRackError::Provider("KMIP Decrypt: no Data in response".into())
+            })?
+            .to_vec();
+
+        Ok(Sensitive::new(data))
     }
 
     async fn sign(
         &self,
         handle: &KeyHandle,
-        algorithm: SigningAlgorithm,
-        _message: &[u8],
+        _algorithm: SigningAlgorithm,
+        message: &[u8],
     ) -> Result<Vec<u8>> {
-        tracing::debug!(
-            key_id = %handle.key_id,
-            algorithm = ?algorithm,
-            "KMIP Sign (stubbed)"
-        );
-        Err(self.not_yet("Sign"))
+        let request = messages::sign_request(&handle.key_id, message, None);
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        let signature = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.find(tag::SIGNATURE_DATA))
+            .and_then(|i| i.as_bytes())
+            .ok_or_else(|| {
+                KeyRackError::Provider("KMIP Sign: no SignatureData in response".into())
+            })?
+            .to_vec();
+
+        Ok(signature)
     }
 
     async fn verify(
         &self,
         handle: &KeyHandle,
-        algorithm: SigningAlgorithm,
-        _message: &[u8],
-        _signature: &[u8],
+        _algorithm: SigningAlgorithm,
+        message: &[u8],
+        signature: &[u8],
     ) -> Result<bool> {
-        tracing::debug!(
-            key_id = %handle.key_id,
-            algorithm = ?algorithm,
-            "KMIP Verify (stubbed)"
-        );
-        Err(self.not_yet("Verify"))
+        let request = messages::verify_request(&handle.key_id, message, signature, None);
+
+        let resp = self.send_request(&request).await?;
+
+        // KMIP returns Success if the signature is valid, or
+        // OperationFailed with a specific reason if invalid.
+        Ok(resp.result_status == ttlv::result_status::SUCCESS)
     }
 
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>> {
-        tracing::debug!(
-            length = length,
-            "KMIP RNGRetrieve (stubbed)"
-        );
-        Err(self.not_yet("RNGRetrieve"))
+        let request = messages::rng_retrieve_request(length as i32);
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        let data = resp
+            .payload
+            .as_ref()
+            .and_then(|p| p.find(tag::DATA))
+            .and_then(|i| i.as_bytes())
+            .ok_or_else(|| {
+                KeyRackError::Provider("KMIP RNGRetrieve: no Data in response".into())
+            })?
+            .to_vec();
+
+        Ok(Sensitive::new(data))
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
-        // KMIP Destroy operation: sends a Destroy request with the
-        // Unique Identifier, receives confirmation.
-        tracing::debug!(
+        let request = messages::destroy_request(&handle.key_id);
+
+        let resp = self.send_request(&request).await?;
+        self.check_response(&resp)?;
+
+        tracing::info!(
             key_id = %handle.key_id,
-            "KMIP Destroy (stubbed)"
+            endpoint = %self.config.endpoint,
+            "KMIP key destroyed"
         );
-        Err(self.not_yet("Destroy"))
+
+        Ok(())
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        use CryptoOperation::*;
+
+        let symmetric_ops = vec![
+            GenerateKey,
+            Encrypt,
+            Decrypt,
+            GenerateDataKey,
+            ReEncrypt,
+            DestroyKey,
+        ];
+        let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
+
+        ProviderCapabilities {
+            provider_name: "kmip".into(),
+            key_specs: vec![
+                KeySpecCapability {
+                    key_spec: KeySpec::Aes256,
+                    operations: symmetric_ops,
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::Ed25519,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::EcdsaP256Sha256,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+                    operations: signing_ops,
+                },
+            ],
+            supports_generate_random: true,
+            supports_atomic_data_key: true,
+            supports_atomic_re_encrypt: true,
+        }
     }
 }
 
@@ -208,34 +405,32 @@ mod tests {
         assert_eq!(provider.endpoint(), "kmip://localhost:5696");
     }
 
-    #[tokio::test]
-    async fn operations_return_not_implemented() {
+    #[test]
+    fn capabilities_report_kmip() {
         let provider = KmipProvider::new(test_config());
+        let caps = provider.capabilities();
+        assert_eq!(caps.provider_name, "kmip");
+        assert!(caps.supports_generate_random);
+        assert!(caps.supports_atomic_data_key);
+        assert_eq!(caps.key_specs.len(), 4);
+    }
 
-        let gen_err = provider.generate_key(&KeySpec::Aes256).await;
-        assert!(gen_err.is_err());
-        let msg = format!("{}", gen_err.unwrap_err());
-        assert!(msg.contains("not yet implemented"));
+    #[test]
+    fn key_spec_mapping() {
+        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Aes256);
+        assert_eq!(alg, crate::ttlv::crypto_algorithm::AES);
+        assert_eq!(len, 256);
+        assert!(sym);
 
-        let handle = KeyHandle {
-            key_id: "test-id".into(),
-            key_spec: KeySpec::Aes256,
-        };
-        assert!(provider.encrypt(&handle, b"pt", b"aad").await.is_err());
-        assert!(provider.decrypt(&handle, b"ct", b"aad").await.is_err());
-        assert!(
-            provider
-                .sign(&handle, SigningAlgorithm::Ed25519, b"msg")
-                .await
-                .is_err()
-        );
-        assert!(
-            provider
-                .verify(&handle, SigningAlgorithm::Ed25519, b"msg", b"sig")
-                .await
-                .is_err()
-        );
-        assert!(provider.generate_random(32).await.is_err());
-        assert!(provider.destroy_key(&handle).await.is_err());
+        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Ed25519);
+        assert_eq!(alg, crate::ttlv::crypto_algorithm::ED25519);
+        assert_eq!(len, 256);
+        assert!(!sym);
+
+        let (alg, len, sym) =
+            KmipProvider::key_spec_to_kmip(&KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 });
+        assert_eq!(alg, crate::ttlv::crypto_algorithm::RSA);
+        assert_eq!(len, 4096);
+        assert!(!sym);
     }
 }

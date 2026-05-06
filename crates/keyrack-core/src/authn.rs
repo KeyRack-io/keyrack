@@ -212,6 +212,28 @@ impl Authenticator for MtlsAuthenticator {
     }
 }
 
+/// Insecure authenticator that accepts all requests as anonymous.
+///
+/// **Dev/test only.** Returns a fixed anonymous principal for every
+/// request without checking any credential.
+pub struct InsecureAuthenticator;
+
+#[async_trait]
+impl Authenticator for InsecureAuthenticator {
+    async fn authenticate(
+        &self,
+        _metadata: &RequestMetadata,
+    ) -> Result<Option<AuthnResult>, AuthnError> {
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: "keyrack:anonymous".into(),
+                principal_type: "Service".into(),
+            },
+            method: "insecure".into(),
+        }))
+    }
+}
+
 /// JWT bearer token authenticator stub.
 ///
 /// Validates `Authorization: Bearer <jwt>` against a JWKS endpoint.

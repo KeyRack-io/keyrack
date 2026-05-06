@@ -19,24 +19,21 @@
 //! The KMIP wire protocol uses TTLV (Tag-Type-Length-Value) encoding.
 //! This implementation provides a minimal KMIP client sufficient for
 //! the `KeyRack` operation set: Create, Get, Encrypt, Decrypt, Sign,
-//! Verify, and Destroy.
+//! Verify, Destroy, and RNG Retrieve.
 //!
 //! ## Connection model
 //!
 //! Each `KmipProvider` holds the endpoint and TLS configuration.
-//! Operations use `tokio::net::TcpStream` + `tokio-rustls` for
-//! TLS transport. Connection pooling is a future enhancement.
-//!
-//! ## Limitations (W1 scope)
-//!
-//! - TTLV encoding is not yet wired to a real TLS transport; the
-//!   current implementation returns `Unimplemented` errors for all
-//!   operations, serving as a typed contract and build target.
-//! - Full KMIP 2.1 TTLV encoding/decoding will be implemented when
-//!   a KMIP test server is available in the CI environment.
+//! Connections use `tokio::net::TcpStream` + `tokio-rustls` for
+//! TLS transport. A single connection is established lazily on first
+//! use and reused for subsequent operations; connection pooling is a
+//! future enhancement.
 
 #![forbid(unsafe_code)]
 
+pub mod connection;
+pub mod messages;
 mod provider;
+pub mod ttlv;
 
 pub use provider::{KmipProvider, KmipProviderConfig};

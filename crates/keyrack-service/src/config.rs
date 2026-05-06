@@ -100,6 +100,11 @@ pub enum PdpConfig {
         #[serde(default = "default_pdp_timeout")]
         timeout_ms: u64,
     },
+    Grpc {
+        endpoint: String,
+        #[serde(default = "default_pdp_timeout")]
+        timeout_ms: u64,
+    },
 }
 
 fn default_pdp_timeout() -> u64 {

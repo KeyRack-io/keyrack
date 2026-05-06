@@ -32,6 +32,7 @@ pub mod lint;
 pub mod migration;
 pub mod pdp;
 pub mod provider;
+pub mod provisioner;
 pub mod resolver;
 pub mod rotation;
 pub mod rule;

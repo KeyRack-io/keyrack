@@ -1,0 +1,53 @@
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: BUSL-1.1
+
+syntax = "proto3";
+
+package keyrack.v1;
+
+option java_package = "io.keyrack.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/struct.proto";
+
+// Policy Decision Point service.
+//
+// KeyRack sends an authorization request for every operation and the
+// PDP returns Permit / Forbid / Indeterminate.
+service PdpService {
+  rpc Authorize(PdpAuthorizeRequest) returns (PdpAuthorizeResponse);
+}
+
+// Maps 1-1 to keyrack_core::pdp::AuthzRequest.
+message PdpAuthorizeRequest {
+  string request_id = 1;
+  string action = 2;
+  PdpPrincipal principal = 3;
+  PdpResource resource = 4;
+  google.protobuf.Struct context = 5;
+}
+
+message PdpPrincipal {
+  string id = 1;
+  string type = 2;
+}
+
+message PdpResource {
+  string id = 1;
+  string type = 2;
+  google.protobuf.Struct attributes = 3;
+}
+
+enum PdpDecision {
+  PDP_DECISION_UNSPECIFIED = 0;
+  PDP_DECISION_PERMIT = 1;
+  PDP_DECISION_FORBID = 2;
+  PDP_DECISION_INDETERMINATE = 3;
+}
+
+message PdpAuthorizeResponse {
+  string request_id = 1;
+  PdpDecision decision = 2;
+  repeated string reasons = 3;
+  optional string policy_version = 4;
+}

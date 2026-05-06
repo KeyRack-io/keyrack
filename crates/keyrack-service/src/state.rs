@@ -13,6 +13,7 @@
 //! Shared application state injected into every gRPC handler.
 
 use keyrack_core::audit::AuditSink;
+use keyrack_core::authn::AuthenticatorChain;
 use keyrack_core::pdp::PolicyDecisionPoint;
 use keyrack_core::provider::CryptoProvider;
 use keyrack_core::storage::StorageBackend;
@@ -28,6 +29,7 @@ pub struct ServiceState {
     pub provider: Arc<dyn CryptoProvider>,
     pub pdp: Arc<dyn PolicyDecisionPoint>,
     pub audit: Arc<dyn AuditSink>,
+    pub authn: Arc<AuthenticatorChain>,
 }
 
 impl ServiceState {

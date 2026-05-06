@@ -21,7 +21,7 @@
 
 use crate::error::Result;
 use crate::key::KeySpec;
-use crate::provider::{CryptoProvider, EncryptOutput, KeyHandle, SigningAlgorithm};
+use crate::provider::{CryptoProvider, EncryptOutput, KeyHandle, ProviderCapabilities, SigningAlgorithm};
 use crate::sensitive::Sensitive;
 use async_trait::async_trait;
 
@@ -98,6 +98,12 @@ impl CryptoProvider for InMemoryProvider {
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
         self.inner.destroy_key(handle).await
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        let mut caps = self.inner.capabilities();
+        caps.provider_name = "in_memory".into();
+        caps
     }
 }
 

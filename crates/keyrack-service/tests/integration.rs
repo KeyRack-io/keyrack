@@ -91,11 +91,15 @@ fn build_test_state_with(
         keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"),
     );
     let provider = Arc::new(InMemoryProvider::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
     Arc::new(ServiceState {
         storage,
         provider,
         pdp,
         audit,
+        authn,
     })
 }
 

@@ -21,7 +21,10 @@
 
 use crate::error::{KeyRackError, Result};
 use crate::key::KeySpec;
-use crate::provider::{CryptoProvider, EncryptOutput, KeyHandle, SigningAlgorithm};
+use crate::provider::{
+    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
+    ProviderCapabilities, SigningAlgorithm,
+};
 use crate::sensitive::Sensitive;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -326,6 +329,26 @@ impl CryptoProvider for SoftwareProvider {
             .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
             .remove(&handle.key_id);
         Ok(())
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        use CryptoOperation::*;
+
+        let symmetric_ops = vec![GenerateKey, Encrypt, Decrypt, GenerateDataKey, ReEncrypt, DestroyKey];
+        let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
+
+        ProviderCapabilities {
+            provider_name: "software".into(),
+            key_specs: vec![
+                KeySpecCapability { key_spec: KeySpec::Aes256, operations: symmetric_ops },
+                KeySpecCapability { key_spec: KeySpec::Ed25519, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops },
+            ],
+            supports_generate_random: true,
+            supports_atomic_data_key: false,
+            supports_atomic_re_encrypt: false,
+        }
     }
 }
 

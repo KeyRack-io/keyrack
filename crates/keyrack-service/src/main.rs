@@ -74,7 +74,11 @@ fn load_config() -> Result<ServiceConfig, Box<dyn std::error::Error>> {
 async fn build_state(
     config: &ServiceConfig,
 ) -> Result<ServiceState, Box<dyn std::error::Error>> {
-    use keyrack_service::config::{AuditConfig, PdpConfig, ProviderConfig, StorageConfig};
+    use keyrack_core::authn::{
+        Authenticator, AuthenticatorChain, BootstrapTokenAuthenticator,
+        InsecureAuthenticator, JwtAuthenticator, MtlsAuthenticator,
+    };
+    use keyrack_service::config::{AuditConfig, AuthnConfig, PdpConfig, ProviderConfig, StorageConfig};
 
     let storage: Arc<dyn keyrack_core::storage::StorageBackend> = match &config.storage {
         StorageConfig::Sqlite { path } => Arc::new(keyrack_sqlite::SqliteStorage::open(path)?),
@@ -115,6 +119,13 @@ async fn build_state(
             endpoint,
             std::time::Duration::from_millis(*timeout_ms),
         )?),
+        PdpConfig::Grpc {
+            endpoint,
+            timeout_ms,
+        } => Arc::new(keyrack_service::pdp_grpc::GrpcPdpClient::new(
+            endpoint,
+            std::time::Duration::from_millis(*timeout_ms),
+        )),
     };
 
     let audit: Arc<dyn keyrack_core::audit::AuditSink> = match &config.audit {
@@ -125,11 +136,38 @@ async fn build_state(
         }
     };
 
+    let authn: Arc<AuthenticatorChain> = {
+        let authenticators: Vec<Box<dyn Authenticator>> = match &config.authn {
+            AuthnConfig::Insecure => {
+                tracing::warn!("authentication disabled (insecure mode) — dev/test only");
+                vec![Box::new(InsecureAuthenticator)]
+            }
+            AuthnConfig::Mtls => {
+                vec![Box::new(MtlsAuthenticator)]
+            }
+            AuthnConfig::Jwt { jwks_url } => {
+                vec![Box::new(JwtAuthenticator::new(jwks_url))]
+            }
+            AuthnConfig::BootstrapToken { max_age_secs } => {
+                let token = std::env::var("KMS_BOOTSTRAP_TOKEN").unwrap_or_default();
+                if token.is_empty() {
+                    tracing::warn!("bootstrap_token auth configured but KMS_BOOTSTRAP_TOKEN is empty");
+                }
+                vec![Box::new(BootstrapTokenAuthenticator::new(
+                    &token,
+                    std::time::Duration::from_secs(*max_age_secs),
+                ))]
+            }
+        };
+        Arc::new(AuthenticatorChain::new(authenticators))
+    };
+
     Ok(ServiceState {
         storage,
         provider,
         pdp,
         audit,
+        authn,
     })
 }
 

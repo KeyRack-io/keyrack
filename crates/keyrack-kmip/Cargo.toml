@@ -15,6 +15,11 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 
 [dev-dependencies]
 keyrack-test-support = { workspace = true }

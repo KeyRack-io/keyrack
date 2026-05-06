@@ -130,6 +130,19 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
+pub fn key_version_to_proto(v: &keyrack_core::key::KeyVersionRecord) -> proto::KeyVersionMetadata {
+    proto::KeyVersionMetadata {
+        version: v.version_number as u32,
+        created_at: Some(datetime_to_timestamp(&v.created_at)),
+        state: if v.is_primary {
+            proto::KeyState::Enabled.into()
+        } else {
+            proto::KeyState::Disabled.into()
+        },
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status {
     use keyrack_core::error::KeyRackError;

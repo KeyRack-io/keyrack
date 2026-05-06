@@ -244,12 +244,62 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
     }
 }
 
-/// Convenience: the default principal used until authn is wired into
-/// the request pipeline.  Will be replaced by the authenticated
-/// principal from the request metadata.
+/// Convenience: the default principal used when authentication is not
+/// configured or as a fallback.
 pub fn default_principal() -> Principal {
     Principal {
         id: "keyrack:anonymous".into(),
         principal_type: "Service".into(),
+    }
+}
+
+/// Extract the authenticated principal from a tonic gRPC request.
+///
+/// Reads standard headers (`authorization`, plus peer certs if available)
+/// and runs them through the configured authenticator chain.
+pub async fn extract_principal_grpc<T>(
+    state: &Arc<ServiceState>,
+    request: &tonic::Request<T>,
+) -> Principal {
+    use keyrack_core::authn::RequestMetadata;
+
+    let mut meta = RequestMetadata::default();
+    for key_and_value in request.metadata().iter() {
+        if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+            if let Ok(v) = value.to_str() {
+                meta.headers.insert(key.as_str().to_owned(), v.to_owned());
+            }
+        }
+    }
+
+    match state.authn.authenticate(&meta).await {
+        Ok(result) => result.principal,
+        Err(e) => {
+            tracing::debug!(error = %e, "authentication failed, using default principal");
+            default_principal()
+        }
+    }
+}
+
+/// Extract the authenticated principal from an axum REST request.
+pub async fn extract_principal_rest(
+    state: &Arc<ServiceState>,
+    headers: &axum::http::HeaderMap,
+) -> Principal {
+    use keyrack_core::authn::RequestMetadata;
+
+    let mut meta = RequestMetadata::default();
+    for (key, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            meta.headers.insert(key.as_str().to_owned(), v.to_owned());
+        }
+    }
+
+    match state.authn.authenticate(&meta).await {
+        Ok(result) => result.principal,
+        Err(e) => {
+            tracing::debug!(error = %e, "authentication failed, using default principal");
+            default_principal()
+        }
     }
 }

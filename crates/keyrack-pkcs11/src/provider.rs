@@ -23,7 +23,10 @@ use cryptoki::session::{Session, UserType};
 use cryptoki::types::AuthPin;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
-use keyrack_core::provider::{CryptoProvider, EncryptOutput, KeyHandle, SigningAlgorithm};
+use keyrack_core::provider::{
+    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
+    ProviderCapabilities, SigningAlgorithm,
+};
 use keyrack_core::sensitive::Sensitive;
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -582,6 +585,26 @@ impl CryptoProvider for Pkcs11Provider {
 
         self.run(move |session| destroy_objects_by_label(session, &label))
             .await
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        use CryptoOperation::*;
+
+        let symmetric_ops = vec![GenerateKey, Encrypt, Decrypt, GenerateDataKey, ReEncrypt, DestroyKey];
+        let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
+
+        ProviderCapabilities {
+            provider_name: "pkcs11".into(),
+            key_specs: vec![
+                KeySpecCapability { key_spec: KeySpec::Aes256, operations: symmetric_ops },
+                KeySpecCapability { key_spec: KeySpec::Ed25519, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops },
+            ],
+            supports_generate_random: true,
+            supports_atomic_data_key: true,
+            supports_atomic_re_encrypt: true,
+        }
     }
 }
 

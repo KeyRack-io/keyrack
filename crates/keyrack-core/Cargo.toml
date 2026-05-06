@@ -32,6 +32,8 @@ sha2 = "0.10"
 rand = "0.8"
 subtle = "2"
 
+tokio = { workspace = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { workspace = true }
