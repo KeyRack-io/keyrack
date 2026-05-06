@@ -60,7 +60,7 @@ pub fn router(state: AppState) -> Router {
         // ── Health / ops ────────────────────────────────────
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics_stub))
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -363,9 +363,16 @@ async fn encrypt(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let ec_hash = body.get("encryption_context")
+        .and_then(|v| v.as_object())
+        .and_then(build_ec)
+        .as_ref()
+        .map(keyrack_core::encryption_context::EncryptionContext::hash);
+    let mut op_ctx = OpContext::key(AuditAction::Encrypt, principal, &key_id);
+    op_ctx.encryption_context_hash = ec_hash;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Encrypt, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -398,9 +405,16 @@ async fn decrypt(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let ec_hash = body.get("encryption_context")
+        .and_then(|v| v.as_object())
+        .and_then(build_ec)
+        .as_ref()
+        .map(keyrack_core::encryption_context::EncryptionContext::hash);
+    let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
+    op_ctx.encryption_context_hash = ec_hash;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Decrypt, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -507,9 +521,16 @@ async fn generate_data_key(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let ec_hash = body.get("encryption_context")
+        .and_then(|v| v.as_object())
+        .and_then(build_ec)
+        .as_ref()
+        .map(keyrack_core::encryption_context::EncryptionContext::hash);
+    let mut op_ctx = OpContext::key(AuditAction::GenerateDataKey, principal, &key_id);
+    op_ctx.encryption_context_hash = ec_hash;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::GenerateDataKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -543,9 +564,16 @@ async fn re_encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let dst_key_id = body.get("destination_key_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let ec_hash = body.get("destination_encryption_context")
+        .and_then(|v| v.as_object())
+        .and_then(build_ec)
+        .as_ref()
+        .map(keyrack_core::encryption_context::EncryptionContext::hash);
+    let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &key_id);
+    op_ctx.encryption_context_hash = ec_hash;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ReEncrypt, principal, &key_id),
+        op_ctx,
         |state| async move {
             let src_lid = parse_lid_rest(&key_id)?;
             let dst_lid = parse_lid_rest(&dst_key_id)?;
@@ -723,8 +751,26 @@ async fn delete_alias(
 
 // ── Health / Readiness / Metrics ────────────────────────────────────
 
-async fn healthz() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    let storage_ok = state.storage.ping().await.is_ok();
+
+    let caps = state.provider.capabilities();
+    let provider_ok = !caps.key_specs.is_empty();
+
+    let status = if storage_ok && provider_ok { "ok" } else { "degraded" };
+    let code = if storage_ok && provider_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (code, Json(serde_json::json!({
+        "status": status,
+        "components": {
+            "storage": if storage_ok { "ok" } else { "error" },
+            "provider": if provider_ok { "ok" } else { "error" },
+        }
+    })))
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -736,8 +782,8 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn metrics_stub() -> impl IntoResponse {
-    (StatusCode::OK, "# HELP keyrack_up KeyRack service is up\n# TYPE keyrack_up gauge\nkeyrack_up 1\n")
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.metrics_handle.render()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ pub struct ServiceState {
     pub pdp: Arc<dyn PolicyDecisionPoint>,
     pub audit: Arc<dyn AuditSink>,
     pub authn: Arc<AuthenticatorChain>,
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl ServiceState {

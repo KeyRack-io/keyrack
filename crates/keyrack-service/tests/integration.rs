@@ -94,12 +94,16 @@ fn build_test_state_with(
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::InsecureAuthenticator),
     ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder();
+    let metrics_handle = recorder.handle();
     Arc::new(ServiceState {
         storage,
         provider,
         pdp,
         audit,
         authn,
+        metrics_handle,
     })
 }
 

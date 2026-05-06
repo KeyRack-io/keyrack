@@ -28,6 +28,7 @@ use keyrack_core::audit::{
 };
 use keyrack_core::pdp::{AuthzRequest, Decision, Principal, RequestContext, Resource};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Extension type inserted into tonic requests by the TLS interceptor
 /// when mTLS client certificates are available. Each entry is a DER-encoded cert.
@@ -40,6 +41,7 @@ pub struct OpContext {
     pub principal: Principal,
     pub resource_id: String,
     pub resource_type: String,
+    pub encryption_context_hash: Option<[u8; 32]>,
 }
 
 impl OpContext {
@@ -49,6 +51,7 @@ impl OpContext {
             principal,
             resource_id: key_id.to_owned(),
             resource_type: "Key".into(),
+            encryption_context_hash: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl OpContext {
             principal,
             resource_id: alias_name.to_owned(),
             resource_type: "Alias".into(),
+            encryption_context_hash: None,
         }
     }
 
@@ -67,6 +71,7 @@ impl OpContext {
             principal,
             resource_id: resource_id.to_owned(),
             resource_type: resource_type.to_owned(),
+            encryption_context_hash: None,
         }
     }
 
@@ -76,6 +81,7 @@ impl OpContext {
             principal: Principal::system(),
             resource_id: resource_id.to_owned(),
             resource_type: resource_type.to_owned(),
+            encryption_context_hash: None,
         }
     }
 }
@@ -99,15 +105,23 @@ where
     F: FnOnce(Arc<ServiceState>) -> Fut,
     Fut: std::future::Future<Output = Result<T, tonic::Status>>,
 {
+    let start = Instant::now();
+
     if let Err(denied) = authorize(state, &ctx).await {
         emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
+        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
         return Err(denied);
     }
 
     let result = op(Arc::clone(state)).await;
 
-    let audit_result = if result.is_ok() { AuditResult::Success } else { AuditResult::Error };
+    let (audit_result, result_str) = if result.is_ok() {
+        (AuditResult::Success, "success")
+    } else {
+        (AuditResult::Error, "error")
+    };
     emit_audit(state, &ctx, audit_result, None).await;
+    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result
 }
@@ -119,7 +133,7 @@ async fn emit_audit(
     event_type_override: Option<keyrack_core::audit::EventType>,
 ) {
     let event_type = event_type_override.unwrap_or_else(|| event_type_for_action(&ctx.action));
-    let event = AuditEvent::new(
+    let mut event = AuditEvent::new(
         event_type,
         ctx.action.clone(),
         AuditPrincipal {
@@ -132,12 +146,18 @@ async fn emit_audit(
         },
         result,
     );
+    if let Some(hash) = ctx.encryption_context_hash {
+        event = event.with_encryption_context_hash(hash);
+    }
     if let Err(e) = state.audit.emit(&event).await {
         tracing::error!(error = %e, event_id = %event.event_id, "failed to emit audit event");
+        crate::metrics::record_audit_error();
     }
 }
 
 async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), tonic::Status> {
+    let pdp_start = Instant::now();
+
     let request = AuthzRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         action: ctx.action.clone(),
@@ -152,12 +172,17 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
 
     let response = state.pdp.evaluate(&request).await.map_err(|e| {
         tracing::error!(error = %e, "PDP evaluation failed");
+        crate::metrics::record_pdp(pdp_start.elapsed(), false);
         tonic::Status::internal("authorization service unavailable")
     })?;
 
     match response.decision {
-        Decision::Permit => Ok(()),
+        Decision::Permit => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
+            Ok(())
+        }
         Decision::Forbid | Decision::Indeterminate => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
             let reasons = response.reasons.join("; ");
             Err(tonic::Status::permission_denied(format!(
                 "authorization denied: {reasons}"
@@ -177,15 +202,23 @@ where
     F: FnOnce(Arc<ServiceState>) -> Fut,
     Fut: std::future::Future<Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>>,
 {
+    let start = Instant::now();
+
     if let Err(denied) = authorize_rest(state, &ctx).await {
         emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
+        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
         return Err(denied);
     }
 
     let result = op(Arc::clone(state)).await;
 
-    let audit_result = if result.is_ok() { AuditResult::Success } else { AuditResult::Error };
+    let (audit_result, result_str) = if result.is_ok() {
+        (AuditResult::Success, "success")
+    } else {
+        (AuditResult::Error, "error")
+    };
     emit_audit(state, &ctx, audit_result, None).await;
+    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result
 }
@@ -194,6 +227,8 @@ async fn authorize_rest(
     state: &Arc<ServiceState>,
     ctx: &OpContext,
 ) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    let pdp_start = Instant::now();
+
     let request = AuthzRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         action: ctx.action.clone(),
@@ -208,6 +243,7 @@ async fn authorize_rest(
 
     let response = state.pdp.evaluate(&request).await.map_err(|e| {
         tracing::error!(error = %e, "PDP evaluation failed");
+        crate::metrics::record_pdp(pdp_start.elapsed(), false);
         rest_error(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "PdpUnavailable",
@@ -216,8 +252,12 @@ async fn authorize_rest(
     })?;
 
     match response.decision {
-        Decision::Permit => Ok(()),
+        Decision::Permit => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
+            Ok(())
+        }
         Decision::Forbid | Decision::Indeterminate => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
             let reasons = response.reasons.join("; ");
             Err(rest_error(
                 axum::http::StatusCode::FORBIDDEN,

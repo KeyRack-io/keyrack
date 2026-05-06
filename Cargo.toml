@@ -34,6 +34,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+tokio-util = "0.7"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -103,9 +103,19 @@ impl KeyService for KeyServiceImpl {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let ec_hash = if req.encryption_context.is_empty() {
+            None
+        } else {
+            let ec = build_encryption_context(&req.encryption_context);
+            ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::hash)
+        };
+
+        let mut op_ctx = OpContext::key(AuditAction::Encrypt, principal, &key_id);
+        op_ctx.encryption_context_hash = ec_hash;
+
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Encrypt, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let record = state
                     .storage
@@ -177,9 +187,19 @@ impl KeyService for KeyServiceImpl {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let ec_hash = if req.encryption_context.is_empty() {
+            None
+        } else {
+            let ec = build_encryption_context(&req.encryption_context);
+            ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::hash)
+        };
+
+        let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
+        op_ctx.encryption_context_hash = ec_hash;
+
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Decrypt, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let record = state
                     .storage
@@ -249,9 +269,19 @@ impl KeyService for KeyServiceImpl {
         let req = request.into_inner();
         let src_key_id = req.source_key_id.clone();
 
+        let dst_ec_hash = if req.destination_encryption_context.is_empty() {
+            None
+        } else {
+            let ec = build_encryption_context(&req.destination_encryption_context);
+            ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::hash)
+        };
+
+        let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id);
+        op_ctx.encryption_context_hash = dst_ec_hash;
+
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id),
+            op_ctx,
             |state| async move {
                 let src_lid = parse_lid(&req.source_key_id)?;
                 let dst_lid = parse_lid(&req.destination_key_id)?;
@@ -322,9 +352,19 @@ impl KeyService for KeyServiceImpl {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let ec_hash = if req.encryption_context.is_empty() {
+            None
+        } else {
+            let ec = build_encryption_context(&req.encryption_context);
+            ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::hash)
+        };
+
+        let mut op_ctx = OpContext::key(AuditAction::GenerateDataKey, principal, &key_id);
+        op_ctx.encryption_context_hash = ec_hash;
+
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GenerateDataKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -379,9 +419,19 @@ impl KeyService for KeyServiceImpl {
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let ec_hash = if req.encryption_context.is_empty() {
+            None
+        } else {
+            let ec = build_encryption_context(&req.encryption_context);
+            ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::hash)
+        };
+
+        let mut op_ctx = OpContext::key(AuditAction::GenerateDataKeyWithoutPlaintext, principal, &key_id);
+        op_ctx.encryption_context_hash = ec_hash;
+
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GenerateDataKeyWithoutPlaintext, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;

@@ -21,6 +21,7 @@
 pub mod config;
 pub mod convert;
 pub mod grpc;
+pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;
 pub mod pdp_http;

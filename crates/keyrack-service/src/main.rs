@@ -26,33 +26,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = load_config()?;
 
-    let state = Arc::new(build_state(&config).await?);
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus metrics recorder");
+
+    let state = Arc::new(build_state(&config, metrics_handle).await?);
 
     let grpc_addr = config.grpc_addr.parse()?;
     let rest_addr: std::net::SocketAddr = config.rest_addr.parse()?;
 
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     let rest_router = keyrack_service::rest::router(Arc::clone(&state));
-    let grpc_service = KeyServiceServer::new(KeyServiceImpl::new(state));
+    let grpc_service = KeyServiceServer::new(KeyServiceImpl::new(Arc::clone(&state)));
 
     tracing::info!(%grpc_addr, %rest_addr, "starting KeyRack gRPC + REST service");
 
+    let rest_cancel = cancel.clone();
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;
     let rest_handle = tokio::spawn(async move {
         axum::serve(rest_listener, rest_router)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(rest_cancel.cancelled_owned())
             .await
     });
 
+    let grpc_cancel = cancel.clone();
     let grpc_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(grpc_service)
-            .serve_with_shutdown(grpc_addr, shutdown_signal())
+            .serve_with_shutdown(grpc_addr, grpc_cancel.cancelled())
             .await
     });
 
+    shutdown_signal().await;
+
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    tracing::info!("initiating graceful shutdown (drain timeout: {DRAIN_TIMEOUT:?})");
+    cancel.cancel();
+
+    let drain_deadline = tokio::time::sleep(DRAIN_TIMEOUT);
+    tokio::pin!(drain_deadline);
+
     tokio::select! {
-        res = grpc_handle => { res??; }
-        res = rest_handle => { res??; }
+        _ = async {
+            let _ = grpc_handle.await;
+            let _ = rest_handle.await;
+        } => {
+            tracing::info!("all servers drained and stopped");
+        }
+        _ = &mut drain_deadline => {
+            tracing::warn!("drain timeout reached, forcing shutdown");
+        }
+    }
+
+    tracing::info!("flushing audit sink");
+    if let Err(e) = state.audit.flush().await {
+        tracing::error!(error = %e, "audit flush failed during shutdown");
     }
 
     tracing::info!("KeyRack service stopped");
@@ -73,6 +102,7 @@ fn load_config() -> Result<ServiceConfig, Box<dyn std::error::Error>> {
 
 async fn build_state(
     config: &ServiceConfig,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServiceState, Box<dyn std::error::Error>> {
     use keyrack_core::authn::{
         Authenticator, AuthenticatorChain, BootstrapTokenAuthenticator,
@@ -168,6 +198,7 @@ async fn build_state(
         pdp,
         audit,
         authn,
+        metrics_handle,
     })
 }
 
