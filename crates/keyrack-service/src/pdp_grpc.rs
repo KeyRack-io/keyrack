@@ -89,7 +89,7 @@ fn authz_to_proto(req: &AuthzRequest) -> proto::PdpAuthorizeRequest {
 
     proto::PdpAuthorizeRequest {
         request_id: req.request_id.clone(),
-        action: format!("{:?}", req.action),
+        action: req.action.to_string(),
         principal: Some(proto::PdpPrincipal {
             id: req.principal.id.clone(),
             r#type: req.principal.principal_type.clone(),
@@ -146,6 +146,9 @@ impl PolicyDecisionPoint for GrpcPdpClient {
             .authorize(proto_req)
             .await
             .map_err(|e| {
+                if let Ok(mut guard) = self.channel.try_write() {
+                    *guard = None;
+                }
                 tracing::error!(
                     pdp_endpoint = %self.endpoint,
                     error = %e,

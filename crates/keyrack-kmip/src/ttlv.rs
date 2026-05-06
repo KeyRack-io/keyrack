@@ -281,9 +281,14 @@ pub fn decode(buf: &mut &[u8]) -> Result<TtlvItem, String> {
 
     let length = buf.get_u32() as usize;
 
-    if buf.remaining() < length {
+    let padded = if typ == TtlvType::Structure {
+        length
+    } else {
+        length + pad_len(length)
+    };
+    if buf.remaining() < padded {
         return Err(format!(
-            "buffer underflow: need {length} bytes, have {}",
+            "buffer underflow: need {padded} bytes (value {length} + padding), have {}",
             buf.remaining()
         ));
     }

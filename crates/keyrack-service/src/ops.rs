@@ -29,6 +29,11 @@ use keyrack_core::audit::{
 use keyrack_core::pdp::{AuthzRequest, Decision, Principal, RequestContext, Resource};
 use std::sync::Arc;
 
+/// Extension type inserted into tonic requests by the TLS interceptor
+/// when mTLS client certificates are available. Each entry is a DER-encoded cert.
+#[derive(Debug, Clone)]
+pub struct PeerCertificates(pub Vec<Vec<u8>>);
+
 /// Describes a pending operation for PDP + audit purposes.
 pub struct OpContext {
     pub action: AuditAction,
@@ -53,6 +58,15 @@ impl OpContext {
             principal,
             resource_id: alias_name.to_owned(),
             resource_type: "Alias".into(),
+        }
+    }
+
+    pub fn resource(action: AuditAction, principal: Principal, resource_id: &str, resource_type: &str) -> Self {
+        Self {
+            action,
+            principal,
+            resource_id: resource_id.to_owned(),
+            resource_type: resource_type.to_owned(),
         }
     }
 
@@ -272,10 +286,14 @@ pub async fn extract_principal_grpc<T>(
         }
     }
 
+    if let Some(certs) = request.extensions().get::<PeerCertificates>() {
+        meta.peer_certificates.clone_from(&certs.0);
+    }
+
     match state.authn.authenticate(&meta).await {
         Ok(result) => result.principal,
         Err(e) => {
-            tracing::debug!(error = %e, "authentication failed, using default principal");
+            tracing::warn!(error = %e, "authentication failed, using default principal");
             default_principal()
         }
     }
@@ -298,7 +316,7 @@ pub async fn extract_principal_rest(
     match state.authn.authenticate(&meta).await {
         Ok(result) => result.principal,
         Err(e) => {
-            tracing::debug!(error = %e, "authentication failed, using default principal");
+            tracing::warn!(error = %e, "authentication failed, using default principal");
             default_principal()
         }
     }

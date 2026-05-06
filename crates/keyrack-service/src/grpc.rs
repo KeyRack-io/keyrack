@@ -876,29 +876,45 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListKeyVersionsRequest>,
     ) -> Result<Response<proto::ListKeyVersionsResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let lid = parse_lid(&req.key_id)?;
-        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
-        let versions: Vec<_> = record.key_versions.iter().map(convert::key_version_to_proto).collect();
-        Ok(Response::new(proto::ListKeyVersionsResponse {
-            versions,
-            next_cursor: String::new(),
-        }))
+        let key_id = req.key_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::ListKeyVersions, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let versions: Vec<_> = record.key_versions.iter().map(convert::key_version_to_proto).collect();
+                Ok(Response::new(proto::ListKeyVersionsResponse {
+                    versions,
+                    next_cursor: String::new(),
+                }))
+            },
+        ).await
     }
 
     async fn get_key_version(
         &self,
         request: Request<proto::GetKeyVersionRequest>,
     ) -> Result<Response<proto::GetKeyVersionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let lid = parse_lid(&req.key_id)?;
-        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
-        let version = record.key_versions.iter()
-            .find(|v| v.version_number == u64::from(req.version))
-            .ok_or_else(|| Status::not_found(format!("version {} not found", req.version)))?;
-        Ok(Response::new(proto::GetKeyVersionResponse {
-            version: Some(convert::key_version_to_proto(version)),
-        }))
+        let key_id = req.key_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyVersion, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let version = record.key_versions.iter()
+                    .find(|v| v.version_number == u64::from(req.version))
+                    .ok_or_else(|| Status::not_found(format!("version {} not found", req.version)))?;
+                Ok(Response::new(proto::GetKeyVersionResponse {
+                    version: Some(convert::key_version_to_proto(version)),
+                }))
+            },
+        ).await
     }
 
     // ── Rotation control ────────────────────────────────────────────
@@ -910,39 +926,59 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::EnableKeyRotationRequest>,
     ) -> Result<Response<proto::EnableKeyRotationResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
-        let _lid = parse_lid(&key_id)?;
-        // Rotation policy persistence is deferred; acknowledge the intent.
-        tracing::info!(key_id, "rotation enabled (policy persistence pending)");
-        Ok(Response::new(proto::EnableKeyRotationResponse {}))
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::EnableKeyRotation, principal, &key_id),
+            |_state| async move {
+                let _lid = parse_lid(&key_id)?;
+                tracing::info!(key_id, "rotation enabled (policy persistence pending)");
+                Ok(Response::new(proto::EnableKeyRotationResponse {}))
+            },
+        ).await
     }
 
     async fn disable_key_rotation(
         &self,
         request: Request<proto::DisableKeyRotationRequest>,
     ) -> Result<Response<proto::DisableKeyRotationResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
-        let _lid = parse_lid(&key_id)?;
-        tracing::info!(key_id, "rotation disabled (policy persistence pending)");
-        Ok(Response::new(proto::DisableKeyRotationResponse {}))
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::DisableKeyRotation, principal, &key_id),
+            |_state| async move {
+                let _lid = parse_lid(&key_id)?;
+                tracing::info!(key_id, "rotation disabled (policy persistence pending)");
+                Ok(Response::new(proto::DisableKeyRotationResponse {}))
+            },
+        ).await
     }
 
     async fn get_key_rotation_status(
         &self,
         request: Request<proto::GetKeyRotationStatusRequest>,
     ) -> Result<Response<proto::GetKeyRotationStatusResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
-        let lid = parse_lid(&key_id)?;
-        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
-        let last_rotated = record.key_versions.iter()
-            .filter(|v| !v.is_primary)
-            .max_by_key(|v| v.version_number)
-            .map(|v| convert::datetime_to_timestamp(&v.created_at));
-        Ok(Response::new(proto::GetKeyRotationStatusResponse {
-            rotation_enabled: false,
-            next_rotation_date: None,
-            last_rotated_at: last_rotated,
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyRotationStatus, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let last_rotated = record.key_versions.iter()
+                    .filter(|v| !v.is_primary)
+                    .max_by_key(|v| v.version_number)
+                    .map(|v| convert::datetime_to_timestamp(&v.created_at));
+                Ok(Response::new(proto::GetKeyRotationStatusResponse {
+                    rotation_enabled: false,
+                    next_rotation_date: None,
+                    last_rotated_at: last_rotated,
+                }))
+            },
+        ).await
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -950,53 +986,76 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRotationHistoryRequest>,
     ) -> Result<Response<proto::GetKeyRotationHistoryResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let lid = parse_lid(&req.key_id)?;
-        let record = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
-        let mut entries = Vec::new();
-        let mut sorted_versions = record.key_versions.clone();
-        sorted_versions.sort_by_key(|v| v.version_number);
-        for window in sorted_versions.windows(2) {
-            entries.push(proto::RotationHistoryEntry {
-                from_version: window[0].version_number as u32,
-                to_version: window[1].version_number as u32,
-                rotated_at: Some(convert::datetime_to_timestamp(&window[1].created_at)),
-            });
-        }
-        Ok(Response::new(proto::GetKeyRotationHistoryResponse {
-            entries,
-            next_cursor: String::new(),
-        }))
+        let key_id = req.key_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyRotationHistory, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let mut entries = Vec::new();
+                let mut sorted_versions = record.key_versions.clone();
+                sorted_versions.sort_by_key(|v| v.version_number);
+                for window in sorted_versions.windows(2) {
+                    entries.push(proto::RotationHistoryEntry {
+                        from_version: window[0].version_number as u32,
+                        to_version: window[1].version_number as u32,
+                        rotated_at: Some(convert::datetime_to_timestamp(&window[1].created_at)),
+                    });
+                }
+                Ok(Response::new(proto::GetKeyRotationHistoryResponse {
+                    entries,
+                    next_cursor: String::new(),
+                }))
+            },
+        ).await
     }
 
     async fn get_key_rotation_policy(
         &self,
         request: Request<proto::GetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::GetKeyRotationPolicyResponse>, Status> {
-        let _key_id = request.into_inner().key_id;
-        Ok(Response::new(proto::GetKeyRotationPolicyResponse {
-            policy: Some(proto::RotationPolicy {
-                enabled: false,
-                rotation_interval_days: 0,
-            }),
-        }))
+        let principal = self.principal(&request).await;
+        let key_id = request.into_inner().key_id;
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyRotationPolicy, principal, &key_id),
+            |_state| async move {
+                Ok(Response::new(proto::GetKeyRotationPolicyResponse {
+                    policy: Some(proto::RotationPolicy {
+                        enabled: false,
+                        rotation_interval_days: 0,
+                    }),
+                }))
+            },
+        ).await
     }
 
     async fn set_key_rotation_policy(
         &self,
         request: Request<proto::SetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::SetKeyRotationPolicyResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let _lid = parse_lid(&req.key_id)?;
-        if let Some(policy) = &req.policy {
-            tracing::info!(
-                key_id = req.key_id,
-                enabled = policy.enabled,
-                interval_days = policy.rotation_interval_days,
-                "rotation policy set (persistence pending)"
-            );
-        }
-        Ok(Response::new(proto::SetKeyRotationPolicyResponse {}))
+        let key_id = req.key_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::SetKeyRotationPolicy, principal, &key_id),
+            |_state| async move {
+                let _lid = parse_lid(&key_id)?;
+                if let Some(policy) = &req.policy {
+                    tracing::info!(
+                        key_id,
+                        enabled = policy.enabled,
+                        interval_days = policy.rotation_interval_days,
+                        "rotation policy set (persistence pending)"
+                    );
+                }
+                Ok(Response::new(proto::SetKeyRotationPolicyResponse {}))
+            },
+        ).await
     }
 
     // ── Hierarchy queries ───────────────────────────────────────────
@@ -1005,49 +1064,74 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyDependentsRequest>,
     ) -> Result<Response<proto::GetKeyDependentsResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let lid = parse_lid(&req.key_id)?;
-        let mut dependents = Vec::new();
-        let mut queue = vec![(lid, 1u32)];
-        while let Some((parent_lid, depth)) = queue.pop() {
-            let children = self.state.storage.list_children(&parent_lid).await
-                .map_err(convert::error_to_status)?;
-            for child in &children {
-                dependents.push(proto::LineageEntry {
-                    id: child.lid.to_string(),
-                    resource_type: "key".into(),
-                    depth,
-                    parent_id: Some(parent_lid.to_string()),
-                });
-                if req.recursive {
-                    queue.push((child.lid, depth + 1));
+        let key_id = req.key_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyDependents, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut dependents = Vec::new();
+                let mut queue = vec![(lid, 1u32)];
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(lid);
+                while let Some((parent_lid, depth)) = queue.pop() {
+                    let children = state.storage.list_children(&parent_lid).await
+                        .map_err(convert::error_to_status)?;
+                    for child in &children {
+                        if !visited.insert(child.lid) {
+                            continue;
+                        }
+                        dependents.push(proto::LineageEntry {
+                            id: child.lid.to_string(),
+                            resource_type: "key".into(),
+                            depth,
+                            parent_id: Some(parent_lid.to_string()),
+                        });
+                        if req.recursive {
+                            queue.push((child.lid, depth + 1));
+                        }
+                    }
                 }
-            }
-        }
-        Ok(Response::new(proto::GetKeyDependentsResponse { dependents }))
+                Ok(Response::new(proto::GetKeyDependentsResponse { dependents }))
+            },
+        ).await
     }
 
     async fn get_key_ancestors(
         &self,
         request: Request<proto::GetKeyAncestorsRequest>,
     ) -> Result<Response<proto::GetKeyAncestorsResponse>, Status> {
+        let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
-        let lid = parse_lid(&key_id)?;
-        let mut ancestors = Vec::new();
-        let mut current = self.state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
-        let mut depth = 1u32;
-        while let Some(parent_lid) = current.parent_lid {
-            current = self.state.storage.get_key(&parent_lid).await.map_err(convert::error_to_status)?;
-            ancestors.push(proto::LineageEntry {
-                id: parent_lid.to_string(),
-                resource_type: "key".into(),
-                depth,
-                parent_id: current.parent_lid.map(|l| l.to_string()),
-            });
-            depth += 1;
-            if depth > 100 { break; }
-        }
-        Ok(Response::new(proto::GetKeyAncestorsResponse { ancestors }))
+        ops::execute(
+            &self.state,
+            OpContext::key(AuditAction::GetKeyAncestors, principal, &key_id),
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut ancestors = Vec::new();
+                let mut current = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let mut depth = 1u32;
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(lid);
+                while let Some(parent_lid) = current.parent_lid {
+                    if !visited.insert(parent_lid) {
+                        break;
+                    }
+                    current = state.storage.get_key(&parent_lid).await.map_err(convert::error_to_status)?;
+                    ancestors.push(proto::LineageEntry {
+                        id: parent_lid.to_string(),
+                        resource_type: "key".into(),
+                        depth,
+                        parent_id: current.parent_lid.map(|l| l.to_string()),
+                    });
+                    depth += 1;
+                    if depth > 100 { break; }
+                }
+                Ok(Response::new(proto::GetKeyAncestorsResponse { ancestors }))
+            },
+        ).await
     }
 
     // ── Aliases ─────────────────────────────────────────────────────
@@ -1183,62 +1267,98 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateHsmConnectionRequest>,
     ) -> Result<Response<proto::CreateHsmConnectionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let conn = keyrack_core::hsm::HsmConnection::new(
-            uuid::Uuid::new_v4().to_string(),
-            hsm_provider_from_proto(req.provider_type()),
-            &req.endpoint,
-            "",
-        );
-        self.state.storage.create_hsm_connection(&conn).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::CreateHsmConnectionResponse {
-            metadata: Some(hsm_connection_to_proto(&conn)),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::CreateHsmConnection, principal, "", "HsmConnection"),
+            |state| async move {
+                let conn = keyrack_core::hsm::HsmConnection::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    hsm_provider_from_proto(req.provider_type()),
+                    &req.endpoint,
+                    "",
+                );
+                state.storage.create_hsm_connection(&conn).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::CreateHsmConnectionResponse {
+                    metadata: Some(hsm_connection_to_proto(&conn)),
+                }))
+            },
+        ).await
     }
 
     async fn get_hsm_connection(
         &self,
         request: Request<proto::GetHsmConnectionRequest>,
     ) -> Result<Response<proto::GetHsmConnectionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
-        let conn = self.state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::GetHsmConnectionResponse {
-            metadata: Some(hsm_connection_to_proto(&conn)),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::GetHsmConnection, principal, &conn_id, "HsmConnection"),
+            |state| async move {
+                let conn = state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::GetHsmConnectionResponse {
+                    metadata: Some(hsm_connection_to_proto(&conn)),
+                }))
+            },
+        ).await
     }
 
     async fn list_hsm_connections(
         &self,
-        _request: Request<proto::ListHsmConnectionsRequest>,
+        request: Request<proto::ListHsmConnectionsRequest>,
     ) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> {
-        let conns = self.state.storage.list_hsm_connections().await.map_err(convert::error_to_status)?;
-        let connections = conns.iter().map(hsm_connection_to_proto).collect();
-        Ok(Response::new(proto::ListHsmConnectionsResponse {
-            connections,
-            next_cursor: String::new(),
-        }))
+        let principal = self.principal(&request).await;
+        let _req = request.into_inner();
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::ListHsmConnections, principal, "*", "HsmConnection"),
+            |state| async move {
+                let conns = state.storage.list_hsm_connections().await.map_err(convert::error_to_status)?;
+                let connections = conns.iter().map(hsm_connection_to_proto).collect();
+                Ok(Response::new(proto::ListHsmConnectionsResponse {
+                    connections,
+                    next_cursor: String::new(),
+                }))
+            },
+        ).await
     }
 
     async fn delete_hsm_connection(
         &self,
         request: Request<proto::DeleteHsmConnectionRequest>,
     ) -> Result<Response<proto::DeleteHsmConnectionResponse>, Status> {
+        let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
-        self.state.storage.delete_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::DeleteHsmConnectionResponse {}))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::DeleteHsmConnection, principal, &conn_id, "HsmConnection"),
+            |state| async move {
+                state.storage.delete_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::DeleteHsmConnectionResponse {}))
+            },
+        ).await
     }
 
     async fn get_hsm_connection_status(
         &self,
         request: Request<proto::GetHsmConnectionStatusRequest>,
     ) -> Result<Response<proto::GetHsmConnectionStatusResponse>, Status> {
+        let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
-        let conn = self.state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::GetHsmConnectionStatusResponse {
-            connection_id: conn.connection_id,
-            status: hsm_status_to_proto(conn.status).into(),
-            last_check: conn.last_health_check_at.map(|dt| convert::datetime_to_timestamp(&dt)),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::GetHsmConnectionStatus, principal, &conn_id, "HsmConnection"),
+            |state| async move {
+                let conn = state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::GetHsmConnectionStatusResponse {
+                    connection_id: conn.connection_id,
+                    status: hsm_status_to_proto(conn.status).into(),
+                    last_check: conn.last_health_check_at.map(|dt| convert::datetime_to_timestamp(&dt)),
+                }))
+            },
+        ).await
     }
 
     // ── Namespaces ────────────────────────────────────────────────
@@ -1247,28 +1367,49 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::RegisterNamespaceRequest>,
     ) -> Result<Response<proto::RegisterNamespaceResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        tracing::info!(name = req.name, "namespace registered (in-memory only)");
-        Ok(Response::new(proto::RegisterNamespaceResponse {
-            name: req.name,
-        }))
+        let name = req.name.clone();
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::RegisterNamespace, principal, &name, "Namespace"),
+            |_state| async move {
+                tracing::info!(name, "namespace registered (in-memory only)");
+                Ok(Response::new(proto::RegisterNamespaceResponse { name }))
+            },
+        ).await
     }
 
     async fn list_namespaces(
         &self,
-        _request: Request<proto::ListNamespacesRequest>,
+        request: Request<proto::ListNamespacesRequest>,
     ) -> Result<Response<proto::ListNamespacesResponse>, Status> {
-        Ok(Response::new(proto::ListNamespacesResponse {
-            names: vec![],
-        }))
+        let principal = self.principal(&request).await;
+        let _req = request.into_inner();
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::ListNamespaces, principal, "*", "Namespace"),
+            |_state| async move {
+                Ok(Response::new(proto::ListNamespacesResponse {
+                    names: vec![],
+                }))
+            },
+        ).await
     }
 
     async fn describe_namespace(
         &self,
         request: Request<proto::DescribeNamespaceRequest>,
     ) -> Result<Response<proto::DescribeNamespaceResponse>, Status> {
+        let principal = self.principal(&request).await;
         let name = request.into_inner().name;
-        Err(Status::not_found(format!("namespace '{name}' not found (namespace registry pending)")))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::DescribeNamespace, principal, &name, "Namespace"),
+            |_state| async move {
+                Err(Status::not_found(format!("namespace '{name}' not found (namespace registry pending)")))
+            },
+        ).await
     }
 
     // ── Rotation jobs ─────────────────────────────────────────────
@@ -1278,62 +1419,91 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListRotationJobsRequest>,
     ) -> Result<Response<proto::ListRotationJobsResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let state_filter = req.state_filter.and_then(|s| {
-            proto::RotationJobState::try_from(s).ok()
-        }).and_then(rotation_job_state_from_proto);
-        let key_filter_lid = req.key_id.and_then(|k| parse_lid(&k).ok());
-        let mut jobs = self.state.storage.list_rotation_jobs(state_filter).await
-            .map_err(convert::error_to_status)?;
-        if let Some(lid) = &key_filter_lid {
-            jobs.retain(|j| j.parent_lid == *lid || j.dependent_lid == *lid);
-        }
-        let job_list = jobs.iter().map(rotation_job_to_proto).collect();
-        Ok(Response::new(proto::ListRotationJobsResponse {
-            jobs: job_list,
-            next_cursor: String::new(),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::ListRotationJobs, principal, "*", "RotationJob"),
+            |state| async move {
+                let state_filter = req.state_filter.and_then(|s| {
+                    proto::RotationJobState::try_from(s).ok()
+                }).and_then(rotation_job_state_from_proto);
+                let key_filter_lid = req.key_id.and_then(|k| parse_lid(&k).ok());
+                let mut jobs = state.storage.list_rotation_jobs(state_filter).await
+                    .map_err(convert::error_to_status)?;
+                if let Some(lid) = &key_filter_lid {
+                    jobs.retain(|j| j.parent_lid == *lid || j.dependent_lid == *lid);
+                }
+                let job_list = jobs.iter().map(rotation_job_to_proto).collect();
+                Ok(Response::new(proto::ListRotationJobsResponse {
+                    jobs: job_list,
+                    next_cursor: String::new(),
+                }))
+            },
+        ).await
     }
 
     async fn acknowledge_rotation_job(
         &self,
         request: Request<proto::AcknowledgeRotationJobRequest>,
     ) -> Result<Response<proto::AcknowledgeRotationJobResponse>, Status> {
+        let principal = self.principal(&request).await;
         let job_id = request.into_inner().job_id;
-        let mut job = self.state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
-        job.transition_to(keyrack_core::rotation::RotationJobState::Acknowledged)
-            .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
-        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::AcknowledgeRotationJobResponse {
-            job: Some(rotation_job_to_proto(&job)),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::AcknowledgeRotationJob, principal, &job_id, "RotationJob"),
+            |state| async move {
+                let mut job = state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
+                job.transition_to(keyrack_core::rotation::RotationJobState::Acknowledged)
+                    .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+                state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::AcknowledgeRotationJobResponse {
+                    job: Some(rotation_job_to_proto(&job)),
+                }))
+            },
+        ).await
     }
 
     async fn complete_rotation_job(
         &self,
         request: Request<proto::CompleteRotationJobRequest>,
     ) -> Result<Response<proto::CompleteRotationJobResponse>, Status> {
+        let principal = self.principal(&request).await;
         let job_id = request.into_inner().job_id;
-        let mut job = self.state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
-        job.transition_to(keyrack_core::rotation::RotationJobState::Completed)
-            .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
-        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::CompleteRotationJobResponse {
-            job: Some(rotation_job_to_proto(&job)),
-        }))
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::CompleteRotationJob, principal, &job_id, "RotationJob"),
+            |state| async move {
+                let mut job = state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
+                job.transition_to(keyrack_core::rotation::RotationJobState::Completed)
+                    .map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+                state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::CompleteRotationJobResponse {
+                    job: Some(rotation_job_to_proto(&job)),
+                }))
+            },
+        ).await
     }
 
     async fn fail_rotation_job(
         &self,
         request: Request<proto::FailRotationJobRequest>,
     ) -> Result<Response<proto::FailRotationJobResponse>, Status> {
+        let principal = self.principal(&request).await;
         let req = request.into_inner();
-        let mut job = self.state.storage.get_rotation_job(&req.job_id).await.map_err(convert::error_to_status)?;
-        job.fail(&req.reason).map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
-        self.state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
-        Ok(Response::new(proto::FailRotationJobResponse {
-            job: Some(rotation_job_to_proto(&job)),
-        }))
+        let job_id = req.job_id.clone();
+        ops::execute(
+            &self.state,
+            OpContext::resource(AuditAction::FailRotationJob, principal, &job_id, "RotationJob"),
+            |state| async move {
+                let mut job = state.storage.get_rotation_job(&req.job_id).await.map_err(convert::error_to_status)?;
+                job.fail(&req.reason).map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;
+                state.storage.update_rotation_job(&job).await.map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::FailRotationJobResponse {
+                    job: Some(rotation_job_to_proto(&job)),
+                }))
+            },
+        ).await
     }
 }
 

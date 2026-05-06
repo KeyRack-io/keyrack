@@ -18,8 +18,11 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
+const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
 pub struct KmipConnection {
     stream: TlsStream<TcpStream>,
+    timeout: std::time::Duration,
 }
 
 impl KmipConnection {
@@ -46,36 +49,58 @@ impl KmipConnection {
             .await
             .map_err(|e| KeyRackError::Provider(format!("KMIP TLS handshake failed: {e}")))?;
 
-        Ok(Self { stream })
+        let timeout = std::time::Duration::from_secs(config.timeout_secs);
+        Ok(Self { stream, timeout })
     }
 
     /// Send a TTLV-encoded request and receive the response.
     pub async fn round_trip(&mut self, request: &ttlv::TtlvItem) -> Result<ttlv::TtlvItem> {
         let encoded = ttlv::encode(request);
-        self.stream
-            .write_all(&encoded)
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("KMIP write failed: {e}")))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("KMIP flush failed: {e}")))?;
 
-        // Read the TTLV header (3 tag + 1 type + 4 length = 8 bytes)
-        let mut header = [0u8; 8];
-        self.stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("KMIP read header failed: {e}")))?;
+        tokio::time::timeout(self.timeout, async {
+            self.stream
+                .write_all(&encoded)
+                .await
+                .map_err(|e| KeyRackError::Provider(format!("KMIP write failed: {e}")))?;
+            self.stream
+                .flush()
+                .await
+                .map_err(|e| KeyRackError::Provider(format!("KMIP flush failed: {e}")))
+        })
+        .await
+        .map_err(|_| KeyRackError::Provider("KMIP write timed out".into()))??;
 
-        let content_length =
-            u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let (header, content_length) = tokio::time::timeout(self.timeout, async {
+            let mut header = [0u8; 8];
+            self.stream
+                .read_exact(&mut header)
+                .await
+                .map_err(|e| KeyRackError::Provider(format!("KMIP read header failed: {e}")))?;
 
-        let mut body = vec![0u8; content_length];
-        self.stream
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("KMIP read body failed: {e}")))?;
+            let content_length =
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+            if content_length > MAX_RESPONSE_SIZE {
+                return Err(KeyRackError::Provider(format!(
+                    "KMIP response too large: {content_length} bytes (max {MAX_RESPONSE_SIZE})"
+                )));
+            }
+
+            Ok::<_, KeyRackError>((header, content_length))
+        })
+        .await
+        .map_err(|_| KeyRackError::Provider("KMIP read header timed out".into()))??;
+
+        let body = tokio::time::timeout(self.timeout, async {
+            let mut body = vec![0u8; content_length];
+            self.stream
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| KeyRackError::Provider(format!("KMIP read body failed: {e}")))?;
+            Ok::<_, KeyRackError>(body)
+        })
+        .await
+        .map_err(|_| KeyRackError::Provider("KMIP read body timed out".into()))??;
 
         let mut full = BytesMut::with_capacity(8 + content_length);
         full.extend_from_slice(&header);

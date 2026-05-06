@@ -72,6 +72,22 @@ impl Default for ProvisionConfig {
 
 type Waiter = broadcast::Sender<std::result::Result<(), String>>;
 
+struct InflightGuard<'a> {
+    inflight: &'a Mutex<HashMap<Lid, Waiter>>,
+    lid: Lid,
+    removed: bool,
+}
+
+impl<'a> Drop for InflightGuard<'a> {
+    fn drop(&mut self) {
+        if !self.removed {
+            if let Ok(mut map) = self.inflight.try_lock() {
+                map.remove(&self.lid);
+            }
+        }
+    }
+}
+
 /// Lazy provisioner with single-flight coalescing.
 pub struct LazyProvisioner {
     storage: Arc<dyn StorageBackend>,
@@ -135,8 +151,10 @@ impl LazyProvisioner {
         parent_lid: Option<&Lid>,
         attrs: &BTreeMap<String, String>,
     ) -> Result<KeyProvisionOutcome> {
-        if self.storage.get_key(lid).await.is_ok() {
-            return Ok(KeyProvisionOutcome::Existed);
+        match self.storage.get_key(lid).await {
+            Ok(_) => return Ok(KeyProvisionOutcome::Existed),
+            Err(KeyRackError::KeyNotFound(_)) => {}
+            Err(e) => return Err(e),
         }
 
         let mut rx = {
@@ -172,6 +190,12 @@ impl LazyProvisioner {
         parent_lid: Option<&Lid>,
         attrs: &BTreeMap<String, String>,
     ) -> Result<KeyProvisionOutcome> {
+        let mut guard = InflightGuard {
+            inflight: &self.inflight,
+            lid: *lid,
+            removed: false,
+        };
+
         let result = self
             .do_provision(lid, parent_lid, attrs)
             .await;
@@ -184,6 +208,7 @@ impl LazyProvisioner {
             };
             let _ = tx.send(broadcast_val);
         }
+        guard.removed = true;
 
         result
     }
@@ -196,8 +221,10 @@ impl LazyProvisioner {
     ) -> Result<KeyProvisionOutcome> {
         // Double-check: another task may have created the key between
         // our initial check and acquiring the leader slot.
-        if self.storage.get_key(lid).await.is_ok() {
-            return Ok(KeyProvisionOutcome::Existed);
+        match self.storage.get_key(lid).await {
+            Ok(_) => return Ok(KeyProvisionOutcome::Existed),
+            Err(KeyRackError::KeyNotFound(_)) => {}
+            Err(e) => return Err(e),
         }
 
         let rule_match = self.rules.match_rule(attrs);
@@ -244,10 +271,15 @@ impl LazyProvisioner {
                 tracing::info!(lid = %lid, "lazy-provisioned key");
                 Ok(KeyProvisionOutcome::Created)
             }
-            Err(KeyRackError::Other(msg)) if msg.contains("already exists") => {
-                Ok(KeyProvisionOutcome::Existed)
+            Err(_) => {
+                // Another task may have created the key concurrently.
+                match self.storage.get_key(lid).await {
+                    Ok(_) => Ok(KeyProvisionOutcome::Existed),
+                    Err(_) => Err(KeyRackError::Other(format!(
+                        "failed to provision key {lid}"
+                    ))),
+                }
             }
-            Err(e) => Err(e),
         }
     }
 }
