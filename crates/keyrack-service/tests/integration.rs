@@ -489,6 +489,139 @@ async fn alias_operations_with_pdp_and_audit() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 7. ENCRYPT WITH ENCRYPTION CONTEXT → AUDIT HASH
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn encrypt_with_ec_emits_audit_with_hash() {
+    let (state, _pdp, audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key = create_aes_key(&svc).await;
+
+    let mut ec = std::collections::HashMap::new();
+    ec.insert("tenant".to_string(), "acme-corp".to_string());
+
+    let _ = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key,
+            plaintext: b"hello".to_vec(),
+            encryption_context: ec,
+        }))
+        .await
+        .expect("encrypt with EC");
+
+    let events = audit.events();
+    let encrypt_event = events.iter().find(|e| e.action == keyrack_core::audit::AuditAction::Encrypt);
+    assert!(encrypt_event.is_some(), "should have an Encrypt audit event");
+    assert!(
+        encrypt_event.unwrap().encryption_context_hash.is_some(),
+        "Encrypt with EC must include encryption_context_hash in audit"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 8. KEY VERSIONS
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn list_key_versions() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key = create_aes_key(&svc).await;
+
+    let resp = svc
+        .list_key_versions(Request::new(proto::ListKeyVersionsRequest {
+            key_id: key,
+            ..Default::default()
+        }))
+        .await
+        .expect("list versions");
+
+    let versions = resp.into_inner().versions;
+    assert!(!versions.is_empty(), "new key should have at least one version");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 9. NAMESPACE OPERATIONS (PDP + Audit)
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn namespace_operations_call_pdp_and_audit() {
+    let (state, pdp, audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let _ = svc
+        .register_namespace(Request::new(proto::RegisterNamespaceRequest {
+            name: "test-ns".into(),
+            yaml_config: "rules: []".into(),
+        }))
+        .await
+        .expect("register namespace");
+
+    assert!(pdp.count() >= 1, "PDP must be called for RegisterNamespace");
+    assert!(audit.event_count() >= 1, "audit event must be emitted for RegisterNamespace");
+
+    let _ = svc
+        .list_namespaces(Request::new(proto::ListNamespacesRequest::default()))
+        .await
+        .expect("list namespaces");
+
+    assert!(pdp.count() >= 2, "PDP must be called for ListNamespaces");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 10. DESCRIBE KEY RETURNS METADATA
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn describe_key_returns_full_metadata() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key = create_aes_key(&svc).await;
+
+    let resp = svc
+        .describe_key(Request::new(proto::DescribeKeyRequest {
+            key_id: key.clone(),
+        }))
+        .await
+        .expect("describe key");
+
+    let meta = resp.into_inner().metadata.expect("metadata must be present");
+    assert_eq!(meta.key_id, key);
+    assert_eq!(meta.description, "test key");
+    assert_eq!(meta.key_spec, i32::from(proto::KeySpec::Aes256));
+    assert!(meta.created_at.is_some());
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 11. GENERATE DATA KEY
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn generate_data_key_returns_both_keys() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key = create_aes_key(&svc).await;
+
+    let resp = svc
+        .generate_data_key(Request::new(proto::GenerateDataKeyRequest {
+            key_id: key.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("generate data key");
+
+    let inner = resp.into_inner();
+    assert!(!inner.plaintext_data_key.is_empty(), "plaintext key must be non-empty");
+    assert!(!inner.encrypted_data_key.is_empty(), "encrypted key must be non-empty");
+    assert_eq!(inner.key_id, key);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Helper
 // ═══════════════════════════════════════════════════════════════════
 
