@@ -5,6 +5,7 @@ use clap::{Args, Subcommand};
 use keyrack_core::migration::{
     self, MigrationAction, MigrationEntry, MigrationPlan,
 };
+use keyrack_core::key::{KeyRecord, KeyState};
 use keyrack_core::storage::{KeyFilter, StorageBackend};
 
 #[derive(Args)]
@@ -148,6 +149,30 @@ fn open_storage(path: &str) -> anyhow::Result<keyrack_sqlite::SqliteStorage> {
         .map_err(|e| anyhow::anyhow!("cannot open storage at {path}: {e}"))
 }
 
+/// Paginate through all keys in storage, collecting every record.
+async fn list_all_keys(db: &impl StorageBackend) -> anyhow::Result<Vec<KeyRecord>> {
+    let mut all_keys = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let filter = KeyFilter {
+            cursor,
+            ..KeyFilter::default()
+        };
+        let page = db
+            .list_keys(&filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list keys: {e}"))?;
+        all_keys.extend(page.items);
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    Ok(all_keys)
+}
+
 async fn plan_migration(
     from_str: &str,
     to_str: &str,
@@ -165,13 +190,11 @@ async fn plan_migration(
 
     let db = open_storage(storage_path)?;
 
-    let filter = KeyFilter::default();
-    let page = db.list_keys(&filter).await
-        .map_err(|e| anyhow::anyhow!("failed to list keys: {e}"))?;
+    let all_keys = list_all_keys(&db).await?;
 
     let mut entries = Vec::new();
 
-    for record in &page.items {
+    for record in &all_keys {
         if record.canonicalization_version == from_version {
             let new_lid = migration::rederive_lid(
                 &record.lid,
@@ -308,6 +331,8 @@ async fn rollback_migration(
     let mut rolled_back = 0usize;
     let mut skipped = 0usize;
 
+    let mut errors = 0usize;
+
     for entry in &plan.entries {
         if !entry.applied || entry.action == MigrationAction::Skip {
             skipped += 1;
@@ -324,10 +349,41 @@ async fn rollback_migration(
             }
         }
 
+        if let Some(new_lid_str) = &entry.new_lid {
+            let new_lid: keyrack_core::lid::Lid = match new_lid_str.parse() {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(lid = %new_lid_str, error = %e, "invalid migrated LID, skipping cleanup");
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            match db.get_key(&new_lid).await {
+                Ok(record) => {
+                    let mut destroyed = record.clone();
+                    destroyed.state = KeyState::Destroyed;
+                    destroyed.occ_version += 1;
+                    if let Err(e) = db.update_key(&destroyed).await {
+                        tracing::error!(lid = %new_lid_str, error = %e, "failed to destroy migrated key copy");
+                        errors += 1;
+                        continue;
+                    }
+                    tracing::info!(lid = %new_lid_str, "marked migrated key copy as destroyed");
+                }
+                Err(e) => {
+                    tracing::warn!(lid = %new_lid_str, error = %e, "migrated key not found, may have been cleaned up already");
+                }
+            }
+        }
+
         rolled_back += 1;
     }
 
-    eprintln!("migration rollback: {rolled_back} rolled back, {skipped} skipped");
+    eprintln!("migration rollback: {rolled_back} rolled back, {skipped} skipped, {errors} errors");
+    if errors > 0 {
+        anyhow::bail!("{errors} key(s) failed during rollback");
+    }
     Ok(())
 }
 
@@ -383,13 +439,12 @@ async fn plan_rule_change(
         .map_err(|e| anyhow::anyhow!("invalid new rules YAML: {e}"))?;
 
     let db = open_storage(storage_path)?;
-    let filter = KeyFilter::default();
-    let page = db.list_keys(&filter).await
-        .map_err(|e| anyhow::anyhow!("failed to list keys: {e}"))?;
+
+    let all_keys = list_all_keys(&db).await?;
 
     let mut entries = Vec::new();
 
-    for record in &page.items {
+    for record in &all_keys {
         let attrs = record.identity_tags.as_map();
 
         let old_parent = old_registry.match_rule(attrs)
@@ -513,12 +568,18 @@ async fn apply_rule_change(
 
         let new_parent_str = new_parent_lid.as_ref().map(|l| l.to_string());
 
+        // TODO(crypto): This only updates `parent_lid` metadata in the
+        // database. A full rule-change migration must also rewrap the key
+        // material under the new parent's wrapping key, which requires a
+        // CryptoProvider. The CLI currently only has direct storage access;
+        // cryptographic rewrap will be wired once the CLI gains gRPC client
+        // support to keyrack-service (which owns the CryptoProvider).
         let mut updated = record.clone();
         updated.parent_lid = new_parent_lid;
         updated.occ_version += 1;
 
         if let Err(e) = db.update_key(&updated).await {
-            tracing::error!(lid = %plan.entries[i].key_lid, error = %e, "failed to rewrap");
+            tracing::error!(lid = %plan.entries[i].key_lid, error = %e, "failed to update parent");
             errors += 1;
             continue;
         }
