@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KeyRack — Sovereign Key Management Service</title>
+<meta name="description" content="Open-source key lifecycle coordination with pluggable HSM backends. Sovereign, policy-driven, production-ready.">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg-primary:#0a0a0f;
+  --bg-secondary:#12121a;
+  --bg-card:#16161f;
+  --bg-code:#0d0d14;
+  --border:#1e1e2e;
+  --text-primary:#e4e4ed;
+  --text-secondary:#9494a8;
+  --text-muted:#6b6b80;
+  --accent:#06b6d4;
+  --accent-dim:#0e7490;
+  --accent-glow:rgba(6,182,212,0.08);
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --font-mono:"SF Mono",SFMono-Regular,ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+}
+html{scroll-behavior:smooth;background:var(--bg-primary);color:var(--text-primary);font-family:var(--font-sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+body{overflow-x:hidden}
+a{color:var(--accent);text-decoration:none;transition:color .15s}
+a:hover{color:#22d3ee}
+
+/* Layout */
+.container{max-width:960px;margin:0 auto;padding:0 24px}
+section{padding:80px 0}
+@media(max-width:640px){section{padding:56px 0}}
+
+/* Nav */
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(10,10,15,0.85);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+nav .container{display:flex;align-items:center;justify-content:space-between;height:56px}
+.nav-brand{font-size:1.1rem;font-weight:700;letter-spacing:-0.02em;color:var(--text-primary)}
+.nav-brand span{color:var(--accent)}
+nav ul{list-style:none;display:flex;gap:24px}
+nav ul a{color:var(--text-secondary);font-size:0.875rem;font-weight:500;transition:color .15s}
+nav ul a:hover{color:var(--text-primary)}
+@media(max-width:640px){nav ul{gap:16px}nav ul a{font-size:0.8rem}}
+
+/* Hero */
+.hero{padding:140px 0 80px;text-align:center}
+@media(max-width:640px){.hero{padding:110px 0 56px}}
+.hero h1{font-size:3rem;font-weight:800;letter-spacing:-0.03em;line-height:1.15;margin-bottom:16px}
+@media(max-width:640px){.hero h1{font-size:2rem}}
+.hero h1 span{color:var(--accent)}
+.hero p{max-width:620px;margin:0 auto 32px;font-size:1.125rem;color:var(--text-secondary);line-height:1.7}
+.hero-actions{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 22px;border-radius:8px;font-size:0.9rem;font-weight:600;transition:all .15s}
+.btn-primary{background:var(--accent);color:#0a0a0f}
+.btn-primary:hover{background:#22d3ee;color:#0a0a0f}
+.btn-secondary{background:transparent;border:1px solid var(--border);color:var(--text-secondary)}
+.btn-secondary:hover{border-color:var(--accent-dim);color:var(--text-primary)}
+
+/* Section headings */
+.section-label{display:inline-block;font-size:0.75rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+.section-title{font-size:1.75rem;font-weight:700;letter-spacing:-0.02em;margin-bottom:8px}
+.section-desc{color:var(--text-secondary);max-width:600px;margin-bottom:40px}
+
+/* Value props */
+.values{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:640px){.values{grid-template-columns:1fr}}
+.value{padding:24px;border-radius:10px;background:var(--bg-card);border:1px solid var(--border);transition:border-color .2s}
+.value:hover{border-color:var(--accent-dim)}
+.value h3{font-size:1rem;font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.value h3 .icon{font-size:0.85rem;color:var(--accent)}
+.value p{font-size:0.875rem;color:var(--text-secondary);line-height:1.65}
+
+/* Architecture */
+.arch-box{background:var(--bg-code);border:1px solid var(--border);border-radius:10px;padding:32px;overflow-x:auto}
+.arch-box pre{font-family:var(--font-mono);font-size:0.82rem;line-height:1.8;color:var(--text-secondary);white-space:pre;margin:0}
+.arch-box .a-hl{color:var(--accent)}
+.arch-box .a-dim{color:var(--text-muted)}
+.arch-box .a-label{color:var(--text-primary);font-weight:600}
+
+/* Features grid */
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:640px){.features{grid-template-columns:1fr 1fr}}
+@media(max-width:420px){.features{grid-template-columns:1fr}}
+.feature{padding:20px;border-radius:10px;background:var(--bg-card);border:1px solid var(--border);text-align:center;transition:border-color .2s}
+.feature:hover{border-color:var(--accent-dim)}
+.feature .f-icon{font-size:1.5rem;margin-bottom:8px}
+.feature h3{font-size:0.9rem;font-weight:700;margin-bottom:4px}
+.feature p{font-size:0.8rem;color:var(--text-secondary);line-height:1.55}
+
+/* Quickstart */
+.code-block{background:var(--bg-code);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.code-header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(255,255,255,0.02)}
+.code-dot{width:10px;height:10px;border-radius:50%;background:var(--border)}
+.code-dot:nth-child(1){background:#ff5f57}
+.code-dot:nth-child(2){background:#febc2e}
+.code-dot:nth-child(3){background:#28c840}
+.code-block pre{padding:20px;overflow-x:auto;font-family:var(--font-mono);font-size:0.82rem;line-height:1.75;color:var(--text-secondary);margin:0}
+.code-block .cm{color:var(--text-muted);font-style:italic}
+.code-block .cmd{color:var(--text-primary)}
+.code-block .flag{color:#c084fc}
+.code-block .str{color:#34d399}
+.code-block .url{color:var(--accent)}
+
+/* Links / footer */
+.links-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media(max-width:640px){.links-grid{grid-template-columns:1fr 1fr}}
+.link-card{display:flex;flex-direction:column;padding:20px;border-radius:10px;background:var(--bg-card);border:1px solid var(--border);transition:border-color .2s}
+.link-card:hover{border-color:var(--accent-dim)}
+.link-card .lc-title{font-size:0.9rem;font-weight:700;margin-bottom:4px}
+.link-card .lc-desc{font-size:0.8rem;color:var(--text-secondary);line-height:1.55}
+footer{border-top:1px solid var(--border);padding:32px 0;text-align:center}
+footer p{font-size:0.8rem;color:var(--text-muted)}
+
+/* License badge */
+.license-badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:0.7rem;font-weight:700;letter-spacing:0.04em;background:rgba(6,182,212,0.1);color:var(--accent);border:1px solid rgba(6,182,212,0.2)}
+
+/* Divider */
+.divider{border:0;border-top:1px solid var(--border);margin:0}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <div class="nav-brand">Key<span>Rack</span></div>
+    <ul>
+      <li><a href="#why">Why</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#quickstart">Quickstart</a></li>
+      <li><a href="https://github.com/keyrack/keyrack">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <h1>Sovereign key management.<br><span>Your hardware. Your rules.</span></h1>
+    <p>KeyRack is an open-source key lifecycle coordination layer. It tracks key hierarchies, drives rotation, and delegates all cryptographic material to HSM backends. It never stores raw key material.</p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/keyrack/keyrack" class="btn btn-secondary">View on GitHub &#8599;</a>
+    </div>
+    <div style="margin-top:24px">
+      <span class="license-badge">BSL 1.1 &rarr; Apache 2.0</span>
+    </div>
+  </div>
+</header>
+
+<hr class="divider">
+
+<section id="why">
+  <div class="container">
+    <div class="section-label">Why KeyRack</div>
+    <h2 class="section-title">Infrastructure you control, end to end</h2>
+    <p class="section-desc">No vendor lock-in. No key material leaving your HSMs. Policy-driven authorization with full audit trails.</p>
+    <div class="values">
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> Sovereign</h3>
+        <p>You control your keys. No cloud vendor lock-in. Run on-premise or in any cloud.</p>
+      </div>
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> Pluggable HSMs</h3>
+        <p>PKCS#11 (Thales, Entrust, YubiHSM, CloudHSM), KMIP for tenant-managed HSMs. Software provider for dev/test.</p>
+      </div>
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> API Compatible</h3>
+        <p>AWS KMS API shim lets existing applications work without code changes. OpenStack Barbican shim for OpenStack environments.</p>
+      </div>
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> Policy-driven</h3>
+        <p>External authorization via any PDP (Cedar, OPA, etc.). Every operation is authorized and audited.</p>
+      </div>
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> Hierarchical Keys</h3>
+        <p>Deterministic key derivation trees. Namespace-scoped rules. Cascade disable across entire hierarchies.</p>
+      </div>
+      <div class="value">
+        <h3><span class="icon">&#9670;</span> Production-ready</h3>
+        <p>gRPC + REST APIs, Prometheus metrics, graceful shutdown, PostgreSQL or SQLite storage.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="architecture">
+  <div class="container">
+    <div class="section-label">Architecture</div>
+    <h2 class="section-title">How it fits together</h2>
+    <p class="section-desc">KeyRack coordinates between clients, HSM backends, policy engines, and storage — never touching raw key material.</p>
+    <div class="arch-box">
+<pre>
+<span class="a-label">  Clients</span>                      <span class="a-label">KeyRack Service</span>                  <span class="a-label">HSM Backends</span>
+
+  <span class="a-hl">AWS SDK</span>        <span class="a-dim">─────┐</span>
+  <span class="a-hl">OpenStack</span>      <span class="a-dim">─────┤</span>
+  <span class="a-hl">gRPC</span>           <span class="a-dim">─────┼────▶</span>  ┌──────────────────┐  <span class="a-dim">────▶</span>  <span class="a-hl">PKCS#11</span>
+  <span class="a-hl">REST</span>           <span class="a-dim">─────┤</span>     │                  │  <span class="a-dim">────▶</span>  <span class="a-hl">KMIP</span>
+  <span class="a-hl">WASM</span>           <span class="a-dim">─────┘</span>     │   <span class="a-hl">keyrack-service</span> │
+                            │                  │
+                            └────────┬─────────┘
+                                     │
+                      <span class="a-dim">┌──────────────┼──────────────┐</span>
+                      <span class="a-dim">▼</span>              <span class="a-dim">▼</span>              <span class="a-dim">▼</span>
+              <span class="a-hl">External PDP</span>     <span class="a-hl">Storage</span>        <span class="a-hl">Audit</span>
+             <span class="a-dim">Cedar / OPA</span>   <span class="a-dim">PostgreSQL</span>   <span class="a-dim">NATS / File</span>
+                            <span class="a-dim">SQLite</span>       <span class="a-dim">Stdout</span>
+</pre>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="features">
+  <div class="container">
+    <div class="section-label">Key Features</div>
+    <h2 class="section-title">Built for real-world KMS</h2>
+    <p class="section-desc">Everything you need to run a production key management service.</p>
+    <div class="features">
+      <div class="feature">
+        <div class="f-icon">&#x1F332;</div>
+        <h3>Hierarchical Key Trees</h3>
+        <p>Deterministic derivation with namespace-scoped rules and cascade operations.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon">&#x1F6E1;</div>
+        <h3>External Policy Engine</h3>
+        <p>Delegate authorization to Cedar, OPA, or any policy decision point.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon">&#x1F512;</div>
+        <h3>HSM-backed Crypto</h3>
+        <p>All cryptographic operations happen inside your HSMs. No key material in memory.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon">&#x1F4DD;</div>
+        <h3>Audit Everything</h3>
+        <p>Structured audit events via NATS, files, or stdout. Full operation traceability.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon">&#x2601;</div>
+        <h3>AWS KMS Compatible</h3>
+        <p>Drop-in API shim so existing AWS SDK applications work without code changes.</p>
+      </div>
+      <div class="feature">
+        <div class="f-icon">&#x1F310;</div>
+        <h3>Barbican Compatible</h3>
+        <p>OpenStack Barbican API shim for integration with OpenStack environments.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="quickstart">
+  <div class="container">
+    <div class="section-label">Quickstart</div>
+    <h2 class="section-title">Up and running in minutes</h2>
+    <p class="section-desc">Clone the repo, start the stack, create a key, encrypt and decrypt data.</p>
+    <div class="code-block">
+      <div class="code-header">
+        <span class="code-dot"></span>
+        <span class="code-dot"></span>
+        <span class="code-dot"></span>
+      </div>
+<pre>
+<span class="cm"># Clone and start the stack</span>
+<span class="cmd">git clone</span> <span class="url">https://github.com/keyrack/keyrack.git</span>
+<span class="cmd">cd</span> keyrack
+<span class="cmd">docker compose up</span> <span class="flag">-d</span> keyrack-service
+
+<span class="cm"># Create a key and capture its ID</span>
+KEY_ID=$(<span class="cmd">curl</span> <span class="flag">-s</span> <span class="url">http://localhost:8080/v1/keys</span> <span class="flag">-X</span> POST \
+  <span class="flag">-H</span> <span class="str">'Content-Type: application/json'</span> \
+  <span class="flag">-d</span> <span class="str">'{"key_spec": "AES_256", "description": "my first key"}'</span> | jq <span class="flag">-r</span> '.lid')
+
+<span class="cm"># Encrypt data (plaintext is base64-encoded)</span>
+<span class="cmd">curl</span> <span class="flag">-s</span> <span class="url">http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt</span> <span class="flag">-X</span> POST \
+  <span class="flag">-H</span> <span class="str">'Content-Type: application/json'</span> \
+  <span class="flag">-d</span> <span class="str">'{"plaintext": "aGVsbG8ga2V5cmFjaw=="}'</span> | jq .
+
+<span class="cm"># Decrypt data</span>
+<span class="cmd">curl</span> <span class="flag">-s</span> <span class="url">http://localhost:8080/v1/keys/$KEY_ID/actions-decrypt</span> <span class="flag">-X</span> POST \
+  <span class="flag">-H</span> <span class="str">'Content-Type: application/json'</span> \
+  <span class="flag">-d</span> <span class="str">'{"ciphertext_blob": "...from above..."}'</span> | jq .
+</pre>
+    </div>
+    <p style="margin-top:16px;color:var(--text-secondary);font-size:0.875rem">
+      Or run the full end-to-end demo: <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.82rem">./examples/quickstart.sh</code>
+    </p>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="links">
+  <div class="container">
+    <div class="section-label">Resources</div>
+    <h2 class="section-title">Links</h2>
+    <p class="section-desc">Everything you need to get started, contribute, or report issues.</p>
+    <div class="links-grid">
+      <a href="https://github.com/keyrack/keyrack" class="link-card">
+        <span class="lc-title">GitHub &#8599;</span>
+        <span class="lc-desc">Source code, issues, and contributions.</span>
+      </a>
+      <a href="docs/" class="link-card">
+        <span class="lc-title">Documentation &#8599;</span>
+        <span class="lc-desc">Guides, API reference, and configuration.</span>
+      </a>
+      <a href="https://github.com/keyrack/keyrack/blob/main/SECURITY.md" class="link-card">
+        <span class="lc-title">Security &#8599;</span>
+        <span class="lc-desc">Vulnerability reporting and security policy.</span>
+      </a>
+      <a href="https://github.com/keyrack/keyrack/blob/main/LICENSE" class="link-card">
+        <span class="lc-title">License &#8599;</span>
+        <span class="lc-desc">BSL 1.1, converting to Apache 2.0 after 4 years.</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>KeyRack is open-source software. Licensed under BSL 1.1 with Apache 2.0 conversion.</p>
+  </div>
+</footer>
+
+</body>
+</html>

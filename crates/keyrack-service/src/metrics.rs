@@ -19,8 +19,6 @@ pub const OP_TOTAL: &str = "keyrack_operations_total";
 pub const PDP_DURATION: &str = "keyrack_pdp_request_duration_seconds";
 pub const PDP_ERRORS: &str = "keyrack_pdp_errors_total";
 pub const AUDIT_EMIT_ERRORS: &str = "keyrack_audit_emit_errors_total";
-pub const HSM_OPS: &str = "keyrack_hsm_operations_total";
-pub const PROVIDER_DURATION: &str = "keyrack_provider_duration_seconds";
 
 pub fn record_op(action: &str, result: &str, duration: std::time::Duration) {
     histogram!(OP_DURATION, "action" => action.to_owned(), "result" => result.to_owned())

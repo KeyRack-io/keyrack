@@ -770,7 +770,17 @@ impl KeyService for KeyServiceImpl {
                     for mut child in children {
                         if child.state == keyrack_core::key::KeyState::Enabled {
                             if child.transition_to(keyrack_core::key::KeyState::Disabled).is_ok() {
-                                let _ = state.storage.update_key(&child).await;
+                                if let Err(e) = state.storage.update_key(&child).await {
+                                    tracing::error!(
+                                        child_lid = %child.lid,
+                                        error = %e,
+                                        "failed to disable descendant key during cascade"
+                                    );
+                                    return Err(Status::internal(format!(
+                                        "cascade disable failed on descendant {}: {e}",
+                                        child.lid
+                                    )));
+                                }
                                 cascade_count += 1;
                                 queue.push(child.lid);
                             }
@@ -787,7 +797,6 @@ impl KeyService for KeyServiceImpl {
                     );
                     // Emit NATS invalidation if event sink is configured
                     state.emit_audit_event(
-                        "CascadeDisable",
                         &key_id,
                         &format!("disabled {cascade_count} descendant(s)"),
                     ).await;

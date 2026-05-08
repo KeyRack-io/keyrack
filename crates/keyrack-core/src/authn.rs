@@ -205,10 +205,10 @@ impl Authenticator for MtlsAuthenticator {
         if metadata.peer_certificates.is_empty() {
             return Ok(None);
         }
-        // TODO: parse leaf certificate, extract SAN/CN, validate chain
-        Err(AuthnError::Internal(
-            "mTLS certificate parsing not yet implemented".into(),
-        ))
+        // TODO(authn): parse leaf certificate, extract SAN/CN, validate chain.
+        // Until implemented, skip so the next authenticator in the chain can try.
+        tracing::warn!("mTLS authenticator received peer certificates but parsing is not yet implemented");
+        Ok(None)
     }
 }
 
@@ -267,10 +267,10 @@ impl Authenticator for JwtAuthenticator {
             return Ok(None);
         }
 
-        // TODO: validate JWT signature against JWKS, extract claims
-        Err(AuthnError::Internal(
-            "JWT validation not yet implemented".into(),
-        ))
+        // TODO(authn): validate JWT signature against JWKS, extract claims.
+        // Until implemented, skip so the next authenticator in the chain can try.
+        tracing::warn!("JWT authenticator received a Bearer token but validation is not yet implemented");
+        Ok(None)
     }
 }
 

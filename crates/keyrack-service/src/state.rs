@@ -37,7 +37,6 @@ impl ServiceState {
     /// Emit an audit event for internal operations (e.g. cascade disable).
     pub async fn emit_audit_event(
         &self,
-        action: &str,
         resource_id: &str,
         detail: &str,
     ) {
@@ -63,7 +62,6 @@ impl ServiceState {
             "detail".to_string(),
             serde_json::Value::String(detail.to_string()),
         );
-        let _ = action;
         if let Err(e) = self.audit.emit(&event).await {
             tracing::warn!(resource_id, error = %e, "failed to emit cascade audit event");
         }

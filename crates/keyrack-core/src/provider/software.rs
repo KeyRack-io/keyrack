@@ -224,7 +224,9 @@ impl CryptoProvider for SoftwareProvider {
 
         let pt = cipher
             .decrypt(&nonce, payload)
-            .map_err(|_| KeyRackError::EncryptionContextMismatch)?;
+            .map_err(|_| KeyRackError::Provider(
+                "AES-GCM authentication failed: wrong key, corrupted ciphertext, or AAD mismatch".into(),
+            ))?;
 
         Ok(Sensitive::new(pt))
     }
@@ -343,7 +345,9 @@ impl CryptoProvider for SoftwareProvider {
                 KeySpecCapability { key_spec: KeySpec::Aes256, operations: symmetric_ops },
                 KeySpecCapability { key_spec: KeySpec::Ed25519, operations: signing_ops.clone() },
                 KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 }, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 }, operations: signing_ops },
             ],
             supports_generate_random: true,
             supports_atomic_data_key: false,

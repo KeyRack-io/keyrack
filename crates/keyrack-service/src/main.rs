@@ -64,19 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("initiating graceful shutdown (drain timeout: {DRAIN_TIMEOUT:?})");
     cancel.cancel();
 
-    let drain_deadline = tokio::time::sleep(DRAIN_TIMEOUT);
-    tokio::pin!(drain_deadline);
-
-    tokio::select! {
-        _ = async {
-            let _ = grpc_handle.await;
-            let _ = rest_handle.await;
-        } => {
-            tracing::info!("all servers drained and stopped");
-        }
-        _ = &mut drain_deadline => {
-            tracing::warn!("drain timeout reached, forcing shutdown");
-        }
+    match tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let _ = grpc_handle.await;
+        let _ = rest_handle.await;
+    }).await {
+        Ok(_) => tracing::info!("all servers drained and stopped"),
+        Err(_) => tracing::warn!("drain timeout reached, forcing shutdown"),
     }
 
     tracing::info!("flushing audit sink");

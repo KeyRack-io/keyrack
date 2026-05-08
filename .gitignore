@@ -135,3 +135,5 @@ yarn-error.log*
 *.pdf.bak
 .aider*
 HIGH_LEVEL.txt
+
+internal/

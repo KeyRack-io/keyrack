@@ -7,14 +7,8 @@ mechanisms; this document covers both.
 
 This is a Phase 1 deliverable so the *primitives* and *opt-out semantics* are
 pinned down before the runtime ships. The tooling that exposes these
-primitives (`keyrack migrate plan|apply|rollback`) lands as part of Phase 1
-(canonicalization variant) and Phase 2 (rule-change variant) — see
-[`PLAN.md`](./PLAN.md) Workstreams 3 and 15.
-
-Companion documents:
-- [`PLAN.md`](./PLAN.md) — overall implementation plan
-- [`KEYRACK_SPEC.md`](./KEYRACK_SPEC.md) — customer requirements (a partner)
-- [`04-prd.md`](./04-prd.md) — product requirements (v2)
+primitives (`keyrack migrate plan|apply|rollback`) support both
+canonicalization migrations and rule-change migrations.
 
 ---
 
@@ -219,7 +213,7 @@ For migration tooling (Phase 2 OSS) to ship, Phase 1 must provide:
 - NATS event topics for migration progress
 - Audit event types for migrate-began, migrate-key, migrate-completed, migrate-failed, migrate-rolled-back
 
-These are listed in `PLAN.md` Workstream 1 and 2 as deliverables.
+These are tracked as core and service deliverables.
 
 ---
 

@@ -286,15 +286,35 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         AuditAction::RotateKey => EventType::KeyRotated,
         AuditAction::EnableKey | AuditAction::DisableKey => EventType::KeyStateChanged,
         AuditAction::ScheduleKeyDeletion | AuditAction::CancelKeyDeletion => EventType::KeyStateChanged,
-        AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => EventType::TagMutation,
-        AuditAction::CreateAlias | AuditAction::DeleteAlias | AuditAction::ListAliases => EventType::AliasMutation,
+        AuditAction::UpdateKey => EventType::KeyStateChanged,
+
+        AuditAction::GetKey | AuditAction::DescribeKey | AuditAction::ListKeys
+        | AuditAction::ListKeyVersions | AuditAction::GetKeyVersion
+        | AuditAction::GetKeyDependents | AuditAction::GetKeyAncestors
+        | AuditAction::GetKeyRotationStatus | AuditAction::GetKeyRotationHistory
+        | AuditAction::GetKeyRotationPolicy => EventType::KeyRead,
+
         AuditAction::Encrypt | AuditAction::Decrypt | AuditAction::Sign | AuditAction::Verify
         | AuditAction::GenerateRandom | AuditAction::GenerateDataKey
         | AuditAction::GenerateDataKeyWithoutPlaintext | AuditAction::ReEncrypt => EventType::CryptoOperation,
+
+        AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => EventType::TagMutation,
+        AuditAction::CreateAlias | AuditAction::DeleteAlias | AuditAction::ListAliases => EventType::AliasMutation,
+
         AuditAction::CreateHsmConnection | AuditAction::DeleteHsmConnection
+        | AuditAction::GetHsmConnection | AuditAction::ListHsmConnections
         | AuditAction::GetHsmConnectionStatus => EventType::HsmConnectionMutation,
+
+        AuditAction::EnableKeyRotation | AuditAction::DisableKeyRotation
+        | AuditAction::SetKeyRotationPolicy => EventType::RotationPolicyChanged,
+
+        AuditAction::ListRotationJobs | AuditAction::AcknowledgeRotationJob
+        | AuditAction::CompleteRotationJob | AuditAction::FailRotationJob => EventType::RotationJobStateChanged,
+
+        AuditAction::RegisterNamespace | AuditAction::ListNamespaces
+        | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
+
         AuditAction::CascadeDisable => EventType::CascadeDisable,
-        _ => EventType::KeyStateChanged,
     }
 }
 

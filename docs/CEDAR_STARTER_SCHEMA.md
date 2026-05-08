@@ -266,11 +266,11 @@ permit (
 ## Using this schema
 
 1. Copy the schema block above into your Cedar PDP's schema file.
-2. Configure KeyRack to point at your Cedar PDP via `--pdp-url` or
-   `KEYRACK_PDP_URL`.
+2. Configure KeyRack to point at your Cedar PDP via the `pdp` section
+   in `keyrack.yaml` (see [OPERATOR.md](./OPERATOR.md#authorization-pdp)).
 3. Write policies using the entity types and actions defined above.
 4. Test policies with `cedar eval` or the Cedar playground before
    deploying.
 
 KeyRack's authorization request shape is documented in
-[`SPEC.md`](./SPEC.md) and [`PDP_WIRE_FORMAT_REQS.md`](../PDP_WIRE_FORMAT_REQS.md).
+[`SPEC.md`](./SPEC.md).

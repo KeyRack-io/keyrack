@@ -1,13 +1,11 @@
-# KeyRack Internal Specification
+# KeyRack Specification
 
 Design decisions that are hard to change retroactively. Each section is
 locked when its content is committed; the version tag in the section header
 records the commit that locked it.
 
 Companion documents:
-- [KEYRACK_SPEC.md](../KEYRACK_SPEC.md) — a partner integration contract (customer requirements)
 - [MIGRATION.md](../MIGRATION.md) — canonicalization and rule-change migration design
-- [PDP_WIRE_FORMAT_REQS.md](../PDP_WIRE_FORMAT_REQS.md) — PDP wire format constraints
 
 ---
 
@@ -16,8 +14,7 @@ Companion documents:
 **Status:** stub — proto definitions land in Workstream 2.
 
 The proto definitions in `proto/keyrack/v1/` are the canonical service
-interface. The RPC set matches `KEYRACK_SPEC.md` §3.1. REST is generated
-from annotations on these protos.
+interface. REST is generated from annotations on these protos.
 
 ---
 
@@ -268,8 +265,8 @@ separate `identity_tags` field (flat `BTreeMap<String, String>`) on
 - Complex attribute values (`I64`, `Bool`, `ListOfString`, `Record`) are
   serialized to their JSON string representation.
 - Visible in **audit events** and **PDP requests** only.
-- **Excluded from tenant-facing API responses** (`KEYRACK_SPEC.md` §5.14,
-  invariant 9).
+- **Excluded from tenant-facing API responses** (security invariant 6
+  in `SECURITY.md`).
 - Never modified after initial derivation.
 
 ### 6.2 User tags (`UserTags`)
