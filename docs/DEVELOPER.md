@@ -166,17 +166,10 @@ impl AuditSink for MyAuditSink {
 
 ---
 
-## PII tokenization
+## PII tokenization (coming soon)
 
-Use `keyrack-pii` to tokenize PII before passing it as an attribute:
-
-```rust
-use keyrack_pii::{Tokenizer, Preset};
-
-let tok = Tokenizer::new(b"my-tenant-salt-at-least-32-bytes!");
-let email_token = tok.tokenize("alice@example.com", Preset::Email);
-// Use email_token as an attribute value instead of the raw email
-```
+The `keyrack-pii` crate will provide helpers for tokenizing PII before
+passing it as a key attribute. This is planned for a future release.
 
 ---
 
@@ -216,7 +209,7 @@ keyrack-core/        # Library: types, traits, canonicalization, LID, providers
 keyrack-service/     # gRPC + REST server binary
 keyrack-cedar-pdp/   # Optional Cedar PDP companion
 keyrack-cli/         # CLI tools: lint, provision, admin, migrate
-keyrack-pii/         # PII tokenization helper
+keyrack-pii/         # PII tokenization helper (coming soon)
 keyrack-wasm/        # WASM target + JS/TS bindings
 keyrack-sqlite/      # SQLite storage backend
 keyrack-postgres/    # PostgreSQL storage backend

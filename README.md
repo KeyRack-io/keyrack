@@ -104,6 +104,7 @@ crates/
 ├── keyrack-cedar-pdp/      Standalone Cedar PDP binary
 ├── keyrack-cli/            CLI tools (lint, provision, migrate, admin)
 ├── keyrack-wasm/           WASM target + JS/TS bindings
+├── keyrack-pii/            PII tokenization helper (coming soon)
 ├── keyrack-pkcs11/         PKCS#11 HSM provider
 ├── keyrack-kmip/           KMIP client provider (HYOK)
 ├── keyrack-postgres/       PostgreSQL storage backend
