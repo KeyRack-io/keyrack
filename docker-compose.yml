@@ -1,4 +1,22 @@
 services:
+  # ---- Standalone service (uses root Dockerfile, config/ mount) ----
+
+  keyrack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    volumes:
+      - ./config:/etc/keyrack:ro
+    environment:
+      - RUST_LOG=info
+    profiles:
+      - standalone
+
+  # ---- Test / E2E infrastructure ----
+
   postgres:
     image: postgres:16-alpine
     environment:

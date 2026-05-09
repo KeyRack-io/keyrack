@@ -1,0 +1,12 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+storage:
+  type: memory
+provider:
+  type: software
+pdp:
+  type: always_allow
+audit:
+  type: stdout
+authn:
+  type: insecure
