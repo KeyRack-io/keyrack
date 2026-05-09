@@ -1,0 +1,13 @@
+[package]
+name = "keyrack-parsec"
+version = "0.1.0"
+edition = "2021"
+description = "Parsec-backed CryptoProvider for KeyRack — hardware security via TPM, PKCS#11, PSA Crypto"
+
+[dependencies]
+async-trait = "0.1"
+keyrack-core = { path = "../keyrack-core" }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

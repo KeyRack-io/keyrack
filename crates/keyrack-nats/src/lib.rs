@@ -162,3 +162,91 @@ impl InvalidationSink for NatsInvalidationSink {
         }
     }
 }
+
+/// NATS publisher for key lifecycle events (state changes, creation, rotation).
+///
+/// Publishes JSON payloads to `{prefix}.{lid}` subjects.
+pub struct NatsStateChangedPublisher {
+    client: async_nats::Client,
+    subject_prefix: String,
+}
+
+impl NatsStateChangedPublisher {
+    /// Create from an existing NATS client with a custom subject prefix.
+    pub fn new(client: async_nats::Client, prefix: String) -> Self {
+        Self {
+            client,
+            subject_prefix: prefix,
+        }
+    }
+
+    /// Connect to a NATS server and create a publisher with the given prefix.
+    pub async fn connect(nats_url: &str, prefix: String) -> Result<Self> {
+        let client = async_nats::connect(nats_url)
+            .await
+            .map_err(|e| KeyRackError::Other(format!("NATS connect: {e}")))?;
+        tracing::info!(url = %nats_url, prefix = %prefix, "NATS state-changed publisher connected");
+        Ok(Self::new(client, prefix))
+    }
+
+    /// Publish a state transition event for a key.
+    pub async fn publish_state_changed(
+        &self,
+        lid: &Lid,
+        old_state: &str,
+        new_state: &str,
+    ) -> Result<()> {
+        let subject = format!("{}.{lid}", self.subject_prefix);
+        let payload = serde_json::json!({
+            "lid": lid.to_string(),
+            "old_state": old_state,
+            "new_state": new_state,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string();
+
+        self.client
+            .publish(subject, payload.into())
+            .await
+            .map_err(|e| KeyRackError::Other(format!("NATS publish state-changed: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Publish a key-created event.
+    pub async fn publish_key_created(&self, lid: &Lid) -> Result<()> {
+        let subject = format!("{}.{lid}", self.subject_prefix);
+        let payload = serde_json::json!({
+            "lid": lid.to_string(),
+            "event": "key_created",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string();
+
+        self.client
+            .publish(subject, payload.into())
+            .await
+            .map_err(|e| KeyRackError::Other(format!("NATS publish key-created: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Publish a rotation-started event for a key.
+    pub async fn publish_rotation_started(&self, lid: &Lid, new_version: u64) -> Result<()> {
+        let subject = format!("{}.{lid}", self.subject_prefix);
+        let payload = serde_json::json!({
+            "lid": lid.to_string(),
+            "event": "rotation_started",
+            "new_version": new_version,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string();
+
+        self.client
+            .publish(subject, payload.into())
+            .await
+            .map_err(|e| KeyRackError::Other(format!("NATS publish rotation-started: {e}")))?;
+
+        Ok(())
+    }
+}
