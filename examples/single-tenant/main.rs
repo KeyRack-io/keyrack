@@ -6,23 +6,23 @@
 //
 // Run: cargo run --example single-tenant
 
-use keyrack_core::attr::AttributeSet;
 use keyrack_core::rule::RuleRegistry;
+use std::collections::BTreeMap;
 
 const NAMESPACE_YAML: &str = r#"
 namespaces:
   - name: enterprise
     max_depth: 3
     routing_rules:
-      - match:
+      - match_pattern:
           service: $service
           purpose: $purpose
         parent:
           service: $service
         priority: 0
-      - match:
+      - match_pattern:
           service: $service
-        parent: _root_
+        parent: null
         priority: 0
 "#;
 
@@ -30,7 +30,6 @@ namespaces:
 async fn main() -> anyhow::Result<()> {
     let registry = RuleRegistry::from_yaml(NAMESPACE_YAML)?;
 
-    // Different services get different key hierarchies
     let services = [
         ("database", "column-encryption"),
         ("database", "backup-encryption"),
@@ -39,16 +38,19 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     for (service, purpose) in &services {
-        let attrs = AttributeSet::from_pairs(&[
-            ("service", service),
-            ("purpose", purpose),
+        let attrs = BTreeMap::from([
+            ("service".to_string(), service.to_string()),
+            ("purpose".to_string(), purpose.to_string()),
         ]);
 
-        let matched = registry.match_rule(attrs.as_canonical())
+        let matched = registry
+            .match_rule(&attrs)
             .expect("should match a rule");
 
-        println!("service={service}, purpose={purpose} → namespace: {}, bindings: {:?}",
-            matched.namespace.name, matched.bindings);
+        println!(
+            "service={service}, purpose={purpose} → namespace: {}, bindings: {:?}",
+            matched.namespace.name, matched.bindings
+        );
     }
 
     println!("\nNo tenant attribute needed. Keys are isolated by service/purpose.");

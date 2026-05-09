@@ -1,0 +1,25 @@
+[package]
+name = "keyrack-examples"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+autolib = false
+autobins = false
+
+[dependencies]
+keyrack-core = { path = "../crates/keyrack-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[[example]]
+name = "single-tenant"
+path = "single-tenant/main.rs"
+
+[[example]]
+name = "multi-tenant"
+path = "multi-tenant/main.rs"
+
+[[example]]
+name = "webapp"
+path = "webapp/main.rs"

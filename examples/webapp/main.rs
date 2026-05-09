@@ -9,8 +9,6 @@
 //
 // Run: cargo run --example webapp
 
-use std::collections::HashMap;
-
 fn main() {
     println!("KeyRack Web Application Example");
     println!("================================\n");
