@@ -1,0 +1,18 @@
+[package]
+name = "keyrack-aws-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "FOSS AWS KMS pass-through proxy with metadata tracking"
+
+[dependencies]
+async-trait = { workspace = true }
+axum = "0.8"
+chrono = { workspace = true }
+keyrack-aws-common = { path = "../keyrack-aws-common" }
+keyrack-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
