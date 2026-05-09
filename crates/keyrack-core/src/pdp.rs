@@ -41,6 +41,8 @@ pub enum AttributeValue {
     Bool(bool),
     Integer(i64),
     StringList(Vec<String>),
+    Record(BTreeMap<String, AttributeValue>),
+    RecordList(Vec<BTreeMap<String, AttributeValue>>),
 }
 
 /// Authorization request sent to the PDP.
@@ -124,10 +126,13 @@ pub struct PolicyReason {
 pub struct Obligation {
     pub obligation_id: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub parameters: BTreeMap<String, serde_json::Value>,
+    pub parameters: BTreeMap<String, AttributeValue>,
 }
 
 /// Authorization response from the PDP.
+///
+/// `rate_limit_class` is expressed as an obligation
+/// (`obligation_id = "rate_limit_class"`), not a top-level field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzResponse {
     pub request_id: String,
@@ -138,8 +143,19 @@ pub struct AuthzResponse {
     pub obligations: Vec<Obligation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_limit_class: Option<String>,
+}
+
+impl AuthzResponse {
+    /// Extract `rate_limit_class` from the obligations array, if present.
+    pub fn rate_limit_class(&self) -> Option<&str> {
+        self.obligations.iter()
+            .find(|o| o.obligation_id == "rate_limit_class")
+            .and_then(|o| o.parameters.get("class"))
+            .and_then(|v| match v {
+                AttributeValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+    }
 }
 
 /// PDP decision.
@@ -179,7 +195,6 @@ impl PolicyDecisionPoint for AlwaysAllow {
             reasons: vec![],
             obligations: vec![],
             policy_version: None,
-            rate_limit_class: None,
         })
     }
 }
@@ -200,7 +215,6 @@ impl PolicyDecisionPoint for AlwaysDeny {
             }],
             obligations: vec![],
             policy_version: None,
-            rate_limit_class: None,
         })
     }
 }

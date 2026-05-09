@@ -77,7 +77,6 @@ impl PolicyDecisionPoint for HttpPdpClient {
                 }],
                 obligations: vec![],
                 policy_version: None,
-                rate_limit_class: None,
             });
         }
 

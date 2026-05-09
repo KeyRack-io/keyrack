@@ -175,7 +175,6 @@ impl PolicyDecisionPoint for GrpcPdpClient {
                 .collect(),
             obligations: vec![],
             policy_version: response.policy_version,
-            rate_limit_class: None,
         })
     }
 }

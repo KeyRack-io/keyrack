@@ -98,7 +98,6 @@ impl CedarEngine {
             reasons,
             obligations: vec![],
             policy_version: None,
-            rate_limit_class: None,
         })
     }
 
