@@ -13,6 +13,11 @@ members = [
     "crates/keyrack-cli",
     "crates/keyrack-wasm",
     "crates/keyrack-pii",
+    "crates/keyrack-aws-common",
+    "crates/keyrack-aws-proxy",
+    "crates/keyrack",
+    "crates/keyrack-parsec",
+    "examples",
 ]
 
 [workspace.package]
