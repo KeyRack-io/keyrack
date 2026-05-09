@@ -707,6 +707,7 @@ impl KeyService for KeyServiceImpl {
                 let limit = if req.max_results == 0 { 100 } else { req.max_results };
                 let filter = keyrack_core::storage::KeyFilter {
                     user_tags: vec![],
+                    state: None,
                     limit: Some(limit),
                     cursor: if req.cursor.is_empty() { None } else { Some(req.cursor) },
                 };

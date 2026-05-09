@@ -16,7 +16,7 @@ use crate::proto;
 use crate::proto::pdp_service_client::PdpServiceClient;
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
-use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision, PolicyDecisionPoint};
+use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision, PolicyDecisionPoint, PolicyReason};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
@@ -164,8 +164,18 @@ impl PolicyDecisionPoint for GrpcPdpClient {
         Ok(AuthzResponse {
             request_id: response.request_id,
             decision: decision_from_proto(decision),
-            reasons: response.reasons,
+            reasons: response
+                .reasons
+                .into_iter()
+                .map(|s| PolicyReason {
+                    policy_id: "external".into(),
+                    reason_code: None,
+                    human_message: Some(s),
+                })
+                .collect(),
+            obligations: vec![],
             policy_version: response.policy_version,
+            rate_limit_class: None,
         })
     }
 }

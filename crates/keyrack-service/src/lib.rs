@@ -27,6 +27,7 @@ pub mod pdp_grpc;
 pub mod pdp_http;
 pub mod rest;
 pub mod state;
+pub mod workers;
 
 pub mod proto {
     #![allow(

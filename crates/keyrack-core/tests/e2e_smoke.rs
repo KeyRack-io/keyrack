@@ -763,6 +763,7 @@ async fn pdp_always_allow_permits() {
 
     let pdp = AlwaysAllow;
     let req = AuthzRequest {
+        pdp_api_version: keyrack_core::pdp::PDP_API_VERSION.into(),
         request_id: "e2e-1".into(),
         action: AuditAction::Encrypt,
         principal: Principal::system(),
@@ -784,11 +785,13 @@ async fn pdp_always_deny_forbids() {
 
     let pdp = AlwaysDeny;
     let req = AuthzRequest {
+        pdp_api_version: keyrack_core::pdp::PDP_API_VERSION.into(),
         request_id: "e2e-2".into(),
         action: AuditAction::CreateKey,
         principal: Principal {
             id: "user:bob".into(),
             principal_type: "User".into(),
+            attributes: BTreeMap::new(),
         },
         resource: Resource {
             id: "lid_test".into(),

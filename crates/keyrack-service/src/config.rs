@@ -36,6 +36,15 @@ pub struct ServiceConfig {
 
     #[serde(default)]
     pub authn: AuthnConfig,
+
+    #[serde(default)]
+    pub provider_deny: Vec<String>,
+
+    #[serde(default = "default_max_plaintext_bytes")]
+    pub max_plaintext_bytes: usize,
+
+    #[serde(default)]
+    pub nats_notify: Option<NatsNotifyConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -48,8 +57,15 @@ impl Default for ServiceConfig {
             pdp: PdpConfig::default(),
             audit: AuditConfig::default(),
             authn: AuthnConfig::default(),
+            provider_deny: Vec::new(),
+            max_plaintext_bytes: default_max_plaintext_bytes(),
+            nats_notify: None,
         }
     }
+}
+
+fn default_max_plaintext_bytes() -> usize {
+    4096
 }
 
 fn default_grpc_addr() -> String {
@@ -148,6 +164,29 @@ fn default_bootstrap_max_age_secs() -> u64 {
     900
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatsNotifyConfig {
+    pub url: String,
+    #[serde(default = "default_audit_prefix")]
+    pub audit_subject_prefix: String,
+    #[serde(default = "default_state_changed_prefix")]
+    pub state_changed_subject_prefix: String,
+    #[serde(default = "default_invalidation_prefix")]
+    pub invalidation_subject_prefix: String,
+}
+
+fn default_audit_prefix() -> String {
+    "kms.audit".into()
+}
+
+fn default_state_changed_prefix() -> String {
+    "kms.key.state-changed".into()
+}
+
+fn default_invalidation_prefix() -> String {
+    "kms.cache.invalidate".into()
+}
+
 impl ServiceConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
@@ -176,6 +215,9 @@ mod tests {
             pdp: PdpConfig::AlwaysAllow,
             audit: AuditConfig::Stdout,
             authn: AuthnConfig::Insecure,
+            provider_deny: Vec::new(),
+            max_plaintext_bytes: default_max_plaintext_bytes(),
+            nats_notify: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();

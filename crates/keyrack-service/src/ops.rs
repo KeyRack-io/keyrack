@@ -26,7 +26,8 @@ use crate::state::ServiceState;
 use keyrack_core::audit::{
     AuditAction, AuditEvent, AuditPrincipal, AuditResource, AuditResult,
 };
-use keyrack_core::pdp::{AuthzRequest, Decision, Principal, RequestContext, Resource};
+use keyrack_core::pdp::{AuthzRequest, Decision, Principal, RequestContext, Resource, PDP_API_VERSION};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -159,6 +160,7 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
     let pdp_start = Instant::now();
 
     let request = AuthzRequest {
+        pdp_api_version: PDP_API_VERSION.into(),
         request_id: uuid::Uuid::new_v4().to_string(),
         action: ctx.action.clone(),
         principal: ctx.principal.clone(),
@@ -183,7 +185,10 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
         }
         Decision::Forbid | Decision::Indeterminate => {
             crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons = response.reasons.join("; ");
+            let reasons: String = response.reasons.iter()
+                .map(|r| r.human_message.as_deref().or(r.reason_code.as_deref()).unwrap_or(&r.policy_id))
+                .collect::<Vec<_>>()
+                .join("; ");
             Err(tonic::Status::permission_denied(format!(
                 "authorization denied: {reasons}"
             )))
@@ -230,6 +235,7 @@ async fn authorize_rest(
     let pdp_start = Instant::now();
 
     let request = AuthzRequest {
+        pdp_api_version: PDP_API_VERSION.into(),
         request_id: uuid::Uuid::new_v4().to_string(),
         action: ctx.action.clone(),
         principal: ctx.principal.clone(),
@@ -258,7 +264,10 @@ async fn authorize_rest(
         }
         Decision::Forbid | Decision::Indeterminate => {
             crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons = response.reasons.join("; ");
+            let reasons: String = response.reasons.iter()
+                .map(|r| r.human_message.as_deref().or(r.reason_code.as_deref()).unwrap_or(&r.policy_id))
+                .collect::<Vec<_>>()
+                .join("; ");
             Err(rest_error(
                 axum::http::StatusCode::FORBIDDEN,
                 "AuthorizationDenied",
@@ -315,6 +324,8 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
+        AuditAction::RotationJobExpired => EventType::RotationJobStateChanged,
+        AuditAction::KeyDestroyed => EventType::KeyDeleted,
     }
 }
 
@@ -324,6 +335,7 @@ pub fn default_principal() -> Principal {
     Principal {
         id: "keyrack:anonymous".into(),
         principal_type: "Service".into(),
+        attributes: BTreeMap::new(),
     }
 }
 

@@ -27,12 +27,29 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// PDP wire format API version (R-V1).
+pub const PDP_API_VERSION: &str = "1.0";
+
+/// Typed attribute value for PDP attribute maps.
+///
+/// Matches the partner's `oneof AttributeValue` proposal. Avoids
+/// `serde_json::Value` ambiguity for boolean/integer distinction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AttributeValue {
+    String(String),
+    Bool(bool),
+    Integer(i64),
+    StringList(Vec<String>),
+}
+
 /// Authorization request sent to the PDP.
 ///
 /// Top-level shape is stable (§8.1):
-/// `{ request_id, action, principal, resource, context }`.
+/// `{ pdp_api_version, request_id, action, principal, resource, context }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzRequest {
+    pub pdp_api_version: String,
     pub request_id: String,
     pub action: AuditAction,
     pub principal: Principal,
@@ -48,6 +65,9 @@ pub struct Principal {
     /// Principal kind (e.g. `"User"`, `"Service"`, `"Admin"`).
     #[serde(rename = "type")]
     pub principal_type: String,
+    /// Caller-specific attributes visible to the PDP (roles, tenant, etc.).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, AttributeValue>,
 }
 
 /// Well-known system principal for internal operations.
@@ -61,6 +81,7 @@ impl Principal {
         Self {
             id: SYSTEM_PRINCIPAL_ID.into(),
             principal_type: "System".into(),
+            attributes: BTreeMap::new(),
         }
     }
 }
@@ -77,7 +98,7 @@ pub struct Resource {
     /// Additional attributes visible to the PDP (e.g. identity tags,
     /// user tags, key state). Content varies by resource type.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub attributes: BTreeMap<String, serde_json::Value>,
+    pub attributes: BTreeMap<String, AttributeValue>,
 }
 
 /// Request-scoped context (non-resource, non-principal data).
@@ -85,7 +106,25 @@ pub struct Resource {
 pub struct RequestContext {
     /// Free-form context pairs visible to the PDP.
     #[serde(flatten)]
-    pub entries: BTreeMap<String, serde_json::Value>,
+    pub entries: BTreeMap<String, AttributeValue>,
+}
+
+/// Structured policy reason from the PDP (two-tier: machine + human).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyReason {
+    pub policy_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_message: Option<String>,
+}
+
+/// Obligation the caller must fulfill after a Permit decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Obligation {
+    pub obligation_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, serde_json::Value>,
 }
 
 /// Authorization response from the PDP.
@@ -94,9 +133,13 @@ pub struct AuthzResponse {
     pub request_id: String,
     pub decision: Decision,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reasons: Vec<String>,
+    pub reasons: Vec<PolicyReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<Obligation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_class: Option<String>,
 }
 
 /// PDP decision.
@@ -134,7 +177,9 @@ impl PolicyDecisionPoint for AlwaysAllow {
             request_id: request.request_id.clone(),
             decision: Decision::Permit,
             reasons: vec![],
+            obligations: vec![],
             policy_version: None,
+            rate_limit_class: None,
         })
     }
 }
@@ -148,8 +193,14 @@ impl PolicyDecisionPoint for AlwaysDeny {
         Ok(AuthzResponse {
             request_id: request.request_id.clone(),
             decision: Decision::Forbid,
-            reasons: vec!["policy: always deny".into()],
+            reasons: vec![PolicyReason {
+                policy_id: "builtin:always_deny".into(),
+                reason_code: Some("always_deny".into()),
+                human_message: Some("policy: always deny".into()),
+            }],
+            obligations: vec![],
             policy_version: None,
+            rate_limit_class: None,
         })
     }
 }
@@ -158,14 +209,15 @@ impl PolicyDecisionPoint for AlwaysDeny {
 mod tests {
     use super::*;
 
-    #[test]
-    fn authz_request_serialization() {
-        let req = AuthzRequest {
+    fn make_test_request(action: AuditAction) -> AuthzRequest {
+        AuthzRequest {
+            pdp_api_version: PDP_API_VERSION.into(),
             request_id: "req-001".into(),
-            action: AuditAction::Encrypt,
+            action,
             principal: Principal {
                 id: "user:alice".into(),
                 principal_type: "User".into(),
+                attributes: BTreeMap::new(),
             },
             resource: Resource {
                 id: "lid_abc".into(),
@@ -173,12 +225,17 @@ mod tests {
                 attributes: BTreeMap::new(),
             },
             context: RequestContext::default(),
-        };
+        }
+    }
 
+    #[test]
+    fn authz_request_serialization() {
+        let req = make_test_request(AuditAction::Encrypt);
         let json = serde_json::to_string(&req).unwrap();
         let parsed: AuthzRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.request_id, "req-001");
         assert_eq!(parsed.action, AuditAction::Encrypt);
+        assert_eq!(parsed.pdp_api_version, "1.0");
     }
 
     #[test]
@@ -186,6 +243,7 @@ mod tests {
         let p = Principal::system();
         assert_eq!(p.id, "keyrack:system");
         assert_eq!(p.principal_type, "System");
+        assert!(p.attributes.is_empty());
     }
 
     #[test]
@@ -198,17 +256,7 @@ mod tests {
     #[tokio::test]
     async fn always_allow_permits() {
         let pdp = AlwaysAllow;
-        let req = AuthzRequest {
-            request_id: "r1".into(),
-            action: AuditAction::Decrypt,
-            principal: Principal::system(),
-            resource: Resource {
-                id: "lid_x".into(),
-                resource_type: "Key".into(),
-                attributes: BTreeMap::new(),
-            },
-            context: RequestContext::default(),
-        };
+        let req = make_test_request(AuditAction::Decrypt);
         let resp = pdp.evaluate(&req).await.unwrap();
         assert!(resp.decision.is_permit());
     }
@@ -216,20 +264,7 @@ mod tests {
     #[tokio::test]
     async fn always_deny_forbids() {
         let pdp = AlwaysDeny;
-        let req = AuthzRequest {
-            request_id: "r2".into(),
-            action: AuditAction::CreateKey,
-            principal: Principal {
-                id: "user:bob".into(),
-                principal_type: "User".into(),
-            },
-            resource: Resource {
-                id: "lid_y".into(),
-                resource_type: "Key".into(),
-                attributes: BTreeMap::new(),
-            },
-            context: RequestContext::default(),
-        };
+        let req = make_test_request(AuditAction::CreateKey);
         let resp = pdp.evaluate(&req).await.unwrap();
         assert_eq!(resp.decision, Decision::Forbid);
         assert!(!resp.reasons.is_empty());
@@ -238,7 +273,7 @@ mod tests {
     #[test]
     fn resource_attributes_included() {
         let mut attrs = BTreeMap::new();
-        attrs.insert("tenant".into(), serde_json::Value::String("globex".into()));
+        attrs.insert("tenant".into(), AttributeValue::String("globex".into()));
 
         let resource = Resource {
             id: "lid_z".into(),
@@ -248,5 +283,16 @@ mod tests {
 
         let json = serde_json::to_string(&resource).unwrap();
         assert!(json.contains("globex"));
+    }
+
+    #[test]
+    fn attribute_value_serde() {
+        let av = AttributeValue::Integer(42);
+        let json = serde_json::to_string(&av).unwrap();
+        assert_eq!(json, "42");
+
+        let av2 = AttributeValue::StringList(vec!["a".into(), "b".into()]);
+        let json2 = serde_json::to_string(&av2).unwrap();
+        assert!(json2.contains("\"a\""));
     }
 }

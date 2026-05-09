@@ -181,6 +181,7 @@ impl Authenticator for BootstrapTokenAuthenticator {
             principal: Principal {
                 id: "keyrack:bootstrap-admin".into(),
                 principal_type: "Admin".into(),
+                attributes: BTreeMap::new(),
             },
             method: "bootstrap_token".into(),
         }))
@@ -228,6 +229,7 @@ impl Authenticator for InsecureAuthenticator {
             principal: Principal {
                 id: "keyrack:anonymous".into(),
                 principal_type: "Service".into(),
+                attributes: BTreeMap::new(),
             },
             method: "insecure".into(),
         }))

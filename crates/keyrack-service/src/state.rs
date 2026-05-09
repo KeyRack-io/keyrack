@@ -17,6 +17,7 @@ use keyrack_core::authn::AuthenticatorChain;
 use keyrack_core::pdp::PolicyDecisionPoint;
 use keyrack_core::provider::CryptoProvider;
 use keyrack_core::storage::StorageBackend;
+use keyrack_nats::NatsStateChangedPublisher;
 use std::sync::Arc;
 
 /// Shared state available to all RPC handlers.
@@ -31,6 +32,8 @@ pub struct ServiceState {
     pub audit: Arc<dyn AuditSink>,
     pub authn: Arc<AuthenticatorChain>,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    pub max_plaintext_bytes: usize,
+    pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
 }
 
 impl ServiceState {

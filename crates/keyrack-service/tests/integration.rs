@@ -104,6 +104,8 @@ fn build_test_state_with(
         audit,
         authn,
         metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
     })
 }
 

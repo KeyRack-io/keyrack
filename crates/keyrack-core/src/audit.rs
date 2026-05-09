@@ -152,9 +152,13 @@ pub enum AuditAction {
     #[serde(rename = "kms:FailRotationJob")]
     FailRotationJob,
 
-    // Cascade
+    // System background operations
     #[serde(rename = "kms:CascadeDisable")]
     CascadeDisable,
+    #[serde(rename = "kms:RotationJobExpired")]
+    RotationJobExpired,
+    #[serde(rename = "kms:KeyDestroyed")]
+    KeyDestroyed,
 }
 
 impl std::fmt::Display for AuditAction {

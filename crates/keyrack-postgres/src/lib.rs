@@ -200,6 +200,9 @@ impl StorageBackend for PostgresStorage {
                 .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
             let record: KeyRecord = serde_json::from_value(json)
                 .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))?;
+            if filter.state.is_some_and(|s| s != record.state) {
+                continue;
+            }
             if filter.user_tags.iter().all(|(k, v)| {
                 record.user_tags.get(k).is_some_and(|tv| tv == v)
             }) {

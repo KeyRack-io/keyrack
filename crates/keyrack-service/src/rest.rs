@@ -23,10 +23,80 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use keyrack_core::audit::AuditAction;
+use keyrack_core::key::KeyRecord;
 use std::sync::Arc;
 
 type AppState = Arc<ServiceState>;
 type RestError = (StatusCode, Json<serde_json::Value>);
+
+/// Tenant-safe key version — strips `key_handle` (provider-internal).
+#[derive(serde::Serialize)]
+struct KeyVersionResponse {
+    version_number: u64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    is_primary: bool,
+}
+
+/// Tenant-safe key response DTO.
+///
+/// Excludes `identity_tags`, `occ_version`, `canonicalization_version`,
+/// and all `key_handle` internals that are provider-private.
+#[derive(serde::Serialize)]
+struct KeyResponse {
+    lid: String,
+    state: keyrack_core::key::KeyState,
+    key_spec: keyrack_core::key::KeySpec,
+    key_usage: keyrack_core::key::KeyUsage,
+    origin: keyrack_core::key::KeyOrigin,
+    provider_class: keyrack_core::key::ProviderClass,
+    description: String,
+    user_tags: keyrack_core::tags::UserTags,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduled_deletion_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_lid: Option<String>,
+    current_key_version: u64,
+    key_versions: Vec<KeyVersionResponse>,
+}
+
+impl From<&KeyRecord> for KeyResponse {
+    fn from(r: &KeyRecord) -> Self {
+        Self {
+            lid: r.lid.to_string(),
+            state: r.state,
+            key_spec: r.key_spec.clone(),
+            key_usage: r.key_usage,
+            origin: r.origin,
+            provider_class: r.provider_class,
+            description: r.description.clone(),
+            user_tags: r.user_tags.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            scheduled_deletion_at: r.scheduled_deletion_at,
+            parent_lid: r.parent_lid.as_ref().map(ToString::to_string),
+            current_key_version: r.current_key_version,
+            key_versions: r.key_versions.iter().map(|v| KeyVersionResponse {
+                version_number: v.version_number,
+                created_at: v.created_at,
+                is_primary: v.is_primary,
+            }).collect(),
+        }
+    }
+}
+
+/// Tenant-safe list page response.
+#[derive(serde::Serialize)]
+struct KeyListResponse {
+    items: Vec<KeyResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+fn key_json(record: &KeyRecord) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(KeyResponse::from(record)).unwrap_or_default())
+}
 
 pub fn router(state: AppState) -> Router {
     let r = Router::new()
@@ -160,7 +230,7 @@ async fn create_key(
                 }],
             };
             state.storage.create_key(&record).await.map_err(map_core_err)?;
-            Ok((StatusCode::CREATED, Json(serde_json::to_value(&record).unwrap_or_default())))
+            Ok((StatusCode::CREATED, key_json(&record)))
         },
     ).await
 }
@@ -177,7 +247,7 @@ async fn get_key(
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -194,7 +264,7 @@ async fn describe_key(
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -218,7 +288,7 @@ async fn update_key(
             record.occ_version += 1;
             record.updated_at = chrono::Utc::now();
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -228,9 +298,13 @@ async fn list_keys(State(state): State<AppState>) -> Result<impl IntoResponse, R
         &state,
         OpContext::system(AuditAction::ListKeys, "", "Key"),
         |state| async move {
-            let filter = keyrack_core::storage::KeyFilter { user_tags: vec![], limit: Some(100), cursor: None };
+            let filter = keyrack_core::storage::KeyFilter { user_tags: vec![], state: None, limit: Some(100), cursor: None };
             let page = state.storage.list_keys(&filter).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&page).unwrap_or_default()))
+            let resp = KeyListResponse {
+                items: page.items.iter().map(KeyResponse::from).collect(),
+                next_cursor: page.next_cursor,
+            };
+            Ok(Json(serde_json::to_value(&resp).unwrap_or_default()))
         },
     ).await
 }
@@ -249,7 +323,7 @@ async fn enable_key(
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
             record.transition_to(keyrack_core::key::KeyState::Enabled).map_err(|(f, t)| transition_err(f, t))?;
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -268,7 +342,7 @@ async fn disable_key(
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
             record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -291,7 +365,7 @@ async fn schedule_key_deletion(
             #[allow(clippy::cast_possible_wrap)]
             { record.scheduled_deletion_at = Some(chrono::Utc::now() + chrono::Duration::days(days as i64)); }
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -314,7 +388,7 @@ async fn cancel_key_deletion(
             record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
             record.scheduled_deletion_at = None;
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }
@@ -347,7 +421,7 @@ async fn rotate_key(
             record.occ_version += 1;
             record.updated_at = chrono::Utc::now();
             state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+            Ok(key_json(&record))
         },
     ).await
 }

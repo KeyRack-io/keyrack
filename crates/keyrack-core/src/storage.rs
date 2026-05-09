@@ -40,6 +40,8 @@ pub struct Page<T: serde::Serialize> {
 pub struct KeyFilter {
     /// Only return keys matching these user-tag key-value pairs (AND).
     pub user_tags: Vec<(String, String)>,
+    /// Only return keys in this state (if set).
+    pub state: Option<crate::key::KeyState>,
     /// Maximum items to return per page.
     pub limit: Option<u32>,
     /// Opaque cursor from a previous `list_keys` call.
@@ -226,6 +228,9 @@ mod tests {
         async fn list_keys(&self, filter: &KeyFilter) -> Result<Page<KeyRecord>> {
             let keys = self.keys.lock().unwrap();
             let mut items: Vec<_> = keys.values().cloned().collect();
+            if let Some(state) = filter.state {
+                items.retain(|r| r.state == state);
+            }
             for (k, v) in &filter.user_tags {
                 items.retain(|r| r.user_tags.get(k) == Some(v.as_str()));
             }

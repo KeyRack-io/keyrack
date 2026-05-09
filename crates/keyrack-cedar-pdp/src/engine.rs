@@ -13,7 +13,7 @@
 //! Cedar policy evaluation engine with hot-reload support.
 
 use cedar_policy::{Authorizer, Context, Entities, PolicySet, Request, Schema};
-use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision};
+use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision, PolicyReason};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -82,17 +82,23 @@ impl CedarEngine {
             cedar_policy::Decision::Deny => Decision::Forbid,
         };
 
-        let reasons: Vec<String> = response
+        let reasons: Vec<PolicyReason> = response
             .diagnostics()
             .reason()
-            .map(std::string::ToString::to_string)
+            .map(|pid| PolicyReason {
+                policy_id: pid.to_string(),
+                reason_code: None,
+                human_message: None,
+            })
             .collect();
 
         Ok(AuthzResponse {
             request_id: req.request_id.clone(),
             decision,
             reasons,
+            obligations: vec![],
             policy_version: None,
+            rate_limit_class: None,
         })
     }
 

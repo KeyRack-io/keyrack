@@ -58,6 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
 
+    let deletion_handle = tokio::spawn(keyrack_service::workers::deletion_worker(
+        Arc::clone(&state),
+        cancel.clone(),
+    ));
+    let rotation_expiry_handle = tokio::spawn(keyrack_service::workers::rotation_expiry_worker(
+        Arc::clone(&state),
+        cancel.clone(),
+    ));
+
     shutdown_signal().await;
 
     const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -67,8 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match tokio::time::timeout(DRAIN_TIMEOUT, async {
         let _ = grpc_handle.await;
         let _ = rest_handle.await;
+        let _ = deletion_handle.await;
+        let _ = rotation_expiry_handle.await;
     }).await {
-        Ok(_) => tracing::info!("all servers drained and stopped"),
+        Ok(_) => tracing::info!("all servers and workers drained"),
         Err(_) => tracing::warn!("drain timeout reached, forcing shutdown"),
     }
 
@@ -132,6 +143,15 @@ async fn build_state(
         }
     };
 
+    let provider_class = match &config.provider {
+        ProviderConfig::Software => "software",
+        ProviderConfig::InMemory => "in_memory",
+        ProviderConfig::Pkcs11 { .. } => "pkcs11",
+    };
+    if config.provider_deny.iter().any(|d| d == provider_class) {
+        return Err(format!("provider class '{provider_class}' is in the deny list").into());
+    }
+
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = match &config.pdp {
         PdpConfig::AlwaysAllow => Arc::new(keyrack_core::pdp::AlwaysAllow),
         PdpConfig::AlwaysDeny => Arc::new(keyrack_core::pdp::AlwaysDeny),
@@ -185,6 +205,17 @@ async fn build_state(
         Arc::new(AuthenticatorChain::new(authenticators))
     };
 
+    let nats_publisher = if let Some(nats_cfg) = &config.nats_notify {
+        let publisher = keyrack_nats::NatsStateChangedPublisher::connect(
+            &nats_cfg.url,
+            nats_cfg.state_changed_subject_prefix.clone(),
+        )
+        .await?;
+        Some(Arc::new(publisher))
+    } else {
+        None
+    };
+
     Ok(ServiceState {
         storage,
         provider,
@@ -192,6 +223,8 @@ async fn build_state(
         audit,
         authn,
         metrics_handle,
+        max_plaintext_bytes: config.max_plaintext_bytes,
+        nats_publisher,
     })
 }
 

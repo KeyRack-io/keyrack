@@ -18,7 +18,7 @@
 
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
-use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision, PolicyDecisionPoint};
+use keyrack_core::pdp::{AuthzRequest, AuthzResponse, Decision, PolicyDecisionPoint, PolicyReason};
 use std::time::Duration;
 
 pub struct HttpPdpClient {
@@ -70,8 +70,14 @@ impl PolicyDecisionPoint for HttpPdpClient {
             return Ok(AuthzResponse {
                 request_id: request.request_id.clone(),
                 decision: Decision::Forbid,
-                reasons: vec![format!("PDP returned HTTP {status}")],
+                reasons: vec![PolicyReason {
+                    policy_id: "external".into(),
+                    reason_code: None,
+                    human_message: Some(format!("PDP returned HTTP {status}")),
+                }],
+                obligations: vec![],
                 policy_version: None,
+                rate_limit_class: None,
             });
         }
 
