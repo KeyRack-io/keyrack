@@ -275,26 +275,35 @@ impl Authenticator for MtlsAuthenticator {
         // Scan Subject Alternative Names for SPIFFE URIs and DNS names.
         let mut spiffe_id: Option<String> = None;
         if let Some(extensions) = &cert.tbs_certificate.extensions {
+            const SAN_OID: der::oid::ObjectIdentifier =
+                der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
             for ext in extensions.iter() {
-                if let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
-                    for name in san.0.iter() {
-                        match name {
-                            GeneralName::UniformResourceIdentifier(uri) => {
-                                let uri_str = uri.as_str();
-                                if uri_str.starts_with("spiffe://") {
-                                    tracing::debug!(spiffe_id = uri_str, "found SPIFFE ID in SAN");
-                                    attributes.insert(
-                                        "spiffe_id".into(),
-                                        AttributeValue::String(uri_str.to_owned()),
-                                    );
-                                    spiffe_id = Some(uri_str.to_owned());
-                                }
+                if ext.extn_id != SAN_OID {
+                    continue;
+                }
+                let san =
+                    SubjectAltName::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                        AuthnError::InvalidCredential(format!(
+                            "failed to parse SubjectAltName extension: {e}"
+                        ))
+                    })?;
+                for name in san.0.iter() {
+                    match name {
+                        GeneralName::UniformResourceIdentifier(uri) => {
+                            let uri_str = uri.as_str();
+                            if uri_str.starts_with("spiffe://") {
+                                tracing::debug!(spiffe_id = uri_str, "found SPIFFE ID in SAN");
+                                attributes.insert(
+                                    "spiffe_id".into(),
+                                    AttributeValue::String(uri_str.to_owned()),
+                                );
+                                spiffe_id = Some(uri_str.to_owned());
                             }
-                            GeneralName::DnsName(dns) => {
-                                tracing::debug!(dns_san = dns.as_str(), "found DNS SAN (not used as principal)");
-                            }
-                            _ => {}
                         }
+                        GeneralName::DnsName(dns) => {
+                            tracing::debug!(dns_san = dns.as_str(), "found DNS SAN (not used as principal)");
+                        }
+                        _ => {}
                     }
                 }
             }

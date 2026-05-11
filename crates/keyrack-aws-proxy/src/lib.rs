@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{body::Bytes, Json, Router};
@@ -26,6 +26,8 @@ pub enum KmsProxyError {
     ParseError(#[from] keyrack_aws_common::KmsError),
 }
 
+const AMZ_JSON_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+
 impl IntoResponse for KmsProxyError {
     fn into_response(self) -> axum::response::Response {
         let (status, body) = match &self {
@@ -42,7 +44,7 @@ impl IntoResponse for KmsProxyError {
                 keyrack_aws_common::error_response("ValidationException", &e.to_string()),
             ),
         };
-        (status, Json(body)).into_response()
+        (status, [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)], Json(body)).into_response()
     }
 }
 
@@ -236,7 +238,7 @@ pub async fn proxy_handler(
         }
     }
 
-    Ok((StatusCode::OK, Json(response)))
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)], Json(response)))
 }
 
 /// Extracts the key ID from the request body or response, depending on

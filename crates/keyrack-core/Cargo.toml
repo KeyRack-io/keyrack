@@ -25,7 +25,7 @@ serde_yaml = "0.9"
 
 # Crypto primitives for software/in-memory providers
 aes-gcm = "0.10"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"

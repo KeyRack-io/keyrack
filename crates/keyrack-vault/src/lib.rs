@@ -120,6 +120,28 @@ impl VaultTransitProvider {
         })
     }
 
+    async fn vault_post_no_body<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
+        let url = self.url(path);
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| KeyRackError::Provider(format!("vault request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = parse_vault_errors(&text).unwrap_or(text);
+            return Err(KeyRackError::Provider(format!(
+                "vault {path} returned {status}: {msg}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn vault_delete(&self, path: &str) -> Result<()> {
         let url = self.url(path);
         let resp = self
@@ -182,18 +204,6 @@ fn vault_signature_algorithm(alg: SigningAlgorithm) -> Option<&'static str> {
         SigningAlgorithm::RsaPssSha256 => Some("pss"),
         _ => None,
     }
-}
-
-/// Strip the `vault:vN:` prefix from Vault ciphertext, returning raw bytes.
-fn strip_vault_prefix(ct: &str) -> Result<Vec<u8>> {
-    let payload = ct
-        .strip_prefix("vault:")
-        .and_then(|s| s.split_once(':').map(|(_, data)| data))
-        .ok_or_else(|| {
-            KeyRackError::Provider(format!("unexpected vault ciphertext format: {ct}"))
-        })?;
-    B64.decode(payload)
-        .map_err(|e| KeyRackError::Provider(format!("base64 decode failed: {e}")))
 }
 
 // ── Vault API request/response shapes ──────────────────────────────────
@@ -298,9 +308,6 @@ struct KeyConfigRequest {
     deletion_allowed: bool,
 }
 
-#[derive(Deserialize)]
-struct CreateKeyResponse {}
-
 // ── CryptoProvider impl ────────────────────────────────────────────────
 
 #[async_trait]
@@ -311,17 +318,8 @@ impl CryptoProvider for VaultTransitProvider {
             key_type: vault_key_type(spec),
         };
 
-        let _: CreateKeyResponse = self
-            .vault_post(&format!("keys/{key_name}"), &body)
-            .await
-            .or_else(|e| {
-                // Vault returns 204 No Content on key creation; handle empty body.
-                if e.to_string().contains("failed to parse vault response") {
-                    Ok(CreateKeyResponse {})
-                } else {
-                    Err(e)
-                }
-            })?;
+        self.vault_post_no_body(&format!("keys/{key_name}"), &body)
+            .await?;
 
         tracing::info!(key_name = %key_name, key_type = vault_key_type(spec), "vault transit key created");
 
@@ -403,8 +401,9 @@ impl CryptoProvider for VaultTransitProvider {
             .vault_post(&format!("sign/{}", handle.key_id), &body)
             .await?;
 
-        // Vault returns `vault:vN:<base64_signature>`.
-        strip_vault_prefix(&resp.data.signature)
+        // Preserve the full Vault-formatted signature (vault:vN:base64)
+        // so verify() can pass it back without hardcoding the version.
+        Ok(resp.data.signature.into_bytes())
     }
 
     async fn verify(
@@ -414,9 +413,9 @@ impl CryptoProvider for VaultTransitProvider {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
-        // Re-encode signature in vault format for the verify endpoint.
-        let sig_b64 = B64.encode(signature);
-        let vault_sig = format!("vault:v1:{sig_b64}");
+        let vault_sig = std::str::from_utf8(signature)
+            .map_err(|e| KeyRackError::Provider(format!("signature is not valid UTF-8: {e}")))?
+            .to_owned();
 
         let body = VerifyRequest {
             input: B64.encode(message),
@@ -455,19 +454,8 @@ impl CryptoProvider for VaultTransitProvider {
         let config = KeyConfigRequest {
             deletion_allowed: true,
         };
-        self.vault_post::<_, serde_json::Value>(
-            &format!("keys/{}/config", handle.key_id),
-            &config,
-        )
-        .await
-        .or_else(|e| {
-            // 204 No Content is expected.
-            if e.to_string().contains("failed to parse vault response") {
-                Ok(serde_json::Value::Null)
-            } else {
-                Err(e)
-            }
-        })?;
+        self.vault_post_no_body(&format!("keys/{}/config", handle.key_id), &config)
+            .await?;
 
         // Step 2: delete the key.
         self.vault_delete(&format!("keys/{}", handle.key_id))

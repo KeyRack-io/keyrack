@@ -493,8 +493,8 @@ impl AuditSigner {
     /// computes the Ed25519 signature over the canonical JSON (with signature
     /// fields excluded), then updates the chain hash.
     pub fn sign_event(&self, event: &mut AuditEvent) {
-        let prev = self.previous_hash.lock().unwrap().clone();
-        event.previous_hash = Some(prev);
+        let mut prev_hash = self.previous_hash.lock().unwrap();
+        event.previous_hash = Some(prev_hash.clone());
         event.signature = None;
 
         let canonical = serde_json::to_string(event)
@@ -506,7 +506,7 @@ impl AuditSigner {
         event.signature = Some(sig_hex.clone());
 
         let new_hash = blake3::hash(sig_hex.as_bytes());
-        *self.previous_hash.lock().unwrap() = hex_encode(new_hash.as_bytes());
+        *prev_hash = hex_encode(new_hash.as_bytes());
     }
 
     /// Returns the public verifying key for external consumers to verify events.
