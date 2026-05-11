@@ -133,6 +133,74 @@ The header is authenticated (included in AES-GCM AAD) but not encrypted.
 
 ---
 
+## AES-GCM nonce budget
+
+AES-256-GCM uses a 96-bit (12-byte) random nonce. The birthday bound
+gives a collision probability of approximately 2^{-32} after 2^{32}
+encryptions under the same key. Beyond this threshold, nonce reuse
+becomes probable, which is catastrophic for GCM (leaks the
+authentication key and enables forgery).
+
+**Practical implication**: a single KeyRack key version should not
+encrypt more than ~4 billion ciphertexts. This is enforced
+operationally rather than technically:
+
+| Control | Status |
+|---------|--------|
+| Rotation policy (30d/90d/365d) resets the counter | Implemented |
+| Monitoring: per-key-version encrypt counter | Planned (dashboard) |
+| Hard cap: reject encrypt after 2^{31} operations per version | Not yet implemented |
+
+For most workloads the rotation policy alone keeps usage well below
+the bound. High-throughput scenarios (>1 billion encrypts per key
+version) should use shorter rotation intervals or a deterministic
+nonce scheme (AES-GCM-SIV), which KeyRack does not currently support.
+
+The nonce is generated using the OS CSPRNG (`OsRng`) via the `aes-gcm`
+crate's built-in nonce generation, not a counter. This means the
+birthday bound applies rather than the stronger sequential bound.
+
+---
+
+## Zeroization posture
+
+KeyRack uses the `zeroize` crate for memory cleanup of sensitive data.
+Current coverage:
+
+| Material | Zeroized on drop? | Mechanism |
+|----------|:-----------------:|-----------|
+| `Sensitive<Vec<u8>>` (plaintext, DEK) | Yes | `Zeroize` derive on `Sensitive<T>` |
+| AES-256 key bytes (software provider) | Yes | Wrapped in `Sensitive` |
+| Ed25519 signing key | Yes | `ed25519-dalek` zeroizes on drop |
+| RSA private key | Partial | `rsa` crate does not guarantee zeroization of all internal `BigUint` limbs |
+| ECDSA P-256 private key | Partial | `p256::SecretKey` implements `Zeroize` but intermediate scalars during signing may not be zeroized |
+| PKCS#11 PIN | Yes | Zeroized after session open |
+| Bootstrap token | No | `String` in config; lives for process lifetime |
+| gRPC/REST request plaintext | No | Tonic/axum buffers are standard `Vec<u8>` |
+| Provider-returned ciphertext | No | Not sensitive (ciphertext), but occupies memory until GC |
+
+### Known gaps
+
+1. **RSA limbs**: The `rsa` crate's `BigUint` values are heap-allocated
+   and may leave residual copies during modular exponentiation. This is
+   a known limitation of the RustCrypto RSA implementation. Mitigation:
+   use PKCS#11 for RSA in production (HSM handles zeroization).
+
+2. **Transport buffers**: Plaintext bytes in tonic/axum request buffers
+   are not zeroized after the handler returns. The data is dropped
+   normally (freed but not scrubbed). Mitigation: use orchestration
+   mode (`--no-default-features`) to keep plaintext out of the service
+   entirely.
+
+3. **Stack copies**: The Rust compiler may create temporary copies of
+   sensitive data on the stack during optimization. This is inherent to
+   safe Rust and cannot be fully mitigated without `unsafe` and
+   platform-specific memory barriers. The `zeroize` crate uses
+   `core::sync::atomic::compiler_fence` to discourage (but not
+   guarantee) elision of zeroing writes.
+
+---
+
 ## Vulnerability disclosure
 
 If you discover a security vulnerability in KeyRack:

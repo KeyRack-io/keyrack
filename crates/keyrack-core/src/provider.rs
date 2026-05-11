@@ -60,6 +60,7 @@ pub enum SigningAlgorithm {
     Ed25519,
     EcdsaP256Sha256,
     RsaPkcs1v15Sha256,
+    RsaPssSha256,
 }
 
 /// Algorithm selector for encryption operations.

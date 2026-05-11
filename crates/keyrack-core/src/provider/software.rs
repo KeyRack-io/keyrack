@@ -38,7 +38,8 @@ use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rsa::pkcs1v15::{SigningKey as RsaSigningKey, VerifyingKey as RsaVerifyingKey};
-use rsa::signature::{SignatureEncoding as _, Signer as _, Verifier as _};
+use rsa::pss::{SigningKey as RsaPssSigningKey, VerifyingKey as RsaPssVerifyingKey};
+use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _, Signer as _, Verifier as _};
 use rsa::RsaPrivateKey;
 use sha2::Sha256;
 
@@ -125,7 +126,8 @@ impl CryptoProvider for SoftwareProvider {
                 let signing_key = P256SigningKey::random(&mut OsRng);
                 KeyMaterial::EcdsaP256(signing_key)
             }
-            KeySpec::RsaPkcs1v15Sha256 { key_size } => {
+            KeySpec::RsaPkcs1v15Sha256 { key_size }
+            | KeySpec::RsaPssSha256 { key_size } => {
                 let bits = *key_size as usize;
                 if !(2048..=4096).contains(&bits) {
                     return Err(KeyRackError::Provider(format!(
@@ -269,6 +271,15 @@ impl CryptoProvider for SoftwareProvider {
                     .sign(message);
                 Ok(sig.to_vec())
             }
+            SigningAlgorithm::RsaPssSha256 => {
+                let private_key = Self::get_material(&keys, handle, |m| match m {
+                    KeyMaterial::Rsa(k) => Some(k.as_ref()),
+                    _ => None,
+                })?;
+                let signing_key = RsaPssSigningKey::<Sha256>::new(private_key.clone());
+                let sig = signing_key.sign_with_rng(&mut OsRng, message);
+                Ok(sig.to_vec())
+            }
         }
     }
 
@@ -316,6 +327,17 @@ impl CryptoProvider for SoftwareProvider {
                     .map_err(|e| KeyRackError::Provider(format!("invalid RSA sig: {e}")))?;
                 Ok(verifying_key.verify(message, &sig).is_ok())
             }
+            SigningAlgorithm::RsaPssSha256 => {
+                let private_key = Self::get_material(&keys, handle, |m| match m {
+                    KeyMaterial::Rsa(k) => Some(k.as_ref()),
+                    _ => None,
+                })?;
+                let verifying_key =
+                    RsaPssVerifyingKey::<Sha256>::new(private_key.to_public_key());
+                let sig = rsa::pss::Signature::try_from(signature)
+                    .map_err(|e| KeyRackError::Provider(format!("invalid RSA-PSS sig: {e}")))?;
+                Ok(verifying_key.verify(message, &sig).is_ok())
+            }
         }
     }
 
@@ -347,7 +369,10 @@ impl CryptoProvider for SoftwareProvider {
                 KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
                 KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops.clone() },
                 KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 }, operations: signing_ops },
+                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 }, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 2048 }, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 3072 }, operations: signing_ops.clone() },
+                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 4096 }, operations: signing_ops },
             ],
             supports_generate_random: true,
             supports_atomic_data_key: false,

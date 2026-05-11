@@ -17,6 +17,7 @@ members = [
     "crates/keyrack-aws-proxy",
     "crates/keyrack",
     "crates/keyrack-parsec",
+    "crates/keyrack-e2e",
     "examples",
 ]
 
@@ -35,7 +36,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"

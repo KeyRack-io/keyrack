@@ -111,6 +111,7 @@ pub enum KeySpec {
     Aes256,
     Ed25519,
     RsaPkcs1v15Sha256 { key_size: u32 },
+    RsaPssSha256 { key_size: u32 },
     EcdsaP256Sha256,
 }
 

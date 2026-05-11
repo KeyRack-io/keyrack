@@ -139,7 +139,8 @@ impl KmipProvider {
             KeySpec::Aes256 => (ttlv::crypto_algorithm::AES, 256, true),
             KeySpec::Ed25519 => (ttlv::crypto_algorithm::ED25519, 256, false),
             KeySpec::EcdsaP256Sha256 => (ttlv::crypto_algorithm::ECDSA, 256, false),
-            KeySpec::RsaPkcs1v15Sha256 { key_size } => {
+            KeySpec::RsaPkcs1v15Sha256 { key_size }
+            | KeySpec::RsaPssSha256 { key_size } => {
                 (ttlv::crypto_algorithm::RSA, *key_size as i32, false)
             }
         }

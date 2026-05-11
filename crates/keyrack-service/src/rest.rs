@@ -182,10 +182,13 @@ async fn create_key(
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::CreateKey, principal, "(new)"),
+        op_ctx,
         |state| async move {
             let spec_str = body.get("key_spec").and_then(|v| v.as_str()).unwrap_or("AES_256");
             let spec = match spec_str {
@@ -195,10 +198,20 @@ async fn create_key(
                 "RSA_2048" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
                 "RSA_3072" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 },
                 "RSA_4096" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 },
+                "RSA_PSS_2048" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 },
+                "RSA_PSS_3072" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 3072 },
+                "RSA_PSS_4096" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 },
                 _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeySpec", &format!("unknown key_spec: {spec_str}"))),
             };
             let handle = state.provider.generate_key(&spec).await.map_err(map_core_err)?;
             let (lid, attrs) = generate_key_lid();
+
+            let parent_lid = body.get("parent_key_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(parse_lid_rest)
+                .transpose()?;
+
             let now = chrono::Utc::now();
             let key_usage = match spec {
                 keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
@@ -208,14 +221,14 @@ async fn create_key(
             let record = keyrack_core::key::KeyRecord {
                 lid,
                 canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
-                parent_lid: None,
+                parent_lid,
                 occ_version: 1,
                 current_key_version: 1,
                 state: keyrack_core::key::KeyState::Enabled,
                 key_usage,
                 key_spec: spec,
                 origin: keyrack_core::key::KeyOrigin::KeyRack,
-                provider_class: keyrack_core::key::ProviderClass::Software,
+                provider_class: state.provider_class,
                 identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
                 user_tags: keyrack_core::tags::UserTags::new(),
                 created_at: now,
@@ -240,10 +253,13 @@ async fn get_key(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::GetKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::GetKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -257,10 +273,13 @@ async fn describe_key(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::DescribeKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::DescribeKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -275,10 +294,13 @@ async fn update_key(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::UpdateKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::UpdateKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -314,10 +336,13 @@ async fn enable_key(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::EnableKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::EnableKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -333,10 +358,13 @@ async fn disable_key(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::DisableKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::DisableKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -353,10 +381,13 @@ async fn schedule_key_deletion(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -375,10 +406,13 @@ async fn cancel_key_deletion(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -398,10 +432,13 @@ async fn rotate_key(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::RotateKey, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -436,6 +473,7 @@ async fn encrypt(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let ec_hash = body.get("encryption_context")
         .and_then(|v| v.as_object())
@@ -444,6 +482,7 @@ async fn encrypt(
         .map(keyrack_core::encryption_context::EncryptionContext::hash);
     let mut op_ctx = OpContext::key(AuditAction::Encrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
         op_ctx,
@@ -458,10 +497,11 @@ async fn encrypt(
             let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
             let primary = record.key_versions.iter().find(|v| v.is_primary)
                 .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
-            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let output = state.provider.encrypt(&primary.key_handle, &plaintext, &aad).await.map_err(map_core_err)?;
+            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
             let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
             let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
+            let aad = header.build_aad(&ec_aad);
+            let output = state.provider.encrypt(&primary.key_handle, &plaintext, &aad).await.map_err(map_core_err)?;
             let blob = header.wrap_payload(&output.ciphertext);
             Ok(Json(serde_json::json!({
                 "ciphertext_blob": base64_encode(&blob),
@@ -478,6 +518,7 @@ async fn decrypt(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let ec_hash = body.get("encryption_context")
         .and_then(|v| v.as_object())
@@ -486,6 +527,7 @@ async fn decrypt(
         .map(keyrack_core::encryption_context::EncryptionContext::hash);
     let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
         op_ctx,
@@ -508,7 +550,8 @@ async fn decrypt(
                 .find(|v| v.version_number == header.key_version)
                 .map(|v| &v.key_handle)
                 .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "key version not found"))?;
-            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let aad = header.build_aad(&ec_aad);
             let plaintext = state.provider.decrypt(version_handle, ciphertext, &aad).await.map_err(map_core_err)?;
             Ok(Json(serde_json::json!({
                 "plaintext": base64_encode(plaintext.expose()),
@@ -525,10 +568,13 @@ async fn sign(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Sign, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -537,6 +583,7 @@ async fn sign(
                 "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
                 "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
                 "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+                "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
                 _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
             };
             let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -560,10 +607,13 @@ async fn verify(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::Verify, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -572,6 +622,7 @@ async fn verify(
                 "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
                 "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
                 "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+                "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
                 _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
             };
             let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
@@ -594,6 +645,7 @@ async fn generate_data_key(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let ec_hash = body.get("encryption_context")
         .and_then(|v| v.as_object())
@@ -602,6 +654,7 @@ async fn generate_data_key(
         .map(keyrack_core::encryption_context::EncryptionContext::hash);
     let mut op_ctx = OpContext::key(AuditAction::GenerateDataKey, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
         op_ctx,
@@ -614,12 +667,13 @@ async fn generate_data_key(
             let primary = record.key_versions.iter().find(|v| v.is_primary)
                 .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
             let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
+            let aad = header.build_aad(&ec_aad);
             #[allow(clippy::cast_possible_truncation)]
             let dek_len = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
             let output = state.provider.generate_data_key(&primary.key_handle, dek_len, &aad).await.map_err(map_core_err)?;
-            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
             Ok(Json(serde_json::json!({
                 "plaintext_data_key": base64_encode(&output.plaintext_key.into_inner()),
                 "encrypted_data_key": base64_encode(&header.wrap_payload(&output.encrypted_key)),
@@ -636,6 +690,7 @@ async fn re_encrypt(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let dst_key_id = body.get("destination_key_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
     let ec_hash = body.get("destination_encryption_context")
@@ -645,6 +700,7 @@ async fn re_encrypt(
         .map(keyrack_core::encryption_context::EncryptionContext::hash);
     let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
         op_ctx,
@@ -661,14 +717,16 @@ async fn re_encrypt(
             let dst_ec = body.get("destination_encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
             let src_version = src_record.key_versions.iter().find(|v| v.version_number == header.key_version)
                 .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "source key version not found"))?;
-            let src_aad = src_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let src_ec_aad = src_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let src_aad = header.build_aad(&src_ec_aad);
             let plaintext = state.provider.decrypt(&src_version.key_handle, ciphertext, &src_aad).await.map_err(map_core_err)?;
             let dst_primary = dst_record.key_versions.iter().find(|v| v.is_primary)
                 .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "dest has no primary"))?;
-            let dst_aad = dst_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let output = state.provider.encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad).await.map_err(map_core_err)?;
             let dst_ec_hash = dst_ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
             let new_header = keyrack_core::header::CiphertextHeader::new(dst_record.lid, dst_record.current_key_version, dst_ec_hash);
+            let dst_ec_aad = dst_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
+            let dst_aad = new_header.build_aad(&dst_ec_aad);
+            let output = state.provider.encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad).await.map_err(map_core_err)?;
             Ok(Json(serde_json::json!({
                 "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
                 "source_key_id": src_record.lid.to_string(),
@@ -702,10 +760,13 @@ async fn list_resource_tags(
     headers: axum::http::HeaderMap,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::ListResourceTags, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::ListResourceTags, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -721,10 +782,13 @@ async fn tag_resource(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::TagResource, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::TagResource, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -749,10 +813,13 @@ async fn untag_resource(
     Path(key_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::UntagResource, principal, &key_id);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::key(AuditAction::UntagResource, principal, &key_id),
+        op_ctx,
         |state| async move {
             let lid = parse_lid_rest(&key_id)?;
             let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
@@ -776,11 +843,14 @@ async fn create_alias(
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let alias_name = body.get("alias_name").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let mut op_ctx = OpContext::alias(AuditAction::CreateAlias, principal, &alias_name);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::alias(AuditAction::CreateAlias, principal, &alias_name),
+        op_ctx,
         |state| async move {
             let target_key_id = body.get("target_key_id").and_then(|v| v.as_str()).unwrap_or("");
             let lid = parse_lid_rest(target_key_id)?;
@@ -812,10 +882,13 @@ async fn delete_alias(
     headers: axum::http::HeaderMap,
     Path(alias_name): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name);
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name),
+        op_ctx,
         |state| async move {
             state.storage.delete_alias(&alias_name).await.map_err(map_core_err)?;
             Ok(StatusCode::NO_CONTENT)

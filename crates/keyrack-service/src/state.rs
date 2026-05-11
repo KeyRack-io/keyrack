@@ -34,6 +34,7 @@ pub struct ServiceState {
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub max_plaintext_bytes: usize,
     pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
+    pub provider_class: keyrack_core::key::ProviderClass,
 }
 
 impl ServiceState {

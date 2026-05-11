@@ -259,6 +259,12 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srn: Option<String>,
 
+    /// The x-request-id propagated from the incoming request (a partner
+    /// integration contract). Enables end-to-end correlation across
+    /// service boundaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+
     /// Free-form metadata for action-specific details (e.g. state
     /// transition from/to, cascade duration, error message).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -289,6 +295,7 @@ impl AuditEvent {
             tenant: None,
             project: None,
             srn: None,
+            request_id: None,
             metadata: serde_json::Map::new(),
         }
     }
@@ -302,6 +309,13 @@ impl AuditEvent {
             let _ = write!(hex, "{byte:02x}");
         }
         self.encryption_context_hash = Some(hex);
+        self
+    }
+
+    /// Attach the x-request-id for end-to-end correlation.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
         self
     }
 

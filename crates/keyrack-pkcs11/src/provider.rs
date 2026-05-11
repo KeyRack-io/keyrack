@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::aead::GcmParams;
 use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
-use cryptoki::mechanism::Mechanism;
+use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
+use cryptoki::mechanism::{Mechanism, MechanismType};
 use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::types::AuthPin;
@@ -322,6 +323,17 @@ fn pkcs11_sign(
             .sign(&Mechanism::Sha256RsaPkcs, priv_handle, message)
             .map_err(|e| KeyRackError::Provider(format!("RSA sign: {e}"))),
 
+        SigningAlgorithm::RsaPssSha256 => {
+            let pss_params = PkcsPssParams {
+                hash_alg: MechanismType::SHA256,
+                mgf: PkcsMgfType::MGF1_SHA256,
+                s_len: 32.into(),
+            };
+            session
+                .sign(&Mechanism::Sha256RsaPkcsPss(pss_params), priv_handle, message)
+                .map_err(|e| KeyRackError::Provider(format!("RSA-PSS sign: {e}")))
+        }
+
         SigningAlgorithm::EcdsaP256Sha256 => {
             let hash = sha256_hash(message);
             let raw_sig = session
@@ -349,6 +361,15 @@ fn pkcs11_verify(
 
         SigningAlgorithm::RsaPkcs1v15Sha256 => {
             session.verify(&Mechanism::Sha256RsaPkcs, pub_handle, message, signature)
+        }
+
+        SigningAlgorithm::RsaPssSha256 => {
+            let pss_params = PkcsPssParams {
+                hash_alg: MechanismType::SHA256,
+                mgf: PkcsMgfType::MGF1_SHA256,
+                s_len: 32.into(),
+            };
+            session.verify(&Mechanism::Sha256RsaPkcsPss(pss_params), pub_handle, message, signature)
         }
 
         SigningAlgorithm::EcdsaP256Sha256 => {
@@ -496,7 +517,8 @@ impl CryptoProvider for Pkcs11Provider {
                 KeySpec::EcdsaP256Sha256 => {
                     generate_ec_key_pair(session, &label_for_closure, P256_OID_DER)?;
                 }
-                KeySpec::RsaPkcs1v15Sha256 { key_size } => {
+                KeySpec::RsaPkcs1v15Sha256 { key_size }
+                | KeySpec::RsaPssSha256 { key_size } => {
                     generate_rsa_key_pair(session, &label_for_closure, *key_size)?;
                 }
             }

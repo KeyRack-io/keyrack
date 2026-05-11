@@ -40,6 +40,15 @@ pub fn proto_to_key_spec(spec: proto::KeySpec) -> Option<keyrack_core::key::KeyS
             key_size: 4096,
         }),
         proto::KeySpec::EcdsaP256 => Some(keyrack_core::key::KeySpec::EcdsaP256Sha256),
+        proto::KeySpec::RsaPss2048 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
+            key_size: 2048,
+        }),
+        proto::KeySpec::RsaPss3072 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
+            key_size: 3072,
+        }),
+        proto::KeySpec::RsaPss4096 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
+            key_size: 4096,
+        }),
         proto::KeySpec::Unspecified => None,
     }
 }
@@ -54,6 +63,11 @@ pub fn key_spec_to_proto(spec: &keyrack_core::key::KeySpec) -> proto::KeySpec {
             _ => proto::KeySpec::Rsa2048,
         },
         keyrack_core::key::KeySpec::EcdsaP256Sha256 => proto::KeySpec::EcdsaP256,
+        keyrack_core::key::KeySpec::RsaPssSha256 { key_size } => match key_size {
+            3072 => proto::KeySpec::RsaPss3072,
+            4096 => proto::KeySpec::RsaPss4096,
+            _ => proto::KeySpec::RsaPss2048,
+        },
     }
 }
 
@@ -70,6 +84,9 @@ pub fn proto_to_signing_algorithm(
         proto::SigningAlgorithm::EcdsaP256Sha256 => {
             Some(keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256)
         }
+        proto::SigningAlgorithm::RsaPssSha256 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPssSha256)
+        }
         proto::SigningAlgorithm::Unspecified => None,
     }
 }
@@ -84,6 +101,9 @@ pub fn signing_algorithm_to_proto(
         }
         keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256 => {
             proto::SigningAlgorithm::EcdsaP256Sha256
+        }
+        keyrack_core::provider::SigningAlgorithm::RsaPssSha256 => {
+            proto::SigningAlgorithm::RsaPssSha256
         }
     }
 }

@@ -141,12 +141,22 @@ async fn build_state(
             };
             Arc::new(keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?)
         }
+        ProviderConfig::Kmip { .. } => {
+            return Err("KMIP provider not yet implemented".into());
+        }
     };
 
+    let provider_class_enum = match &config.provider {
+        ProviderConfig::Software => keyrack_core::key::ProviderClass::Software,
+        ProviderConfig::InMemory => keyrack_core::key::ProviderClass::InMemory,
+        ProviderConfig::Pkcs11 { .. } => keyrack_core::key::ProviderClass::Pkcs11,
+        ProviderConfig::Kmip { .. } => keyrack_core::key::ProviderClass::Kmip,
+    };
     let provider_class = match &config.provider {
         ProviderConfig::Software => "software",
         ProviderConfig::InMemory => "in_memory",
         ProviderConfig::Pkcs11 { .. } => "pkcs11",
+        ProviderConfig::Kmip { .. } => "kmip",
     };
     if config.provider_deny.iter().any(|d| d == provider_class) {
         return Err(format!("provider class '{provider_class}' is in the deny list").into());
@@ -225,6 +235,7 @@ async fn build_state(
         metrics_handle,
         max_plaintext_bytes: config.max_plaintext_bytes,
         nats_publisher,
+        provider_class: provider_class_enum,
     })
 }
 

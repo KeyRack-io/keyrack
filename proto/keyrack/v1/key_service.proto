@@ -99,6 +99,9 @@ enum KeySpec {
   RSA_3072 = 4;
   RSA_4096 = 5;
   ECDSA_P256 = 6;
+  RSA_PSS_2048 = 7;
+  RSA_PSS_3072 = 8;
+  RSA_PSS_4096 = 9;
 }
 
 enum KeyUsage {
@@ -127,6 +130,7 @@ enum SigningAlgorithm {
   ED25519_PURE = 1;
   RSA_PKCS1_V15_SHA256 = 2;
   ECDSA_P256_SHA256 = 3;
+  RSA_PSS_SHA256 = 4;
 }
 
 // Key metadata visible to callers (identity tags excluded per §5.14).

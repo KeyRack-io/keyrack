@@ -36,6 +36,10 @@ impl KeyServiceImpl {
     async fn principal<T>(&self, request: &Request<T>) -> keyrack_core::pdp::Principal {
         ops::extract_principal_grpc(&self.state, request).await
     }
+
+    fn request_id<T>(&self, request: &Request<T>) -> String {
+        ops::extract_request_id_grpc(request)
+    }
 }
 
 #[cfg(not(feature = "crypto-endpoints"))]
@@ -99,6 +103,7 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
@@ -112,6 +117,7 @@ impl KeyService for KeyServiceImpl {
 
         let mut op_ctx = OpContext::key(AuditAction::Encrypt, principal, &key_id);
         op_ctx.encryption_context_hash = ec_hash;
+        op_ctx.request_id = request_id;
 
         ops::execute(
             &self.state,
@@ -138,16 +144,10 @@ impl KeyService for KeyServiceImpl {
                     .find(|v| v.is_primary)
                     .ok_or_else(|| Status::internal("no primary key version"))?;
 
-                let aad = ec
+                let ec_aad = ec
                     .as_ref()
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
-
-                let output = state
-                    .provider
-                    .encrypt(&primary_version.key_handle, &req.plaintext, &aad)
-                    .await
-                    .map_err(convert::error_to_status)?;
 
                 let ec_hash = ec.as_ref().map_or(
                     [0u8; 32],
@@ -159,6 +159,14 @@ impl KeyService for KeyServiceImpl {
                     record.current_key_version,
                     ec_hash,
                 );
+
+                let aad = header.build_aad(&ec_aad);
+
+                let output = state
+                    .provider
+                    .encrypt(&primary_version.key_handle, &req.plaintext, &aad)
+                    .await
+                    .map_err(convert::error_to_status)?;
 
                 let ciphertext_blob = header.wrap_payload(&output.ciphertext);
 
@@ -183,6 +191,7 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
@@ -196,6 +205,7 @@ impl KeyService for KeyServiceImpl {
 
         let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
         op_ctx.encryption_context_hash = ec_hash;
+        op_ctx.request_id = request_id;
 
         ops::execute(
             &self.state,
@@ -235,10 +245,12 @@ impl KeyService for KeyServiceImpl {
                     .map(|v| &v.key_handle)
                     .ok_or_else(|| Status::not_found("key version not found"))?;
 
-                let aad = ec
+                let ec_aad = ec
                     .as_ref()
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
+
+                let aad = header.build_aad(&ec_aad);
 
                 let plaintext = state
                     .provider
@@ -265,6 +277,7 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let src_key_id = req.source_key_id.clone();
@@ -278,6 +291,7 @@ impl KeyService for KeyServiceImpl {
 
         let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id);
         op_ctx.encryption_context_hash = dst_ec_hash;
+        op_ctx.request_id = request_id;
 
         ops::execute(
             &self.state,
@@ -300,9 +314,10 @@ impl KeyService for KeyServiceImpl {
                     .find(|v| v.version_number == header.key_version)
                     .ok_or_else(|| Status::not_found("source key version not found"))?;
 
-                let src_aad = src_ec.as_ref()
+                let src_ec_aad = src_ec.as_ref()
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
+                let src_aad = header.build_aad(&src_ec_aad);
 
                 let plaintext = state.provider
                     .decrypt(&src_version.key_handle, ciphertext, &src_aad)
@@ -312,14 +327,6 @@ impl KeyService for KeyServiceImpl {
                     .find(|v| v.is_primary)
                     .ok_or_else(|| Status::internal("destination has no primary version"))?;
 
-                let dst_aad = dst_ec.as_ref()
-                    .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
-                    .unwrap_or_default();
-
-                let output = state.provider
-                    .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
-                    .await.map_err(convert::error_to_status)?;
-
                 let dst_ec_hash = dst_ec.as_ref().map_or(
                     [0u8; 32],
                     keyrack_core::encryption_context::EncryptionContext::hash,
@@ -328,6 +335,15 @@ impl KeyService for KeyServiceImpl {
                 let new_header = keyrack_core::header::CiphertextHeader::new(
                     dst_record.lid, dst_record.current_key_version, dst_ec_hash,
                 );
+
+                let dst_ec_aad = dst_ec.as_ref()
+                    .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+                    .unwrap_or_default();
+                let dst_aad = new_header.build_aad(&dst_ec_aad);
+
+                let output = state.provider
+                    .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                    .await.map_err(convert::error_to_status)?;
 
                 Ok(Response::new(proto::ReEncryptResponse {
                     ciphertext_blob: new_header.wrap_payload(&output.ciphertext),
@@ -348,6 +364,7 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
@@ -361,6 +378,7 @@ impl KeyService for KeyServiceImpl {
 
         let mut op_ctx = OpContext::key(AuditAction::GenerateDataKey, principal, &key_id);
         op_ctx.encryption_context_hash = ec_hash;
+        op_ctx.request_id = request_id;
 
         ops::execute(
             &self.state,
@@ -377,15 +395,9 @@ impl KeyService for KeyServiceImpl {
                     .ok_or_else(|| Status::internal("no primary key version"))?;
 
                 let ec = build_encryption_context(&req.encryption_context);
-                let aad = ec.as_ref()
+                let ec_aad = ec.as_ref()
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
-
-                let dek_len = dek_length_from_spec(req.key_spec);
-
-                let output = state.provider
-                    .generate_data_key(&primary.key_handle, dek_len, &aad)
-                    .await.map_err(convert::error_to_status)?;
 
                 let ec_hash = ec.as_ref().map_or(
                     [0u8; 32],
@@ -395,6 +407,13 @@ impl KeyService for KeyServiceImpl {
                 let header = keyrack_core::header::CiphertextHeader::new(
                     record.lid, record.current_key_version, ec_hash,
                 );
+
+                let aad = header.build_aad(&ec_aad);
+                let dek_len = dek_length_from_spec(req.key_spec);
+
+                let output = state.provider
+                    .generate_data_key(&primary.key_handle, dek_len, &aad)
+                    .await.map_err(convert::error_to_status)?;
 
                 Ok(Response::new(proto::GenerateDataKeyResponse {
                     plaintext_data_key: output.plaintext_key.into_inner(),
@@ -415,6 +434,7 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
@@ -428,6 +448,7 @@ impl KeyService for KeyServiceImpl {
 
         let mut op_ctx = OpContext::key(AuditAction::GenerateDataKeyWithoutPlaintext, principal, &key_id);
         op_ctx.encryption_context_hash = ec_hash;
+        op_ctx.request_id = request_id;
 
         ops::execute(
             &self.state,
@@ -441,15 +462,16 @@ impl KeyService for KeyServiceImpl {
                 let primary = record.key_versions.iter().find(|v| v.is_primary)
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let ec = build_encryption_context(&req.encryption_context);
-                let aad = ec.as_ref()
+                let ec_aad = ec.as_ref()
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
+                let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
+                let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
+                let aad = header.build_aad(&ec_aad);
                 let dek_len = dek_length_from_spec(req.key_spec);
                 let output = state.provider
                     .generate_data_key(&primary.key_handle, dek_len, &aad)
                     .await.map_err(convert::error_to_status)?;
-                let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-                let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
                 Ok(Response::new(proto::GenerateDataKeyWithoutPlaintextResponse {
                     encrypted_data_key: header.wrap_payload(&output.encrypted_key),
                     key_id: record.lid.to_string(),
@@ -468,11 +490,14 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let req = request.into_inner();
 
+        let mut op_ctx = OpContext::system(AuditAction::GenerateRandom, "", "System");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::system(AuditAction::GenerateRandom, "", "System"),
+            op_ctx,
             |state| async move {
                 let random_bytes = state
                     .provider
@@ -497,13 +522,16 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Sign, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let alg_proto = proto::SigningAlgorithm::try_from(req.signing_algorithm)
                     .unwrap_or(proto::SigningAlgorithm::Unspecified);
@@ -539,13 +567,16 @@ impl KeyService for KeyServiceImpl {
 
         #[cfg(feature = "crypto-endpoints")]
         {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
 
+        let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::Verify, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let alg_proto = proto::SigningAlgorithm::try_from(req.signing_algorithm)
                     .unwrap_or(proto::SigningAlgorithm::Unspecified);
@@ -577,12 +608,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateKeyRequest>,
     ) -> Result<Response<proto::CreateKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
 
+        let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::CreateKey, principal, "(new)"),
+            op_ctx,
             |state| async move {
                 let spec = convert::proto_to_key_spec(
                     proto::KeySpec::try_from(req.key_spec).unwrap_or(proto::KeySpec::Unspecified),
@@ -593,6 +627,12 @@ impl KeyService for KeyServiceImpl {
 
                 let (lid, attrs) = generate_key_lid();
 
+                let parent_lid = req.parent_key_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(parse_lid)
+                    .transpose()?;
+
                 let now = chrono::Utc::now();
                 let key_usage = match spec {
                     keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
@@ -602,14 +642,14 @@ impl KeyService for KeyServiceImpl {
                 let record = keyrack_core::key::KeyRecord {
                     lid,
                     canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
-                    parent_lid: None,
+                    parent_lid,
                     occ_version: 1,
                     current_key_version: 1,
                     state: keyrack_core::key::KeyState::Enabled,
                     key_usage,
                     key_spec: spec,
                     origin: keyrack_core::key::KeyOrigin::KeyRack,
-                    provider_class: keyrack_core::key::ProviderClass::Software,
+                    provider_class: state.provider_class,
                     identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
                     user_tags: keyrack_core::tags::UserTags::new(),
                     created_at: now,
@@ -637,11 +677,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRequest>,
     ) -> Result<Response<proto::GetKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::GetKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -656,11 +699,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DescribeKeyRequest>,
     ) -> Result<Response<proto::DescribeKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::DescribeKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::DescribeKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -675,12 +721,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::UpdateKeyRequest>,
     ) -> Result<Response<proto::UpdateKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::UpdateKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::UpdateKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -699,9 +748,12 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListKeysRequest>,
     ) -> Result<Response<proto::ListKeysResponse>, Status> {
+        let request_id = self.request_id(&request);
+        let mut op_ctx = OpContext::system(AuditAction::ListKeys, "", "Key");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::system(AuditAction::ListKeys, "", "Key"),
+            op_ctx,
             |state| async move {
                 let req = request.into_inner();
                 let limit = if req.max_results == 0 { 100 } else { req.max_results };
@@ -725,11 +777,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::EnableKeyRequest>,
     ) -> Result<Response<proto::EnableKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::EnableKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::EnableKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -748,11 +803,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DisableKeyRequest>,
     ) -> Result<Response<proto::DisableKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::DisableKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::DisableKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -814,12 +872,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ScheduleKeyDeletionRequest>,
     ) -> Result<Response<proto::ScheduleKeyDeletionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -841,11 +902,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CancelKeyDeletionRequest>,
     ) -> Result<Response<proto::CancelKeyDeletionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -868,11 +932,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::RotateKeyRequest>,
     ) -> Result<Response<proto::RotateKeyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::RotateKey, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -893,31 +960,42 @@ impl KeyService for KeyServiceImpl {
                 record.updated_at = chrono::Utc::now();
                 state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
 
-                // Create rotation jobs for dependent keys (§5.6)
-                let dependents = state.storage.list_children(&lid).await
-                    .map_err(convert::error_to_status)?;
-                for dep in &dependents {
-                    let job = keyrack_core::rotation::RotationJob::new(
-                        uuid::Uuid::new_v4().to_string(),
-                        lid,
-                        dep.lid,
-                        new_version,
-                    );
-                    if let Err(e) = state.storage.create_rotation_job(&job).await {
-                        tracing::warn!(
-                            parent = %lid,
-                            dependent = %dep.lid,
-                            error = %e,
-                            "failed to create rotation job for dependent"
+                // Create rotation jobs for all descendant keys recursively (§5.6)
+                let mut queue = vec![lid];
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(lid);
+                let mut total_jobs = 0usize;
+                while let Some(parent_lid) = queue.pop() {
+                    let children = state.storage.list_children(&parent_lid).await
+                        .map_err(convert::error_to_status)?;
+                    for dep in &children {
+                        if !visited.insert(dep.lid) {
+                            continue;
+                        }
+                        let job = keyrack_core::rotation::RotationJob::new(
+                            uuid::Uuid::new_v4().to_string(),
+                            lid,
+                            dep.lid,
+                            new_version,
                         );
+                        if let Err(e) = state.storage.create_rotation_job(&job).await {
+                            tracing::warn!(
+                                parent = %lid,
+                                dependent = %dep.lid,
+                                error = %e,
+                                "failed to create rotation job for dependent"
+                            );
+                        }
+                        total_jobs += 1;
+                        queue.push(dep.lid);
                     }
                 }
-                if !dependents.is_empty() {
+                if total_jobs > 0 {
                     tracing::info!(
                         key = %key_id,
                         new_version,
-                        jobs_created = dependents.len(),
-                        "rotation jobs created for dependents"
+                        jobs_created = total_jobs,
+                        "rotation jobs created for descendants (recursive)"
                     );
                 }
 
@@ -936,12 +1014,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListKeyVersionsRequest>,
     ) -> Result<Response<proto::ListKeyVersionsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::ListKeyVersions, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ListKeyVersions, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -958,12 +1039,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyVersionRequest>,
     ) -> Result<Response<proto::GetKeyVersionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyVersion, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyVersion, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -978,22 +1062,32 @@ impl KeyService for KeyServiceImpl {
     }
 
     // ── Rotation control ────────────────────────────────────────────
-    // Rotation policy is stored per-key as metadata. Since the KeyRecord
-    // doesn't yet have a rotation_policy field, these RPCs use a minimal
-    // in-memory representation derived from the key's version history.
+    // Rotation policy is persisted via user_tags on the KeyRecord:
+    //   _keyrack_rotation_enabled      = "true" | "false"
+    //   _keyrack_rotation_interval_days = "<u32>"
 
     async fn enable_key_rotation(
         &self,
         request: Request<proto::EnableKeyRotationRequest>,
     ) -> Result<Response<proto::EnableKeyRotationResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::EnableKeyRotation, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::EnableKeyRotation, principal, &key_id),
-            |_state| async move {
-                let _lid = parse_lid(&key_id)?;
-                tracing::info!(key_id, "rotation enabled (policy persistence pending)");
+            op_ctx,
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut record = state.storage.get_key(&lid).await
+                    .map_err(convert::error_to_status)?;
+                record.user_tags.set("_keyrack_rotation_enabled", "true");
+                record.occ_version += 1;
+                record.updated_at = chrono::Utc::now();
+                state.storage.update_key(&record).await
+                    .map_err(convert::error_to_status)?;
+                tracing::info!(key_id, "rotation enabled");
                 Ok(Response::new(proto::EnableKeyRotationResponse {}))
             },
         ).await
@@ -1003,14 +1097,24 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DisableKeyRotationRequest>,
     ) -> Result<Response<proto::DisableKeyRotationResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::DisableKeyRotation, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::DisableKeyRotation, principal, &key_id),
-            |_state| async move {
-                let _lid = parse_lid(&key_id)?;
-                tracing::info!(key_id, "rotation disabled (policy persistence pending)");
+            op_ctx,
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut record = state.storage.get_key(&lid).await
+                    .map_err(convert::error_to_status)?;
+                record.user_tags.set("_keyrack_rotation_enabled", "false");
+                record.occ_version += 1;
+                record.updated_at = chrono::Utc::now();
+                state.storage.update_key(&record).await
+                    .map_err(convert::error_to_status)?;
+                tracing::info!(key_id, "rotation disabled");
                 Ok(Response::new(proto::DisableKeyRotationResponse {}))
             },
         ).await
@@ -1020,20 +1124,25 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRotationStatusRequest>,
     ) -> Result<Response<proto::GetKeyRotationStatusResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationStatus, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyRotationStatus, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let rotation_enabled = record.user_tags.get("_keyrack_rotation_enabled")
+                    .map_or(false, |v| v == "true");
                 let last_rotated = record.key_versions.iter()
                     .filter(|v| !v.is_primary)
                     .max_by_key(|v| v.version_number)
                     .map(|v| convert::datetime_to_timestamp(&v.created_at));
                 Ok(Response::new(proto::GetKeyRotationStatusResponse {
-                    rotation_enabled: false,
+                    rotation_enabled,
                     next_rotation_date: None,
                     last_rotated_at: last_rotated,
                 }))
@@ -1046,12 +1155,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRotationHistoryRequest>,
     ) -> Result<Response<proto::GetKeyRotationHistoryResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationHistory, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyRotationHistory, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -1077,16 +1189,28 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::GetKeyRotationPolicyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationPolicy, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyRotationPolicy, principal, &key_id),
-            |_state| async move {
+            op_ctx,
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let record = state.storage.get_key(&lid).await
+                    .map_err(convert::error_to_status)?;
+                let enabled = record.user_tags.get("_keyrack_rotation_enabled")
+                    .map_or(false, |v| v == "true");
+                let rotation_interval_days = record.user_tags
+                    .get("_keyrack_rotation_interval_days")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
                 Ok(Response::new(proto::GetKeyRotationPolicyResponse {
                     policy: Some(proto::RotationPolicy {
-                        enabled: false,
-                        rotation_interval_days: 0,
+                        enabled,
+                        rotation_interval_days,
                     }),
                 }))
             },
@@ -1097,20 +1221,35 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::SetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::SetKeyRotationPolicyResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::SetKeyRotationPolicy, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::SetKeyRotationPolicy, principal, &key_id),
-            |_state| async move {
-                let _lid = parse_lid(&key_id)?;
+            op_ctx,
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut record = state.storage.get_key(&lid).await
+                    .map_err(convert::error_to_status)?;
                 if let Some(policy) = &req.policy {
+                    let enabled_str = if policy.enabled { "true" } else { "false" };
+                    record.user_tags.set("_keyrack_rotation_enabled", enabled_str);
+                    record.user_tags.set(
+                        "_keyrack_rotation_interval_days",
+                        &policy.rotation_interval_days.to_string(),
+                    );
+                    record.occ_version += 1;
+                    record.updated_at = chrono::Utc::now();
+                    state.storage.update_key(&record).await
+                        .map_err(convert::error_to_status)?;
                     tracing::info!(
                         key_id,
                         enabled = policy.enabled,
                         interval_days = policy.rotation_interval_days,
-                        "rotation policy set (persistence pending)"
+                        "rotation policy persisted"
                     );
                 }
                 Ok(Response::new(proto::SetKeyRotationPolicyResponse {}))
@@ -1124,12 +1263,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyDependentsRequest>,
     ) -> Result<Response<proto::GetKeyDependentsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyDependents, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyDependents, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut dependents = Vec::new();
@@ -1163,11 +1305,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetKeyAncestorsRequest>,
     ) -> Result<Response<proto::GetKeyAncestorsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyAncestors, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::GetKeyAncestors, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut ancestors = Vec::new();
@@ -1200,12 +1345,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateAliasRequest>,
     ) -> Result<Response<proto::CreateAliasResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let alias_name = req.alias_name.clone();
+        let mut op_ctx = OpContext::alias(AuditAction::CreateAlias, principal, &alias_name);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::alias(AuditAction::CreateAlias, principal, &alias_name),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&req.target_key_id)?;
                 let alias = keyrack_core::storage::AliasRecord {
@@ -1226,11 +1374,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DeleteAliasRequest>,
     ) -> Result<Response<proto::DeleteAliasResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let alias_name = request.into_inner().alias_name;
+        let mut op_ctx = OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name),
+            op_ctx,
             |state| async move {
                 state.storage.delete_alias(&alias_name).await.map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::DeleteAliasResponse {}))
@@ -1242,9 +1393,11 @@ impl KeyService for KeyServiceImpl {
         &self,
         _request: Request<proto::ListAliasesRequest>,
     ) -> Result<Response<proto::ListAliasesResponse>, Status> {
+        let mut op_ctx = OpContext::system(AuditAction::ListAliases, "", "Alias");
+        op_ctx.request_id = ops::extract_request_id_grpc(&_request);
         ops::execute(
             &self.state,
-            OpContext::system(AuditAction::ListAliases, "", "Alias"),
+            op_ctx,
             |state| async move {
                 let aliases = state.storage.list_aliases().await.map_err(convert::error_to_status)?;
                 let alias_list = aliases.iter().map(|a| proto::AliasEntry {
@@ -1263,12 +1416,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::TagResourceRequest>,
     ) -> Result<Response<proto::TagResourceResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::TagResource, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::TagResource, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -1285,12 +1441,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::UntagResourceRequest>,
     ) -> Result<Response<proto::UntagResourceResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
+        let mut op_ctx = OpContext::key(AuditAction::UntagResource, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::UntagResource, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -1307,11 +1466,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListResourceTagsRequest>,
     ) -> Result<Response<proto::ListResourceTagsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::ListResourceTags, principal, &key_id);
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::key(AuditAction::ListResourceTags, principal, &key_id),
+            op_ctx,
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
@@ -1327,11 +1489,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CreateHsmConnectionRequest>,
     ) -> Result<Response<proto::CreateHsmConnectionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
+        let mut op_ctx = OpContext::resource(AuditAction::CreateHsmConnection, principal, "", "HsmConnection");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::CreateHsmConnection, principal, "", "HsmConnection"),
+            op_ctx,
             |state| async move {
                 let conn = keyrack_core::hsm::HsmConnection::new(
                     uuid::Uuid::new_v4().to_string(),
@@ -1351,11 +1516,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetHsmConnectionRequest>,
     ) -> Result<Response<proto::GetHsmConnectionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
+        let mut op_ctx = OpContext::resource(AuditAction::GetHsmConnection, principal, &conn_id, "HsmConnection");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::GetHsmConnection, principal, &conn_id, "HsmConnection"),
+            op_ctx,
             |state| async move {
                 let conn = state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::GetHsmConnectionResponse {
@@ -1369,11 +1537,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListHsmConnectionsRequest>,
     ) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let _req = request.into_inner();
+        let mut op_ctx = OpContext::resource(AuditAction::ListHsmConnections, principal, "*", "HsmConnection");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::ListHsmConnections, principal, "*", "HsmConnection"),
+            op_ctx,
             |state| async move {
                 let conns = state.storage.list_hsm_connections().await.map_err(convert::error_to_status)?;
                 let connections = conns.iter().map(hsm_connection_to_proto).collect();
@@ -1389,11 +1560,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DeleteHsmConnectionRequest>,
     ) -> Result<Response<proto::DeleteHsmConnectionResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
+        let mut op_ctx = OpContext::resource(AuditAction::DeleteHsmConnection, principal, &conn_id, "HsmConnection");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::DeleteHsmConnection, principal, &conn_id, "HsmConnection"),
+            op_ctx,
             |state| async move {
                 state.storage.delete_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::DeleteHsmConnectionResponse {}))
@@ -1405,11 +1579,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::GetHsmConnectionStatusRequest>,
     ) -> Result<Response<proto::GetHsmConnectionStatusResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let conn_id = request.into_inner().connection_id;
+        let mut op_ctx = OpContext::resource(AuditAction::GetHsmConnectionStatus, principal, &conn_id, "HsmConnection");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::GetHsmConnectionStatus, principal, &conn_id, "HsmConnection"),
+            op_ctx,
             |state| async move {
                 let conn = state.storage.get_hsm_connection(&conn_id).await.map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::GetHsmConnectionStatusResponse {
@@ -1427,12 +1604,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::RegisterNamespaceRequest>,
     ) -> Result<Response<proto::RegisterNamespaceResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let name = req.name.clone();
+        let mut op_ctx = OpContext::resource(AuditAction::RegisterNamespace, principal, &name, "Namespace");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::RegisterNamespace, principal, &name, "Namespace"),
+            op_ctx,
             |_state| async move {
                 tracing::info!(name, "namespace registered (in-memory only)");
                 Ok(Response::new(proto::RegisterNamespaceResponse { name }))
@@ -1444,11 +1624,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListNamespacesRequest>,
     ) -> Result<Response<proto::ListNamespacesResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let _req = request.into_inner();
+        let mut op_ctx = OpContext::resource(AuditAction::ListNamespaces, principal, "*", "Namespace");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::ListNamespaces, principal, "*", "Namespace"),
+            op_ctx,
             |_state| async move {
                 Ok(Response::new(proto::ListNamespacesResponse {
                     names: vec![],
@@ -1461,11 +1644,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::DescribeNamespaceRequest>,
     ) -> Result<Response<proto::DescribeNamespaceResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let name = request.into_inner().name;
+        let mut op_ctx = OpContext::resource(AuditAction::DescribeNamespace, principal, &name, "Namespace");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::DescribeNamespace, principal, &name, "Namespace"),
+            op_ctx,
             |_state| async move {
                 Err(Status::not_found(format!("namespace '{name}' not found (namespace registry pending)")))
             },
@@ -1479,11 +1665,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::ListRotationJobsRequest>,
     ) -> Result<Response<proto::ListRotationJobsResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
+        let mut op_ctx = OpContext::resource(AuditAction::ListRotationJobs, principal, "*", "RotationJob");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::ListRotationJobs, principal, "*", "RotationJob"),
+            op_ctx,
             |state| async move {
                 let state_filter = req.state_filter.and_then(|s| {
                     proto::RotationJobState::try_from(s).ok()
@@ -1507,11 +1696,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::AcknowledgeRotationJobRequest>,
     ) -> Result<Response<proto::AcknowledgeRotationJobResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let job_id = request.into_inner().job_id;
+        let mut op_ctx = OpContext::resource(AuditAction::AcknowledgeRotationJob, principal, &job_id, "RotationJob");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::AcknowledgeRotationJob, principal, &job_id, "RotationJob"),
+            op_ctx,
             |state| async move {
                 let mut job = state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
                 job.transition_to(keyrack_core::rotation::RotationJobState::Acknowledged)
@@ -1528,11 +1720,14 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::CompleteRotationJobRequest>,
     ) -> Result<Response<proto::CompleteRotationJobResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let job_id = request.into_inner().job_id;
+        let mut op_ctx = OpContext::resource(AuditAction::CompleteRotationJob, principal, &job_id, "RotationJob");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::CompleteRotationJob, principal, &job_id, "RotationJob"),
+            op_ctx,
             |state| async move {
                 let mut job = state.storage.get_rotation_job(&job_id).await.map_err(convert::error_to_status)?;
                 job.transition_to(keyrack_core::rotation::RotationJobState::Completed)
@@ -1549,12 +1744,15 @@ impl KeyService for KeyServiceImpl {
         &self,
         request: Request<proto::FailRotationJobRequest>,
     ) -> Result<Response<proto::FailRotationJobResponse>, Status> {
+        let request_id = self.request_id(&request);
         let principal = self.principal(&request).await;
         let req = request.into_inner();
         let job_id = req.job_id.clone();
+        let mut op_ctx = OpContext::resource(AuditAction::FailRotationJob, principal, &job_id, "RotationJob");
+        op_ctx.request_id = request_id;
         ops::execute(
             &self.state,
-            OpContext::resource(AuditAction::FailRotationJob, principal, &job_id, "RotationJob"),
+            op_ctx,
             |state| async move {
                 let mut job = state.storage.get_rotation_job(&req.job_id).await.map_err(convert::error_to_status)?;
                 job.fail(&req.reason).map_err(|(from, to)| Status::failed_precondition(format!("cannot transition from {from} to {to}")))?;

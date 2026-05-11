@@ -103,6 +103,13 @@ pub enum ProviderConfig {
         token_label: String,
         pin: String,
     },
+    Kmip {
+        host: String,
+        port: u16,
+        client_cert: String,
+        client_key: String,
+        ca_cert: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

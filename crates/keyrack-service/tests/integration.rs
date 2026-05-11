@@ -106,6 +106,7 @@ fn build_test_state_with(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        provider_class: keyrack_core::key::ProviderClass::Software,
     })
 }
 

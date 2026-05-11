@@ -125,6 +125,21 @@ impl CiphertextHeader {
         self.encryption_context_hash != ZERO_CONTEXT_HASH
     }
 
+    /// Build the AAD (Additional Authenticated Data) for AES-GCM.
+    ///
+    /// The AAD is the encoded header bytes concatenated with the
+    /// caller-supplied encryption context AAD. This binds the header
+    /// fields (LID, key version, EC hash) into the GCM authentication
+    /// tag, preventing header tampering without detection.
+    #[must_use]
+    pub fn build_aad(&self, ec_aad: &[u8]) -> Vec<u8> {
+        let header_bytes = self.encode();
+        let mut aad = Vec::with_capacity(HEADER_SIZE + ec_aad.len());
+        aad.extend_from_slice(&header_bytes);
+        aad.extend_from_slice(ec_aad);
+        aad
+    }
+
     /// Pack header + ciphertext payload into a single blob.
     #[must_use]
     pub fn wrap_payload(&self, ciphertext_payload: &[u8]) -> Vec<u8> {

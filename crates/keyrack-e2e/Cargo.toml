@@ -5,9 +5,6 @@ edition = "2021"
 description = "E2E test + demo binary for KeyRack — exercises gRPC and REST from the outside"
 publish = false
 
-# Standalone crate (not in the workspace) to avoid slowing normal builds.
-[workspace]
-
 [[bin]]
 name = "keyrack-e2e"
 path = "src/main.rs"

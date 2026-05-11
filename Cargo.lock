@@ -2091,6 +2091,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyrack-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "prost",
+ "prost-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic 0.12.3",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "keyrack-examples"
 version = "0.0.0"
 dependencies = [

@@ -31,6 +31,32 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Generate a new request ID (UUIDv7 for monotonic time-ordering).
+pub fn new_request_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Extract x-request-id from gRPC metadata, falling back to a generated UUIDv7.
+pub fn extract_request_id_grpc<T>(request: &tonic::Request<T>) -> String {
+    request
+        .metadata()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(new_request_id)
+}
+
+/// Extract x-request-id from HTTP headers, falling back to a generated UUIDv7.
+pub fn extract_request_id_rest(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(new_request_id)
+}
+
 /// Extension type inserted into tonic requests by the TLS interceptor
 /// when mTLS client certificates are available. Each entry is a DER-encoded cert.
 #[derive(Debug, Clone)]
@@ -43,6 +69,8 @@ pub struct OpContext {
     pub resource_id: String,
     pub resource_type: String,
     pub encryption_context_hash: Option<[u8; 32]>,
+    /// Propagated x-request-id for end-to-end correlation (a partner contract).
+    pub request_id: String,
 }
 
 impl OpContext {
@@ -53,6 +81,7 @@ impl OpContext {
             resource_id: key_id.to_owned(),
             resource_type: "Key".into(),
             encryption_context_hash: None,
+            request_id: new_request_id(),
         }
     }
 
@@ -63,6 +92,7 @@ impl OpContext {
             resource_id: alias_name.to_owned(),
             resource_type: "Alias".into(),
             encryption_context_hash: None,
+            request_id: new_request_id(),
         }
     }
 
@@ -73,6 +103,7 @@ impl OpContext {
             resource_id: resource_id.to_owned(),
             resource_type: resource_type.to_owned(),
             encryption_context_hash: None,
+            request_id: new_request_id(),
         }
     }
 
@@ -83,6 +114,7 @@ impl OpContext {
             resource_id: resource_id.to_owned(),
             resource_type: resource_type.to_owned(),
             encryption_context_hash: None,
+            request_id: new_request_id(),
         }
     }
 }
@@ -107,6 +139,7 @@ where
     Fut: std::future::Future<Output = Result<T, tonic::Status>>,
 {
     let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize(state, &ctx).await {
         emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
@@ -146,7 +179,8 @@ async fn emit_audit(
             resource_type: ctx.resource_type.clone(),
         },
         result,
-    );
+    )
+    .with_request_id(ctx.request_id.clone());
     if let Some(hash) = ctx.encryption_context_hash {
         event = event.with_encryption_context_hash(hash);
     }
@@ -161,7 +195,7 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
 
     let request = AuthzRequest {
         pdp_api_version: PDP_API_VERSION.into(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: ctx.request_id.clone(),
         action: ctx.action.clone(),
         principal: ctx.principal.clone(),
         resource: Resource {
@@ -208,6 +242,7 @@ where
     Fut: std::future::Future<Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>>,
 {
     let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize_rest(state, &ctx).await {
         emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
@@ -236,7 +271,7 @@ async fn authorize_rest(
 
     let request = AuthzRequest {
         pdp_api_version: PDP_API_VERSION.into(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: ctx.request_id.clone(),
         action: ctx.action.clone(),
         principal: ctx.principal.clone(),
         resource: Resource {
