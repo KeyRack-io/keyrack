@@ -4,15 +4,26 @@ version = "0.1.0"
 edition = "2021"
 description = "FOSS AWS KMS pass-through proxy with metadata tracking"
 
+[[bin]]
+name = "keyrack-aws-proxy"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
 axum = "0.8"
 chrono = { workspace = true }
 keyrack-aws-common = { path = "../keyrack-aws-common" }
 keyrack-core = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

@@ -21,6 +21,7 @@ pub fn key_state_to_proto(state: &KeyState) -> proto::KeyState {
         KeyState::Creating => proto::KeyState::Creating,
         KeyState::Enabled => proto::KeyState::Enabled,
         KeyState::Disabled => proto::KeyState::Disabled,
+        KeyState::Compromised => proto::KeyState::Compromised,
         KeyState::PendingDeletion => proto::KeyState::PendingDeletion,
         KeyState::Destroyed => proto::KeyState::Destroyed,
     }

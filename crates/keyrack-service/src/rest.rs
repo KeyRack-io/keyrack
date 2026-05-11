@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/:key_id/actions-disable", post(disable_key))
         .route("/v1/keys/:key_id/actions-schedule-deletion", post(schedule_key_deletion))
         .route("/v1/keys/:key_id/actions-cancel-deletion", post(cancel_key_deletion))
+        .route("/v1/keys/:key_id/actions-report-compromise", post(report_key_compromise))
         .route("/v1/keys/:key_id/actions-rotate", post(rotate_key));
 
     // Crypto operation routes: gated behind the `crypto-endpoints` feature.
@@ -203,6 +204,12 @@ async fn create_key(
                 "RSA_PSS_4096" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 },
                 _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeySpec", &format!("unknown key_spec: {spec_str}"))),
             };
+            if matches!(&spec, keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 } | keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 }) {
+                tracing::warn!(
+                    "RSA-2048 provides only 112-bit security and is deprecated per NIST guidance (2030 deadline). \
+                     Consider RSA-3072+ or ECDSA P-256 for new keys."
+                );
+            }
             let handle = state.provider.generate_key(&spec).await.map_err(map_core_err)?;
             let (lid, attrs) = generate_key_lid();
 
@@ -422,6 +429,34 @@ async fn cancel_key_deletion(
             record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
             record.scheduled_deletion_at = None;
             state.storage.update_key(&record).await.map_err(map_core_err)?;
+            Ok(key_json(&record))
+        },
+    ).await
+}
+
+async fn report_key_compromise(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key_id): Path<String>,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::ReportKeyCompromise, principal, &key_id);
+    op_ctx.request_id = request_id;
+    ops::execute_rest(
+        &state,
+        op_ctx,
+        |state| async move {
+            let lid = parse_lid_rest(&key_id)?;
+            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+            let old_state = record.state.to_string();
+            record.transition_to(keyrack_core::key::KeyState::Compromised).map_err(|(f, t)| transition_err(f, t))?;
+            state.storage.update_key(&record).await.map_err(map_core_err)?;
+            if let Some(nats) = &state.nats_publisher {
+                if let Err(e) = nats.publish_state_changed(&lid, &old_state, "compromised").await {
+                    tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
+                }
+            }
             Ok(key_json(&record))
         },
     ).await

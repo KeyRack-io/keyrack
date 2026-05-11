@@ -29,7 +29,9 @@
 use crate::lid::Lid;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -67,6 +69,8 @@ pub enum AuditAction {
     ScheduleKeyDeletion,
     #[serde(rename = "kms:CancelKeyDeletion")]
     CancelKeyDeletion,
+    #[serde(rename = "kms:ReportKeyCompromise")]
+    ReportKeyCompromise,
     #[serde(rename = "kms:RotateKey")]
     RotateKey,
 
@@ -184,6 +188,7 @@ pub enum EventType {
     RotationPolicyChanged,
     RotationJobStateChanged,
     NamespaceOperation,
+    KeyCompromised,
     CascadeDisable,
     AuthorizationDenied,
 }
@@ -269,6 +274,14 @@ pub struct AuditEvent {
     /// transition from/to, cascade duration, error message).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+
+    /// Ed25519 signature over the canonical JSON of this event (excluding signature fields).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
+    /// Hex-encoded hash of the previous event's signature, forming a hash chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_hash: Option<String>,
 }
 
 impl AuditEvent {
@@ -297,6 +310,8 @@ impl AuditEvent {
             srn: None,
             request_id: None,
             metadata: serde_json::Map::new(),
+            signature: None,
+            previous_hash: None,
         }
     }
 
@@ -443,6 +458,151 @@ impl AuditSink for FileSink {
             .map_err(|e| crate::error::KeyRackError::Other(e.to_string()))?;
         Ok(())
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Audit event signer (tamper-evidence via Ed25519 + hash chain)
+// ────────────────────────────────────────────────────────────────────
+
+/// Signs audit events with Ed25519 and maintains a BLAKE3 hash chain
+/// linking consecutive events for tamper evidence.
+pub struct AuditSigner {
+    signing_key: ed25519_dalek::SigningKey,
+    previous_hash: Mutex<String>,
+}
+
+impl AuditSigner {
+    /// Create a signer from an existing Ed25519 signing key.
+    /// The hash chain starts with a zero hash (64 hex zeros).
+    #[must_use]
+    pub fn new(signing_key: ed25519_dalek::SigningKey) -> Self {
+        Self {
+            signing_key,
+            previous_hash: Mutex::new("0".repeat(64)),
+        }
+    }
+
+    /// Generate a new random signing key.
+    #[must_use]
+    pub fn generate() -> Self {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        Self::new(signing_key)
+    }
+
+    /// Sign an event in-place: sets `previous_hash` from the chain state,
+    /// computes the Ed25519 signature over the canonical JSON (with signature
+    /// fields excluded), then updates the chain hash.
+    pub fn sign_event(&self, event: &mut AuditEvent) {
+        let prev = self.previous_hash.lock().unwrap().clone();
+        event.previous_hash = Some(prev);
+        event.signature = None;
+
+        let canonical = serde_json::to_string(event)
+            .expect("AuditEvent serialization should not fail");
+
+        let sig = self.signing_key.sign(canonical.as_bytes());
+        let sig_hex = hex_encode(sig.to_bytes().as_slice());
+
+        event.signature = Some(sig_hex.clone());
+
+        let new_hash = blake3::hash(sig_hex.as_bytes());
+        *self.previous_hash.lock().unwrap() = hex_encode(new_hash.as_bytes());
+    }
+
+    /// Returns the public verifying key for external consumers to verify events.
+    #[must_use]
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// Verify a signed audit event against a known verifying key.
+    /// Returns `false` if the event is unsigned or the signature is invalid.
+    #[must_use]
+    pub fn verify_event(event: &AuditEvent, verifying_key: &ed25519_dalek::VerifyingKey) -> bool {
+        let sig_hex = match &event.signature {
+            Some(s) => s.clone(),
+            None => return false,
+        };
+
+        let sig_bytes = match hex_decode(&sig_hex) {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let sig = match ed25519_dalek::Signature::from_slice(&sig_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mut verify_event = event.clone();
+        verify_event.signature = None;
+
+        let canonical = match serde_json::to_string(&verify_event) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        verifying_key.verify(canonical.as_bytes(), &sig).is_ok()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Signing audit sink (decorator)
+// ────────────────────────────────────────────────────────────────────
+
+/// A decorator sink that signs every event before forwarding to the inner sink.
+pub struct SigningAuditSink {
+    inner: Box<dyn AuditSink>,
+    signer: AuditSigner,
+}
+
+impl SigningAuditSink {
+    #[must_use]
+    pub fn new(inner: Box<dyn AuditSink>, signer: AuditSigner) -> Self {
+        Self { inner, signer }
+    }
+
+    /// Returns the verifying (public) key for this sink's signer.
+    #[must_use]
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signer.verifying_key()
+    }
+}
+
+#[async_trait]
+impl AuditSink for SigningAuditSink {
+    async fn emit(&self, event: &AuditEvent) -> crate::error::Result<()> {
+        let mut signed_event = event.clone();
+        self.signer.sign_event(&mut signed_event);
+        self.inner.emit(&signed_event).await
+    }
+
+    async fn flush(&self) -> crate::error::Result<()> {
+        self.inner.flush().await
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Hex helpers (avoids pulling in `hex` crate)
+// ────────────────────────────────────────────────────────────────────
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -601,6 +761,8 @@ mod tests {
         assert!(!json.contains("project"));
         assert!(!json.contains("srn"));
         assert!(!json.contains("metadata"));
+        assert!(!json.contains("signature"));
+        assert!(!json.contains("previous_hash"));
     }
 
     #[tokio::test]
@@ -731,5 +893,126 @@ mod tests {
             let roundtripped: AuditAction = serde_json::from_str(&json).unwrap();
             assert_eq!(*action, roundtripped);
         }
+    }
+
+    #[test]
+    fn signer_signs_and_verifies() {
+        let signer = AuditSigner::generate();
+        let vk = signer.verifying_key();
+
+        let mut event = AuditEvent::new(
+            EventType::CryptoOperation,
+            AuditAction::Encrypt,
+            AuditPrincipal {
+                id: "user:test".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "lid_sign_test".into(),
+                resource_type: "Key".into(),
+            },
+            AuditResult::Success,
+        );
+
+        signer.sign_event(&mut event);
+
+        assert!(event.signature.is_some());
+        assert!(event.previous_hash.is_some());
+        assert!(AuditSigner::verify_event(&event, &vk));
+    }
+
+    #[test]
+    fn tampered_event_fails_verification() {
+        let signer = AuditSigner::generate();
+        let vk = signer.verifying_key();
+
+        let mut event = AuditEvent::new(
+            EventType::CryptoOperation,
+            AuditAction::Encrypt,
+            AuditPrincipal {
+                id: "user:test".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "lid_tamper_test".into(),
+                resource_type: "Key".into(),
+            },
+            AuditResult::Success,
+        );
+
+        signer.sign_event(&mut event);
+        event.resource.id = "lid_evil".into();
+
+        assert!(!AuditSigner::verify_event(&event, &vk));
+    }
+
+    #[test]
+    fn hash_chain_links_events() {
+        let signer = AuditSigner::generate();
+
+        let mut e1 = AuditEvent::new(
+            EventType::KeyCreated,
+            AuditAction::CreateKey,
+            AuditPrincipal { id: "u:a".into(), principal_type: "User".into() },
+            AuditResource { id: "k1".into(), resource_type: "Key".into() },
+            AuditResult::Success,
+        );
+        signer.sign_event(&mut e1);
+
+        let expected_next_hash = {
+            let sig_hex = e1.signature.as_ref().unwrap();
+            let hash = blake3::hash(sig_hex.as_bytes());
+            hex_encode(hash.as_bytes())
+        };
+
+        let mut e2 = AuditEvent::new(
+            EventType::KeyCreated,
+            AuditAction::CreateKey,
+            AuditPrincipal { id: "u:a".into(), principal_type: "User".into() },
+            AuditResource { id: "k2".into(), resource_type: "Key".into() },
+            AuditResult::Success,
+        );
+        signer.sign_event(&mut e2);
+
+        assert_eq!(e2.previous_hash.as_deref(), Some(expected_next_hash.as_str()));
+    }
+
+    #[test]
+    fn unsigned_event_fails_verification() {
+        let signer = AuditSigner::generate();
+        let vk = signer.verifying_key();
+
+        let event = AuditEvent::new(
+            EventType::CryptoOperation,
+            AuditAction::Decrypt,
+            AuditPrincipal { id: "u:x".into(), principal_type: "User".into() },
+            AuditResource { id: "k".into(), resource_type: "Key".into() },
+            AuditResult::Success,
+        );
+
+        assert!(!AuditSigner::verify_event(&event, &vk));
+    }
+
+    #[tokio::test]
+    async fn signing_sink_signs_before_forwarding() {
+        let (inner, events) = CollectorSink::new();
+        let signer = AuditSigner::generate();
+        let vk = signer.verifying_key();
+        let signing_sink = SigningAuditSink::new(Box::new(inner), signer);
+
+        let event = AuditEvent::new(
+            EventType::CryptoOperation,
+            AuditAction::Encrypt,
+            AuditPrincipal { id: "u:sink".into(), principal_type: "User".into() },
+            AuditResource { id: "k_sink".into(), resource_type: "Key".into() },
+            AuditResult::Success,
+        );
+
+        signing_sink.emit(&event).await.unwrap();
+
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].signature.is_some());
+        assert!(AuditSigner::verify_event(&captured[0], &vk));
     }
 }

@@ -144,6 +144,20 @@ async fn build_state(
         ProviderConfig::Kmip { .. } => {
             return Err("KMIP provider not yet implemented".into());
         }
+        ProviderConfig::VaultTransit {
+            vault_addr,
+            vault_token,
+            mount_path,
+        } => {
+            Arc::new(
+                keyrack_vault::VaultTransitProvider::new(
+                    vault_addr,
+                    vault_token,
+                    mount_path.as_deref(),
+                )
+                .await?,
+            )
+        }
     };
 
     let provider_class_enum = match &config.provider {
@@ -151,12 +165,14 @@ async fn build_state(
         ProviderConfig::InMemory => keyrack_core::key::ProviderClass::InMemory,
         ProviderConfig::Pkcs11 { .. } => keyrack_core::key::ProviderClass::Pkcs11,
         ProviderConfig::Kmip { .. } => keyrack_core::key::ProviderClass::Kmip,
+        ProviderConfig::VaultTransit { .. } => keyrack_core::key::ProviderClass::VaultTransit,
     };
     let provider_class = match &config.provider {
         ProviderConfig::Software => "software",
         ProviderConfig::InMemory => "in_memory",
         ProviderConfig::Pkcs11 { .. } => "pkcs11",
         ProviderConfig::Kmip { .. } => "kmip",
+        ProviderConfig::VaultTransit { .. } => "vault_transit",
     };
     if config.provider_deny.iter().any(|d| d == provider_class) {
         return Err(format!("provider class '{provider_class}' is in the deny list").into());
@@ -181,11 +197,23 @@ async fn build_state(
         )),
     };
 
-    let audit: Arc<dyn keyrack_core::audit::AuditSink> = match &config.audit {
-        AuditConfig::Stdout => Arc::new(keyrack_core::audit::StdoutSink),
-        AuditConfig::File { path } => Arc::new(keyrack_core::audit::FileSink::new(path)),
-        AuditConfig::Nats { url } => {
-            Arc::new(keyrack_nats::NatsAuditSink::connect(url).await?)
+    let audit: Arc<dyn keyrack_core::audit::AuditSink> = {
+        let base_sink: Box<dyn keyrack_core::audit::AuditSink> = match &config.audit {
+            AuditConfig::Stdout => Box::new(keyrack_core::audit::StdoutSink),
+            AuditConfig::File { path } => Box::new(keyrack_core::audit::FileSink::new(path)),
+            AuditConfig::Nats { url } => {
+                Box::new(keyrack_nats::NatsAuditSink::connect(url).await?)
+            }
+        };
+
+        if config.sign_audit_events {
+            let signer = keyrack_core::audit::AuditSigner::generate();
+            let vk = signer.verifying_key();
+            let vk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(verifying_key = %vk_hex, "audit event signing enabled");
+            Arc::new(keyrack_core::audit::SigningAuditSink::new(base_sink, signer))
+        } else {
+            Arc::from(base_sink)
         }
     };
 
@@ -199,7 +227,9 @@ async fn build_state(
                 vec![Box::new(MtlsAuthenticator)]
             }
             AuthnConfig::Jwt { jwks_url } => {
-                vec![Box::new(JwtAuthenticator::new(jwks_url))]
+                let jwt_auth = JwtAuthenticator::new(jwks_url, None).await
+                    .map_err(|e| -> Box<dyn std::error::Error> { format!("JWT authenticator init failed: {e}").into() })?;
+                vec![Box::new(jwt_auth)]
             }
             AuthnConfig::BootstrapToken { max_age_secs } => {
                 let token = std::env::var("KMS_BOOTSTRAP_TOKEN").unwrap_or_default();

@@ -1,3 +1,5 @@
+pub mod aws_backend;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

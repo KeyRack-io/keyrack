@@ -623,6 +623,13 @@ impl KeyService for KeyServiceImpl {
                 )
                 .ok_or_else(|| Status::invalid_argument("key_spec is required"))?;
 
+                if matches!(&spec, keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 } | keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 }) {
+                    tracing::warn!(
+                        "RSA-2048 provides only 112-bit security and is deprecated per NIST guidance (2030 deadline). \
+                         Consider RSA-3072+ or ECDSA P-256 for new keys."
+                    );
+                }
+
                 let handle = state.provider.generate_key(&spec).await.map_err(convert::error_to_status)?;
 
                 let (lid, attrs) = generate_key_lid();
@@ -665,6 +672,12 @@ impl KeyService for KeyServiceImpl {
                 };
 
                 state.storage.create_key(&record).await.map_err(convert::error_to_status)?;
+
+                if let Some(nats) = &state.nats_publisher {
+                    if let Err(e) = nats.publish_key_created(&lid).await {
+                        tracing::warn!(lid = %lid, error = %e, "NATS key-created publish failed");
+                    }
+                }
 
                 Ok(Response::new(proto::CreateKeyResponse {
                     metadata: Some(convert::key_record_to_metadata(&record)),
@@ -788,10 +801,16 @@ impl KeyService for KeyServiceImpl {
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let old_state = record.state.to_string();
                 record.transition_to(keyrack_core::key::KeyState::Enabled).map_err(|(from, to)| {
                     Status::failed_precondition(format!("cannot transition from {from} to {to}"))
                 })?;
                 state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
+                if let Some(nats) = &state.nats_publisher {
+                    if let Err(e) = nats.publish_state_changed(&lid, &old_state, "enabled").await {
+                        tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
+                    }
+                }
                 Ok(Response::new(proto::EnableKeyResponse {
                     metadata: Some(convert::key_record_to_metadata(&record)),
                 }))
@@ -814,10 +833,16 @@ impl KeyService for KeyServiceImpl {
             |state| async move {
                 let lid = parse_lid(&key_id)?;
                 let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let old_state = record.state.to_string();
                 record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(from, to)| {
                     Status::failed_precondition(format!("cannot transition from {from} to {to}"))
                 })?;
                 state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
+                if let Some(nats) = &state.nats_publisher {
+                    if let Err(e) = nats.publish_state_changed(&lid, &old_state, "disabled").await {
+                        tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
+                    }
+                }
 
                 // Cascade: disable all descendant keys recursively
                 let cascade_start = std::time::Instant::now();
@@ -928,6 +953,38 @@ impl KeyService for KeyServiceImpl {
         ).await
     }
 
+    async fn report_key_compromise(
+        &self,
+        request: Request<proto::ReportKeyCompromiseRequest>,
+    ) -> Result<Response<proto::ReportKeyCompromiseResponse>, Status> {
+        let request_id = self.request_id(&request);
+        let principal = self.principal(&request).await;
+        let key_id = request.into_inner().key_id;
+        let mut op_ctx = OpContext::key(AuditAction::ReportKeyCompromise, principal, &key_id);
+        op_ctx.request_id = request_id;
+        ops::execute(
+            &self.state,
+            op_ctx,
+            |state| async move {
+                let lid = parse_lid(&key_id)?;
+                let mut record = state.storage.get_key(&lid).await.map_err(convert::error_to_status)?;
+                let old_state = record.state.to_string();
+                record.transition_to(keyrack_core::key::KeyState::Compromised).map_err(|(from, to)| {
+                    Status::failed_precondition(format!("cannot transition from {from} to {to}"))
+                })?;
+                state.storage.update_key(&record).await.map_err(convert::error_to_status)?;
+                if let Some(nats) = &state.nats_publisher {
+                    if let Err(e) = nats.publish_state_changed(&lid, &old_state, "compromised").await {
+                        tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
+                    }
+                }
+                Ok(Response::new(proto::ReportKeyCompromiseResponse {
+                    metadata: Some(convert::key_record_to_metadata(&record)),
+                }))
+            },
+        ).await
+    }
+
     async fn rotate_key(
         &self,
         request: Request<proto::RotateKeyRequest>,
@@ -997,6 +1054,12 @@ impl KeyService for KeyServiceImpl {
                         jobs_created = total_jobs,
                         "rotation jobs created for descendants (recursive)"
                     );
+                }
+
+                if let Some(nats) = &state.nats_publisher {
+                    if let Err(e) = nats.publish_rotation_started(&lid, new_version).await {
+                        tracing::warn!(lid = %lid, error = %e, "NATS rotation-started publish failed");
+                    }
                 }
 
                 #[allow(clippy::cast_possible_truncation)]

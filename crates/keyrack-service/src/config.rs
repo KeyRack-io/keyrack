@@ -34,6 +34,10 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub audit: AuditConfig,
 
+    /// Enable Ed25519 signing of audit events for tamper evidence.
+    #[serde(default)]
+    pub sign_audit_events: bool,
+
     #[serde(default)]
     pub authn: AuthnConfig,
 
@@ -56,6 +60,7 @@ impl Default for ServiceConfig {
             provider: ProviderConfig::default(),
             pdp: PdpConfig::default(),
             audit: AuditConfig::default(),
+            sign_audit_events: false,
             authn: AuthnConfig::default(),
             provider_deny: Vec::new(),
             max_plaintext_bytes: default_max_plaintext_bytes(),
@@ -109,6 +114,11 @@ pub enum ProviderConfig {
         client_cert: String,
         client_key: String,
         ca_cert: Option<String>,
+    },
+    VaultTransit {
+        vault_addr: String,
+        vault_token: String,
+        mount_path: Option<String>,
     },
 }
 
@@ -221,6 +231,7 @@ mod tests {
             provider: ProviderConfig::Software,
             pdp: PdpConfig::AlwaysAllow,
             audit: AuditConfig::Stdout,
+            sign_audit_events: false,
             authn: AuthnConfig::Insecure,
             provider_deny: Vec::new(),
             max_plaintext_bytes: default_max_plaintext_bytes(),

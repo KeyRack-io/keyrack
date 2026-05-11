@@ -47,6 +47,9 @@ pub enum KeyState {
     Creating,
     Enabled,
     Disabled,
+    /// NIST SP 800-57: key material may have been exposed.
+    /// Decrypt/verify allowed for existing data; encrypt/sign forbidden.
+    Compromised,
     PendingDeletion,
     Destroyed,
 }
@@ -62,7 +65,7 @@ impl KeyState {
     /// Disabled keys allow decrypt for data recovery.
     #[must_use]
     pub fn permits_decrypt(&self) -> bool {
-        matches!(self, Self::Enabled | Self::Disabled)
+        matches!(self, Self::Enabled | Self::Disabled | Self::Compromised)
     }
 
     /// Returns the set of states this state can transition to.
@@ -70,8 +73,9 @@ impl KeyState {
     pub fn valid_transitions(&self) -> &'static [KeyState] {
         match self {
             Self::Creating => &[Self::Enabled],
-            Self::Enabled => &[Self::Disabled, Self::PendingDeletion],
-            Self::Disabled => &[Self::Enabled, Self::PendingDeletion],
+            Self::Enabled => &[Self::Disabled, Self::Compromised, Self::PendingDeletion],
+            Self::Disabled => &[Self::Enabled, Self::Compromised, Self::PendingDeletion],
+            Self::Compromised => &[Self::PendingDeletion],
             Self::PendingDeletion => &[Self::Disabled, Self::Destroyed],
             Self::Destroyed => &[],
         }
@@ -90,6 +94,7 @@ impl std::fmt::Display for KeyState {
             Self::Creating => f.write_str("creating"),
             Self::Enabled => f.write_str("enabled"),
             Self::Disabled => f.write_str("disabled"),
+            Self::Compromised => f.write_str("compromised"),
             Self::PendingDeletion => f.write_str("pending_deletion"),
             Self::Destroyed => f.write_str("destroyed"),
         }
@@ -123,6 +128,7 @@ pub enum ProviderClass {
     Pkcs11,
     Kmip,
     InMemory,
+    VaultTransit,
 }
 
 /// Where the key material originated.

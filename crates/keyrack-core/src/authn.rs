@@ -27,9 +27,16 @@
 //! - **Bootstrap token** — OSS fallback for deployments without a PDP.
 //!   Time-bounded, audit-logged with WARN on every use.
 
-use crate::pdp::Principal;
+use crate::pdp::{AttributeValue, Principal};
 use async_trait::async_trait;
+use der::Decode;
+use jsonwebtoken::jwk::JwkSet;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::SubjectAltName;
+use x509_cert::Certificate;
 
 /// Metadata carried on an incoming request.
 ///
@@ -188,14 +195,46 @@ impl Authenticator for BootstrapTokenAuthenticator {
     }
 }
 
-/// mTLS authenticator stub.
+/// mTLS authenticator.
 ///
 /// Extracts the principal from the peer certificate's Subject Alternative
-/// Name.  Supports both CN-based and SPIFFE SVID URI extraction.
+/// Name or Subject CN.  Supports both CN-based and SPIFFE SVID URI
+/// extraction.
 ///
-/// Full implementation (certificate parsing, SPIFFE validation) is
-/// deferred until the TLS stack integration in the service binary.
+/// **Does not** validate the certificate chain or verify signatures —
+/// that is the responsibility of the TLS layer (tonic/rustls).  This
+/// authenticator only extracts identity information from the
+/// already-validated leaf certificate.
 pub struct MtlsAuthenticator;
+
+impl MtlsAuthenticator {
+    /// Extract the Common Name from the certificate's Subject field.
+    fn extract_cn(cert: &Certificate) -> Option<String> {
+        use der::oid::db::rfc4519::CN;
+        cert.tbs_certificate
+            .subject
+            .0
+            .iter()
+            .flat_map(|rdn| rdn.0.iter())
+            .find(|atav| atav.oid == CN)
+            .and_then(|atav| {
+                // The CN value is typically a UTF8String or PrintableString.
+                // `ToString` on the `Any` value gives us the decoded string.
+                let val = &atav.value;
+                der::asn1::Utf8StringRef::try_from(val)
+                    .map(|s| s.as_str().to_owned())
+                    .or_else(|_| {
+                        der::asn1::PrintableStringRef::try_from(val)
+                            .map(|s| s.as_str().to_owned())
+                    })
+                    .or_else(|_| {
+                        der::asn1::Ia5StringRef::try_from(val)
+                            .map(|s| s.as_str().to_owned())
+                    })
+                    .ok()
+            })
+    }
+}
 
 #[async_trait]
 impl Authenticator for MtlsAuthenticator {
@@ -206,10 +245,80 @@ impl Authenticator for MtlsAuthenticator {
         if metadata.peer_certificates.is_empty() {
             return Ok(None);
         }
-        // TODO(authn): parse leaf certificate, extract SAN/CN, validate chain.
-        // Until implemented, skip so the next authenticator in the chain can try.
-        tracing::warn!("mTLS authenticator received peer certificates but parsing is not yet implemented");
-        Ok(None)
+
+        let leaf_der = &metadata.peer_certificates[0];
+        let cert = Certificate::from_der(leaf_der).map_err(|e| {
+            AuthnError::InvalidCredential(format!("failed to parse peer certificate: {e}"))
+        })?;
+
+        let mut attributes = BTreeMap::<String, AttributeValue>::new();
+
+        // Extract serial number (hex-encoded).
+        let serial = cert
+            .tbs_certificate
+            .serial_number
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        attributes.insert(
+            "serial_number".into(),
+            AttributeValue::String(serial),
+        );
+
+        // Extract Common Name from Subject.
+        let cn = Self::extract_cn(&cert);
+        if let Some(ref cn_val) = cn {
+            attributes.insert("cn".into(), AttributeValue::String(cn_val.clone()));
+        }
+
+        // Scan Subject Alternative Names for SPIFFE URIs and DNS names.
+        let mut spiffe_id: Option<String> = None;
+        if let Some(extensions) = &cert.tbs_certificate.extensions {
+            for ext in extensions.iter() {
+                if let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
+                    for name in san.0.iter() {
+                        match name {
+                            GeneralName::UniformResourceIdentifier(uri) => {
+                                let uri_str = uri.as_str();
+                                if uri_str.starts_with("spiffe://") {
+                                    tracing::debug!(spiffe_id = uri_str, "found SPIFFE ID in SAN");
+                                    attributes.insert(
+                                        "spiffe_id".into(),
+                                        AttributeValue::String(uri_str.to_owned()),
+                                    );
+                                    spiffe_id = Some(uri_str.to_owned());
+                                }
+                            }
+                            GeneralName::DnsName(dns) => {
+                                tracing::debug!(dns_san = dns.as_str(), "found DNS SAN (not used as principal)");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // SPIFFE ID takes precedence over CN for the principal ID.
+        let principal_id = match (&spiffe_id, &cn) {
+            (Some(sid), _) => sid.clone(),
+            (None, Some(cn_val)) => cn_val.clone(),
+            (None, None) => {
+                return Err(AuthnError::InvalidCredential(
+                    "peer certificate has neither a CN nor a SPIFFE SAN".into(),
+                ));
+            }
+        };
+
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: principal_id,
+                principal_type: "Service".into(),
+                attributes,
+            },
+            method: "mtls".into(),
+        }))
     }
 }
 
@@ -236,22 +345,233 @@ impl Authenticator for InsecureAuthenticator {
     }
 }
 
-/// JWT bearer token authenticator stub.
+/// JWT bearer token authenticator.
 ///
 /// Validates `Authorization: Bearer <jwt>` against a JWKS endpoint.
+/// On construction, fetches the JWKS key set and caches it.  If a
+/// token's `kid` is not found in the cache, the JWKS is refreshed once
+/// before returning an error.
 ///
-/// Full implementation (JWKS fetching, signature validation, claims
-/// extraction) is deferred.
+/// Supported algorithms: RS256, RS384, RS512, ES256, ES384, EdDSA.
 pub struct JwtAuthenticator {
-    _jwks_url: String,
+    jwks_url: String,
+    jwks: Arc<RwLock<JwkSet>>,
+    required_issuer: Option<String>,
+    http: reqwest::Client,
+    /// Optional namespace prefix for custom claims to extract.
+    claims_namespace: Option<String>,
 }
 
 impl JwtAuthenticator {
-    #[must_use]
-    pub fn new(jwks_url: impl Into<String>) -> Self {
+    /// Create a new JWT authenticator by fetching the JWKS from `jwks_url`.
+    ///
+    /// - `issuer`: if `Some`, the `iss` claim in every token must match.
+    pub async fn new(jwks_url: &str, issuer: Option<&str>) -> Result<Self, AuthnError> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| AuthnError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+        let jwks = Self::fetch_jwks_with(&http, jwks_url).await?;
+
+        Ok(Self {
+            jwks_url: jwks_url.to_owned(),
+            jwks: Arc::new(RwLock::new(jwks)),
+            required_issuer: issuer.map(ToOwned::to_owned),
+            http,
+            claims_namespace: None,
+        })
+    }
+
+    /// Create a `JwtAuthenticator` from a pre-loaded `JwkSet`.
+    ///
+    /// Useful for tests and environments where the JWKS is loaded from a
+    /// local file or embedded in configuration.
+    pub fn from_jwks(
+        jwks: JwkSet,
+        jwks_url: &str,
+        issuer: Option<&str>,
+    ) -> Self {
         Self {
-            _jwks_url: jwks_url.into(),
+            jwks_url: jwks_url.to_owned(),
+            jwks: Arc::new(RwLock::new(jwks)),
+            required_issuer: issuer.map(ToOwned::to_owned),
+            http: reqwest::Client::new(),
+            claims_namespace: None,
         }
+    }
+
+    /// Set a namespace prefix for custom claims to extract into principal
+    /// attributes (e.g. `"https://myapp.example.com/"`).
+    pub fn with_claims_namespace(mut self, ns: impl Into<String>) -> Self {
+        self.claims_namespace = Some(ns.into());
+        self
+    }
+
+    /// Manually refresh the cached JWKS by re-fetching from the endpoint.
+    pub async fn refresh_jwks(&self) -> Result<(), AuthnError> {
+        let new_jwks = Self::fetch_jwks_with(&self.http, &self.jwks_url).await?;
+        let mut cache = self.jwks.write().await;
+        *cache = new_jwks;
+        Ok(())
+    }
+
+    async fn fetch_jwks_with(http: &reqwest::Client, url: &str) -> Result<JwkSet, AuthnError> {
+        let resp = http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AuthnError::Internal(format!("JWKS fetch failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(AuthnError::Internal(format!(
+                "JWKS endpoint returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        resp.json::<JwkSet>()
+            .await
+            .map_err(|e| AuthnError::Internal(format!("JWKS parse failed: {e}")))
+    }
+
+    fn algorithm_from_jwk(
+        alg: &jsonwebtoken::jwk::AlgorithmParameters,
+    ) -> Result<jsonwebtoken::Algorithm, AuthnError> {
+        use jsonwebtoken::jwk::AlgorithmParameters;
+        use jsonwebtoken::Algorithm;
+        match alg {
+            AlgorithmParameters::RSA(_) => Ok(Algorithm::RS256),
+            AlgorithmParameters::EllipticCurve(ec) => {
+                use jsonwebtoken::jwk::EllipticCurve;
+                match ec.curve {
+                    EllipticCurve::P256 => Ok(Algorithm::ES256),
+                    EllipticCurve::P384 => Ok(Algorithm::ES384),
+                    _ => Err(AuthnError::InvalidCredential(format!(
+                        "unsupported EC curve: {:?}",
+                        ec.curve
+                    ))),
+                }
+            }
+            AlgorithmParameters::OctetKeyPair(_) => Ok(Algorithm::EdDSA),
+            _ => Err(AuthnError::InvalidCredential(
+                "unsupported JWK algorithm type".into(),
+            )),
+        }
+    }
+
+    /// Resolve algorithm: prefer the `alg` declared in the JWT header, fall
+    /// back to inferring from the JWK key type.
+    fn resolve_algorithm(
+        header: &jsonwebtoken::Header,
+        jwk: &jsonwebtoken::jwk::Jwk,
+    ) -> Result<jsonwebtoken::Algorithm, AuthnError> {
+        if let Some(key_alg) = &jwk.common.key_algorithm {
+            use jsonwebtoken::jwk::KeyAlgorithm;
+            let alg = match key_alg {
+                KeyAlgorithm::RS256 => jsonwebtoken::Algorithm::RS256,
+                KeyAlgorithm::RS384 => jsonwebtoken::Algorithm::RS384,
+                KeyAlgorithm::RS512 => jsonwebtoken::Algorithm::RS512,
+                KeyAlgorithm::ES256 => jsonwebtoken::Algorithm::ES256,
+                KeyAlgorithm::ES384 => jsonwebtoken::Algorithm::ES384,
+                KeyAlgorithm::EdDSA => jsonwebtoken::Algorithm::EdDSA,
+                other => {
+                    return Err(AuthnError::InvalidCredential(format!(
+                        "unsupported key algorithm: {other:?}"
+                    )));
+                }
+            };
+            return Ok(alg);
+        }
+
+        if header.alg != jsonwebtoken::Algorithm::default() {
+            return Ok(header.alg);
+        }
+
+        Self::algorithm_from_jwk(&jwk.algorithm)
+    }
+
+    fn validate_and_decode(
+        token: &str,
+        jwk: &jsonwebtoken::jwk::Jwk,
+        required_issuer: Option<&str>,
+    ) -> Result<jsonwebtoken::TokenData<serde_json::Value>, AuthnError> {
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| AuthnError::InvalidCredential(format!("malformed JWT header: {e}")))?;
+
+        let algorithm = Self::resolve_algorithm(&header, jwk)?;
+
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_jwk(jwk).map_err(|e| {
+                AuthnError::InvalidCredential(format!("cannot build decoding key from JWK: {e}"))
+            })?;
+
+        let mut validation = jsonwebtoken::Validation::new(algorithm);
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        // We don't require `aud` by default — callers can layer that on.
+        validation.validate_aud = false;
+
+        if let Some(iss) = required_issuer {
+            validation.set_issuer(&[iss]);
+        }
+
+        jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation).map_err(
+            |e| AuthnError::InvalidCredential(format!("JWT validation failed: {e}")),
+        )
+    }
+
+    fn extract_attributes(
+        claims: &serde_json::Value,
+        namespace: Option<&str>,
+    ) -> BTreeMap<String, AttributeValue> {
+        let mut attrs = BTreeMap::new();
+        let obj = match claims.as_object() {
+            Some(o) => o,
+            None => return attrs,
+        };
+
+        if let Some(serde_json::Value::String(iss)) = obj.get("iss") {
+            attrs.insert("iss".into(), AttributeValue::String(iss.clone()));
+        }
+
+        match obj.get("aud") {
+            Some(serde_json::Value::String(aud)) => {
+                attrs.insert("aud".into(), AttributeValue::String(aud.clone()));
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                let list: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                    .collect();
+                if !list.is_empty() {
+                    attrs.insert("aud".into(), AttributeValue::StringList(list));
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(serde_json::Value::String(email)) = obj.get("email") {
+            attrs.insert("email".into(), AttributeValue::String(email.clone()));
+        }
+
+        if let Some(ns) = namespace {
+            for (key, value) in obj {
+                if let Some(suffix) = key.strip_prefix(ns) {
+                    if !suffix.is_empty() {
+                        if let Some(s) = value.as_str() {
+                            attrs.insert(suffix.to_owned(), AttributeValue::String(s.to_owned()));
+                        } else if let Some(b) = value.as_bool() {
+                            attrs.insert(suffix.to_owned(), AttributeValue::Bool(b));
+                        } else if let Some(n) = value.as_i64() {
+                            attrs.insert(suffix.to_owned(), AttributeValue::Integer(n));
+                        }
+                    }
+                }
+            }
+        }
+
+        attrs
     }
 }
 
@@ -265,14 +585,61 @@ impl Authenticator for JwtAuthenticator {
             return Ok(None);
         };
 
-        if !auth_header.starts_with("Bearer ey") {
+        let Some(token) = auth_header.strip_prefix("Bearer ") else {
             return Ok(None);
-        }
+        };
 
-        // TODO(authn): validate JWT signature against JWKS, extract claims.
-        // Until implemented, skip so the next authenticator in the chain can try.
-        tracing::warn!("JWT authenticator received a Bearer token but validation is not yet implemented");
-        Ok(None)
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| AuthnError::InvalidCredential(format!("malformed JWT header: {e}")))?;
+
+        let kid = header
+            .kid
+            .as_deref()
+            .ok_or_else(|| AuthnError::InvalidCredential("JWT header missing `kid`".into()))?;
+
+        // Try to find the key in the current cache, refresh once on miss.
+        let token_data = {
+            let jwks = self.jwks.read().await;
+            let maybe_jwk = jwks.find(kid);
+            match maybe_jwk {
+                Some(jwk) => {
+                    Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
+                }
+                None => {
+                    drop(jwks);
+                    tracing::debug!(kid, "kid not found in JWKS cache, refreshing");
+                    self.refresh_jwks().await?;
+                    let jwks = self.jwks.read().await;
+                    let jwk = jwks.find(kid).ok_or_else(|| {
+                        AuthnError::InvalidCredential(format!(
+                            "no JWK found for kid `{kid}` after refresh"
+                        ))
+                    })?;
+                    Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
+                }
+            }
+        };
+
+        let sub = token_data
+            .claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AuthnError::InvalidCredential("JWT missing `sub` claim".into())
+            })?
+            .to_owned();
+
+        let attributes =
+            Self::extract_attributes(&token_data.claims, self.claims_namespace.as_deref());
+
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: sub,
+                principal_type: "jwt".into(),
+                attributes,
+            },
+            method: "jwt".into(),
+        }))
     }
 }
 
@@ -377,7 +744,12 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_no_bearer_skips() {
-        let authn = JwtAuthenticator::new("https://example.com/.well-known/jwks.json");
+        let empty_jwks = jsonwebtoken::jwk::JwkSet { keys: vec![] };
+        let authn = JwtAuthenticator::from_jwks(
+            empty_jwks,
+            "https://example.com/.well-known/jwks.json",
+            None,
+        );
         let metadata = RequestMetadata::default();
         let result = authn.authenticate(&metadata).await.unwrap();
         assert!(result.is_none());

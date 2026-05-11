@@ -32,6 +32,7 @@ service KeyService {
   rpc DisableKey(DisableKeyRequest) returns (DisableKeyResponse);
   rpc ScheduleKeyDeletion(ScheduleKeyDeletionRequest) returns (ScheduleKeyDeletionResponse);
   rpc CancelKeyDeletion(CancelKeyDeletionRequest) returns (CancelKeyDeletionResponse);
+  rpc ReportKeyCompromise(ReportKeyCompromiseRequest) returns (ReportKeyCompromiseResponse);
   rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
 
   // ── Key versions ──────────────────────────────────────────────────
@@ -117,6 +118,7 @@ enum KeyState {
   DISABLED = 3;
   PENDING_DELETION = 4;
   DESTROYED = 5;
+  COMPROMISED = 6;
 }
 
 enum KeyOrigin {
@@ -352,6 +354,14 @@ message CancelKeyDeletionRequest {
 }
 
 message CancelKeyDeletionResponse {
+  KeyMetadata metadata = 1;
+}
+
+message ReportKeyCompromiseRequest {
+  string key_id = 1;
+}
+
+message ReportKeyCompromiseResponse {
   KeyMetadata metadata = 1;
 }
 

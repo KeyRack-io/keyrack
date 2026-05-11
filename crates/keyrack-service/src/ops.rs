@@ -330,6 +330,7 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         AuditAction::RotateKey => EventType::KeyRotated,
         AuditAction::EnableKey | AuditAction::DisableKey => EventType::KeyStateChanged,
         AuditAction::ScheduleKeyDeletion | AuditAction::CancelKeyDeletion => EventType::KeyStateChanged,
+        AuditAction::ReportKeyCompromise => EventType::KeyCompromised,
         AuditAction::UpdateKey => EventType::KeyStateChanged,
 
         AuditAction::GetKey | AuditAction::DescribeKey | AuditAction::ListKeys
