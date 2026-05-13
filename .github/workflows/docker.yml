@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: keyrack/keyrack-service
+  IMAGE_NAME: keyrack-io/keyrack-service
 
 jobs:
   build-and-push:

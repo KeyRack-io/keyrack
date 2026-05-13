@@ -12,6 +12,11 @@ services:
       - ./config:/etc/keyrack:ro
     environment:
       - RUST_LOG=info
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     profiles:
       - standalone
 
