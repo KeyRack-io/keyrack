@@ -119,6 +119,34 @@ provider:
   pin: "${KMS_PKCS11_PIN}"
 ```
 
+### Vault Transit (FOSS — external KMS integration)
+
+Delegates key operations to HashiCorp Vault's Transit engine. Ideal for
+teams already running Vault.
+
+```yaml
+provider:
+  type: vault_transit
+  vault_addr: "https://vault.internal:8200"
+  vault_token: "${VAULT_TOKEN}"
+  mount_path: "transit"        # optional, defaults to "transit"
+```
+
+### KMIP (planned)
+
+```yaml
+provider:
+  type: kmip
+  host: "kmip.internal"
+  port: 5696
+  client_cert: "/etc/keyrack/tls/kmip-client.pem"
+  client_key: "/etc/keyrack/tls/kmip-client-key.pem"
+  ca_cert: "/etc/keyrack/tls/kmip-ca.pem"   # optional
+```
+
+> KMIP provider is not yet implemented. The config is parsed and
+> validated — the service will refuse to start with a clear error.
+
 ### In-memory (test fixtures)
 
 ```yaml
@@ -172,6 +200,37 @@ Configure it via environment variables:
 
 See [CEDAR_STARTER_SCHEMA.md](CEDAR_STARTER_SCHEMA.md) for an example
 schema that operators can copy into their PDP deployment.
+
+### Cedar sidecar PDP (convenience alias)
+
+A shorthand for pointing at the bundled `keyrack-cedar-pdp` HTTP endpoint:
+
+```yaml
+pdp:
+  type: cedar
+  endpoint: "http://cedar-pdp:8181/v1/authorize"
+  timeout_ms: 5000
+```
+
+Functionally identical to `type: http` — saves operators from remembering
+which PDP backend they're running.
+
+### PDP TLS / mTLS
+
+Both `http` and `grpc` PDP types support optional TLS:
+
+```yaml
+pdp:
+  type: http
+  endpoint: "https://pdp.internal:8443/v1/authorize"
+  timeout_ms: 5000
+  ca_cert: "/etc/keyrack/tls/pdp-ca.pem"
+  client_cert: "/etc/keyrack/tls/pdp-client.pem"
+  client_key: "/etc/keyrack/tls/pdp-client-key.pem"
+```
+
+- `ca_cert`: Custom CA for the PDP's server certificate
+- `client_cert` + `client_key`: Client cert/key for mTLS to the PDP
 
 ---
 
@@ -247,6 +306,57 @@ audit:
 
 ---
 
+## TLS configuration
+
+### gRPC server TLS
+
+Enable TLS (and optionally mTLS) on the gRPC endpoint:
+
+```yaml
+tls:
+  server_cert: "/etc/keyrack/tls/server.pem"
+  server_key: "/etc/keyrack/tls/server-key.pem"
+  ca_cert: "/etc/keyrack/tls/ca.pem"   # enables mTLS — omit for TLS-only
+```
+
+When `ca_cert` is set, clients must present a valid certificate signed by
+this CA. Unauthenticated connections are rejected at the TLS handshake.
+
+### gRPC keepalive
+
+```yaml
+grpc_keepalive:
+  time_secs: 30       # send keepalive ping every 30s (default)
+  timeout_secs: 10    # close connection if no response in 10s (default)
+```
+
+Keepalive prevents load-balancer idle timeouts and detects dead peers
+faster.
+
+### Certificate hot-reload
+
+When TLS is enabled, KeyRack polls the cert/key files every 30 seconds.
+If the files change on disk (e.g. after cert-manager renewal), the
+service logs a notice. **V1 limitation:** tonic does not support live TLS
+credential swapping on a running listener; perform a rolling restart
+after certificate renewal. The infrastructure is in place for seamless
+reload in a future version.
+
+### Audit event signing
+
+Enable Ed25519 tamper-evidence signatures on audit events:
+
+```yaml
+sign_audit_events: true
+```
+
+On startup the service generates an ephemeral Ed25519 keypair and logs
+the hex-encoded verifying key. Each audit event is signed and includes a
+hash-chain reference to the previous event, ensuring tampering or
+deletion is detectable.
+
+---
+
 ## Monitoring
 
 ### Health endpoints
@@ -266,6 +376,29 @@ audit:
 | `keyrack_pdp_request_duration_seconds` | PDP evaluation latency |
 | `keyrack_pdp_errors_total` | PDP transport/evaluation failures |
 | `keyrack_audit_emit_errors_total` | Audit sink write failures |
+
+### Request correlation (`x-request-id`)
+
+All REST and gRPC endpoints propagate the `x-request-id` header for
+end-to-end tracing. If the client omits the header, the service
+generates a UUIDv7. The REST gateway echoes the resolved request ID in
+every response header. The same ID appears in audit events and PDP
+authorization requests.
+
+---
+
+## NATS event distribution
+
+Configure NATS for distributed audit events, key state-change
+notifications, and cache invalidation:
+
+```yaml
+nats_notify:
+  url: "nats://nats.internal:4222"
+  audit_subject_prefix: "kms.audit"
+  state_changed_subject_prefix: "kms.key.state-changed"
+  invalidation_subject_prefix: "kms.cache.invalidate"
+```
 
 ---
 

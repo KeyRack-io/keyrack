@@ -19,6 +19,7 @@ use crate::ops::{self, OpContext};
 use crate::state::ServiceState;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -132,7 +133,26 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
+        .layer(middleware::from_fn(echo_request_id))
         .with_state(state)
+}
+
+async fn echo_request_id(
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> impl IntoResponse {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(ops::new_request_id);
+
+    let mut response = next.run(req).await;
+    if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", val);
+    }
+    response
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -322,10 +342,18 @@ async fn update_key(
     ).await
 }
 
-async fn list_keys(State(state): State<AppState>) -> Result<impl IntoResponse, RestError> {
+async fn list_keys(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
+    op_ctx.resource_type = "Key".into();
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::system(AuditAction::ListKeys, "", "Key"),
+        op_ctx,
         |state| async move {
             let filter = keyrack_core::storage::KeyFilter { user_tags: vec![], state: None, limit: Some(100), cursor: None };
             let page = state.storage.list_keys(&filter).await.map_err(map_core_err)?;
@@ -774,11 +802,16 @@ async fn re_encrypt(
 #[cfg(feature = "crypto-endpoints")]
 async fn generate_random(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::resource(AuditAction::GenerateRandom, principal, "", "System");
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::system(AuditAction::GenerateRandom, "", "System"),
+        op_ctx,
         |state| async move {
             #[allow(clippy::cast_possible_truncation)]
             let n = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
@@ -900,10 +933,17 @@ async fn create_alias(
     ).await
 }
 
-async fn list_aliases(State(state): State<AppState>) -> Result<impl IntoResponse, RestError> {
+async fn list_aliases(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::alias(AuditAction::ListAliases, principal, "");
+    op_ctx.request_id = request_id;
     ops::execute_rest(
         &state,
-        OpContext::system(AuditAction::ListAliases, "", "Alias"),
+        op_ctx,
         |state| async move {
             let aliases = state.storage.list_aliases().await.map_err(map_core_err)?;
             let items: Vec<_> = aliases.iter().map(|a| serde_json::json!({ "alias_name": a.alias_name, "target_key_id": a.target_lid.to_string() })).collect();

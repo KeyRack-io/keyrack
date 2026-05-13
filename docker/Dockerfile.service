@@ -39,4 +39,6 @@ COPY --from=builder /build/target/release/keyrack-cedar-pdp /usr/local/bin/
 
 EXPOSE 50051 8080
 
+ENV KEYRACK_CONFIG=/config/keyrack.yaml
+
 ENTRYPOINT ["keyrack-service"]

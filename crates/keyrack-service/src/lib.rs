@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cert_reload;
 pub mod config;
 pub mod convert;
 pub mod grpc;

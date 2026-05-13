@@ -49,6 +49,12 @@ pub struct ServiceConfig {
 
     #[serde(default)]
     pub nats_notify: Option<NatsNotifyConfig>,
+
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
+    #[serde(default)]
+    pub grpc_keepalive: Option<GrpcKeepaliveConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -65,6 +71,8 @@ impl Default for ServiceConfig {
             provider_deny: Vec::new(),
             max_plaintext_bytes: default_max_plaintext_bytes(),
             nats_notify: None,
+            tls: None,
+            grpc_keepalive: None,
         }
     }
 }
@@ -132,8 +140,27 @@ pub enum PdpConfig {
         endpoint: String,
         #[serde(default = "default_pdp_timeout")]
         timeout_ms: u64,
+        #[serde(default)]
+        ca_cert: Option<String>,
+        #[serde(default)]
+        client_cert: Option<String>,
+        #[serde(default)]
+        client_key: Option<String>,
     },
     Grpc {
+        endpoint: String,
+        #[serde(default = "default_pdp_timeout")]
+        timeout_ms: u64,
+        #[serde(default)]
+        ca_cert: Option<String>,
+        #[serde(default)]
+        client_cert: Option<String>,
+        #[serde(default)]
+        client_key: Option<String>,
+    },
+    /// Cedar sidecar PDP — convenience alias for `Http` pointing at a
+    /// `keyrack-cedar-pdp` instance (e.g. `http://cedar-pdp:8181/v1/authorize`).
+    Cedar {
         endpoint: String,
         #[serde(default = "default_pdp_timeout")]
         timeout_ms: u64,
@@ -204,6 +231,30 @@ fn default_invalidation_prefix() -> String {
     "kms.cache.invalidate".into()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    pub server_cert: String,
+    pub server_key: String,
+    /// If set, enables mTLS by validating client certificates against this CA.
+    pub ca_cert: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcKeepaliveConfig {
+    #[serde(default = "default_keepalive_time_secs")]
+    pub time_secs: u64,
+    #[serde(default = "default_keepalive_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_keepalive_time_secs() -> u64 {
+    30
+}
+
+fn default_keepalive_timeout_secs() -> u64 {
+    10
+}
+
 impl ServiceConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
@@ -236,6 +287,8 @@ mod tests {
             provider_deny: Vec::new(),
             max_plaintext_bytes: default_max_plaintext_bytes(),
             nats_notify: None,
+            tls: None,
+            grpc_keepalive: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();

@@ -15,6 +15,7 @@ use keyrack_service::grpc::KeyServiceImpl;
 use keyrack_service::proto::key_service_server::KeyServiceServer;
 use keyrack_service::state::ServiceState;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%grpc_addr, %rest_addr, "starting KeyRack gRPC + REST service");
 
+    if let Some(tls_cfg) = &config.tls {
+        let (reloader, _cert_rx) = keyrack_service::cert_reload::CertReloader::new(
+            &tls_cfg.server_cert,
+            &tls_cfg.server_key,
+        );
+        tokio::spawn(reloader.watch_loop(std::time::Duration::from_secs(30)));
+        tracing::info!("TLS cert hot-reload watcher started (polling every 30s)");
+    }
+
     let rest_cancel = cancel.clone();
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;
     let rest_handle = tokio::spawn(async move {
@@ -52,7 +62,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc_cancel = cancel.clone();
     let grpc_handle = tokio::spawn(async move {
-        Server::builder()
+        let mut builder = Server::builder();
+
+        if let Some(tls_cfg) = &config.tls {
+            use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+
+            let cert_pem = tokio::fs::read(&tls_cfg.server_cert)
+                .await
+                .expect("failed to read TLS server certificate");
+            let key_pem = tokio::fs::read(&tls_cfg.server_key)
+                .await
+                .expect("failed to read TLS server key");
+            let identity = Identity::from_pem(cert_pem, key_pem);
+
+            let mut tls = ServerTlsConfig::new().identity(identity);
+
+            if let Some(ca_path) = &tls_cfg.ca_cert {
+                let ca_pem = tokio::fs::read(ca_path)
+                    .await
+                    .expect("failed to read TLS CA certificate");
+                tls = tls.client_ca_root(Certificate::from_pem(ca_pem));
+                tracing::info!("mTLS enabled: client certificates will be validated");
+            }
+
+            builder = builder
+                .tls_config(tls)
+                .expect("invalid TLS configuration");
+            tracing::info!("TLS enabled on gRPC server");
+
+            // TODO: Extract peer certificates from the TLS connection into
+            // PeerCertificates request extensions so MtlsAuthenticator can
+            // derive identity. Transport-level mTLS validation is active; this
+            // only affects identity propagation to the PDP/audit layer.
+        }
+
+        if let Some(ka) = &config.grpc_keepalive {
+            builder = builder
+                .http2_keepalive_interval(Some(Duration::from_secs(ka.time_secs)))
+                .http2_keepalive_timeout(Some(Duration::from_secs(ka.timeout_secs)));
+            tracing::info!(
+                time_secs = ka.time_secs,
+                timeout_secs = ka.timeout_secs,
+                "gRPC HTTP/2 keepalive enabled"
+            );
+        }
+
+        builder
             .add_service(grpc_service)
             .serve_with_shutdown(grpc_addr, grpc_cancel.cancelled())
             .await
@@ -184,17 +239,40 @@ async fn build_state(
         PdpConfig::Http {
             endpoint,
             timeout_ms,
+            ca_cert,
+            client_cert,
+            client_key,
         } => Arc::new(keyrack_service::pdp_http::HttpPdpClient::new(
             endpoint,
             std::time::Duration::from_millis(*timeout_ms),
+            ca_cert.as_deref(),
+            client_cert.as_deref(),
+            client_key.as_deref(),
         )?),
         PdpConfig::Grpc {
             endpoint,
             timeout_ms,
+            ca_cert,
+            client_cert,
+            client_key,
         } => Arc::new(keyrack_service::pdp_grpc::GrpcPdpClient::new(
             endpoint,
             std::time::Duration::from_millis(*timeout_ms),
-        )),
+            ca_cert.as_deref(),
+            client_cert.as_deref(),
+            client_key.as_deref(),
+        )?),
+        PdpConfig::Cedar {
+            endpoint,
+            timeout_ms,
+        } => {
+            tracing::info!(endpoint = %endpoint, "using Cedar sidecar PDP via HTTP");
+            Arc::new(keyrack_service::pdp_http::HttpPdpClient::new(
+                endpoint,
+                std::time::Duration::from_millis(*timeout_ms),
+                None, None, None,
+            )?)
+        }
     };
 
     let audit: Arc<dyn keyrack_core::audit::AuditSink> = {

@@ -28,10 +28,37 @@ pub struct HttpPdpClient {
 }
 
 impl HttpPdpClient {
-    pub fn new(endpoint: impl Into<String>, timeout: Duration) -> Result<Self> {
+    pub fn new(
+        endpoint: impl Into<String>,
+        timeout: Duration,
+        ca_cert: Option<&str>,
+        client_cert: Option<&str>,
+        client_key: Option<&str>,
+    ) -> Result<Self> {
         let endpoint = endpoint.into();
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+
+        if let Some(ca_path) = ca_cert {
+            let pem = std::fs::read(ca_path)
+                .map_err(|e| KeyRackError::Other(format!("failed to read PDP CA cert {ca_path}: {e}")))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| KeyRackError::Other(format!("invalid PDP CA cert: {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
+            let mut id_pem = std::fs::read(cert_path)
+                .map_err(|e| KeyRackError::Other(format!("failed to read PDP client cert {cert_path}: {e}")))?;
+            let key_pem = std::fs::read(key_path)
+                .map_err(|e| KeyRackError::Other(format!("failed to read PDP client key {key_path}: {e}")))?;
+            id_pem.push(b'\n');
+            id_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&id_pem)
+                .map_err(|e| KeyRackError::Other(format!("invalid PDP client identity: {e}")))?;
+            builder = builder.identity(identity);
+        }
+
+        let client = builder
             .build()
             .map_err(|e| KeyRackError::Other(format!("failed to build HTTP PDP client: {e}")))?;
 
