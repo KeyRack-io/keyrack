@@ -10,3 +10,36 @@ audit:
   type: stdout
 authn:
   type: insecure
+
+# --- Optional configuration below ---
+
+# Key record cache (improves latency, required for HYOK deployments)
+# cache:
+#   ttl_secs: 300
+#   max_capacity: 10000
+
+# Persistent audit signing key (32-byte Ed25519 seed file).
+# If omitted, an ephemeral key is generated each startup.
+# audit_signing_key_path: "/etc/keyrack/keys/audit-signing.key"
+
+# JWT authentication with issuer/audience validation:
+# authn:
+#   type: jwt
+#   jwks_url: "https://auth.example.com/.well-known/jwks.json"
+#   issuer: "https://auth.example.com/"
+#   audience: "keyrack"
+#   claims_namespace: "https://keyrack.io/v1"
+
+# Chain authenticator (first match wins):
+# authn:
+#   type: chain
+#   authenticators:
+#     - type: jwt
+#       jwks_url: "https://auth.example.com/.well-known/jwks.json"
+#     - type: forwarded_identity
+#     - type: bootstrap_token
+#       max_age_secs: 300
+
+# Forwarded identity (trust upstream header, only behind mTLS):
+# authn:
+#   type: forwarded_identity

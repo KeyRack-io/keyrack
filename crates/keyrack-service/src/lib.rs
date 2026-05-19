@@ -18,9 +18,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod cert_reload;
 pub mod config;
 pub mod convert;
+pub mod domain;
 pub mod grpc;
 pub mod metrics;
 pub mod ops;

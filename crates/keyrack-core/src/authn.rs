@@ -354,6 +354,62 @@ impl Authenticator for InsecureAuthenticator {
     }
 }
 
+/// Forwarded identity authenticator for trusted service-to-service calls.
+///
+/// Extracts pre-authenticated principal identity from headers set by a
+/// trusted upstream service (e.g. a Barbican shim or API gateway).
+///
+/// **Security:** This authenticator trusts the headers unconditionally.
+/// It MUST only be used behind verified mTLS from known trusted services.
+/// Typically deployed as the second authenticator in a chain after mTLS.
+///
+/// Headers:
+/// - `x-keyrack-principal-id` (required): Principal identifier
+/// - `x-keyrack-project-id` (optional): Project/tenant scope
+/// - `x-keyrack-domain-id` (optional): Domain/organization scope
+pub struct ForwardedIdentityAuthenticator;
+
+#[async_trait]
+impl Authenticator for ForwardedIdentityAuthenticator {
+    async fn authenticate(
+        &self,
+        metadata: &RequestMetadata,
+    ) -> Result<Option<AuthnResult>, AuthnError> {
+        let principal_id = match metadata.headers.get("x-keyrack-principal-id") {
+            Some(id) if !id.is_empty() => id.clone(),
+            Some(_) => {
+                return Err(AuthnError::InvalidCredential(
+                    "x-keyrack-principal-id header is empty".into(),
+                ));
+            }
+            None => return Ok(None),
+        };
+
+        let mut attributes = BTreeMap::new();
+        if let Some(project_id) = metadata.headers.get("x-keyrack-project-id") {
+            attributes.insert(
+                "project_id".into(),
+                AttributeValue::String(project_id.clone()),
+            );
+        }
+        if let Some(domain_id) = metadata.headers.get("x-keyrack-domain-id") {
+            attributes.insert(
+                "domain_id".into(),
+                AttributeValue::String(domain_id.clone()),
+            );
+        }
+
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: principal_id,
+                principal_type: "ForwardedIdentity".into(),
+                attributes,
+            },
+            method: "forwarded_identity".into(),
+        }))
+    }
+}
+
 /// JWT bearer token authenticator.
 ///
 /// Validates `Authorization: Bearer <jwt>` against a JWKS endpoint.

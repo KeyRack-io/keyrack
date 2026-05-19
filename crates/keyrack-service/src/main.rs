@@ -159,15 +159,70 @@ fn load_config() -> Result<ServiceConfig, Box<dyn std::error::Error>> {
     }
 }
 
+async fn build_authenticators(
+    config: &keyrack_service::config::AuthnConfig,
+) -> Result<Vec<Box<dyn keyrack_core::authn::Authenticator>>, Box<dyn std::error::Error>> {
+    use keyrack_core::authn::{
+        BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator,
+        InsecureAuthenticator, JwtAuthenticator, MtlsAuthenticator,
+    };
+    use keyrack_service::config::AuthnConfig;
+
+    match config {
+        AuthnConfig::Insecure => {
+            tracing::warn!("authentication disabled (insecure mode) — dev/test only");
+            Ok(vec![Box::new(InsecureAuthenticator)])
+        }
+        AuthnConfig::Mtls => {
+            Ok(vec![Box::new(MtlsAuthenticator)])
+        }
+        AuthnConfig::Jwt { jwks_url, issuer, audience, claims_namespace } => {
+            if let Some(aud) = audience {
+                tracing::info!(
+                    audience = %aud,
+                    "audience configured but not enforced at authn layer; \
+                     the `aud` claim is available in principal attributes for PDP enforcement"
+                );
+            }
+            let mut jwt_auth = JwtAuthenticator::new(jwks_url, issuer.as_deref()).await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("JWT authenticator init failed: {e}").into()
+                })?;
+            if let Some(ns) = claims_namespace {
+                jwt_auth = jwt_auth.with_claims_namespace(ns.clone());
+            }
+            Ok(vec![Box::new(jwt_auth)])
+        }
+        AuthnConfig::BootstrapToken { max_age_secs } => {
+            let token = std::env::var("KMS_BOOTSTRAP_TOKEN").unwrap_or_default();
+            if token.is_empty() {
+                tracing::warn!("bootstrap_token auth configured but KMS_BOOTSTRAP_TOKEN is empty");
+            }
+            Ok(vec![Box::new(BootstrapTokenAuthenticator::new(
+                &token,
+                std::time::Duration::from_secs(*max_age_secs),
+            ))])
+        }
+        AuthnConfig::ForwardedIdentity => {
+            Ok(vec![Box::new(ForwardedIdentityAuthenticator)])
+        }
+        AuthnConfig::Chain { authenticators } => {
+            let mut all: Vec<Box<dyn keyrack_core::authn::Authenticator>> = Vec::new();
+            for sub in authenticators {
+                let mut sub_auths = Box::pin(build_authenticators(sub)).await?;
+                all.append(&mut sub_auths);
+            }
+            Ok(all)
+        }
+    }
+}
+
 async fn build_state(
     config: &ServiceConfig,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServiceState, Box<dyn std::error::Error>> {
-    use keyrack_core::authn::{
-        Authenticator, AuthenticatorChain, BootstrapTokenAuthenticator,
-        InsecureAuthenticator, JwtAuthenticator, MtlsAuthenticator,
-    };
-    use keyrack_service::config::{AuditConfig, AuthnConfig, PdpConfig, ProviderConfig, StorageConfig};
+    use keyrack_core::authn::AuthenticatorChain;
+    use keyrack_service::config::{AuditConfig, PdpConfig, ProviderConfig, StorageConfig};
 
     let storage: Arc<dyn keyrack_core::storage::StorageBackend> = match &config.storage {
         StorageConfig::Sqlite { path } => Arc::new(keyrack_sqlite::SqliteStorage::open(path)?),
@@ -175,6 +230,22 @@ async fn build_state(
             Arc::new(keyrack_postgres::PostgresStorage::connect(database_url).await?)
         }
         StorageConfig::Memory => Arc::new(keyrack_sqlite::SqliteStorage::in_memory()?),
+    };
+
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> = if let Some(cache_cfg) = &config.cache {
+        let ttl = std::time::Duration::from_secs(cache_cfg.ttl_secs);
+        tracing::info!(
+            max_capacity = cache_cfg.max_capacity,
+            ttl_secs = cache_cfg.ttl_secs,
+            "key record cache enabled"
+        );
+        Arc::new(keyrack_service::cache::CachingStorage::new(
+            storage,
+            cache_cfg.max_capacity,
+            ttl,
+        ))
+    } else {
+        storage
     };
 
     let provider: Arc<dyn keyrack_core::provider::CryptoProvider> = match &config.provider {
@@ -280,12 +351,51 @@ async fn build_state(
             AuditConfig::Stdout => Box::new(keyrack_core::audit::StdoutSink),
             AuditConfig::File { path } => Box::new(keyrack_core::audit::FileSink::new(path)),
             AuditConfig::Nats { url } => {
-                Box::new(keyrack_nats::NatsAuditSink::connect(url).await?)
+                let mut sink = keyrack_nats::NatsAuditSink::connect(url).await?;
+                if let Some(nats_cfg) = &config.nats_notify {
+                    sink = sink.with_prefix(&nats_cfg.audit_subject_prefix);
+                }
+                Box::new(sink)
             }
         };
 
         if config.sign_audit_events {
-            let signer = keyrack_core::audit::AuditSigner::generate();
+            let signer = match &config.audit_signing_key_path {
+                Some(path) => {
+                    let key_path = std::path::Path::new(path);
+                    let signing_key = if key_path.exists() {
+                        let bytes = std::fs::read(key_path)
+                            .map_err(|e| -> Box<dyn std::error::Error> {
+                                format!("failed to read audit signing key at {path}: {e}").into()
+                            })?;
+                        if bytes.len() != 32 {
+                            return Err(format!(
+                                "audit signing key at {path} must be exactly 32 bytes, got {}",
+                                bytes.len()
+                            ).into());
+                        }
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&bytes);
+                        ed25519_dalek::SigningKey::from_bytes(&seed)
+                    } else {
+                        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+                        if let Some(parent) = key_path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::write(key_path, key.to_bytes())
+                            .map_err(|e| -> Box<dyn std::error::Error> {
+                                format!("failed to persist audit signing key to {path}: {e}").into()
+                            })?;
+                        tracing::info!(%path, "generated and persisted new audit signing key");
+                        key
+                    };
+                    keyrack_core::audit::AuditSigner::new(signing_key)
+                }
+                None => {
+                    tracing::info!("using ephemeral audit signing key (will not persist across restarts)");
+                    keyrack_core::audit::AuditSigner::generate()
+                }
+            };
             let vk = signer.verifying_key();
             let vk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
             tracing::info!(verifying_key = %vk_hex, "audit event signing enabled");
@@ -296,30 +406,7 @@ async fn build_state(
     };
 
     let authn: Arc<AuthenticatorChain> = {
-        let authenticators: Vec<Box<dyn Authenticator>> = match &config.authn {
-            AuthnConfig::Insecure => {
-                tracing::warn!("authentication disabled (insecure mode) — dev/test only");
-                vec![Box::new(InsecureAuthenticator)]
-            }
-            AuthnConfig::Mtls => {
-                vec![Box::new(MtlsAuthenticator)]
-            }
-            AuthnConfig::Jwt { jwks_url } => {
-                let jwt_auth = JwtAuthenticator::new(jwks_url, None).await
-                    .map_err(|e| -> Box<dyn std::error::Error> { format!("JWT authenticator init failed: {e}").into() })?;
-                vec![Box::new(jwt_auth)]
-            }
-            AuthnConfig::BootstrapToken { max_age_secs } => {
-                let token = std::env::var("KMS_BOOTSTRAP_TOKEN").unwrap_or_default();
-                if token.is_empty() {
-                    tracing::warn!("bootstrap_token auth configured but KMS_BOOTSTRAP_TOKEN is empty");
-                }
-                vec![Box::new(BootstrapTokenAuthenticator::new(
-                    &token,
-                    std::time::Duration::from_secs(*max_age_secs),
-                ))]
-            }
-        };
+        let authenticators = build_authenticators(&config.authn).await?;
         Arc::new(AuthenticatorChain::new(authenticators))
     };
 

@@ -21,3 +21,8 @@ audit:
 
 authn:
   type: insecure
+
+# Enable caching for integration tests (exercises the cache path)
+cache:
+  ttl_secs: 60
+  max_capacity: 1000

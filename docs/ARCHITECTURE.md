@@ -72,6 +72,27 @@ while delegating actual cryptography to pluggable backends.
 
 ---
 
+### Internal Layering (keyrack-service)
+
+```
+gRPC handlers  ─┐
+                 ├──▶  domain.rs (protocol-agnostic business logic)
+REST handlers  ─┘           │
+                            ▼
+                     ops layer (PDP authorization + audit emission)
+                            │
+                            ▼
+                   CryptoProvider / StorageBackend
+```
+
+All business logic lives in `domain.rs`. Both gRPC and REST handlers
+delegate to the same domain functions, eliminating behavioral divergence
+between API surfaces. The `ops` layer wraps every domain call with PDP
+authorization and audit emission, making those guarantees structural
+rather than per-handler.
+
+---
+
 ## Key Concepts
 
 ### Logical Key Identity (LID)
@@ -206,7 +227,7 @@ pub trait CryptoProvider: Send + Sync {
 | **PKCS#11** | HSM hardware | Production, regulated | Yes (if HSM is FIPS-validated) |
 | **KMIP** | Remote HSM via TTLV/TLS | Production, HYOK | Yes (if HSM is FIPS-validated) |
 | **Parsec** (stub) | PSA Crypto / TPM | IoT/embedded (future) | Depends on backend |
-| **Vault Transit** (planned) | Vault server | Brownfield adoption | No (Vault is not FIPS module) |
+| **Vault Transit** | Vault server | Brownfield adoption | No (Vault is not FIPS module) |
 
 The provider choice is a deployment-time configuration decision. Same
 KeyRack API, same key hierarchy, different security properties based
@@ -383,3 +404,5 @@ replication, cache invalidation, and peer discovery.
 | `keyrack` | Library: high-level Rust client facade |
 | `keyrack-aws-common` | Library: shared AWS KMS JSON-RPC parsing |
 | `keyrack-aws-proxy` | Library: FOSS AWS KMS pass-through proxy |
+| `keyrack-vault` | Library: HashiCorp Vault Transit CryptoProvider |
+| `keyrack-e2e` | Integration tests: end-to-end API test suite |

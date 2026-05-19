@@ -181,6 +181,22 @@ async fn emit_audit(
         result,
     )
     .with_request_id(ctx.request_id.clone());
+
+    let tenant = ctx.principal.attributes.get("tenant_id")
+        .or_else(|| ctx.principal.attributes.get("domain_id"))
+        .and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    let project = ctx.principal.attributes.get("project_id")
+        .and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    if tenant.is_some() || project.is_some() {
+        event = event.with_context(tenant, project, None);
+    }
+
     if let Some(hash) = ctx.encryption_context_hash {
         event = event.with_encryption_context_hash(hash);
     }

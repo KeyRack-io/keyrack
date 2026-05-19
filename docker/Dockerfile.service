@@ -20,6 +20,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY proto/ proto/
+COPY examples/ examples/
 
 RUN cargo build --release \
     -p keyrack-service \

@@ -132,7 +132,10 @@ provider:
   mount_path: "transit"        # optional, defaults to "transit"
 ```
 
-### KMIP (planned)
+### KMIP (HYOK / multi-cloud)
+
+Delegates key operations to a remote KMIP-compliant HSM. Enables Hold
+Your Own Key (HYOK) deployments where tenants control their own HSMs.
 
 ```yaml
 provider:
@@ -143,9 +146,6 @@ provider:
   client_key: "/etc/keyrack/tls/kmip-client-key.pem"
   ca_cert: "/etc/keyrack/tls/kmip-ca.pem"   # optional
 ```
-
-> KMIP provider is not yet implemented. The config is parsed and
-> validated — the service will refuse to start with a clear error.
 
 ### In-memory (test fixtures)
 
@@ -273,6 +273,41 @@ Extracts the principal from the peer certificate's SAN.
 authn:
   type: jwt
   jwks_url: "https://auth.example.com/.well-known/jwks.json"
+  issuer: "https://auth.example.com/"          # optional: validate `iss` claim
+  audience: "keyrack"                          # optional: extracted for PDP, not enforced at authn layer
+  claims_namespace: "https://keyrack.io/v1"    # optional: prefix for custom claims
+```
+
+The `issuer` field, if set, rejects tokens whose `iss` claim does not match.
+The `audience` field is extracted into principal attributes so the PDP can
+enforce audience restrictions — it is not validated at the authn layer.
+The `claims_namespace` lets you scope custom claims (e.g.
+`https://keyrack.io/v1/tenant_id`).
+
+### Forwarded identity
+
+Trust the `x-keyrack-principal-id` header set by an already-authenticated
+upstream (e.g. the Barbican shim). **Only safe behind mTLS.**
+
+```yaml
+authn:
+  type: forwarded_identity
+```
+
+### Chain (multiple authenticators)
+
+Try authenticators in order; first successful match wins.
+
+```yaml
+authn:
+  type: chain
+  authenticators:
+    - type: jwt
+      jwks_url: "https://auth.example.com/.well-known/jwks.json"
+      issuer: "https://auth.example.com/"
+    - type: mtls
+    - type: bootstrap_token
+      max_age_secs: 300
 ```
 
 ---
@@ -355,6 +390,16 @@ the hex-encoded verifying key. Each audit event is signed and includes a
 hash-chain reference to the previous event, ensuring tampering or
 deletion is detectable.
 
+To persist the signing key across restarts (so verifiers can use a stable
+public key), provide a path to a 32-byte Ed25519 seed file:
+
+```yaml
+audit_signing_key_path: "/etc/keyrack/keys/audit-signing.key"
+```
+
+If not set, an ephemeral key is generated each startup and the verifying
+key is logged at INFO level.
+
 ---
 
 ## Monitoring
@@ -399,6 +444,24 @@ nats_notify:
   state_changed_subject_prefix: "kms.key.state-changed"
   invalidation_subject_prefix: "kms.cache.invalidate"
 ```
+
+---
+
+## Key record cache
+
+Enable in-memory caching of key records to reduce storage round-trips:
+
+```yaml
+cache:
+  ttl_secs: 300          # cache TTL in seconds (default: 300 = 5 minutes)
+  max_capacity: 10000    # maximum cached entries (default: 10,000)
+```
+
+The cache is invalidated on key state changes and rotation. For HYOK
+deployments, `ttl_secs` is the upper bound on time-to-lockout after a
+tenant disconnects their HSM — lower it if faster revocation is required.
+
+If omitted, caching is disabled and every operation hits the storage backend.
 
 ---
 

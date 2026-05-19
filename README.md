@@ -7,10 +7,12 @@ hierarchies, drives rotation, and delegates all cryptographic material to
 HSM backends (PKCS#11, KMIP). It never stores raw key material.
 
 - **Sovereign** — you control your keys. No cloud vendor lock-in.
-- **Pluggable HSMs** — PKCS#11 (Thales, Entrust, YubiHSM, CloudHSM), KMIP for tenant-managed HSMs.
+- **Pluggable HSMs** — PKCS#11 (Thales, Entrust, YubiHSM, CloudHSM), KMIP for tenant-managed HSMs, Vault Transit.
 - **API compatible** — AWS KMS and OpenStack Barbican shims let existing apps work without code changes.
 - **Policy-driven** — external authorization via any PDP (Cedar, OPA). Every operation is authorized and audited.
 - **Hierarchical keys** — deterministic key derivation trees with namespace-scoped rules and cascade disable.
+- **HYOK (Hold Your Own Key)** — tenants plug in their own HSM; disconnect guarantees bounded lockout via configurable cache TTL.
+- **Cryptographic audit** — Ed25519-signed events with BLAKE3 hash chain, delivered over NATS.
 
 ## Quickstart
 
@@ -79,7 +81,7 @@ storage:
   path: "/var/lib/keyrack/keyrack.db"
 
 provider:
-  type: software        # or: pkcs11, in_memory
+  type: software        # or: pkcs11, kmip, vault_transit, in_memory
 
 pdp:
   type: http
@@ -88,9 +90,17 @@ pdp:
 
 audit:
   type: stdout           # or: file, nats
+sign_audit_events: true
+audit_signing_key_path: "/var/lib/keyrack/audit-signing-key"
 
 authn:
-  type: insecure         # or: bootstrap_token, mtls, jwt
+  type: jwt              # or: mtls, bootstrap_token, forwarded_identity, chain, insecure
+  jwks_url: "https://your-idp/.well-known/jwks.json"
+  issuer: "https://your-idp"
+
+cache:
+  max_capacity: 10000
+  ttl_secs: 300
 ```
 
 See [docs/OPERATOR.md](docs/OPERATOR.md) for the full configuration reference.
@@ -109,7 +119,8 @@ crates/
 ├── keyrack-kmip/           KMIP client provider (HYOK)
 ├── keyrack-postgres/       PostgreSQL storage backend
 ├── keyrack-sqlite/         SQLite storage backend
-├── keyrack-nats/           NATS audit sink
+├── keyrack-nats/           NATS audit sink + state-change publisher
+├── keyrack-vault/          HashiCorp Vault Transit provider
 └── keyrack-test-support/   Shared test fixtures
 docs/
 ├── OPERATOR.md             Running KeyRack in production
@@ -146,11 +157,24 @@ The same operations are available over gRPC on port 50051.
 
 ## Documentation
 
+- [Why KeyRack?](docs/WHY_KEYRACK.md) — motivation, use cases, comparison
+- [Integration guide](docs/INTEGRATION_GUIDE.md) — AuthN, AuthZ, Audit, production checklist
 - [Operator guide](docs/OPERATOR.md) — configuration, deployment, monitoring
 - [Developer guide](docs/DEVELOPER.md) — using the library, writing custom providers
 - [Security model](docs/SECURITY.md) — threat model, invariants, vulnerability disclosure
 - [Cedar starter schema](docs/CEDAR_STARTER_SCHEMA.md) — example PDP schema
-- [Migration design](MIGRATION.md) — key hierarchy migration semantics
+
+## Demos
+
+Five runnable demos (each a `docker compose up` away):
+
+| Demo | What it shows | Provider |
+|------|--------------|----------|
+| [01-foss-vault](../demos/01-foss-vault/) | Key lifecycle with Vault Transit | Vault |
+| [02-foss-softhsm](../demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
+| [03-aws-kms-shim](../demos/03-aws-kms-shim/) | Unmodified boto3 client | AWS KMS shim |
+| [04-hyok-full-stack](../demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
+| [05-hyok-aws-shim](../demos/05-hyok-aws-shim/) | Enterprise path: boto3 → HYOK | AWS KMS shim + full stack |
 
 ## License
 

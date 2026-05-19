@@ -55,6 +55,18 @@ pub struct ServiceConfig {
 
     #[serde(default)]
     pub grpc_keepalive: Option<GrpcKeepaliveConfig>,
+
+    /// Key record cache configuration. Enables in-memory caching of
+    /// `get_key` results for improved latency. The TTL also serves as
+    /// the upper bound on time-to-lockout for HYOK disconnect scenarios.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+
+    /// Path to persistent Ed25519 signing key for audit events.
+    /// If not set, an ephemeral key is generated each startup.
+    /// Format: 32 raw bytes (the Ed25519 secret seed).
+    #[serde(default)]
+    pub audit_signing_key_path: Option<String>,
 }
 
 impl Default for ServiceConfig {
@@ -73,6 +85,8 @@ impl Default for ServiceConfig {
             nats_notify: None,
             tls: None,
             grpc_keepalive: None,
+            cache: None,
+            audit_signing_key_path: None,
         }
     }
 }
@@ -182,26 +196,42 @@ pub enum AuditConfig {
 
 /// Authentication configuration.
 ///
-/// Multiple authenticators are tried in order (mTLS first, then JWT, then
-/// bootstrap token).  `Insecure` accepts all requests as a system
-/// principal — suitable only for local development.
+/// Use `Chain` variant to combine multiple authenticators (tried in order).
+/// For production deployments, consider `Chain { authenticators: [Mtls, ForwardedIdentity] }`
+/// or `Chain { authenticators: [Jwt { ... }, BootstrapToken { ... }] }`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthnConfig {
-    /// mTLS + optional JWT.  Production default.
+    /// Mutual TLS client-certificate authentication. Production default.
     #[default]
     Mtls,
-    /// JWT bearer token only (no mTLS).
+    /// JWT bearer token validated against a JWKS endpoint.
     Jwt {
         jwks_url: String,
+        #[serde(default)]
+        issuer: Option<String>,
+        /// Not enforced at the authn layer (core sets `validate_aud = false`).
+        /// The `aud` claim is extracted into principal attributes so the PDP
+        /// can enforce audience restrictions.
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
+        claims_namespace: Option<String>,
     },
     /// OSS fallback: bootstrap bearer token, time-bounded.
     BootstrapToken {
         #[serde(default = "default_bootstrap_max_age_secs")]
         max_age_secs: u64,
     },
+    /// Trust `x-keyrack-principal-id` header from an already-authenticated
+    /// upstream service (e.g. the Barbican shim). Only safe behind mTLS.
+    ForwardedIdentity,
     /// Skip authentication entirely (dev/test only).
     Insecure,
+    /// Chain of authenticators tried in order (first match wins).
+    Chain {
+        authenticators: Vec<AuthnConfig>,
+    },
 }
 
 fn default_bootstrap_max_age_secs() -> u64 {
@@ -255,6 +285,36 @@ fn default_keepalive_timeout_secs() -> u64 {
     10
 }
 
+/// Configuration for the key record cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Maximum number of key records to cache (default: 10,000).
+    #[serde(default = "default_cache_max_capacity")]
+    pub max_capacity: u64,
+    /// Cache TTL in seconds (default: 300 = 5 minutes).
+    /// For HYOK deployments, this is the upper bound on time-to-lockout
+    /// after a tenant disconnects their HSM.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+fn default_cache_max_capacity() -> u64 {
+    10_000
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_capacity: default_cache_max_capacity(),
+            ttl_secs: default_cache_ttl_secs(),
+        }
+    }
+}
+
 impl ServiceConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
@@ -289,6 +349,8 @@ mod tests {
             nats_notify: None,
             tls: None,
             grpc_keepalive: None,
+            cache: None,
+            audit_signing_key_path: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();

@@ -57,6 +57,9 @@ pub enum KeyRackError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error("provider unavailable: {0}")]
+    ProviderUnavailable(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 

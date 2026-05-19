@@ -73,9 +73,9 @@ KeyRack's compliance posture is fundamentally determined by which cryptographic 
 | Framework | Readiness | Deployment mode | Primary gaps | Effort to close |
 |---|---|---|---|---|
 | **FIPS 140-3** | Partial | PKCS#11 path only | BLAKE3 used internally (not FIPS-approved); RustCrypto not CMVP-validated; no power-up self-tests | High |
-| **SOC 2 Type II** | Strong | Both | Audit log tamper-evidence for FOSS; policy documentation templates | Low–Medium |
+| **SOC 2 Type II** | Strong | Both | Policy documentation templates | Low |
 | **PCI-DSS v4.0** | Partial | PKCS#11 path required | Split knowledge / dual control not surfaced in software; cryptoperiod enforcement | Medium |
-| **HIPAA** | Strong | Both | Audit log integrity for FOSS deployments | Low |
+| **HIPAA** | Strong | Both | — | Low |
 | **GDPR** | Strong | Both | Key destruction certificate; DPIA template | Low |
 | **NIST SP 800-57** | Mostly aligned | Both | No "Compromised" key state; RSA-2048 deprecation; no PQC algorithms | Medium |
 | **eIDAS** | Significant gaps | PKCS#11 path required | RSA-PSS absent; no SAM integration; no QSCD certification; no PQC | High |
@@ -131,11 +131,11 @@ A `--features fips` build flag that replaces BLAKE3 with SHA-256 or SHA3-256 is 
 | AWS KMS compatibility shim | No | `commercial:keyrack-aws-kms-shim` |
 | Management UI | No | `commercial:keyrack-ui` |
 | Compliance templates and reporting | No | `commercial:compliance` |
-| Signed audit trail (tamper-evidence) | No (NATS durable delivery only) | Yes (a partner receipt chain) |
+| Signed audit trail (tamper-evidence) | Yes (Ed25519 hash-chain, ephemeral or persistent key) | Yes (a partner receipt chain) |
 
 ### What this means for compliance
 
-- **SOC 2 / HIPAA**: FOSS provides the technical controls. Commercial adds audit trail tamper-evidence (signed receipts) and compliance documentation. An FOSS deployment can pass a SOC 2 audit with operational controls around audit log integrity.
+- **SOC 2 / HIPAA**: FOSS provides the technical controls including Ed25519 signed audit trails with hash-chaining. Commercial adds compliance documentation templates and the partner receipt chain. An FOSS deployment can pass a SOC 2 audit with `sign_audit_events: true` and a persistent signing key.
 - **PCI-DSS**: FOSS provides key lifecycle and HSM integration. Commercial adds compliance templates and potentially the HA deployment required for availability. Split knowledge / dual control is an HSM operational concern regardless.
 - **FIPS 140-3**: Same story for both — depends on the HSM certificate. The BLAKE3 internal usage affects both.
 - **GDPR**: FOSS crypto-shredding is the strongest feature. Commercial adds a key destruction certificate and DPIA template.

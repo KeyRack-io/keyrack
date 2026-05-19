@@ -45,6 +45,31 @@ fn make_auth_pin(pin: &str) -> AuthPin {
     AuthPin::new(pin.to_owned().into_boxed_str())
 }
 
+/// Classify a cryptoki error as a transient HSM connectivity/session failure.
+fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
+    matches!(
+        e,
+        cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::DeviceError
+                | cryptoki::error::RvError::DeviceRemoved
+                | cryptoki::error::RvError::TokenNotPresent
+                | cryptoki::error::RvError::SessionClosed
+                | cryptoki::error::RvError::SessionHandleInvalid,
+            _,
+        )
+    )
+}
+
+/// Map a cryptoki error to the appropriate `KeyRackError` variant,
+/// distinguishing transient HSM failures from permanent provider errors.
+fn map_pkcs11_error(context: &str, e: cryptoki::error::Error) -> KeyRackError {
+    if is_transient_pkcs11_error(&e) {
+        KeyRackError::ProviderUnavailable(format!("{context}: {e}"))
+    } else {
+        KeyRackError::Provider(format!("{context}: {e}"))
+    }
+}
+
 /// Configuration for constructing a [`Pkcs11Provider`].
 #[derive(Clone)]
 pub struct Pkcs11ProviderConfig {
@@ -110,10 +135,10 @@ impl Pkcs11Provider {
         tokio::task::spawn_blocking(move || {
             let session = ctx
                 .open_rw_session(slot)
-                .map_err(|e| KeyRackError::Provider(format!("open session: {e}")))?;
+                .map_err(|e| map_pkcs11_error("open session", e))?;
             session
                 .login(UserType::User, Some(&make_auth_pin(&pin)))
-                .map_err(|e| KeyRackError::Provider(format!("login: {e}")))?;
+                .map_err(|e| map_pkcs11_error("login", e))?;
             f(&session)
         })
         .await
@@ -151,7 +176,7 @@ fn find_object(
     ];
     let objects = session
         .find_objects(&template)
-        .map_err(|e| KeyRackError::Provider(format!("find_objects: {e}")))?;
+        .map_err(|e| map_pkcs11_error("find_objects", e))?;
 
     objects
         .into_iter()
@@ -258,7 +283,7 @@ fn pkcs11_encrypt(
 
     let nonce_bytes = session
         .generate_random_vec(12)
-        .map_err(|e| KeyRackError::Provider(format!("generate nonce: {e}")))?;
+        .map_err(|e| map_pkcs11_error("generate nonce", e))?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&nonce_bytes);
 
@@ -266,7 +291,7 @@ fn pkcs11_encrypt(
         .map_err(|e| KeyRackError::Provider(format!("GCM params: {e}")))?;
     let ct = session
         .encrypt(&Mechanism::AesGcm(gcm_params), obj, plaintext)
-        .map_err(|e| KeyRackError::Provider(format!("AES-GCM encrypt: {e}")))?;
+        .map_err(|e| map_pkcs11_error("AES-GCM encrypt", e))?;
 
     // Wire format: 12-byte nonce || ciphertext+tag
     let mut out = Vec::with_capacity(12 + ct.len());
@@ -298,7 +323,13 @@ fn pkcs11_decrypt(
         .map_err(|e| KeyRackError::Provider(format!("GCM params: {e}")))?;
     let pt = session
         .decrypt(&Mechanism::AesGcm(gcm_params), obj, ct)
-        .map_err(|_| KeyRackError::EncryptionContextMismatch)?;
+        .map_err(|e| {
+            if is_transient_pkcs11_error(&e) {
+                KeyRackError::ProviderUnavailable(format!("AES-GCM decrypt: {e}"))
+            } else {
+                KeyRackError::EncryptionContextMismatch
+            }
+        })?;
 
     Ok(Sensitive::new(pt))
 }
@@ -316,12 +347,12 @@ fn pkcs11_sign(
             let params = EddsaParams::new(EddsaSignatureScheme::Ed25519);
             session
                 .sign(&Mechanism::Eddsa(params), priv_handle, message)
-                .map_err(|e| KeyRackError::Provider(format!("Ed25519 sign: {e}")))
+                .map_err(|e| map_pkcs11_error("Ed25519 sign", e))
         }
 
         SigningAlgorithm::RsaPkcs1v15Sha256 => session
             .sign(&Mechanism::Sha256RsaPkcs, priv_handle, message)
-            .map_err(|e| KeyRackError::Provider(format!("RSA sign: {e}"))),
+            .map_err(|e| map_pkcs11_error("RSA sign", e)),
 
         SigningAlgorithm::RsaPssSha256 => {
             let pss_params = PkcsPssParams {
@@ -331,14 +362,14 @@ fn pkcs11_sign(
             };
             session
                 .sign(&Mechanism::Sha256RsaPkcsPss(pss_params), priv_handle, message)
-                .map_err(|e| KeyRackError::Provider(format!("RSA-PSS sign: {e}")))
+                .map_err(|e| map_pkcs11_error("RSA-PSS sign", e))
         }
 
         SigningAlgorithm::EcdsaP256Sha256 => {
             let hash = sha256_hash(message);
             let raw_sig = session
                 .sign(&Mechanism::Ecdsa, priv_handle, &hash)
-                .map_err(|e| KeyRackError::Provider(format!("ECDSA sign: {e}")))?;
+                .map_err(|e| map_pkcs11_error("ECDSA sign", e))?;
             ecdsa_der::raw_to_der(&raw_sig, P256_COMPONENT_LEN)
         }
     }
@@ -386,7 +417,7 @@ fn pkcs11_verify(
             | cryptoki::error::RvError::SignatureLenRange,
             _,
         )) => Ok(false),
-        Err(e) => Err(KeyRackError::Provider(format!("verify: {e}"))),
+        Err(e) => Err(map_pkcs11_error("verify", e)),
     }
 }
 
@@ -492,12 +523,12 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
     let template = vec![Attribute::Label(label.as_bytes().to_vec())];
     let objects = session
         .find_objects(&template)
-        .map_err(|e| KeyRackError::Provider(format!("find for destroy: {e}")))?;
+        .map_err(|e| map_pkcs11_error("find for destroy", e))?;
 
     for obj in objects {
         session
             .destroy_object(obj)
-            .map_err(|e| KeyRackError::Provider(format!("destroy_object: {e}")))?;
+            .map_err(|e| map_pkcs11_error("destroy_object", e))?;
     }
     Ok(())
 }
@@ -596,7 +627,7 @@ impl CryptoProvider for Pkcs11Provider {
         self.run(move |session| {
             let bytes = session
                 .generate_random_vec(len)
-                .map_err(|e| KeyRackError::Provider(format!("generate_random: {e}")))?;
+                .map_err(|e| map_pkcs11_error("generate_random", e))?;
             Ok(Sensitive::new(bytes))
         })
         .await
