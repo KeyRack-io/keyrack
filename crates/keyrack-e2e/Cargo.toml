@@ -2,6 +2,7 @@
 name = "keyrack-e2e"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "E2E test + demo binary for KeyRack — exercises gRPC and REST from the outside"
 publish = false
 

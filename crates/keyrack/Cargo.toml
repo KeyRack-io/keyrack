@@ -6,7 +6,8 @@ license = "Apache-2.0"
 description = "High-level Rust client library for KeyRack KMS"
 
 [dependencies]
-keyrack-core = { path = "../keyrack-core" }
+# IMPORTANT: this crate is the permissive (Apache-2.0) client SDK. It MUST NOT
+# depend on keyrack-core or any AGPL crate. Enforced by scripts/check-sdk-no-agpl.sh.
 tonic = "0.13"
 tokio = { version = "1", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }

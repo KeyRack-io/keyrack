@@ -1,5 +1,45 @@
-pub use keyrack_core::attr::{AttributeSet, AttributeValue};
-pub use keyrack_core::lid::Lid;
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// This crate is the permissive (Apache-2.0) client SDK for KeyRack.
+//
+// It MUST NOT depend on `keyrack-core` or any AGPL-licensed crate. It contains
+// no orchestration algorithms — no LID derivation/canonicalization, no
+// resolver, no rule engine, no cascade logic, no ciphertext codec. It exposes
+// only opaque identifiers, plain DTOs, and the network client. Key identity is
+// computed server-side; the SDK treats identifiers as opaque handles. This
+// boundary is enforced in CI by `scripts/check-sdk-no-agpl.sh`.
+
+//! High-level Rust client library for KeyRack KMS (Apache-2.0).
+
+/// Opaque key identifier returned by the KeyRack service.
+///
+/// The SDK never derives, parses, or canonicalizes this value client-side; it
+/// is an opaque handle minted by the server. This keeps the crown-jewel LID
+/// derivation logic exclusively in the AGPL core.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct KeyId(String);
+
+impl KeyId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for KeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for KeyId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
 
 pub type Attributes = std::collections::BTreeMap<String, String>;
 
@@ -66,7 +106,7 @@ impl RoutingRule {
 }
 
 pub struct ResolvedKey {
-    lid: Lid,
+    lid: KeyId,
     version: u32,
 }
 
@@ -74,7 +114,7 @@ impl ResolvedKey {
     pub fn version(&self) -> u32 {
         self.version
     }
-    pub fn lid(&self) -> &Lid {
+    pub fn lid(&self) -> &KeyId {
         &self.lid
     }
 }

@@ -74,4 +74,4 @@ cd crates/keyrack-wasm
 
 ## License
 
-BUSL-1.1 (converts to Apache-2.0 on 2030-01-01)
+AGPL-3.0-or-later (commercial licensing available)

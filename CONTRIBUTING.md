@@ -91,7 +91,24 @@ Each crate under `crates/` has a focused responsibility:
 - Property tests via `proptest` for canonicalization and LID derivation
 - E2E tests in Docker with SoftHSM (PKCS#11) and PostgreSQL
 
-## License
+## License & Contributor License Agreement
 
-By contributing, you agree that your contributions will be licensed under
-the same license as the project (BSL 1.1 with Apache 2.0 conversion).
+KeyRack's core is licensed under **AGPL-3.0-or-later**; the Protocol Buffers
+definitions and the high-level `keyrack` client SDK are **Apache-2.0**.
+
+KeyRack is dual-licensed: it is offered both under the AGPL and under separate
+commercial terms. To make that sustainable, all contributions require a
+**Contributor License Agreement** ([CLA.md](CLA.md)), which grants the Licensor
+the right to license your contribution under both the AGPL and commercial
+terms. You retain copyright to your contributions.
+
+Concretely:
+
+1. Sign off every commit under the
+   [Developer Certificate of Origin](https://developercertificate.org/)
+   with `git commit -s`.
+2. Accept the [CLA](CLA.md) when prompted on your first pull request (entities
+   contributing on behalf of an employer should execute the corporate variant —
+   see the CLA for details).
+
+Pull requests cannot be merged until the CLA is on file.

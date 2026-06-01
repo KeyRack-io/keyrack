@@ -178,5 +178,14 @@ Five runnable demos (each a `docker compose up` away):
 
 ## License
 
-Business Source License 1.1, converting to Apache License 2.0 four years
-after each release. See [LICENSE](LICENSE) for full terms.
+KeyRack's core is licensed under the **GNU Affero General Public License v3.0
+or later** (AGPL-3.0-or-later). See [LICENSE](LICENSE) for full terms.
+
+The Protocol Buffers definitions (`proto/`) and the high-level client SDK
+(`keyrack` crate) are licensed under **Apache-2.0** to maximize interoperability
+and ease of integration for applications.
+
+Using KeyRack's engine inside a larger work that you distribute or operate as a
+network service requires that work to comply with the AGPL. **Alternative
+commercial licensing is available** for organizations that wish to embed KeyRack
+without the AGPL's reciprocity obligations — contact the Licensor.

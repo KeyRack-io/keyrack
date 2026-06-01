@@ -25,8 +25,8 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.80"
-license = "BUSL-1.1"
-repository = "https://github.com/keyrack/keyrack"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Keyrack-io/keyrack"
 
 [workspace.dependencies]
 # Shared versions pinned here; crates reference via { workspace = true }

@@ -127,8 +127,8 @@ Unlike Barbican, KeyRack provides actual HYOK semantics, a proper key hierarchy,
 
 | Component | Role | License |
 |-----------|------|---------|
-| **keyrack-oss** | Core KMS: key lifecycle, crypto operations, gRPC + REST APIs, pluggable providers, Cedar authorization, NATS eventing | MIT / Apache-2.0 |
-| **keyrack-commercial** | AWS KMS shim, Barbican shim, HA clustering, key pooling, vendor HSM adapters, management UI | BUSL-1.1 |
+| **keyrack-oss** | Core KMS: key lifecycle, crypto operations, gRPC + REST APIs, pluggable providers, Cedar authorization, NATS eventing | AGPL-3.0-or-later (proto + client SDK: Apache-2.0) |
+| **keyrack-commercial** | AWS KMS shim, Barbican shim, HA clustering, key pooling, vendor HSM adapters, management UI | Proprietary |
 
 ### Key hierarchy
 
@@ -191,13 +191,15 @@ FIPS 140-3 compliance is achieved through the HSM provider path. The HSM's certi
 | API compatibility | Proprietary per provider | Native gRPC/REST + AWS KMS shim + Barbican shim |
 | Authorization model | IAM policies (provider-specific) | Cedar policy-as-code (portable, auditable) |
 | Crypto-shredding | Manual, no cascade guarantee | Key hierarchy with cascade-disable and cascade-destroy |
-| Open source | No | Core is MIT/Apache-2.0 |
+| Open source | No | Core is AGPL-3.0-or-later (OSI/FSF-approved) |
 
 ---
 
 ## Getting Started
 
-KeyRack's core is open source under MIT/Apache-2.0.
+KeyRack's core is open source under AGPL-3.0-or-later (the Protocol Buffers
+definitions and the client SDK are Apache-2.0). Commercial licensing is
+available for embedding without AGPL reciprocity.
 
 - **Repository:** [keyrack-oss](https://github.com/Keyrack-io/keyrack)
 - **Security model:** [`docs/compliance/CRYPTO_SECURITY_MODEL.md`](compliance/CRYPTO_SECURITY_MODEL.md)

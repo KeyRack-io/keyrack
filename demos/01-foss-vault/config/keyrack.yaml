@@ -1,0 +1,25 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+provider:
+  type: vault_transit
+  vault_addr: http://vault:8200
+  vault_token: demo-root-token
+
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout
+
+sign_audit_events: true
+
+authn:
+  type: insecure
+
+cache:
+  max_capacity: 1000
+  ttl_secs: 60

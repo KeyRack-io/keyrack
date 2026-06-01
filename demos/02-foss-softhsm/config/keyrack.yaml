@@ -1,0 +1,25 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+provider:
+  type: pkcs11
+  lib_path: /usr/lib/softhsm/libsofthsm2.so
+  token_label: keyrack-demo
+  pin: "1234"
+
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout
+sign_audit_events: true
+
+authn:
+  type: insecure
+
+cache:
+  max_capacity: 1000
+  ttl_secs: 60

@@ -2,7 +2,8 @@
 name = "keyrack-aws-proxy"
 version = "0.1.0"
 edition = "2021"
-description = "FOSS AWS KMS pass-through proxy with metadata tracking"
+license = "AGPL-3.0-or-later"
+description = "AWS KMS pass-through proxy with metadata tracking"
 
 [[bin]]
 name = "keyrack-aws-proxy"

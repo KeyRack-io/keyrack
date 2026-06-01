@@ -8,7 +8,7 @@
 
 KeyRack is an attribute-based key management service (KMS) with a pluggable cryptographic provider architecture. It manages the full key lifecycle — generation, storage, rotation, access control, audit, and destruction — while delegating actual cryptographic operations to configurable backend providers.
 
-KeyRack is open-source (BUSL-1.1, converting to Apache 2.0 in 2030) with commercial extensions for high availability, AWS KMS compatibility, management UI, and compliance tooling.
+KeyRack is open-source (AGPL-3.0-or-later; the Protocol Buffers definitions and client SDK are Apache-2.0) with commercial extensions for high availability, AWS KMS compatibility, management UI, and compliance tooling.
 
 ### Core components
 

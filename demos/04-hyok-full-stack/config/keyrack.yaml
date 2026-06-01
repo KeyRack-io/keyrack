@@ -1,0 +1,38 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+provider:
+  type: pkcs11
+  lib_path: /usr/lib/softhsm/libsofthsm2.so
+  token_label: tenant-a
+  pin: "1234"
+
+pdp:
+  type: http
+  endpoint: http://cedar-pdp:8181/v1/authorize
+  timeout_ms: 5000
+
+audit:
+  type: nats
+  url: nats://nats:4222
+
+sign_audit_events: true
+audit_signing_key_path: /data/audit-signing-key
+
+authn:
+  type: jwt
+  jwks_url: http://jwt-issuer:9000/.well-known/jwks.json
+  issuer: http://jwt-issuer:9000
+  claims_namespace: "keyrack:"
+
+nats_notify:
+  url: nats://nats:4222
+  audit_subject_prefix: kms.audit
+  state_changed_subject_prefix: kms.key.state-changed
+
+cache:
+  max_capacity: 1000
+  ttl_secs: 10

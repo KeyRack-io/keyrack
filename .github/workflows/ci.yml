@@ -54,6 +54,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  license-boundary:
+    name: SDK license boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Ensure Apache-2.0 SDK links no AGPL crate
+        run: ./scripts/check-sdk-no-agpl.sh
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest
