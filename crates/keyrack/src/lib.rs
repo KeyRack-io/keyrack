@@ -7,8 +7,7 @@
 // no orchestration algorithms — no LID derivation/canonicalization, no
 // resolver, no rule engine, no cascade logic, no ciphertext codec. It exposes
 // only opaque identifiers, plain DTOs, and the network client. Key identity is
-// computed server-side; the SDK treats identifiers as opaque handles. This
-// boundary is enforced in CI by `scripts/check-sdk-no-agpl.sh`.
+// computed server-side; the SDK treats identifiers as opaque handles.
 
 //! High-level Rust client library for KeyRack KMS (Apache-2.0).
 

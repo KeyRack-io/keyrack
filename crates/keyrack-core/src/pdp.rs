@@ -40,8 +40,8 @@ pub const PDP_API_VERSION: &str = "1.0";
 
 /// Typed attribute value for PDP attribute maps.
 ///
-/// Matches the partner's `oneof AttributeValue` proposal. Avoids
-/// `serde_json::Value` ambiguity for boolean/integer distinction.
+/// Uses an explicit `oneof AttributeValue` to avoid `serde_json::Value`
+/// ambiguity for the boolean/integer distinction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AttributeValue {

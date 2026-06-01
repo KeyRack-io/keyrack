@@ -131,11 +131,11 @@ A `--features fips` build flag that replaces BLAKE3 with SHA-256 or SHA3-256 is 
 | AWS KMS compatibility shim | No | `commercial:keyrack-aws-kms-shim` |
 | Management UI | No | `commercial:keyrack-ui` |
 | Compliance templates and reporting | No | `commercial:compliance` |
-| Signed audit trail (tamper-evidence) | Yes (Ed25519 hash-chain, ephemeral or persistent key) | Yes (a partner receipt chain) |
+| Signed audit trail (tamper-evidence) | Yes (Ed25519 hash-chain, ephemeral or persistent key) | Yes (commercial receipt chain) |
 
 ### What this means for compliance
 
-- **SOC 2 / HIPAA**: FOSS provides the technical controls including Ed25519 signed audit trails with hash-chaining. Commercial adds compliance documentation templates and the partner receipt chain. An FOSS deployment can pass a SOC 2 audit with `sign_audit_events: true` and a persistent signing key.
+- **SOC 2 / HIPAA**: FOSS provides the technical controls including Ed25519 signed audit trails with hash-chaining. Commercial adds compliance documentation templates and the commercial receipt chain. An FOSS deployment can pass a SOC 2 audit with `sign_audit_events: true` and a persistent signing key.
 - **PCI-DSS**: FOSS provides key lifecycle and HSM integration. Commercial adds compliance templates and potentially the HA deployment required for availability. Split knowledge / dual control is an HSM operational concern regardless.
 - **FIPS 140-3**: Same story for both — depends on the HSM certificate. The BLAKE3 internal usage affects both.
 - **GDPR**: FOSS crypto-shredding is the strongest feature. Commercial adds a key destruction certificate and DPIA template.

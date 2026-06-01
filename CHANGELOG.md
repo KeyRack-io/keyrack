@@ -4,7 +4,7 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [0.1.0] — Unreleased
 
-Full release — follows alpha once a partner integration tests pass.
+Full release — follows alpha once integration tests pass.
 
 ## [0.1.0-alpha.1] — 2026-05-13
 

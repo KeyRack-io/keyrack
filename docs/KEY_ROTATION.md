@@ -124,7 +124,7 @@ Each job follows this state machine:
                     └──▶ expired (auto, after 24h default)
 ```
 
-The consuming service (e.g. a partner volume service) is expected to:
+The consuming service (e.g. a volume-encryption service) is expected to:
 
 1. **Poll** for pending jobs via `ListRotationJobs(state=PENDING)`.
 2. **Acknowledge** the job (`AcknowledgeRotationJob`).

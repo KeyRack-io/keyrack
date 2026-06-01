@@ -21,7 +21,7 @@
 
 | Language | Why | Effort | Form |
 |----------|-----|--------|------|
-| **Go** | Dominant cloud-native language. a partner uses Go. K8s ecosystem. | 3-5 days | gRPC client wrapper with retry, pooling, typed errors |
+| **Go** | Dominant cloud-native language. Common for platform integrators. K8s ecosystem. | 3-5 days | gRPC client wrapper with retry, pooling, typed errors |
 | **Python** | Largest web backend community. Django/FastAPI/Flask. | 2-3 days | REST wrapper (`pip install keyrack`) |
 | **TypeScript** | Browser + Node.js. Growing backend share (Deno, Bun). | 1-2 weeks | WASM module + REST client + npm package |
 

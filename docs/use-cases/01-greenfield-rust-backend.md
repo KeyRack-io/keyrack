@@ -5,7 +5,7 @@
 Backend engineers building a new service or platform in Rust who need
 key management from day one.
 
-**Examples:** a partner (cloud platform), SaaS startups, fintech services,
+**Examples:** cloud platforms, SaaS startups, fintech services,
 any Rust service that handles sensitive data.
 
 ## The problem

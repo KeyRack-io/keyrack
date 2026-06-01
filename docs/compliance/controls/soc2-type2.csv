@@ -27,5 +27,5 @@ P1.1,Privacy notice and consent,No,operator,N/A,"Organizational concern. KeyRack
 P6.1,PII encryption,Yes,keyrack-core,Implemented,"AES-256-GCM encryption. Identity tag tokenization via BLAKE3 with per-tenant salt"
 P8.1,Disposal of PII,Yes,keyrack-core,Implemented,"Crypto-shredding via key destruction. Identity tags can be purged independently"
 AUDIT-01,Audit log completeness,Yes,keyrack-service,Implemented,"Every operation (including denied requests) emits an audit event. Events include principal, action, resource, result, timestamp"
-AUDIT-02,Audit log tamper-evidence,Partial,keyrack-nats,Partial,"NATS provides durable delivery. Signed audit receipts available in commercial edition (a partner). FOSS lacks cryptographic audit chain"
+AUDIT-02,Audit log tamper-evidence,Partial,keyrack-nats,Partial,"NATS provides durable delivery. Signed audit receipts available in commercial edition. FOSS lacks cryptographic audit chain"
 AUDIT-03,Audit log retention,No,operator,N/A,"Retention is a deployment/operational concern. NATS JetStream supports configurable retention"

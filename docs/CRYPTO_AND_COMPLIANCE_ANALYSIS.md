@@ -154,18 +154,18 @@ For a KMS, the Security and Confidentiality criteria are primary. Auditors expec
 | Gap | Severity | Notes |
 |---|---|---|
 | No built-in key management policy documentation generator | Low | SOC 2 requires documented policies; KeyRack provides the technical controls but policy documents are an organizational concern |
-| Audit log tamper-evidence | Medium | NATS provides durable delivery, but the audit trail itself is not cryptographically signed by KeyRack (the partner Audit service adds receipt signing). FOSS deployments lack this. |
+| Audit log tamper-evidence | Medium | NATS provides durable delivery, but the audit trail itself is not cryptographically signed by KeyRack (the commercial audit service adds receipt signing). FOSS deployments lack this. |
 | Continuous monitoring / alerting | Low | KeyRack emits metrics and events, but SOC 2 Type II requires evidence of monitoring over time. This is an operational concern. |
 
 #### What would be needed to close them?
 
-1. **FOSS audit integrity** — add an optional audit log signing feature (e.g., hash chain or Ed25519 signature on audit events) for FOSS deployments without the partner audit pipeline.
+1. **FOSS audit integrity** — add an optional audit log signing feature (e.g., hash chain or Ed25519 signature on audit events) for FOSS deployments without the commercial audit pipeline.
 2. **Policy template generation** — ship a template key management policy document with the FOSS distribution.
 3. **Operational runbooks** — document key rotation procedures, incident response for compromised keys, and destruction verification.
 
 #### FOSS or commercial concern?
 
-**Both, but primarily commercial.** SOC 2 Type II is relevant for commercial SaaS offerings. FOSS users self-hosting don't typically undergo SOC 2 audits, but the technical controls KeyRack provides are the foundation. The audit trail completeness is strong for commercial deployments with the full a partner stack; FOSS deployments may need the signed audit log feature.
+**Both, but primarily commercial.** SOC 2 Type II is relevant for commercial SaaS offerings. FOSS users self-hosting don't typically undergo SOC 2 audits, but the technical controls KeyRack provides are the foundation. The audit trail completeness is strong for commercial deployments with the full commercial stack; FOSS deployments may need the signed audit log feature.
 
 ---
 
@@ -249,14 +249,14 @@ As of 2026, HIPAA encryption requirements have shifted from "addressable" to **m
 | Key management per SP 800-57 | Full key lifecycle with states aligned to NIST | ✅ (see §2.8) |
 | Audit logging | Every operation audited; PDP decisions logged | ✅ |
 | Access controls | PDP authorization on every operation | ✅ |
-| Tamper-evident logs | NATS durable delivery; a partner receipt chain signing | ⚠️ Partial (commercial only) |
+| Tamper-evident logs | NATS durable delivery; commercial receipt chain signing | ⚠️ Partial (commercial only) |
 | No plaintext in logs | `Sensitive<T>` wrapper enforced | ✅ |
 
 #### Where are the gaps?
 
 | Gap | Severity | Notes |
 |---|---|---|
-| Tamper-evident audit logs (FOSS) | Medium | FOSS deployments without the partner audit pipeline lack cryptographic audit chain signing |
+| Tamper-evident audit logs (FOSS) | Medium | FOSS deployments without the commercial audit pipeline lack cryptographic audit chain signing |
 | Annual assessment tooling | Low | Organizational, not software |
 | BAA (Business Associate Agreement) considerations | N/A | Legal, not technical |
 

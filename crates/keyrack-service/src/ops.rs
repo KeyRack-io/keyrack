@@ -77,7 +77,7 @@ pub struct OpContext {
     pub resource_id: String,
     pub resource_type: String,
     pub encryption_context_hash: Option<[u8; 32]>,
-    /// Propagated x-request-id for end-to-end correlation (a partner contract).
+    /// Propagated x-request-id for end-to-end correlation across services.
     pub request_id: String,
 }
 

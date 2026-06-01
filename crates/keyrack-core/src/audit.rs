@@ -268,13 +268,12 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
 
-    /// a partner Resource Name of the resource.
+    /// Stable resource name (SRN) of the resource.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srn: Option<String>,
 
-    /// The x-request-id propagated from the incoming request (a partner
-    /// integration contract). Enables end-to-end correlation across
-    /// service boundaries.
+    /// The x-request-id propagated from the incoming request. Enables
+    /// end-to-end correlation across service boundaries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 

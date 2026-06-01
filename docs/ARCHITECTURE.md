@@ -358,13 +358,13 @@ startup via `sqlx`.
 └──────────────────────────────┘
 ```
 
-### Sidecar (a partner deployment)
+### Sidecar (host-application deployment)
 
 ```
 ┌─────────────────────────────────────────────┐
 │  Pod / VM                                   │
 │  ┌─────────────┐   ┌─────────────────────┐  │
-│  │  a partner   │──▶│  keyrack-service    │  │
+│  │  Host app   │──▶│  keyrack-service    │  │
 │  │  monolith   │   │  localhost:50051    │  │
 │  │             │   │  localhost:8080     │  │
 │  └─────────────┘   └──────────┬──────────┘  │
@@ -375,7 +375,7 @@ startup via `sqlx`.
 └─────────────────────────────────────────────┘
          │
          ▼
-    a partner PDP (TCP + gRPC + mTLS)
+    External PDP (TCP + gRPC + mTLS)
 ```
 
 ### HA / Multi-node (Commercial, V2)

@@ -35,7 +35,7 @@ rotation tooling. The capability gap is universal.
 |---------|------|---------|
 | **Self-hosters** (Nextcloud, Matrix, CryptPad operators) | FOSS core, native API | AGPL-3.0 |
 | **Sovereign cloud providers** (European national clouds, Gaia-X) | FOSS core + commercial shims | Commercial |
-| **Platform integrators** (a partner, enterprise platforms) | FOSS core embedded as sidecar | AGPL-3.0 + commercial |
+| **Platform integrators** (enterprise platforms) | FOSS core embedded as sidecar | AGPL-3.0 + commercial |
 | **Security-conscious enterprises** (healthcare, finance, defence) | FOSS core, self-hosted | AGPL-3.0 |
 | **IoT gateway operators** | FOSS core on ARM64, Parsec provider | AGPL-3.0 |
 
@@ -135,7 +135,7 @@ for:
 
 ### Sidecar (Platform Integration)
 
-KeyRack runs alongside a host application (e.g. a partner monolith)
+KeyRack runs alongside a host application (e.g. a host monolith)
 on localhost. The host communicates via gRPC or REST. Suitable for:
 - Multi-service platforms needing unified key management
 - Applications requiring embedded KMS coordination
