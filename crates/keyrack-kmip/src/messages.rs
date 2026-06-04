@@ -259,6 +259,7 @@ pub fn parse_response(msg: &TtlvItem) -> Result<KmipResponse, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ttlv::{block_cipher_mode, crypto_algorithm, decode, encode};
 
     #[test]
     fn create_symmetric_encodes_and_decodes() {
