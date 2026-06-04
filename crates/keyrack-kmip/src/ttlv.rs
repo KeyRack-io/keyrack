@@ -69,39 +69,39 @@ impl TtlvType {
 
 /// Well-known KMIP tags (3-byte values stored as u32 for convenience).
 pub mod tag {
-    pub const REQUEST_MESSAGE: u32 = 0x420078;
-    pub const RESPONSE_MESSAGE: u32 = 0x42007B;
-    pub const REQUEST_HEADER: u32 = 0x420077;
-    pub const RESPONSE_HEADER: u32 = 0x42007A;
-    pub const PROTOCOL_VERSION: u32 = 0x420069;
-    pub const PROTOCOL_VERSION_MAJOR: u32 = 0x42006A;
-    pub const PROTOCOL_VERSION_MINOR: u32 = 0x42006B;
-    pub const BATCH_COUNT: u32 = 0x42000D;
-    pub const BATCH_ITEM: u32 = 0x42000F;
-    pub const OPERATION: u32 = 0x42005C;
-    pub const RESULT_STATUS: u32 = 0x42007F;
-    pub const RESULT_REASON: u32 = 0x420080;
-    pub const RESULT_MESSAGE: u32 = 0x420081;
-    pub const REQUEST_PAYLOAD: u32 = 0x420079;
-    pub const RESPONSE_PAYLOAD: u32 = 0x42007C;
-    pub const UNIQUE_ID: u32 = 0x420094;
-    pub const OBJECT_TYPE: u32 = 0x420057;
-    pub const TEMPLATE_ATTRIBUTE: u32 = 0x420091;
-    pub const ATTRIBUTE: u32 = 0x420008;
-    pub const ATTRIBUTE_NAME: u32 = 0x42000A;
-    pub const ATTRIBUTE_VALUE: u32 = 0x42000B;
-    pub const CRYPTOGRAPHIC_ALGORITHM: u32 = 0x420028;
-    pub const CRYPTOGRAPHIC_LENGTH: u32 = 0x42002A;
-    pub const CRYPTOGRAPHIC_USAGE_MASK: u32 = 0x42002C;
-    pub const DATA: u32 = 0x4200C2;
-    pub const IV_COUNTER_NONCE: u32 = 0x42003D;
-    pub const CRYPTOGRAPHIC_PARAMETERS: u32 = 0x42002B;
-    pub const BLOCK_CIPHER_MODE: u32 = 0x420011;
-    pub const PADDING_METHOD: u32 = 0x42005F;
-    pub const HASHING_ALGORITHM: u32 = 0x420038;
-    pub const DIGITAL_SIGNATURE_ALGORITHM: u32 = 0x4200AE;
-    pub const SIGNATURE_DATA: u32 = 0x4200C3;
-    pub const MAC_DATA: u32 = 0x4200C4;
+    pub const REQUEST_MESSAGE: u32 = 0x0042_0078;
+    pub const RESPONSE_MESSAGE: u32 = 0x0042_007B;
+    pub const REQUEST_HEADER: u32 = 0x0042_0077;
+    pub const RESPONSE_HEADER: u32 = 0x0042_007A;
+    pub const PROTOCOL_VERSION: u32 = 0x0042_0069;
+    pub const PROTOCOL_VERSION_MAJOR: u32 = 0x0042_006A;
+    pub const PROTOCOL_VERSION_MINOR: u32 = 0x0042_006B;
+    pub const BATCH_COUNT: u32 = 0x0042_000D;
+    pub const BATCH_ITEM: u32 = 0x0042_000F;
+    pub const OPERATION: u32 = 0x0042_005C;
+    pub const RESULT_STATUS: u32 = 0x0042_007F;
+    pub const RESULT_REASON: u32 = 0x0042_0080;
+    pub const RESULT_MESSAGE: u32 = 0x0042_0081;
+    pub const REQUEST_PAYLOAD: u32 = 0x0042_0079;
+    pub const RESPONSE_PAYLOAD: u32 = 0x0042_007C;
+    pub const UNIQUE_ID: u32 = 0x0042_0094;
+    pub const OBJECT_TYPE: u32 = 0x0042_0057;
+    pub const TEMPLATE_ATTRIBUTE: u32 = 0x0042_0091;
+    pub const ATTRIBUTE: u32 = 0x0042_0008;
+    pub const ATTRIBUTE_NAME: u32 = 0x0042_000A;
+    pub const ATTRIBUTE_VALUE: u32 = 0x0042_000B;
+    pub const CRYPTOGRAPHIC_ALGORITHM: u32 = 0x0042_0028;
+    pub const CRYPTOGRAPHIC_LENGTH: u32 = 0x0042_002A;
+    pub const CRYPTOGRAPHIC_USAGE_MASK: u32 = 0x0042_002C;
+    pub const DATA: u32 = 0x0042_00C2;
+    pub const IV_COUNTER_NONCE: u32 = 0x0042_003D;
+    pub const CRYPTOGRAPHIC_PARAMETERS: u32 = 0x0042_002B;
+    pub const BLOCK_CIPHER_MODE: u32 = 0x0042_0011;
+    pub const PADDING_METHOD: u32 = 0x0042_005F;
+    pub const HASHING_ALGORITHM: u32 = 0x0042_0038;
+    pub const DIGITAL_SIGNATURE_ALGORITHM: u32 = 0x0042_00AE;
+    pub const SIGNATURE_DATA: u32 = 0x0042_00C3;
+    pub const MAC_DATA: u32 = 0x0042_00C4;
 }
 
 /// KMIP operation enum values.
@@ -286,9 +286,9 @@ pub fn decode(buf: &mut &[u8]) -> Result<TtlvItem, String> {
     }
 
     let tag = {
-        let b0 = buf.get_u8() as u32;
-        let b1 = buf.get_u8() as u32;
-        let b2 = buf.get_u8() as u32;
+        let b0 = u32::from(buf.get_u8());
+        let b1 = u32::from(buf.get_u8());
+        let b2 = u32::from(buf.get_u8());
         (b0 << 16) | (b1 << 8) | b2
     };
 
@@ -325,11 +325,11 @@ pub fn decode(buf: &mut &[u8]) -> Result<TtlvItem, String> {
             buf.advance(pad);
             TtlvValue::Integer(v)
         }
-        TtlvType::LongInteger => {
+        TtlvType::LongInteger | TtlvType::DateTime => {
             let v = buf.get_i64();
             TtlvValue::LongInteger(v)
         }
-        TtlvType::BigInteger => {
+        TtlvType::BigInteger | TtlvType::ByteString => {
             let mut data = vec![0u8; length];
             buf.copy_to_slice(&mut data);
             let pad = pad_len(length);
@@ -353,17 +353,6 @@ pub fn decode(buf: &mut &[u8]) -> Result<TtlvItem, String> {
             buf.advance(pad);
             let s = String::from_utf8(data).map_err(|e| format!("invalid UTF-8: {e}"))?;
             TtlvValue::TextString(s)
-        }
-        TtlvType::ByteString => {
-            let mut data = vec![0u8; length];
-            buf.copy_to_slice(&mut data);
-            let pad = pad_len(length);
-            buf.advance(pad);
-            TtlvValue::ByteString(data)
-        }
-        TtlvType::DateTime => {
-            let v = buf.get_i64();
-            TtlvValue::LongInteger(v)
         }
         TtlvType::Interval => {
             let v = buf.get_u32();

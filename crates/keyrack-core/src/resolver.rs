@@ -98,9 +98,7 @@ pub fn resolve_chain(
         depth += 1;
 
         let rule_match = rules.match_rule(&current_attrs).ok_or_else(|| {
-            KeyRackError::Other(format!(
-                "no rule matches attributes: {current_attrs:?}"
-            ))
+            KeyRackError::Other(format!("no rule matches attributes: {current_attrs:?}"))
         })?;
 
         if rule_match.rule.is_root() {
@@ -108,16 +106,12 @@ pub fn resolve_chain(
         }
 
         if rule_match.rule.is_attachment_boundary() {
-            let attachment = rule_match
-                .namespace
-                .attachment
-                .as_ref()
-                .ok_or_else(|| {
-                    KeyRackError::Other(format!(
-                        "namespace '{}' has attachment rule but no attachment context",
-                        rule_match.namespace.name
-                    ))
-                })?;
+            let attachment = rule_match.namespace.attachment.as_ref().ok_or_else(|| {
+                KeyRackError::Other(format!(
+                    "namespace '{}' has attachment rule but no attachment context",
+                    rule_match.namespace.name
+                ))
+            })?;
 
             current_attrs = attachment.clone();
             continue;
@@ -126,9 +120,7 @@ pub fn resolve_chain(
         let parent_attrs = rule_match
             .rule
             .resolve_parent(&rule_match.bindings)
-            .ok_or_else(|| {
-                KeyRackError::Other("rule matched but produced no parent".into())
-            })?;
+            .ok_or_else(|| KeyRackError::Other("rule matched but produced no parent".into()))?;
 
         current_attrs = parent_attrs;
     }
@@ -170,9 +162,7 @@ mod tests {
                         ("kind".into(), "tenant-root".into()),
                         ("tenant".into(), "$T".into()),
                     ]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "root".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "root".into())])),
                     priority: 0,
                     key_spec: None,
                 },
@@ -192,16 +182,12 @@ mod tests {
                         ("kind".into(), "dek".into()),
                         ("user".into(), "$U".into()),
                     ]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "app-kek".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "app-kek".into())])),
                     priority: 0,
                     key_spec: None,
                 },
                 RoutingRule {
-                    match_pattern: BTreeMap::from([
-                        ("kind".into(), "app-kek".into()),
-                    ]),
+                    match_pattern: BTreeMap::from([("kind".into(), "app-kek".into())]),
                     parent: ParentRef::Attachment,
                     priority: 0,
                     key_spec: None,
@@ -263,10 +249,7 @@ mod tests {
         let mut rules = Vec::new();
         for i in 0..10 {
             rules.push(RoutingRule {
-                match_pattern: BTreeMap::from([(
-                    "kind".into(),
-                    format!("level-{i}"),
-                )]),
+                match_pattern: BTreeMap::from([("kind".into(), format!("level-{i}"))]),
                 parent: ParentRef::Pattern(BTreeMap::from([(
                     "kind".into(),
                     format!("level-{}", i + 1),
@@ -291,7 +274,10 @@ mod tests {
 
         let attrs = BTreeMap::from([("kind".into(), "level-0".into())]);
         let err = resolve_chain(&reg, &attrs, &config).unwrap_err();
-        assert!(matches!(err, KeyRackError::DepthLimitExceeded { max_depth: 3 }));
+        assert!(matches!(
+            err,
+            KeyRackError::DepthLimitExceeded { max_depth: 3 }
+        ));
     }
 
     #[test]
@@ -304,17 +290,13 @@ mod tests {
             routing_rules: vec![
                 RoutingRule {
                     match_pattern: BTreeMap::from([("kind".into(), "a".into())]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "b".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "b".into())])),
                     priority: 0,
                     key_spec: None,
                 },
                 RoutingRule {
                     match_pattern: BTreeMap::from([("kind".into(), "b".into())]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "a".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "a".into())])),
                     priority: 0,
                     key_spec: None,
                 },

@@ -69,8 +69,7 @@ pub fn run(args: LintArgs) -> anyhow::Result<()> {
         OutputFormat::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&diags)
-                    .unwrap_or_else(|_| "[]".into())
+                serde_json::to_string_pretty(&diags).unwrap_or_else(|_| "[]".into())
             );
         }
     }

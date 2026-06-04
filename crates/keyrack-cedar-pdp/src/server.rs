@@ -42,7 +42,10 @@ async fn authorize(
     Json(req): Json<AuthzRequest>,
 ) -> impl IntoResponse {
     match engine.evaluate(&req).await {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(&resp).unwrap_or_default())),
+        Ok(resp) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&resp).unwrap_or_default()),
+        ),
         Err(e) => {
             tracing::error!(error = %e, "Cedar evaluation failed");
             (

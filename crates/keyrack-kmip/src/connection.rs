@@ -135,13 +135,11 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16)> {
         .or_else(|| endpoint.strip_prefix("kmips://"))
         .unwrap_or(endpoint);
 
-    let (host, port_str) = stripped
-        .rsplit_once(':')
-        .ok_or_else(|| {
-            KeyRackError::Provider(format!(
-                "invalid KMIP endpoint (expected host:port): {endpoint}"
-            ))
-        })?;
+    let (host, port_str) = stripped.rsplit_once(':').ok_or_else(|| {
+        KeyRackError::Provider(format!(
+            "invalid KMIP endpoint (expected host:port): {endpoint}"
+        ))
+    })?;
 
     let port: u16 = port_str
         .parse()
@@ -161,9 +159,7 @@ fn build_tls_config(config: &KmipProviderConfig) -> Result<rustls::ClientConfig>
         let mut reader = std::io::BufReader::new(&ca_data[..]);
         let certs = rustls_pemfile::certs(&mut reader)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                KeyRackError::Provider(format!("invalid CA cert PEM: {e}"))
-            })?;
+            .map_err(|e| KeyRackError::Provider(format!("invalid CA cert PEM: {e}")))?;
         for cert in certs {
             root_store.add(cert).map_err(|e| {
                 KeyRackError::Provider(format!("cannot add CA cert to root store: {e}"))
@@ -186,9 +182,7 @@ fn build_tls_config(config: &KmipProviderConfig) -> Result<rustls::ClientConfig>
         let mut cert_reader = std::io::BufReader::new(&cert_data[..]);
         let certs = rustls_pemfile::certs(&mut cert_reader)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                KeyRackError::Provider(format!("invalid client cert PEM: {e}"))
-            })?;
+            .map_err(|e| KeyRackError::Provider(format!("invalid client cert PEM: {e}")))?;
 
         let mut key_reader = std::io::BufReader::new(&key_data[..]);
         let key = rustls_pemfile::private_key(&mut key_reader)

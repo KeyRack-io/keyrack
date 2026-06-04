@@ -38,7 +38,7 @@
 //! 6. **Depth budget warnings** — `max_depth` set unusually low (<3) or
 //!    high (>64).
 
-use crate::rule::{Namespace, ParentRef, RuleRegistry, RoutingRule};
+use crate::rule::{Namespace, ParentRef, RoutingRule, RuleRegistry};
 use serde::Serialize;
 
 /// Severity level for a lint diagnostic.
@@ -66,7 +66,14 @@ impl std::fmt::Display for LintDiagnostic {
             Some(i) => format!("{}[rule {}]", self.namespace, i),
             None => self.namespace.clone(),
         };
-        write!(f, "{}: [{}] {} ({})", loc, self.severity_tag(), self.message, self.code)
+        write!(
+            f,
+            "{}: [{}] {} ({})",
+            loc,
+            self.severity_tag(),
+            self.message,
+            self.code
+        )
     }
 }
 
@@ -115,7 +122,10 @@ fn check_depth_budget(ns: &Namespace, diags: &mut Vec<LintDiagnostic>) {
             namespace: ns.name.clone(),
             rule_index: None,
             code: "W002".into(),
-            message: format!("max_depth={} is unusually low — most hierarchies need at least 3 levels", ns.max_depth),
+            message: format!(
+                "max_depth={} is unusually low — most hierarchies need at least 3 levels",
+                ns.max_depth
+            ),
         });
     } else if ns.max_depth > 64 {
         diags.push(LintDiagnostic {
@@ -123,20 +133,28 @@ fn check_depth_budget(ns: &Namespace, diags: &mut Vec<LintDiagnostic>) {
             namespace: ns.name.clone(),
             rule_index: None,
             code: "W003".into(),
-            message: format!("max_depth={} is unusually high — deep hierarchies impact cascade-disable latency", ns.max_depth),
+            message: format!(
+                "max_depth={} is unusually high — deep hierarchies impact cascade-disable latency",
+                ns.max_depth
+            ),
         });
     }
 }
 
 fn check_missing_attachment(ns: &Namespace, diags: &mut Vec<LintDiagnostic>) {
-    let has_boundary = ns.routing_rules.iter().any(RoutingRule::is_attachment_boundary);
+    let has_boundary = ns
+        .routing_rules
+        .iter()
+        .any(RoutingRule::is_attachment_boundary);
     if has_boundary && ns.attachment.is_none() {
         diags.push(LintDiagnostic {
             severity: Severity::Error,
             namespace: ns.name.clone(),
             rule_index: None,
             code: "E001".into(),
-            message: "namespace has an _attachment_ boundary rule but no attachment context defined".into(),
+            message:
+                "namespace has an _attachment_ boundary rule but no attachment context defined"
+                    .into(),
         });
     }
 }
@@ -292,13 +310,12 @@ mod tests {
         }
     }
 
-    fn make_rule(
-        pattern: &[(&str, &str)],
-        parent: ParentRef,
-        priority: i32,
-    ) -> RoutingRule {
+    fn make_rule(pattern: &[(&str, &str)], parent: ParentRef, priority: i32) -> RoutingRule {
         RoutingRule {
-            match_pattern: pattern.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect(),
+            match_pattern: pattern
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
             parent,
             priority,
             key_spec: None,
@@ -378,11 +395,7 @@ mod tests {
 
     #[test]
     fn ambiguous_rules_detected() {
-        let r1 = make_rule(
-            &[("kind", "$K")],
-            ParentRef::Root,
-            0,
-        );
+        let r1 = make_rule(&[("kind", "$K")], ParentRef::Root, 0);
         let r2 = make_rule(
             &[("kind", "$K")],
             ParentRef::Pattern(BTreeMap::from([("kind".into(), "other".into())])),
@@ -392,17 +405,16 @@ mod tests {
         let mut reg = RuleRegistry::new();
         reg.register(ns);
         let diags = lint(&reg);
-        assert!(diags.iter().any(|d| d.code == "W004"), "expected ambiguity warning: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.code == "W004"),
+            "expected ambiguity warning: {diags:?}"
+        );
     }
 
     #[test]
     fn unreachable_rule_detected() {
         let general = make_rule(&[("kind", "$K")], ParentRef::Root, 0);
-        let specific = make_rule(
-            &[("kind", "dek"), ("tenant", "$T")],
-            ParentRef::Root,
-            0,
-        );
+        let specific = make_rule(&[("kind", "dek"), ("tenant", "$T")], ParentRef::Root, 0);
         // general has specificity (0,1), specific has (1,1) — specific dominates
         // But general matches a superset, so it's NOT unreachable
         // Let's make a case where it IS unreachable:
@@ -413,7 +425,10 @@ mod tests {
         let mut reg = RuleRegistry::new();
         reg.register(ns);
         let diags = lint(&reg);
-        assert!(diags.iter().any(|d| d.code == "W005"), "expected unreachable warning: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.code == "W005"),
+            "expected unreachable warning: {diags:?}"
+        );
     }
 
     #[test]
@@ -433,6 +448,9 @@ namespaces:
 "#;
         let reg = RuleRegistry::from_yaml(yaml).unwrap();
         let diags = lint(&reg);
-        assert!(diags.is_empty(), "clean config should have no diags: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "clean config should have no diags: {diags:?}"
+        );
     }
 }

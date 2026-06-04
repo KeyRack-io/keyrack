@@ -32,14 +32,17 @@
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 
+/// PEM certificate and private key bytes broadcast on renewal.
+pub type TlsMaterial = (Vec<u8>, Vec<u8>);
+
 pub struct CertReloader {
     cert_path: String,
     key_path: String,
-    tx: watch::Sender<(Vec<u8>, Vec<u8>)>,
+    tx: watch::Sender<TlsMaterial>,
 }
 
 impl CertReloader {
-    pub fn new(cert_path: &str, key_path: &str) -> (Self, watch::Receiver<(Vec<u8>, Vec<u8>)>) {
+    pub fn new(cert_path: &str, key_path: &str) -> (Self, watch::Receiver<TlsMaterial>) {
         let cert = std::fs::read(cert_path).unwrap_or_default();
         let key = std::fs::read(key_path).unwrap_or_default();
         let (tx, rx) = watch::channel((cert, key));
@@ -62,19 +65,18 @@ impl CertReloader {
                 if let Ok(modified) = m.modified() {
                     if modified > last_modified {
                         last_modified = modified;
-                        match (
+                        if let (Ok(cert), Ok(key)) = (
                             tokio::fs::read(&self.cert_path).await,
                             tokio::fs::read(&self.key_path).await,
                         ) {
-                            (Ok(cert), Ok(key)) => {
-                                tracing::info!("TLS certificates reloaded from disk");
-                                tracing::warn!(
-                                    "live TLS swap is not yet supported — restart the \
-                                     service to apply the new certificates"
-                                );
-                                let _ = self.tx.send((cert, key));
-                            }
-                            _ => tracing::warn!("failed to reload TLS certificates"),
+                            tracing::info!("TLS certificates reloaded from disk");
+                            tracing::warn!(
+                                "live TLS swap is not yet supported — restart the \
+                                 service to apply the new certificates"
+                            );
+                            let _ = self.tx.send((cert, key));
+                        } else {
+                            tracing::warn!("failed to reload TLS certificates");
                         }
                     }
                 }

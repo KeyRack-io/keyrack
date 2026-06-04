@@ -68,8 +68,8 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     /// Open (or create) a database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| KeyRackError::Storage(format!("open: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| KeyRackError::Storage(format!("open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
         Ok(Self {
@@ -92,9 +92,10 @@ impl SqliteStorage {
     where
         F: FnOnce(&Connection) -> Result<R>,
     {
-        let conn = self.conn.lock().map_err(|e| {
-            KeyRackError::Storage(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| KeyRackError::Storage(format!("lock poisoned: {e}")))?;
         f(&conn)
     }
 }
@@ -216,9 +217,11 @@ impl StorageBackend for SqliteStorage {
                 if filter.state.is_some_and(|s| s != record.state) {
                     continue;
                 }
-                if filter.user_tags.iter().all(|(k, v)| {
-                    record.user_tags.get(k).is_some_and(|tv| tv == v)
-                }) {
+                if filter
+                    .user_tags
+                    .iter()
+                    .all(|(k, v)| record.user_tags.get(k).is_some_and(|tv| tv == v))
+                {
                     items.push(record);
                 }
             }
@@ -247,7 +250,11 @@ impl StorageBackend for SqliteStorage {
                 let json = row.map_err(|e| map_sql(&e))?;
                 let record: KeyRecord = serde_json::from_str(&json)
                     .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))?;
-                if record.parent_lid.as_ref().is_some_and(|p| p.to_string() == parent_str) {
+                if record
+                    .parent_lid
+                    .as_ref()
+                    .is_some_and(|p| p.to_string() == parent_str)
+                {
                     children.push(record);
                 }
             }
@@ -480,10 +487,7 @@ impl StorageBackend for SqliteStorage {
                         vec![Box::new(state_str)],
                     )
                 }
-                None => (
-                    "SELECT record_json FROM rotation_jobs",
-                    vec![],
-                ),
+                None => ("SELECT record_json FROM rotation_jobs", vec![]),
             };
 
             let mut stmt = conn.prepare(sql).map_err(|e| map_sql(&e))?;
@@ -522,7 +526,5 @@ mod tests {
         store.ping().await.unwrap();
     }
 
-    keyrack_test_support::storage_conformance_tests!(
-        SqliteStorage::in_memory().unwrap()
-    );
+    keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }

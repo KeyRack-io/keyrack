@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! Prometheus metrics instrumentation for the KeyRack service.
+//! Prometheus metrics instrumentation for the `KeyRack` service.
 
 use metrics::{counter, histogram};
 
@@ -31,8 +31,7 @@ pub const AUDIT_EMIT_ERRORS: &str = "keyrack_audit_emit_errors_total";
 pub fn record_op(action: &str, result: &str, duration: std::time::Duration) {
     histogram!(OP_DURATION, "action" => action.to_owned(), "result" => result.to_owned())
         .record(duration.as_secs_f64());
-    counter!(OP_TOTAL, "action" => action.to_owned(), "result" => result.to_owned())
-        .increment(1);
+    counter!(OP_TOTAL, "action" => action.to_owned(), "result" => result.to_owned()).increment(1);
 }
 
 pub fn record_pdp(duration: std::time::Duration, success: bool) {

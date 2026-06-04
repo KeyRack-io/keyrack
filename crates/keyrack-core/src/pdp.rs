@@ -156,7 +156,8 @@ pub struct AuthzResponse {
 impl AuthzResponse {
     /// Extract `rate_limit_class` from the obligations array, if present.
     pub fn rate_limit_class(&self) -> Option<&str> {
-        self.obligations.iter()
+        self.obligations
+            .iter()
             .find(|o| o.obligation_id == "rate_limit_class")
             .and_then(|o| o.parameters.get("class"))
             .and_then(|v| match v {

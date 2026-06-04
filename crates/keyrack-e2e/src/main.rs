@@ -94,9 +94,7 @@ impl PhaseRunner {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env(),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
@@ -211,9 +209,7 @@ async fn phase_health(
 // Phase 2: Key lifecycle (gRPC)
 // ═════════════════════════════════════════════════════════════════════
 
-async fn phase_lifecycle(
-    grpc: &mut KeyServiceClient<Channel>,
-) -> (u32, u32, String, String) {
+async fn phase_lifecycle(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32, String, String) {
     let mut r = PhaseRunner::new("2 — Key lifecycle (gRPC)");
     let mut aes_key_id = String::new();
     let mut ed_key_id = String::new();
@@ -231,7 +227,11 @@ async fn phase_lifecycle(
         Ok(resp) => {
             let meta = resp.into_inner().metadata.unwrap();
             aes_key_id = meta.key_id.clone();
-            assert_check(&mut r, "CreateKey AES-256", meta.state == proto::KeyState::Enabled as i32);
+            assert_check(
+                &mut r,
+                "CreateKey AES-256",
+                meta.state == proto::KeyState::Enabled as i32,
+            );
         }
         Err(e) => r.fail("CreateKey AES-256", &e),
     }
@@ -249,7 +249,11 @@ async fn phase_lifecycle(
         Ok(resp) => {
             let meta = resp.into_inner().metadata.unwrap();
             ed_key_id = meta.key_id.clone();
-            assert_check(&mut r, "CreateKey Ed25519", meta.state == proto::KeyState::Enabled as i32);
+            assert_check(
+                &mut r,
+                "CreateKey Ed25519",
+                meta.state == proto::KeyState::Enabled as i32,
+            );
         }
         Err(e) => r.fail("CreateKey Ed25519", &e),
     }
@@ -585,9 +589,7 @@ async fn phase_rest(http: &reqwest::Client, rest: &str) -> (u32, u32) {
             "plaintext": b64encode(b"REST encrypt test"),
         });
         match http
-            .post(format!(
-                "{rest}/v1/keys/{rest_key_id}/actions-encrypt"
-            ))
+            .post(format!("{rest}/v1/keys/{rest_key_id}/actions-encrypt"))
             .json(&enc_body)
             .send()
             .await
@@ -600,9 +602,7 @@ async fn phase_rest(http: &reqwest::Client, rest: &str) -> (u32, u32) {
                 // POST .../actions-decrypt
                 let dec_body = serde_json::json!({ "ciphertext_blob": ct });
                 match http
-                    .post(format!(
-                        "{rest}/v1/keys/{rest_key_id}/actions-decrypt"
-                    ))
+                    .post(format!("{rest}/v1/keys/{rest_key_id}/actions-decrypt"))
                     .json(&dec_body)
                     .send()
                     .await
@@ -617,7 +617,10 @@ async fn phase_rest(http: &reqwest::Client, rest: &str) -> (u32, u32) {
                             pt == b"REST encrypt test",
                         );
                     }
-                    Ok(dresp) => r.fail("POST actions-decrypt", &format!("status {}", dresp.status())),
+                    Ok(dresp) => r.fail(
+                        "POST actions-decrypt",
+                        &format!("status {}", dresp.status()),
+                    ),
                     Err(e) => r.fail("POST actions-decrypt", &e),
                 }
             }
@@ -640,10 +643,7 @@ async fn phase_rest(http: &reqwest::Client, rest: &str) -> (u32, u32) {
 // Phase 5: Aliases and tags
 // ═════════════════════════════════════════════════════════════════════
 
-async fn phase_aliases_tags(
-    grpc: &mut KeyServiceClient<Channel>,
-    aes_key_id: &str,
-) -> (u32, u32) {
+async fn phase_aliases_tags(grpc: &mut KeyServiceClient<Channel>, aes_key_id: &str) -> (u32, u32) {
     let mut r = PhaseRunner::new("5 — Aliases and tags");
 
     if aes_key_id.is_empty() {
@@ -730,7 +730,9 @@ async fn phase_aliases_tags(
         Ok(resp) => {
             let tags = resp.into_inner().tags;
             let has_env = tags.iter().any(|t| t.key == "env" && t.value == "e2e-test");
-            let has_team = tags.iter().any(|t| t.key == "team" && t.value == "platform");
+            let has_team = tags
+                .iter()
+                .any(|t| t.key == "team" && t.value == "platform");
             assert_check(&mut r, "ListResourceTags (env)", has_env);
             assert_check(&mut r, "ListResourceTags (team)", has_team);
         }
@@ -771,10 +773,7 @@ async fn phase_aliases_tags(
 // Phase 6: Key rotation
 // ═════════════════════════════════════════════════════════════════════
 
-async fn phase_rotation(
-    grpc: &mut KeyServiceClient<Channel>,
-    aes_key_id: &str,
-) -> (u32, u32) {
+async fn phase_rotation(grpc: &mut KeyServiceClient<Channel>, aes_key_id: &str) -> (u32, u32) {
     let mut r = PhaseRunner::new("6 — Key rotation");
 
     if aes_key_id.is_empty() {
@@ -812,7 +811,11 @@ async fn phase_rotation(
     {
         Ok(resp) => {
             let inner = resp.into_inner();
-            assert_check(&mut r, "RotateKey (new_version >= 2)", inner.new_version >= 2);
+            assert_check(
+                &mut r,
+                "RotateKey (new_version >= 2)",
+                inner.new_version >= 2,
+            );
         }
         Err(e) => r.fail("RotateKey", &e),
     }
@@ -847,7 +850,11 @@ async fn phase_rotation(
     {
         Ok(resp) => {
             let enc = resp.into_inner();
-            assert_check(&mut r, "Encrypt (post-rotation)", !enc.ciphertext_blob.is_empty());
+            assert_check(
+                &mut r,
+                "Encrypt (post-rotation)",
+                !enc.ciphertext_blob.is_empty(),
+            );
         }
         Err(e) => r.fail("Encrypt (post-rotation)", &e),
     }
@@ -908,7 +915,10 @@ async fn phase_hierarchy(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32) {
             }
         }
         Err(e) => {
-            r.fail("CreateKey child", &format!("{e} [hierarchy may not be fully wired]"));
+            r.fail(
+                "CreateKey child",
+                &format!("{e} [hierarchy may not be fully wired]"),
+            );
         }
     }
 
@@ -921,7 +931,11 @@ async fn phase_hierarchy(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32) {
     {
         Ok(resp) => {
             let meta = resp.into_inner().metadata.unwrap();
-            assert_check(&mut r, "DescribeKey (hierarchy root)", meta.key_id == root_id);
+            assert_check(
+                &mut r,
+                "DescribeKey (hierarchy root)",
+                meta.key_id == root_id,
+            );
         }
         Err(e) => r.fail("DescribeKey (hierarchy root)", &e),
     }

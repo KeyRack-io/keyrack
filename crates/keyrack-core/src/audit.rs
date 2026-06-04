@@ -504,8 +504,8 @@ impl AuditSigner {
         event.previous_hash = Some(prev_hash.clone());
         event.signature = None;
 
-        let canonical = serde_json::to_string(event)
-            .expect("AuditEvent serialization should not fail");
+        let canonical =
+            serde_json::to_string(event).expect("AuditEvent serialization should not fail");
 
         let sig = self.signing_key.sign(canonical.as_bytes());
         let sig_hex = hex_encode(sig.to_bytes().as_slice());
@@ -531,22 +531,19 @@ impl AuditSigner {
             None => return false,
         };
 
-        let sig_bytes = match hex_decode(&sig_hex) {
-            Some(b) => b,
-            None => return false,
+        let Some(sig_bytes) = hex_decode(&sig_hex) else {
+            return false;
         };
 
-        let sig = match ed25519_dalek::Signature::from_slice(&sig_bytes) {
-            Ok(s) => s,
-            Err(_) => return false,
+        let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig_bytes) else {
+            return false;
         };
 
         let mut verify_event = event.clone();
         verify_event.signature = None;
 
-        let canonical = match serde_json::to_string(&verify_event) {
-            Ok(s) => s,
-            Err(_) => return false,
+        let Ok(canonical) = serde_json::to_string(&verify_event) else {
+            return false;
         };
 
         verifying_key.verify(canonical.as_bytes(), &sig).is_ok()
@@ -670,7 +667,10 @@ mod tests {
     fn action_display_format() {
         assert_eq!(AuditAction::Encrypt.to_string(), "kms:Encrypt");
         assert_eq!(AuditAction::CreateKey.to_string(), "kms:CreateKey");
-        assert_eq!(AuditAction::CascadeDisable.to_string(), "kms:CascadeDisable");
+        assert_eq!(
+            AuditAction::CascadeDisable.to_string(),
+            "kms:CascadeDisable"
+        );
     }
 
     #[test]
@@ -692,7 +692,10 @@ mod tests {
         .with_encryption_context_hash(hash);
 
         let expected_hex = "ab".repeat(32);
-        assert_eq!(event.encryption_context_hash.as_deref(), Some(expected_hex.as_str()));
+        assert_eq!(
+            event.encryption_context_hash.as_deref(),
+            Some(expected_hex.as_str())
+        );
     }
 
     #[test]
@@ -960,8 +963,14 @@ mod tests {
         let mut e1 = AuditEvent::new(
             EventType::KeyCreated,
             AuditAction::CreateKey,
-            AuditPrincipal { id: "u:a".into(), principal_type: "User".into() },
-            AuditResource { id: "k1".into(), resource_type: "Key".into() },
+            AuditPrincipal {
+                id: "u:a".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "k1".into(),
+                resource_type: "Key".into(),
+            },
             AuditResult::Success,
         );
         signer.sign_event(&mut e1);
@@ -975,13 +984,22 @@ mod tests {
         let mut e2 = AuditEvent::new(
             EventType::KeyCreated,
             AuditAction::CreateKey,
-            AuditPrincipal { id: "u:a".into(), principal_type: "User".into() },
-            AuditResource { id: "k2".into(), resource_type: "Key".into() },
+            AuditPrincipal {
+                id: "u:a".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "k2".into(),
+                resource_type: "Key".into(),
+            },
             AuditResult::Success,
         );
         signer.sign_event(&mut e2);
 
-        assert_eq!(e2.previous_hash.as_deref(), Some(expected_next_hash.as_str()));
+        assert_eq!(
+            e2.previous_hash.as_deref(),
+            Some(expected_next_hash.as_str())
+        );
     }
 
     #[test]
@@ -992,8 +1010,14 @@ mod tests {
         let event = AuditEvent::new(
             EventType::CryptoOperation,
             AuditAction::Decrypt,
-            AuditPrincipal { id: "u:x".into(), principal_type: "User".into() },
-            AuditResource { id: "k".into(), resource_type: "Key".into() },
+            AuditPrincipal {
+                id: "u:x".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "k".into(),
+                resource_type: "Key".into(),
+            },
             AuditResult::Success,
         );
 
@@ -1010,8 +1034,14 @@ mod tests {
         let event = AuditEvent::new(
             EventType::CryptoOperation,
             AuditAction::Encrypt,
-            AuditPrincipal { id: "u:sink".into(), principal_type: "User".into() },
-            AuditResource { id: "k_sink".into(), resource_type: "Key".into() },
+            AuditPrincipal {
+                id: "u:sink".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: "k_sink".into(),
+                resource_type: "Key".into(),
+            },
             AuditResult::Success,
         );
 

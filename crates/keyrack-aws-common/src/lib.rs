@@ -54,13 +54,11 @@ pub struct KmsErrorResponse {
 /// Parses the AWS `X-Amz-Target` header value (format: `TrentService.ActionName`)
 /// into a `KmsAction`.
 pub fn parse_action(target_header: &str) -> Result<KmsAction, KmsError> {
-    let action_name = target_header
-        .strip_prefix("TrentService.")
-        .ok_or_else(|| {
-            KmsError::MalformedRequest(format!(
-                "expected 'TrentService.' prefix, got: {target_header}"
-            ))
-        })?;
+    let action_name = target_header.strip_prefix("TrentService.").ok_or_else(|| {
+        KmsError::MalformedRequest(format!(
+            "expected 'TrentService.' prefix, got: {target_header}"
+        ))
+    })?;
 
     match action_name {
         "CreateKey" => Ok(KmsAction::CreateKey),

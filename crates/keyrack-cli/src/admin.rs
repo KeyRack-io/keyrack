@@ -21,9 +21,7 @@
 use clap::{Args, Subcommand};
 use keyrack_core::rule::RuleRegistry;
 use keyrack_service::proto::key_service_client::KeyServiceClient;
-use keyrack_service::proto::{
-    DescribeKeyRequest, DisableKeyRequest, RotateKeyRequest,
-};
+use keyrack_service::proto::{DescribeKeyRequest, DisableKeyRequest, RotateKeyRequest};
 
 #[derive(Args)]
 pub struct AdminArgs {
@@ -107,18 +105,28 @@ pub enum AdminCommand {
 
 pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
     match args.command {
-        AdminCommand::InspectKey { lid, endpoint, format } => {
-            inspect_key(&lid, &endpoint, &format).await
-        }
+        AdminCommand::InspectKey {
+            lid,
+            endpoint,
+            format,
+        } => inspect_key(&lid, &endpoint, &format).await,
         AdminCommand::InspectNamespace { name, file, format } => {
             inspect_namespace(&name, &file, &format)
         }
-        AdminCommand::AuditQuery { action, since, principal, log_file, format } => {
-            audit_query(action.as_deref(), since.as_deref(), principal.as_deref(), &log_file, &format)
-        }
-        AdminCommand::Rotate { lid, endpoint } => {
-            rotate_key(&lid, &endpoint).await
-        }
+        AdminCommand::AuditQuery {
+            action,
+            since,
+            principal,
+            log_file,
+            format,
+        } => audit_query(
+            action.as_deref(),
+            since.as_deref(),
+            principal.as_deref(),
+            &log_file,
+            &format,
+        ),
+        AdminCommand::Rotate { lid, endpoint } => rotate_key(&lid, &endpoint).await,
         AdminCommand::CascadeDisable { root_lid, endpoint } => {
             cascade_disable(&root_lid, &endpoint).await
         }
@@ -130,7 +138,8 @@ async fn inspect_key(
     endpoint: &str,
     format: &super::lint::OutputFormat,
 ) -> anyhow::Result<()> {
-    let mut client = KeyServiceClient::connect(endpoint.to_string()).await
+    let mut client = KeyServiceClient::connect(endpoint.to_string())
+        .await
         .map_err(|e| anyhow::anyhow!("cannot connect to {endpoint}: {e}"))?;
 
     let resp = client
@@ -140,20 +149,41 @@ async fn inspect_key(
         .await
         .map_err(|e| anyhow::anyhow!("DescribeKey failed: {e}"))?;
 
-    let meta = resp.into_inner().metadata
+    let meta = resp
+        .into_inner()
+        .metadata
         .ok_or_else(|| anyhow::anyhow!("no metadata in response"))?;
 
     match format {
         super::lint::OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&format_key_metadata(&meta))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&format_key_metadata(&meta))?
+            );
         }
         super::lint::OutputFormat::Human => {
             let m = format_key_metadata(&meta);
             println!("Key: {}", meta.key_id);
-            println!("  Spec:        {:?}", keyrack_service::proto::KeySpec::try_from(meta.key_spec).unwrap_or(keyrack_service::proto::KeySpec::Unspecified));
-            println!("  Usage:       {:?}", keyrack_service::proto::KeyUsage::try_from(meta.key_usage).unwrap_or(keyrack_service::proto::KeyUsage::Unspecified));
-            println!("  State:       {:?}", keyrack_service::proto::KeyState::try_from(meta.state).unwrap_or(keyrack_service::proto::KeyState::Unspecified));
-            println!("  Origin:      {:?}", keyrack_service::proto::KeyOrigin::try_from(meta.origin).unwrap_or(keyrack_service::proto::KeyOrigin::Unspecified));
+            println!(
+                "  Spec:        {:?}",
+                keyrack_service::proto::KeySpec::try_from(meta.key_spec)
+                    .unwrap_or(keyrack_service::proto::KeySpec::Unspecified)
+            );
+            println!(
+                "  Usage:       {:?}",
+                keyrack_service::proto::KeyUsage::try_from(meta.key_usage)
+                    .unwrap_or(keyrack_service::proto::KeyUsage::Unspecified)
+            );
+            println!(
+                "  State:       {:?}",
+                keyrack_service::proto::KeyState::try_from(meta.state)
+                    .unwrap_or(keyrack_service::proto::KeyState::Unspecified)
+            );
+            println!(
+                "  Origin:      {:?}",
+                keyrack_service::proto::KeyOrigin::try_from(meta.origin)
+                    .unwrap_or(keyrack_service::proto::KeyOrigin::Unspecified)
+            );
             println!("  Description: {}", meta.description);
             println!("  Version:     {}", meta.current_key_version);
             println!("  OCC:         {}", meta.occ_version);
@@ -208,7 +238,8 @@ fn inspect_namespace(
     let registry = RuleRegistry::from_yaml(&yaml)
         .map_err(|e| anyhow::anyhow!("invalid namespace YAML: {e}"))?;
 
-    let ns = registry.get_namespace(name)
+    let ns = registry
+        .get_namespace(name)
         .ok_or_else(|| anyhow::anyhow!("namespace '{name}' not found in file"))?;
 
     match format {
@@ -224,12 +255,15 @@ fn inspect_namespace(
                     "key_spec": rule.key_spec.as_ref().map(|ks| format!("{ks:?}")),
                 })
             }).collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "name": ns.name,
-                "max_depth": ns.max_depth,
-                "attachment": ns.attachment,
-                "rules": rules_json,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": ns.name,
+                    "max_depth": ns.max_depth,
+                    "attachment": ns.attachment,
+                    "rules": rules_json,
+                }))?
+            );
         }
         super::lint::OutputFormat::Human => {
             println!("Namespace: {}", ns.name);
@@ -240,9 +274,14 @@ fn inspect_namespace(
             println!("  Rules ({}):", ns.routing_rules.len());
             for (i, rule) in ns.routing_rules.iter().enumerate() {
                 let spec = rule.specificity();
-                println!("    [{i}] match={:?}  parent={:?}  priority={}  specificity=({},{})",
-                    rule.match_pattern, rule.parent, rule.priority,
-                    spec.concrete_count, spec.variable_count);
+                println!(
+                    "    [{i}] match={:?}  parent={:?}  priority={}  specificity=({},{})",
+                    rule.match_pattern,
+                    rule.parent,
+                    rule.priority,
+                    spec.concrete_count,
+                    spec.variable_count
+                );
             }
         }
     }
@@ -294,7 +333,10 @@ fn audit_query(
         }
 
         if let Some(cutoff) = since_cutoff {
-            let ts_str = event.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            let ts_str = event
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
                 if ts.with_timezone(&chrono::Utc) < cutoff {
                     continue;
@@ -307,7 +349,10 @@ fn audit_query(
                 println!("{}", serde_json::to_string(&event)?);
             }
             super::lint::OutputFormat::Human => {
-                let ts = event.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
+                let ts = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let action = event.get("action").and_then(|v| v.as_str()).unwrap_or("?");
                 let result = event.get("result").and_then(|v| v.as_str()).unwrap_or("?");
                 let principal = event
@@ -320,7 +365,9 @@ fn audit_query(
                     .and_then(|r| r.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
-                println!("{ts}  {action:<30}  {result:<8}  principal={principal}  resource={resource}");
+                println!(
+                    "{ts}  {action:<30}  {result:<8}  principal={principal}  resource={resource}"
+                );
             }
         }
         count += 1;
@@ -333,7 +380,8 @@ fn audit_query(
 fn parse_duration_ago(s: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
     let s = s.trim();
     let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
-    let num: i64 = num_str.parse()
+    let num: i64 = num_str
+        .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration: {s} — expected format like 1h, 30m, 7d"))?;
     let duration = match unit {
         "s" => chrono::TimeDelta::seconds(num),
@@ -346,7 +394,8 @@ fn parse_duration_ago(s: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> 
 }
 
 async fn rotate_key(lid: &str, endpoint: &str) -> anyhow::Result<()> {
-    let mut client = KeyServiceClient::connect(endpoint.to_string()).await
+    let mut client = KeyServiceClient::connect(endpoint.to_string())
+        .await
         .map_err(|e| anyhow::anyhow!("cannot connect to {endpoint}: {e}"))?;
 
     let resp = client
@@ -362,7 +411,8 @@ async fn rotate_key(lid: &str, endpoint: &str) -> anyhow::Result<()> {
 }
 
 async fn cascade_disable(root_lid: &str, endpoint: &str) -> anyhow::Result<()> {
-    let mut client = KeyServiceClient::connect(endpoint.to_string()).await
+    let mut client = KeyServiceClient::connect(endpoint.to_string())
+        .await
         .map_err(|e| anyhow::anyhow!("cannot connect to {endpoint}: {e}"))?;
 
     let resp = client
@@ -374,8 +424,12 @@ async fn cascade_disable(root_lid: &str, endpoint: &str) -> anyhow::Result<()> {
 
     let meta = resp.into_inner().metadata;
     if let Some(m) = meta {
-        println!("disabled key {} (state: {:?})", m.key_id,
-            keyrack_service::proto::KeyState::try_from(m.state).unwrap_or(keyrack_service::proto::KeyState::Unspecified));
+        println!(
+            "disabled key {} (state: {:?})",
+            m.key_id,
+            keyrack_service::proto::KeyState::try_from(m.state)
+                .unwrap_or(keyrack_service::proto::KeyState::Unspecified)
+        );
     } else {
         println!("disabled key {root_lid}");
     }

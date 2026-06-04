@@ -26,7 +26,7 @@
 //!
 //! Displayed as `lid_` followed by 64 lowercase hex characters.
 
-use crate::canon::{CanonicalizationVersion, CanonicalForm};
+use crate::canon::{CanonicalForm, CanonicalizationVersion};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

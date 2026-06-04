@@ -34,8 +34,7 @@ use std::collections::BTreeMap;
 // ---------------------------------------------------------------------------
 
 fn arb_string() -> impl Strategy<Value = String> {
-    prop::string::string_regex("[a-zA-Z0-9_\\-\\.éèêëàâäùûüîïôöçñ ]{0,64}")
-        .unwrap()
+    prop::string::string_regex("[a-zA-Z0-9_\\-\\.éèêëàâäùûüîïôöçñ ]{0,64}").unwrap()
 }
 
 fn arb_attribute_value() -> impl Strategy<Value = AttributeValue> {
@@ -47,8 +46,7 @@ fn arb_attribute_value() -> impl Strategy<Value = AttributeValue> {
     ];
 
     leaf.prop_recursive(3, 32, 4, |inner| {
-        prop::collection::btree_map(arb_string(), inner, 0..4)
-            .prop_map(AttributeValue::Record)
+        prop::collection::btree_map(arb_string(), inner, 0..4).prop_map(AttributeValue::Record)
     })
 }
 

@@ -301,7 +301,8 @@ macro_rules! service_conformance_tests {
             let svc = $svc_expr;
             let result = svc
                 .get_key(Request::new(GetKeyRequest {
-                    key_id: "lid:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                    key_id: "lid:0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
                 }))
                 .await;
             assert!(result.is_err(), "GetKey for nonexistent key should fail");

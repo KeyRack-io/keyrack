@@ -103,10 +103,14 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
             let data = std::fs::read_to_string(path)?;
             serde_json::from_str::<Checkpoint>(&data)?
         } else {
-            Checkpoint { completed_lids: HashSet::new() }
+            Checkpoint {
+                completed_lids: HashSet::new(),
+            }
         }
     } else {
-        Checkpoint { completed_lids: HashSet::new() }
+        Checkpoint {
+            completed_lids: HashSet::new(),
+        }
     };
 
     let pending: Vec<_> = all_lids
@@ -123,15 +127,21 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
                     eprintln!("  [dry-run] would provision LID {lid} (attrs: {attrs:?})");
                 }
                 super::lint::OutputFormat::Json => {
-                    println!("{}", serde_json::json!({
-                        "action": "create",
-                        "lid": lid,
-                        "attributes": attrs,
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "action": "create",
+                            "lid": lid,
+                            "attributes": attrs,
+                        })
+                    );
                 }
             }
         }
-        eprintln!("dry-run complete: {} key(s) would be created", pending.len());
+        eprintln!(
+            "dry-run complete: {} key(s) would be created",
+            pending.len()
+        );
         return Ok(());
     }
 
@@ -215,10 +225,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
 }
 
 fn load_inputs(path: &PathBuf) -> anyhow::Result<Vec<BTreeMap<String, String>>> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
         "json" => {
@@ -228,11 +235,7 @@ fn load_inputs(path: &PathBuf) -> anyhow::Result<Vec<BTreeMap<String, String>>> 
         }
         "csv" => {
             let mut reader = csv::Reader::from_path(path)?;
-            let headers: Vec<String> = reader
-                .headers()?
-                .iter()
-                .map(String::from)
-                .collect();
+            let headers: Vec<String> = reader.headers()?.iter().map(String::from).collect();
 
             let mut rows = Vec::new();
             for result in reader.records() {

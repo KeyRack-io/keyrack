@@ -154,10 +154,10 @@ fn identity_pipeline_complex_attributes() {
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("acme".into()));
     attrs.insert("kind", AttributeValue::String("signing-key".into()));
-    attrs.insert("algorithms", AttributeValue::ListOfString(vec![
-        "ed25519".into(),
-        "ecdsa-p256".into(),
-    ]));
+    attrs.insert(
+        "algorithms",
+        AttributeValue::ListOfString(vec!["ed25519".into(), "ecdsa-p256".into()]),
+    );
     attrs.insert("extra", AttributeValue::Record(extra));
     attrs.insert("active", AttributeValue::Bool(true));
 
@@ -267,7 +267,10 @@ fn key_state_operation_permissions() {
         KeyState::PendingDeletion,
         KeyState::Destroyed,
     ] {
-        assert!(!state.permits_encrypt(), "{state:?} should not permit encrypt");
+        assert!(
+            !state.permits_encrypt(),
+            "{state:?} should not permit encrypt"
+        );
     }
     assert!(KeyState::Enabled.permits_encrypt());
 
@@ -471,9 +474,15 @@ async fn provider_aes256_gcm_round_trip() {
     let aad = b"tenant=acme,lid=lid_abc123";
 
     let ct = provider.encrypt(&handle, plaintext, aad).await.unwrap();
-    assert_ne!(ct.ciphertext, plaintext, "ciphertext must differ from plaintext");
+    assert_ne!(
+        ct.ciphertext, plaintext,
+        "ciphertext must differ from plaintext"
+    );
 
-    let pt = provider.decrypt(&handle, &ct.ciphertext, aad).await.unwrap();
+    let pt = provider
+        .decrypt(&handle, &ct.ciphertext, aad)
+        .await
+        .unwrap();
     assert_eq!(pt.expose().as_slice(), plaintext);
 }
 
@@ -483,8 +492,13 @@ async fn provider_aes256_gcm_aad_mismatch_fails() {
     let provider = SoftwareProvider::new();
     let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
 
-    let ct = provider.encrypt(&handle, b"secret", b"context-a").await.unwrap();
-    let result = provider.decrypt(&handle, &ct.ciphertext, b"context-b").await;
+    let ct = provider
+        .encrypt(&handle, b"secret", b"context-a")
+        .await
+        .unwrap();
+    let result = provider
+        .decrypt(&handle, &ct.ciphertext, b"context-b")
+        .await;
     assert!(result.is_err(), "wrong AAD must fail decryption");
 }
 
@@ -509,7 +523,10 @@ async fn provider_sign_verify_all_v1_algorithms() {
         let sig = provider.sign(&handle, *algo, message).await.unwrap();
         assert!(!sig.is_empty(), "{algo:?} signature must be non-empty");
 
-        let valid = provider.verify(&handle, *algo, message, &sig).await.unwrap();
+        let valid = provider
+            .verify(&handle, *algo, message, &sig)
+            .await
+            .unwrap();
         assert!(valid, "{algo:?} valid signature must verify");
 
         let invalid = provider
@@ -526,8 +543,14 @@ async fn provider_inmem_parity() {
     let provider = InMemoryProvider::new();
     let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
 
-    let ct = provider.encrypt(&handle, b"parity test", b"aad").await.unwrap();
-    let pt = provider.decrypt(&handle, &ct.ciphertext, b"aad").await.unwrap();
+    let ct = provider
+        .encrypt(&handle, b"parity test", b"aad")
+        .await
+        .unwrap();
+    let pt = provider
+        .decrypt(&handle, &ct.ciphertext, b"aad")
+        .await
+        .unwrap();
     assert_eq!(pt.expose().as_slice(), b"parity test");
 
     let sign_handle = provider.generate_key(&KeySpec::Ed25519).await.unwrap();
@@ -688,7 +711,10 @@ async fn integrated_encrypt_with_header_and_context() {
     // Verify context matches before decrypting.
     let mut ctx_at_decrypt = EncryptionContext::new();
     ctx_at_decrypt.insert("volume_id", "vol-456");
-    assert_eq!(ctx_at_decrypt.hash(), recovered_header.encryption_context_hash);
+    assert_eq!(
+        ctx_at_decrypt.hash(),
+        recovered_header.encryption_context_hash
+    );
 
     let pt = provider
         .decrypt(&handle, recovered_ct, &ctx_at_decrypt.to_aad_bytes())
@@ -837,12 +863,7 @@ fn rotation_job_happy_path() {
 fn rotation_job_failure_path() {
     use keyrack_core::rotation::*;
 
-    let mut job = RotationJob::new(
-        "rj-e2e-2",
-        make_test_lid("p"),
-        make_test_lid("c"),
-        3,
-    );
+    let mut job = RotationJob::new("rj-e2e-2", make_test_lid("p"), make_test_lid("c"), 3);
     job.transition_to(RotationJobState::Acknowledged).unwrap();
     job.fail("HSM timeout during re-wrap").unwrap();
     assert_eq!(job.state, RotationJobState::Failed);

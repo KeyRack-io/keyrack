@@ -75,8 +75,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("admin API listening on 0.0.0.0:{admin_port}");
 
     tokio::try_join!(
-        async { axum::serve(proxy_listener, proxy_router).await.map_err(anyhow::Error::from) },
-        async { axum::serve(admin_listener, admin_app).await.map_err(anyhow::Error::from) },
+        async {
+            axum::serve(proxy_listener, proxy_router)
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        async {
+            axum::serve(admin_listener, admin_app)
+                .await
+                .map_err(anyhow::Error::from)
+        },
     )?;
 
     Ok(())

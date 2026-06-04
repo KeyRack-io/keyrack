@@ -86,7 +86,7 @@ struct InflightGuard<'a> {
     removed: bool,
 }
 
-impl<'a> Drop for InflightGuard<'a> {
+impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         if !self.removed {
             if let Ok(mut map) = self.inflight.try_lock() {
@@ -134,7 +134,7 @@ impl LazyProvisioner {
         let mut existed = Vec::new();
 
         // Walk the chain root-first so parent keys exist before children.
-        let reversed: Vec<_> = chain.iter().rev().cloned().collect();
+        let reversed: Vec<_> = chain.iter().rev().copied().collect();
 
         for (i, lid) in reversed.iter().enumerate() {
             let parent_lid = if i > 0 { Some(&reversed[i - 1]) } else { None };
@@ -204,9 +204,7 @@ impl LazyProvisioner {
             removed: false,
         };
 
-        let result = self
-            .do_provision(lid, parent_lid, attrs)
-            .await;
+        let result = self.do_provision(lid, parent_lid, attrs).await;
 
         let mut inflight = self.inflight.lock().await;
         if let Some(tx) = inflight.remove(lid) {
@@ -296,7 +294,7 @@ impl std::fmt::Debug for LazyProvisioner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyProvisioner")
             .field("config", &self.config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -553,10 +551,8 @@ mod tests {
             ("user".into(), "alice".into()),
         ]);
 
-        let bob_attrs = BTreeMap::from([
-            ("kind".into(), "dek".into()),
-            ("user".into(), "bob".into()),
-        ]);
+        let bob_attrs =
+            BTreeMap::from([("kind".into(), "dek".into()), ("user".into(), "bob".into())]);
 
         let r1 = prov.resolve_and_provision(&alice_attrs).await.unwrap();
         assert_eq!(r1.created.len(), 4);
@@ -565,7 +561,11 @@ mod tests {
         // Bob gets a new DEK but shares kek + tenant-root + root with Alice
         assert_eq!(r2.chain.len(), 4);
         assert_eq!(r2.created.len(), 1, "only bob's DEK should be new");
-        assert_eq!(r2.existed.len(), 3, "kek + tenant-root + root already exist");
+        assert_eq!(
+            r2.existed.len(),
+            3,
+            "kek + tenant-root + root already exist"
+        );
     }
 
     #[tokio::test]
@@ -590,9 +590,9 @@ mod tests {
         for _ in 0..10 {
             let p = Arc::clone(&prov);
             let a = attrs.clone();
-            handles.push(tokio::spawn(async move {
-                p.resolve_and_provision(&a).await
-            }));
+            handles.push(tokio::spawn(
+                async move { p.resolve_and_provision(&a).await },
+            ));
         }
 
         let mut total_created = 0;

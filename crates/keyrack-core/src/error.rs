@@ -49,7 +49,9 @@ pub enum KeyRackError {
     #[error("encryption context mismatch")]
     EncryptionContextMismatch,
 
-    #[error("optimistic concurrency conflict on key {lid}: expected version {expected}, found {actual}")]
+    #[error(
+        "optimistic concurrency conflict on key {lid}: expected version {expected}, found {actual}"
+    )]
     OptimisticConcurrencyConflict {
         lid: Lid,
         expected: u64,

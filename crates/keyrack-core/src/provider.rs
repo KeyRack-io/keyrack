@@ -214,7 +214,8 @@ pub trait CryptoProvider: Send + Sync {
         dest_aad: &[u8],
     ) -> Result<EncryptOutput> {
         let plaintext = self.decrypt(source_handle, ciphertext, source_aad).await?;
-        self.encrypt(dest_handle, plaintext.expose(), dest_aad).await
+        self.encrypt(dest_handle, plaintext.expose(), dest_aad)
+            .await
     }
 
     /// Destroy key material. After this call, the handle is invalid.

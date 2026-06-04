@@ -113,27 +113,23 @@ impl KmipProvider {
         let mut guard = self.get_connection().await?;
         let conn = guard.as_mut().unwrap();
 
-        let response_item = match conn.round_trip(request).await {
-            Ok(item) => item,
-            Err(_) => {
-                // Connection may be stale; reconnect once.
-                tracing::debug!(endpoint = %self.config.endpoint, "reconnecting after error");
-                let new_conn = KmipConnection::connect(&self.config).await?;
-                *conn = new_conn;
-                conn.round_trip(request).await?
-            }
+        let response_item = if let Ok(item) = conn.round_trip(request).await {
+            item
+        } else {
+            // Connection may be stale; reconnect once.
+            tracing::debug!(endpoint = %self.config.endpoint, "reconnecting after error");
+            let new_conn = KmipConnection::connect(&self.config).await?;
+            *conn = new_conn;
+            conn.round_trip(request).await?
         };
 
         messages::parse_response(&response_item)
             .map_err(|e| KeyRackError::Provider(format!("KMIP response parse error: {e}")))
     }
 
-    fn check_response(&self, resp: &messages::KmipResponse) -> Result<()> {
+    fn check_response(resp: &messages::KmipResponse) -> Result<()> {
         if resp.result_status != ttlv::result_status::SUCCESS {
-            let msg = resp
-                .result_message
-                .as_deref()
-                .unwrap_or("unknown error");
+            let msg = resp.result_message.as_deref().unwrap_or("unknown error");
             return Err(KeyRackError::Provider(format!(
                 "KMIP operation failed (status=0x{:02X}): {msg}",
                 resp.result_status
@@ -147,8 +143,7 @@ impl KmipProvider {
             KeySpec::Aes256 => (ttlv::crypto_algorithm::AES, 256, true),
             KeySpec::Ed25519 => (ttlv::crypto_algorithm::ED25519, 256, false),
             KeySpec::EcdsaP256Sha256 => (ttlv::crypto_algorithm::ECDSA, 256, false),
-            KeySpec::RsaPkcs1v15Sha256 { key_size }
-            | KeySpec::RsaPssSha256 { key_size } => {
+            KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {
                 (ttlv::crypto_algorithm::RSA, *key_size as i32, false)
             }
         }
@@ -167,7 +162,7 @@ impl CryptoProvider for KmipProvider {
         };
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
         let unique_id = resp
             .payload
@@ -205,18 +200,17 @@ impl CryptoProvider for KmipProvider {
         );
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
-        let payload = resp.payload.as_ref().ok_or_else(|| {
-            KeyRackError::Provider("KMIP Encrypt: no payload in response".into())
-        })?;
+        let payload = resp
+            .payload
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("KMIP Encrypt: no payload in response".into()))?;
 
         let ciphertext = payload
             .find(tag::DATA)
             .and_then(|i| i.as_bytes())
-            .ok_or_else(|| {
-                KeyRackError::Provider("KMIP Encrypt: no Data in response".into())
-            })?
+            .ok_or_else(|| KeyRackError::Provider("KMIP Encrypt: no Data in response".into()))?
             .to_vec();
 
         let iv = payload
@@ -254,16 +248,14 @@ impl CryptoProvider for KmipProvider {
         );
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
         let data = resp
             .payload
             .as_ref()
             .and_then(|p| p.find(tag::DATA))
             .and_then(|i| i.as_bytes())
-            .ok_or_else(|| {
-                KeyRackError::Provider("KMIP Decrypt: no Data in response".into())
-            })?
+            .ok_or_else(|| KeyRackError::Provider("KMIP Decrypt: no Data in response".into()))?
             .to_vec();
 
         Ok(Sensitive::new(data))
@@ -278,7 +270,7 @@ impl CryptoProvider for KmipProvider {
         let request = messages::sign_request(&handle.key_id, message, None);
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
         let signature = resp
             .payload
@@ -313,16 +305,14 @@ impl CryptoProvider for KmipProvider {
         let request = messages::rng_retrieve_request(length as i32);
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
         let data = resp
             .payload
             .as_ref()
             .and_then(|p| p.find(tag::DATA))
             .and_then(|i| i.as_bytes())
-            .ok_or_else(|| {
-                KeyRackError::Provider("KMIP RNGRetrieve: no Data in response".into())
-            })?
+            .ok_or_else(|| KeyRackError::Provider("KMIP RNGRetrieve: no Data in response".into()))?
             .to_vec();
 
         Ok(Sensitive::new(data))
@@ -332,7 +322,7 @@ impl CryptoProvider for KmipProvider {
         let request = messages::destroy_request(&handle.key_id);
 
         let resp = self.send_request(&request).await?;
-        self.check_response(&resp)?;
+        Self::check_response(&resp)?;
 
         tracing::info!(
             key_id = %handle.key_id,
@@ -344,7 +334,9 @@ impl CryptoProvider for KmipProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        use CryptoOperation::*;
+        use CryptoOperation::{
+            Decrypt, DestroyKey, Encrypt, GenerateDataKey, GenerateKey, ReEncrypt, Sign, Verify,
+        };
 
         let symmetric_ops = vec![
             GenerateKey,

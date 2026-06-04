@@ -198,8 +198,12 @@ fn default_pdp_timeout() -> u64 {
 pub enum AuditConfig {
     #[default]
     Stdout,
-    File { path: String },
-    Nats { url: String },
+    File {
+        path: String,
+    },
+    Nats {
+        url: String,
+    },
 }
 
 /// Authentication configuration.
@@ -237,9 +241,7 @@ pub enum AuthnConfig {
     /// Skip authentication entirely (dev/test only).
     Insecure,
     /// Chain of authenticators tried in order (first match wins).
-    Chain {
-        authenticators: Vec<AuthnConfig>,
-    },
+    Chain { authenticators: Vec<AuthnConfig> },
 }
 
 fn default_bootstrap_max_age_secs() -> u64 {

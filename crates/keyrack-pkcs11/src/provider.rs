@@ -70,8 +70,8 @@ fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
 
 /// Map a cryptoki error to the appropriate `KeyRackError` variant,
 /// distinguishing transient HSM failures from permanent provider errors.
-fn map_pkcs11_error(context: &str, e: cryptoki::error::Error) -> KeyRackError {
-    if is_transient_pkcs11_error(&e) {
+fn map_pkcs11_error(context: &str, e: &cryptoki::error::Error) -> KeyRackError {
+    if is_transient_pkcs11_error(e) {
         KeyRackError::ProviderUnavailable(format!("{context}: {e}"))
     } else {
         KeyRackError::Provider(format!("{context}: {e}"))
@@ -143,10 +143,10 @@ impl Pkcs11Provider {
         tokio::task::spawn_blocking(move || {
             let session = ctx
                 .open_rw_session(slot)
-                .map_err(|e| map_pkcs11_error("open session", e))?;
+                .map_err(|e| map_pkcs11_error("open session", &e))?;
             session
                 .login(UserType::User, Some(&make_auth_pin(&pin)))
-                .map_err(|e| map_pkcs11_error("login", e))?;
+                .map_err(|e| map_pkcs11_error("login", &e))?;
             f(&session)
         })
         .await
@@ -173,18 +173,14 @@ fn find_slot_by_label(ctx: &Pkcs11, label: &str) -> Result<cryptoki::slot::Slot>
     )))
 }
 
-fn find_object(
-    session: &Session,
-    label: &str,
-    class: ObjectClass,
-) -> Result<ObjectHandle> {
+fn find_object(session: &Session, label: &str, class: ObjectClass) -> Result<ObjectHandle> {
     let template = vec![
         Attribute::Label(label.as_bytes().to_vec()),
         Attribute::Class(class),
     ];
     let objects = session
         .find_objects(&template)
-        .map_err(|e| map_pkcs11_error("find_objects", e))?;
+        .map_err(|e| map_pkcs11_error("find_objects", &e))?;
 
     objects
         .into_iter()
@@ -291,7 +287,7 @@ fn pkcs11_encrypt(
 
     let nonce_bytes = session
         .generate_random_vec(12)
-        .map_err(|e| map_pkcs11_error("generate nonce", e))?;
+        .map_err(|e| map_pkcs11_error("generate nonce", &e))?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&nonce_bytes);
 
@@ -299,7 +295,7 @@ fn pkcs11_encrypt(
         .map_err(|e| KeyRackError::Provider(format!("GCM params: {e}")))?;
     let ct = session
         .encrypt(&Mechanism::AesGcm(gcm_params), obj, plaintext)
-        .map_err(|e| map_pkcs11_error("AES-GCM encrypt", e))?;
+        .map_err(|e| map_pkcs11_error("AES-GCM encrypt", &e))?;
 
     // Wire format: 12-byte nonce || ciphertext+tag
     let mut out = Vec::with_capacity(12 + ct.len());
@@ -355,12 +351,12 @@ fn pkcs11_sign(
             let params = EddsaParams::new(EddsaSignatureScheme::Ed25519);
             session
                 .sign(&Mechanism::Eddsa(params), priv_handle, message)
-                .map_err(|e| map_pkcs11_error("Ed25519 sign", e))
+                .map_err(|e| map_pkcs11_error("Ed25519 sign", &e))
         }
 
         SigningAlgorithm::RsaPkcs1v15Sha256 => session
             .sign(&Mechanism::Sha256RsaPkcs, priv_handle, message)
-            .map_err(|e| map_pkcs11_error("RSA sign", e)),
+            .map_err(|e| map_pkcs11_error("RSA sign", &e)),
 
         SigningAlgorithm::RsaPssSha256 => {
             let pss_params = PkcsPssParams {
@@ -369,15 +365,19 @@ fn pkcs11_sign(
                 s_len: 32.into(),
             };
             session
-                .sign(&Mechanism::Sha256RsaPkcsPss(pss_params), priv_handle, message)
-                .map_err(|e| map_pkcs11_error("RSA-PSS sign", e))
+                .sign(
+                    &Mechanism::Sha256RsaPkcsPss(pss_params),
+                    priv_handle,
+                    message,
+                )
+                .map_err(|e| map_pkcs11_error("RSA-PSS sign", &e))
         }
 
         SigningAlgorithm::EcdsaP256Sha256 => {
             let hash = sha256_hash(message);
             let raw_sig = session
                 .sign(&Mechanism::Ecdsa, priv_handle, &hash)
-                .map_err(|e| map_pkcs11_error("ECDSA sign", e))?;
+                .map_err(|e| map_pkcs11_error("ECDSA sign", &e))?;
             ecdsa_der::raw_to_der(&raw_sig, P256_COMPONENT_LEN)
         }
     }
@@ -408,7 +408,12 @@ fn pkcs11_verify(
                 mgf: PkcsMgfType::MGF1_SHA256,
                 s_len: 32.into(),
             };
-            session.verify(&Mechanism::Sha256RsaPkcsPss(pss_params), pub_handle, message, signature)
+            session.verify(
+                &Mechanism::Sha256RsaPkcsPss(pss_params),
+                pub_handle,
+                message,
+                signature,
+            )
         }
 
         SigningAlgorithm::EcdsaP256Sha256 => {
@@ -425,7 +430,7 @@ fn pkcs11_verify(
             | cryptoki::error::RvError::SignatureLenRange,
             _,
         )) => Ok(false),
-        Err(e) => Err(map_pkcs11_error("verify", e)),
+        Err(e) => Err(map_pkcs11_error("verify", &e)),
     }
 }
 
@@ -437,27 +442,81 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
 #[allow(clippy::many_single_char_names)]
 fn sha256_compute(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5,
-        0x3956_c25b, 0x59f1_11f1, 0x923f_82a4, 0xab1c_5ed5,
-        0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
-        0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174,
-        0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc,
-        0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
-        0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
-        0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967,
-        0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
-        0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85,
-        0xa2bf_e8a1, 0xa81a_664b, 0xc24b_8b70, 0xc76c_51a3,
-        0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
-        0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5,
-        0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
-        0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
-        0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
     ];
 
     let mut h: [u32; 8] = [
-        0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
-        0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
     ];
 
     let bit_len = (data.len() as u64) * 8;
@@ -531,12 +590,12 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
     let template = vec![Attribute::Label(label.as_bytes().to_vec())];
     let objects = session
         .find_objects(&template)
-        .map_err(|e| map_pkcs11_error("find for destroy", e))?;
+        .map_err(|e| map_pkcs11_error("find for destroy", &e))?;
 
     for obj in objects {
         session
             .destroy_object(obj)
-            .map_err(|e| map_pkcs11_error("destroy_object", e))?;
+            .map_err(|e| map_pkcs11_error("destroy_object", &e))?;
     }
     Ok(())
 }
@@ -556,8 +615,7 @@ impl CryptoProvider for Pkcs11Provider {
                 KeySpec::EcdsaP256Sha256 => {
                     generate_ec_key_pair(session, &label_for_closure, P256_OID_DER)?;
                 }
-                KeySpec::RsaPkcs1v15Sha256 { key_size }
-                | KeySpec::RsaPssSha256 { key_size } => {
+                KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {
                     generate_rsa_key_pair(session, &label_for_closure, *key_size)?;
                 }
             }
@@ -623,10 +681,8 @@ impl CryptoProvider for Pkcs11Provider {
         let message = message.to_vec();
         let signature = signature.to_vec();
 
-        self.run(move |session| {
-            pkcs11_verify(session, &label, algorithm, &message, &signature)
-        })
-        .await
+        self.run(move |session| pkcs11_verify(session, &label, algorithm, &message, &signature))
+            .await
     }
 
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>> {
@@ -635,7 +691,7 @@ impl CryptoProvider for Pkcs11Provider {
         self.run(move |session| {
             let bytes = session
                 .generate_random_vec(len)
-                .map_err(|e| map_pkcs11_error("generate_random", e))?;
+                .map_err(|e| map_pkcs11_error("generate_random", &e))?;
             Ok(Sensitive::new(bytes))
         })
         .await
@@ -649,18 +705,39 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        use CryptoOperation::*;
+        use CryptoOperation::{
+            Decrypt, DestroyKey, Encrypt, GenerateDataKey, GenerateKey, ReEncrypt, Sign, Verify,
+        };
 
-        let symmetric_ops = vec![GenerateKey, Encrypt, Decrypt, GenerateDataKey, ReEncrypt, DestroyKey];
+        let symmetric_ops = vec![
+            GenerateKey,
+            Encrypt,
+            Decrypt,
+            GenerateDataKey,
+            ReEncrypt,
+            DestroyKey,
+        ];
         let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
 
         ProviderCapabilities {
             provider_name: "pkcs11".into(),
             key_specs: vec![
-                KeySpecCapability { key_spec: KeySpec::Aes256, operations: symmetric_ops },
-                KeySpecCapability { key_spec: KeySpec::Ed25519, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops },
+                KeySpecCapability {
+                    key_spec: KeySpec::Aes256,
+                    operations: symmetric_ops,
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::Ed25519,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::EcdsaP256Sha256,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+                    operations: signing_ops,
+                },
             ],
             supports_generate_random: true,
             supports_atomic_data_key: true,

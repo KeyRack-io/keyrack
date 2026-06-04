@@ -47,14 +47,9 @@ pub struct ServiceState {
 
 impl ServiceState {
     /// Emit an audit event for internal operations (e.g. cascade disable).
-    pub async fn emit_audit_event(
-        &self,
-        resource_id: &str,
-        detail: &str,
-    ) {
+    pub async fn emit_audit_event(&self, resource_id: &str, detail: &str) {
         use keyrack_core::audit::{
-            AuditAction, AuditEvent, AuditPrincipal, AuditResource,
-            AuditResult, EventType,
+            AuditAction, AuditEvent, AuditPrincipal, AuditResource, AuditResult, EventType,
         };
 
         let mut event = AuditEvent::new(

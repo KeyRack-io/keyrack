@@ -105,8 +105,7 @@ impl SoftwareProvider {
         let mat = keys
             .get(&handle.key_id)
             .ok_or_else(|| KeyRackError::Provider(format!("key not found: {}", handle.key_id)))?;
-        extract(mat)
-            .ok_or_else(|| KeyRackError::Provider("key type mismatch".into()))
+        extract(mat).ok_or_else(|| KeyRackError::Provider("key type mismatch".into()))
     }
 }
 
@@ -134,8 +133,7 @@ impl CryptoProvider for SoftwareProvider {
                 let signing_key = P256SigningKey::random(&mut OsRng);
                 KeyMaterial::EcdsaP256(signing_key)
             }
-            KeySpec::RsaPkcs1v15Sha256 { key_size }
-            | KeySpec::RsaPssSha256 { key_size } => {
+            KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {
                 let bits = *key_size as usize;
                 if !(2048..=4096).contains(&bits) {
                     return Err(KeyRackError::Provider(format!(
@@ -225,18 +223,19 @@ impl CryptoProvider for SoftwareProvider {
             .map_err(|e| KeyRackError::Provider(format!("AES init failed: {e}")))?;
 
         let (nonce_bytes, ct) = ciphertext.split_at(12);
-        let nonce_arr: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
-            KeyRackError::Provider("invalid nonce length".into())
-        })?;
+        let nonce_arr: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| KeyRackError::Provider("invalid nonce length".into()))?;
         let nonce = aes_gcm::Nonce::from(nonce_arr);
 
         let payload = Payload { msg: ct, aad };
 
-        let pt = cipher
-            .decrypt(&nonce, payload)
-            .map_err(|_| KeyRackError::Provider(
-                "AES-GCM authentication failed: wrong key, corrupted ciphertext, or AAD mismatch".into(),
-            ))?;
+        let pt = cipher.decrypt(&nonce, payload).map_err(|_| {
+            KeyRackError::Provider(
+                "AES-GCM authentication failed: wrong key, corrupted ciphertext, or AAD mismatch"
+                    .into(),
+            )
+        })?;
 
         Ok(Sensitive::new(pt))
     }
@@ -275,8 +274,7 @@ impl CryptoProvider for SoftwareProvider {
                     _ => None,
                 })?;
                 let signing_key = RsaSigningKey::<Sha256>::new(private_key.clone());
-                let sig = signing_key
-                    .sign(message);
+                let sig = signing_key.sign(message);
                 Ok(sig.to_vec())
             }
             SigningAlgorithm::RsaPssSha256 => {
@@ -329,8 +327,7 @@ impl CryptoProvider for SoftwareProvider {
                     KeyMaterial::Rsa(k) => Some(k.as_ref()),
                     _ => None,
                 })?;
-                let verifying_key =
-                    RsaVerifyingKey::<Sha256>::new(private_key.to_public_key());
+                let verifying_key = RsaVerifyingKey::<Sha256>::new(private_key.to_public_key());
                 let sig = rsa::pkcs1v15::Signature::try_from(signature)
                     .map_err(|e| KeyRackError::Provider(format!("invalid RSA sig: {e}")))?;
                 Ok(verifying_key.verify(message, &sig).is_ok())
@@ -340,8 +337,7 @@ impl CryptoProvider for SoftwareProvider {
                     KeyMaterial::Rsa(k) => Some(k.as_ref()),
                     _ => None,
                 })?;
-                let verifying_key =
-                    RsaPssVerifyingKey::<Sha256>::new(private_key.to_public_key());
+                let verifying_key = RsaPssVerifyingKey::<Sha256>::new(private_key.to_public_key());
                 let sig = rsa::pss::Signature::try_from(signature)
                     .map_err(|e| KeyRackError::Provider(format!("invalid RSA-PSS sig: {e}")))?;
                 Ok(verifying_key.verify(message, &sig).is_ok())
@@ -364,23 +360,59 @@ impl CryptoProvider for SoftwareProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        use CryptoOperation::*;
+        use CryptoOperation::{
+            Decrypt, DestroyKey, Encrypt, GenerateDataKey, GenerateKey, ReEncrypt, Sign, Verify,
+        };
 
-        let symmetric_ops = vec![GenerateKey, Encrypt, Decrypt, GenerateDataKey, ReEncrypt, DestroyKey];
+        let symmetric_ops = vec![
+            GenerateKey,
+            Encrypt,
+            Decrypt,
+            GenerateDataKey,
+            ReEncrypt,
+            DestroyKey,
+        ];
         let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
 
         ProviderCapabilities {
             provider_name: "software".into(),
             key_specs: vec![
-                KeySpecCapability { key_spec: KeySpec::Aes256, operations: symmetric_ops },
-                KeySpecCapability { key_spec: KeySpec::Ed25519, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::EcdsaP256Sha256, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 2048 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 3072 }, operations: signing_ops.clone() },
-                KeySpecCapability { key_spec: KeySpec::RsaPssSha256 { key_size: 4096 }, operations: signing_ops },
+                KeySpecCapability {
+                    key_spec: KeySpec::Aes256,
+                    operations: symmetric_ops,
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::Ed25519,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::EcdsaP256Sha256,
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 },
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 },
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPssSha256 { key_size: 2048 },
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPssSha256 { key_size: 3072 },
+                    operations: signing_ops.clone(),
+                },
+                KeySpecCapability {
+                    key_spec: KeySpec::RsaPssSha256 { key_size: 4096 },
+                    operations: signing_ops,
+                },
             ],
             supports_generate_random: true,
             supports_atomic_data_key: false,
@@ -402,7 +434,10 @@ mod tests {
         let aad = b"context";
 
         let ct = provider.encrypt(&handle, plaintext, aad).await.unwrap();
-        let pt = provider.decrypt(&handle, &ct.ciphertext, aad).await.unwrap();
+        let pt = provider
+            .decrypt(&handle, &ct.ciphertext, aad)
+            .await
+            .unwrap();
 
         assert_eq!(pt.expose().as_slice(), plaintext);
     }
@@ -486,12 +521,7 @@ mod tests {
             .unwrap());
 
         assert!(!provider
-            .verify(
-                &handle,
-                SigningAlgorithm::RsaPkcs1v15Sha256,
-                b"wrong",
-                &sig
-            )
+            .verify(&handle, SigningAlgorithm::RsaPkcs1v15Sha256, b"wrong", &sig)
             .await
             .unwrap());
     }

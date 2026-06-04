@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! HashiCorp Vault Transit secrets engine provider for KeyRack.
+//! `HashiCorp` Vault Transit secrets engine provider for `KeyRack`.
 //!
 //! Delegates all cryptographic operations to Vault's Transit engine
 //! over its HTTP API. Key material never leaves Vault.
@@ -36,7 +36,7 @@ use keyrack_core::sensitive::Sensitive;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Crypto provider backed by HashiCorp Vault's Transit secrets engine.
+/// Crypto provider backed by `HashiCorp` Vault's Transit secrets engine.
 pub struct VaultTransitProvider {
     client: Client,
     vault_addr: String,
@@ -123,9 +123,8 @@ impl VaultTransitProvider {
             )));
         }
 
-        serde_json::from_str(&text).map_err(|e| {
-            KeyRackError::Provider(format!("failed to parse vault response: {e}"))
-        })
+        serde_json::from_str(&text)
+            .map_err(|e| KeyRackError::Provider(format!("failed to parse vault response: {e}")))
     }
 
     async fn vault_post_no_body<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
@@ -199,8 +198,8 @@ fn vault_key_type(spec: &KeySpec) -> &'static str {
 
 fn vault_hash_algorithm(alg: SigningAlgorithm) -> &'static str {
     match alg {
-        SigningAlgorithm::Ed25519 => "sha2-256",
-        SigningAlgorithm::EcdsaP256Sha256
+        SigningAlgorithm::Ed25519
+        | SigningAlgorithm::EcdsaP256Sha256
         | SigningAlgorithm::RsaPkcs1v15Sha256
         | SigningAlgorithm::RsaPssSha256 => "sha2-256",
     }
@@ -368,9 +367,8 @@ impl CryptoProvider for VaultTransitProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
-        let ct_str = std::str::from_utf8(ciphertext).map_err(|e| {
-            KeyRackError::Provider(format!("ciphertext is not valid UTF-8: {e}"))
-        })?;
+        let ct_str = std::str::from_utf8(ciphertext)
+            .map_err(|e| KeyRackError::Provider(format!("ciphertext is not valid UTF-8: {e}")))?;
 
         let body = DecryptRequest {
             ciphertext: ct_str.to_owned(),
@@ -446,9 +444,7 @@ impl CryptoProvider for VaultTransitProvider {
             format: "base64",
         };
 
-        let resp: RandomResponse = self
-            .vault_post(&format!("random/{length}"), &body)
-            .await?;
+        let resp: RandomResponse = self.vault_post(&format!("random/{length}"), &body).await?;
 
         let bytes = B64.decode(&resp.data.random_bytes).map_err(|e| {
             KeyRackError::Provider(format!("base64 decode of random bytes failed: {e}"))
@@ -474,7 +470,7 @@ impl CryptoProvider for VaultTransitProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        use CryptoOperation::*;
+        use CryptoOperation::{Decrypt, DestroyKey, Encrypt, GenerateKey, Sign, Verify};
 
         let encrypt_ops = vec![GenerateKey, Encrypt, Decrypt, DestroyKey];
         let sign_ops = vec![GenerateKey, Sign, Verify, DestroyKey];

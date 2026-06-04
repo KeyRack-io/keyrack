@@ -55,15 +55,18 @@ impl GrpcPdpClient {
 
             let mut tls = ClientTlsConfig::new();
             if let Some(ca_path) = ca_cert {
-                let pem = std::fs::read(ca_path)
-                    .map_err(|e| KeyRackError::Other(format!("failed to read PDP CA cert {ca_path}: {e}")))?;
+                let pem = std::fs::read(ca_path).map_err(|e| {
+                    KeyRackError::Other(format!("failed to read PDP CA cert {ca_path}: {e}"))
+                })?;
                 tls = tls.ca_certificate(Certificate::from_pem(pem));
             }
             if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
-                let cert_pem = std::fs::read(cert_path)
-                    .map_err(|e| KeyRackError::Other(format!("failed to read PDP client cert: {e}")))?;
-                let key_pem = std::fs::read(key_path)
-                    .map_err(|e| KeyRackError::Other(format!("failed to read PDP client key: {e}")))?;
+                let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                    KeyRackError::Other(format!("failed to read PDP client cert: {e}"))
+                })?;
+                let key_pem = std::fs::read(key_path).map_err(|e| {
+                    KeyRackError::Other(format!("failed to read PDP client key: {e}"))
+                })?;
                 tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
             }
             Some(tls)
@@ -95,16 +98,17 @@ impl GrpcPdpClient {
             .timeout(self.timeout);
 
         if let Some(tls) = &self.tls_config {
-            ep = ep.tls_config(tls.clone())
+            ep = ep
+                .tls_config(tls.clone())
                 .map_err(|e| KeyRackError::Other(format!("PDP gRPC TLS config error: {e}")))?;
         }
 
-        let channel = ep
-            .connect()
-            .await
-            .map_err(|e| {
-                KeyRackError::Other(format!("failed to connect to PDP at {}: {e}", self.endpoint))
-            })?;
+        let channel = ep.connect().await.map_err(|e| {
+            KeyRackError::Other(format!(
+                "failed to connect to PDP at {}: {e}",
+                self.endpoint
+            ))
+        })?;
         *guard = Some(channel.clone());
         Ok(channel)
     }
@@ -116,9 +120,7 @@ impl GrpcPdpClient {
 
 fn attr_to_proto(val: &AttributeValue) -> proto::PdpAttributeValue {
     let value = match val {
-        AttributeValue::String(s) => {
-            proto::pdp_attribute_value::Value::StringValue(s.clone())
-        }
+        AttributeValue::String(s) => proto::pdp_attribute_value::Value::StringValue(s.clone()),
         AttributeValue::Bool(b) => proto::pdp_attribute_value::Value::BoolValue(*b),
         AttributeValue::Integer(n) => proto::pdp_attribute_value::Value::IntValue(*n),
         AttributeValue::StringList(list) => {
@@ -148,7 +150,9 @@ fn attr_to_proto(val: &AttributeValue) -> proto::PdpAttributeValue {
 fn attr_map_to_proto(
     map: &BTreeMap<String, AttributeValue>,
 ) -> std::collections::HashMap<String, proto::PdpAttributeValue> {
-    map.iter().map(|(k, v)| (k.clone(), attr_to_proto(v))).collect()
+    map.iter()
+        .map(|(k, v)| (k.clone(), attr_to_proto(v)))
+        .collect()
 }
 
 fn attr_from_proto(pv: &proto::PdpAttributeValue) -> Option<AttributeValue> {
@@ -164,14 +168,12 @@ fn attr_from_proto(pv: &proto::PdpAttributeValue) -> Option<AttributeValue> {
         proto::pdp_attribute_value::Value::Record(rec) => {
             Some(AttributeValue::Record(attr_map_from_proto(&rec.fields)))
         }
-        proto::pdp_attribute_value::Value::RecordList(rl) => {
-            Some(AttributeValue::RecordList(
-                rl.records
-                    .iter()
-                    .map(|r| attr_map_from_proto(&r.fields))
-                    .collect(),
-            ))
-        }
+        proto::pdp_attribute_value::Value::RecordList(rl) => Some(AttributeValue::RecordList(
+            rl.records
+                .iter()
+                .map(|r| attr_map_from_proto(&r.fields))
+                .collect(),
+        )),
         proto::pdp_attribute_value::Value::Timestamp(_) => None,
     }
 }
@@ -253,7 +255,11 @@ fn response_from_proto(response: proto::PdpAuthorizeResponse) -> AuthzResponse {
     AuthzResponse {
         request_id: response.request_id,
         decision: decision_from_proto(decision),
-        reasons: response.reasons.into_iter().map(reason_from_proto).collect(),
+        reasons: response
+            .reasons
+            .into_iter()
+            .map(reason_from_proto)
+            .collect(),
         obligations: response
             .obligations
             .into_iter()
@@ -303,6 +309,6 @@ impl std::fmt::Debug for GrpcPdpClient {
         f.debug_struct("GrpcPdpClient")
             .field("endpoint", &self.endpoint)
             .field("timeout", &self.timeout)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

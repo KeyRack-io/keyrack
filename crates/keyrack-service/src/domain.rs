@@ -73,9 +73,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
                 Self::NotFound(e.to_string())
             }
             KeyRackError::InvalidStateTransition { .. }
-            | KeyRackError::OperationNotPermitted { .. } => {
-                Self::FailedPrecondition(e.to_string())
-            }
+            | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
             | KeyRackError::EncryptionContextMismatch
             | KeyRackError::DepthLimitExceeded { .. }
@@ -99,14 +97,18 @@ impl DomainError {
                 let msg = e.to_string();
                 match e {
                     KeyRackError::KeyNotFound(_) => tonic::Status::not_found(msg),
-                    KeyRackError::OptimisticConcurrencyConflict { .. } => tonic::Status::aborted(msg),
+                    KeyRackError::OptimisticConcurrencyConflict { .. } => {
+                        tonic::Status::aborted(msg)
+                    }
                     KeyRackError::InvalidStateTransition { .. }
                     | KeyRackError::OperationNotPermitted { .. }
                     | KeyRackError::ImmutableTag { .. }
                     | KeyRackError::DepthLimitExceeded { .. }
                     | KeyRackError::CycleDetected { .. } => tonic::Status::failed_precondition(msg),
                     KeyRackError::EncryptionContextMismatch => tonic::Status::invalid_argument(msg),
-                    KeyRackError::AuthorizationDenied { .. } => tonic::Status::permission_denied(msg),
+                    KeyRackError::AuthorizationDenied { .. } => {
+                        tonic::Status::permission_denied(msg)
+                    }
                     KeyRackError::ProviderUnavailable(_) => tonic::Status::unavailable(msg),
                     _ => tonic::Status::internal(msg),
                 }
@@ -120,19 +122,33 @@ impl DomainError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             Self::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
             Self::FailedPrecondition(_) => (StatusCode::CONFLICT, "FailedPrecondition"),
-            Self::ProviderUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable"),
+            Self::ProviderUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
+            }
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
             Self::Core(e) => {
                 use keyrack_core::error::KeyRackError;
                 match e {
                     KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
-                    KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
-                    KeyRackError::InvalidStateTransition { .. } => (StatusCode::CONFLICT, "InvalidStateTransition"),
-                    KeyRackError::OperationNotPermitted { .. } => (StatusCode::FORBIDDEN, "OperationNotPermitted"),
+                    KeyRackError::OptimisticConcurrencyConflict { .. } => {
+                        (StatusCode::CONFLICT, "OccConflict")
+                    }
+                    KeyRackError::InvalidStateTransition { .. } => {
+                        (StatusCode::CONFLICT, "InvalidStateTransition")
+                    }
+                    KeyRackError::OperationNotPermitted { .. } => {
+                        (StatusCode::FORBIDDEN, "OperationNotPermitted")
+                    }
                     KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
-                    KeyRackError::EncryptionContextMismatch => (StatusCode::BAD_REQUEST, "EncryptionContextMismatch"),
-                    KeyRackError::AuthorizationDenied { .. } => (StatusCode::FORBIDDEN, "AuthorizationDenied"),
-                    KeyRackError::ProviderUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable"),
+                    KeyRackError::EncryptionContextMismatch => {
+                        (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
+                    }
+                    KeyRackError::AuthorizationDenied { .. } => {
+                        (StatusCode::FORBIDDEN, "AuthorizationDenied")
+                    }
+                    KeyRackError::ProviderUnavailable(_) => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
+                    }
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
                 }
             }
@@ -163,14 +179,9 @@ pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
-    let lid = Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &canonical,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+    let lid = Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &canonical);
     (lid, attrs)
 }
 
@@ -257,16 +268,9 @@ pub async fn create_key(
     Ok(record)
 }
 
-pub async fn get_key(
-    state: &Arc<ServiceState>,
-    key_id: &str,
-) -> Result<KeyRecord, DomainError> {
+pub async fn get_key(state: &Arc<ServiceState>, key_id: &str) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    state
-        .storage
-        .get_key(&lid)
-        .await
-        .map_err(DomainError::from)
+    state.storage.get_key(&lid).await.map_err(DomainError::from)
 }
 
 pub struct UpdateKeyInput {
@@ -279,7 +283,11 @@ pub async fn update_key(
     input: UpdateKeyInput,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(&input.key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     if let Some(desc) = input.description {
         record.description = desc;
     }
@@ -316,12 +324,13 @@ pub async fn list_keys(
         .map_err(DomainError::from)
 }
 
-pub async fn enable_key(
-    state: &Arc<ServiceState>,
-    key_id: &str,
-) -> Result<KeyRecord, DomainError> {
+pub async fn enable_key(state: &Arc<ServiceState>, key_id: &str) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let old_state = record.state.to_string();
     record
         .transition_to(KeyState::Enabled)
@@ -332,7 +341,10 @@ pub async fn enable_key(
         .await
         .map_err(DomainError::from)?;
     if let Some(nats) = &state.nats_publisher {
-        if let Err(e) = nats.publish_state_changed(&lid, &old_state, "enabled").await {
+        if let Err(e) = nats
+            .publish_state_changed(&lid, &old_state, "enabled")
+            .await
+        {
             tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
         }
     }
@@ -349,7 +361,11 @@ pub async fn disable_key(
     key_id: &str,
 ) -> Result<DisableKeyResult, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let old_state = record.state.to_string();
     record
         .transition_to(KeyState::Disabled)
@@ -361,7 +377,10 @@ pub async fn disable_key(
         .map_err(DomainError::from)?;
 
     if let Some(nats) = &state.nats_publisher {
-        if let Err(e) = nats.publish_state_changed(&lid, &old_state, "disabled").await {
+        if let Err(e) = nats
+            .publish_state_changed(&lid, &old_state, "disabled")
+            .await
+        {
             tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
         }
     }
@@ -377,9 +396,7 @@ pub async fn disable_key(
             .await
             .map_err(DomainError::from)?;
         for mut child in children {
-            if child.state == KeyState::Enabled
-                && child.transition_to(KeyState::Disabled).is_ok()
-            {
+            if child.state == KeyState::Enabled && child.transition_to(KeyState::Disabled).is_ok() {
                 if let Err(e) = state.storage.update_key(&child).await {
                     tracing::error!(
                         child_lid = %child.lid,
@@ -421,8 +438,16 @@ pub async fn schedule_key_deletion(
     grace_period_days: u32,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
-    let days = if grace_period_days == 0 { 7 } else { grace_period_days };
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
+    let days = if grace_period_days == 0 {
+        7
+    } else {
+        grace_period_days
+    };
     record
         .transition_to(KeyState::PendingDeletion)
         .map_err(|(f, t)| transition_err(f, t))?;
@@ -441,7 +466,11 @@ pub async fn cancel_key_deletion(
     key_id: &str,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     if record.state != KeyState::PendingDeletion {
         return Err(DomainError::FailedPrecondition(
             "can only cancel deletion from PendingDeletion".into(),
@@ -464,7 +493,11 @@ pub async fn report_key_compromise(
     key_id: &str,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let old_state = record.state.to_string();
     record
         .transition_to(KeyState::Compromised)
@@ -496,7 +529,11 @@ pub async fn rotate_key(
     key_id: &str,
 ) -> Result<RotateKeyResult, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     if record.state != KeyState::Enabled {
         return Err(DomainError::FailedPrecondition(
             "key must be Enabled to rotate".into(),
@@ -610,7 +647,11 @@ pub mod crypto {
         input: EncryptInput,
     ) -> Result<EncryptOutput, DomainError> {
         let lid = parse_lid(&input.key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+        let record = state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(DomainError::from)?;
 
         if !record.state.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
@@ -670,7 +711,11 @@ pub mod crypto {
         input: DecryptInput,
     ) -> Result<DecryptOutput, DomainError> {
         let lid = parse_lid(&input.key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+        let record = state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(DomainError::from)?;
 
         if !record.state.permits_decrypt() {
             return Err(DomainError::FailedPrecondition(format!(
@@ -741,8 +786,16 @@ pub mod crypto {
         let src_lid = parse_lid(&input.source_key_id)?;
         let dst_lid = parse_lid(&input.destination_key_id)?;
 
-        let src_record = state.storage.get_key(&src_lid).await.map_err(DomainError::from)?;
-        let dst_record = state.storage.get_key(&dst_lid).await.map_err(DomainError::from)?;
+        let src_record = state
+            .storage
+            .get_key(&src_lid)
+            .await
+            .map_err(DomainError::from)?;
+        let dst_record = state
+            .storage
+            .get_key(&dst_lid)
+            .await
+            .map_err(DomainError::from)?;
 
         let (header, ciphertext) = CiphertextHeader::unwrap_payload(&input.ciphertext_blob)
             .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
@@ -777,11 +830,8 @@ pub mod crypto {
             .as_ref()
             .map_or([0u8; 32], EncryptionContext::hash);
 
-        let new_header = CiphertextHeader::new(
-            dst_record.lid,
-            dst_record.current_key_version,
-            dst_ec_hash,
-        );
+        let new_header =
+            CiphertextHeader::new(dst_record.lid, dst_record.current_key_version, dst_ec_hash);
 
         let dst_ec_aad = input
             .destination_encryption_context
@@ -820,7 +870,11 @@ pub mod crypto {
         input: SignInput,
     ) -> Result<SignOutput, DomainError> {
         let lid = parse_lid(&input.key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+        let record = state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(DomainError::from)?;
 
         if !record.state.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
@@ -866,7 +920,11 @@ pub mod crypto {
         input: VerifyInput,
     ) -> Result<VerifyOutput, DomainError> {
         let lid = parse_lid(&input.key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+        let record = state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(DomainError::from)?;
 
         if !record.state.permits_decrypt() {
             return Err(DomainError::FailedPrecondition(format!(
@@ -917,7 +975,11 @@ pub mod crypto {
         input: GenerateDataKeyInput,
     ) -> Result<GenerateDataKeyOutput, DomainError> {
         let lid = parse_lid(&input.key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+        let record = state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(DomainError::from)?;
 
         if !record.state.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
@@ -1019,7 +1081,11 @@ pub async fn list_key_versions(
     key_id: &str,
 ) -> Result<Vec<KeyVersionRecord>, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     Ok(record.key_versions)
 }
 
@@ -1029,7 +1095,11 @@ pub async fn get_key_version(
     version: u64,
 ) -> Result<KeyVersionRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     record
         .key_versions
         .into_iter()
@@ -1044,7 +1114,11 @@ pub async fn enable_key_rotation(
     key_id: &str,
 ) -> Result<(), DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     record.user_tags.set("_keyrack_rotation_enabled", "true");
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
@@ -1062,7 +1136,11 @@ pub async fn disable_key_rotation(
     key_id: &str,
 ) -> Result<(), DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     record.user_tags.set("_keyrack_rotation_enabled", "false");
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
@@ -1085,7 +1163,11 @@ pub async fn get_key_rotation_status(
     key_id: &str,
 ) -> Result<RotationStatus, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let rotation_enabled = record.user_tags.get("_keyrack_rotation_enabled") == Some("true");
     let last_rotated_at = record
         .key_versions
@@ -1110,7 +1192,11 @@ pub async fn get_key_rotation_history(
     key_id: &str,
 ) -> Result<Vec<RotationHistoryEntry>, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut sorted = record.key_versions;
     sorted.sort_by_key(|v| v.version_number);
     let entries = sorted
@@ -1134,7 +1220,11 @@ pub async fn get_key_rotation_policy(
     key_id: &str,
 ) -> Result<RotationPolicy, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let enabled = record.user_tags.get("_keyrack_rotation_enabled") == Some("true");
     let rotation_interval_days = record
         .user_tags
@@ -1153,7 +1243,11 @@ pub async fn set_key_rotation_policy(
     policy: RotationPolicy,
 ) -> Result<(), DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let enabled_str = if policy.enabled { "true" } else { "false" };
     record
         .user_tags
@@ -1228,7 +1322,11 @@ pub async fn get_key_ancestors(
 ) -> Result<Vec<LineageEntry>, DomainError> {
     let lid = parse_lid(key_id)?;
     let mut ancestors = Vec::new();
-    let mut current = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut current = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut depth = 1u32;
     let mut visited = HashSet::new();
     visited.insert(lid);
@@ -1277,10 +1375,7 @@ pub async fn create_alias(
     Ok(alias)
 }
 
-pub async fn delete_alias(
-    state: &Arc<ServiceState>,
-    alias_name: &str,
-) -> Result<(), DomainError> {
+pub async fn delete_alias(state: &Arc<ServiceState>, alias_name: &str) -> Result<(), DomainError> {
     state
         .storage
         .delete_alias(alias_name)
@@ -1291,7 +1386,11 @@ pub async fn delete_alias(
 pub async fn list_aliases(
     state: &Arc<ServiceState>,
 ) -> Result<Vec<keyrack_core::storage::AliasRecord>, DomainError> {
-    state.storage.list_aliases().await.map_err(DomainError::from)
+    state
+        .storage
+        .list_aliases()
+        .await
+        .map_err(DomainError::from)
 }
 
 // ── Tags ────────────────────────────────────────────────────────────
@@ -1302,7 +1401,11 @@ pub async fn tag_resource(
     tags: Vec<(String, String)>,
 ) -> Result<(), DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     for (k, v) in tags {
         record.user_tags.set(k, v);
     }
@@ -1321,7 +1424,11 @@ pub async fn untag_resource(
     tag_keys: Vec<String>,
 ) -> Result<(), DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let mut record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     for key in &tag_keys {
         record.user_tags.remove(key);
     }
@@ -1339,7 +1446,11 @@ pub async fn list_resource_tags(
     key_id: &str,
 ) -> Result<Vec<(String, String)>, DomainError> {
     let lid = parse_lid(key_id)?;
-    let record = state.storage.get_key(&lid).await.map_err(DomainError::from)?;
+    let record = state
+        .storage
+        .get_key(&lid)
+        .await
+        .map_err(DomainError::from)?;
     Ok(record
         .user_tags
         .iter()

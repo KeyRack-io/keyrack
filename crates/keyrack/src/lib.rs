@@ -164,9 +164,7 @@ impl KeyRack {
 
     pub async fn resolve(&self, _attrs: &Attributes) -> Result<ResolvedKey, KeyRackError> {
         // TODO: wire to gRPC ResolveKey
-        Err(KeyRackError::Service(
-            "not yet connected to service".into(),
-        ))
+        Err(KeyRackError::Service("not yet connected to service".into()))
     }
 
     pub async fn resolve_at_version(
@@ -175,9 +173,7 @@ impl KeyRack {
         _version: u32,
     ) -> Result<ResolvedKey, KeyRackError> {
         // TODO: wire to gRPC ResolveKeyAtVersion
-        Err(KeyRackError::Service(
-            "not yet connected to service".into(),
-        ))
+        Err(KeyRackError::Service("not yet connected to service".into()))
     }
 
     pub async fn poll_data_reencryption_jobs(

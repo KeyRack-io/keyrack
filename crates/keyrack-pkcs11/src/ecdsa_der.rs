@@ -60,9 +60,7 @@ pub fn raw_to_der(raw: &[u8], component_len: usize) -> Result<Vec<u8>> {
 /// Each component is zero-padded to `component_len` bytes.
 pub fn der_to_raw(der: &[u8], component_len: usize) -> Result<Vec<u8>> {
     if der.len() < 6 || der[0] != 0x30 {
-        return Err(KeyRackError::Provider(
-            "invalid DER ECDSA signature".into(),
-        ));
+        return Err(KeyRackError::Provider("invalid DER ECDSA signature".into()));
     }
 
     let mut pos = 2; // skip SEQUENCE tag + length
@@ -99,9 +97,7 @@ fn encode_integer(val: &[u8]) -> Vec<u8> {
 
 fn read_integer(der: &[u8], pos: &mut usize, pad_to: usize) -> Result<Vec<u8>> {
     if *pos >= der.len() || der[*pos] != 0x02 {
-        return Err(KeyRackError::Provider(
-            "expected INTEGER tag in DER".into(),
-        ));
+        return Err(KeyRackError::Provider("expected INTEGER tag in DER".into()));
     }
     *pos += 1;
 

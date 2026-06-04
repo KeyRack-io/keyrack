@@ -97,8 +97,8 @@ fn bench_resolve(c: &mut Criterion) {
 
     c.bench_function("resolve_chain (4-deep)", |b| {
         b.iter(|| {
-            let chain = resolve_chain(black_box(&reg), black_box(&attrs), black_box(&config))
-                .unwrap();
+            let chain =
+                resolve_chain(black_box(&reg), black_box(&attrs), black_box(&config)).unwrap();
             black_box(chain);
         });
     });
@@ -113,10 +113,7 @@ fn bench_canonicalize(c: &mut Criterion) {
 
     c.bench_function("canonicalize V1 (4 attrs)", |b| {
         b.iter(|| {
-            let form = canonicalize(
-                black_box(CanonicalizationVersion::V1),
-                black_box(&attrs),
-            );
+            let form = canonicalize(black_box(CanonicalizationVersion::V1), black_box(&attrs));
             black_box(form);
         });
     });
@@ -130,10 +127,7 @@ fn bench_lid_derive(c: &mut Criterion) {
 
     c.bench_function("lid_derive (BLAKE3)", |b| {
         b.iter(|| {
-            let lid = Lid::derive(
-                black_box(CanonicalizationVersion::V1),
-                black_box(&form),
-            );
+            let lid = Lid::derive(black_box(CanonicalizationVersion::V1), black_box(&form));
             black_box(lid);
         });
     });

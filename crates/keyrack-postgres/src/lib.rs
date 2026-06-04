@@ -112,21 +112,19 @@ impl StorageBackend for PostgresStorage {
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let occ = record.occ_version as i64;
 
-        sqlx::query(
-            "INSERT INTO kr_keys (lid, record_json, occ_version) VALUES ($1, $2, $3)",
-        )
-        .bind(&lid_str)
-        .bind(&json)
-        .bind(occ)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                KeyRackError::Other("key already exists".into())
-            } else {
-                KeyRackError::Storage(format!("create_key: {e}"))
-            }
-        })?;
+        sqlx::query("INSERT INTO kr_keys (lid, record_json, occ_version) VALUES ($1, $2, $3)")
+            .bind(&lid_str)
+            .bind(&json)
+            .bind(occ)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    KeyRackError::Other("key already exists".into())
+                } else {
+                    KeyRackError::Storage(format!("create_key: {e}"))
+                }
+            })?;
         Ok(())
     }
 
@@ -142,8 +140,7 @@ impl StorageBackend for PostgresStorage {
         let json: serde_json::Value = row
             .try_get("record_json")
             .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
-        serde_json::from_value(json)
-            .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
+        serde_json::from_value(json).map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
     }
 
     async fn update_key(&self, record: &KeyRecord) -> Result<()> {
@@ -211,9 +208,11 @@ impl StorageBackend for PostgresStorage {
             if filter.state.is_some_and(|s| s != record.state) {
                 continue;
             }
-            if filter.user_tags.iter().all(|(k, v)| {
-                record.user_tags.get(k).is_some_and(|tv| tv == v)
-            }) {
+            if filter
+                .user_tags
+                .iter()
+                .all(|(k, v)| record.user_tags.get(k).is_some_and(|tv| tv == v))
+            {
                 items.push(record);
             }
         }
@@ -237,7 +236,11 @@ impl StorageBackend for PostgresStorage {
                 .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
             let record: KeyRecord = serde_json::from_value(json)
                 .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))?;
-            if record.parent_lid.as_ref().is_some_and(|p| p.to_string() == parent_str) {
+            if record
+                .parent_lid
+                .as_ref()
+                .is_some_and(|p| p.to_string() == parent_str)
+            {
                 children.push(record);
             }
         }
@@ -290,24 +293,22 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn list_aliases(&self) -> Result<Vec<AliasRecord>> {
-        let rows =
-            sqlx::query("SELECT alias_name, target_lid, created_at FROM kr_aliases")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| KeyRackError::Storage(format!("list_aliases: {e}")))?;
+        let rows = sqlx::query("SELECT alias_name, target_lid, created_at FROM kr_aliases")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| KeyRackError::Storage(format!("list_aliases: {e}")))?;
 
         let mut items = Vec::new();
         for row in &rows {
-            let name: String = row.try_get("alias_name").map_err(|e| {
-                KeyRackError::Storage(format!("column: {e}"))
-            })?;
-            let lid_str: String = row.try_get("target_lid").map_err(|e| {
-                KeyRackError::Storage(format!("column: {e}"))
-            })?;
-            let created_at: chrono::DateTime<chrono::Utc> =
-                row.try_get("created_at").map_err(|e| {
-                    KeyRackError::Storage(format!("column: {e}"))
-                })?;
+            let name: String = row
+                .try_get("alias_name")
+                .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
+            let lid_str: String = row
+                .try_get("target_lid")
+                .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
+            let created_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("created_at")
+                .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
             let lid = lid_str
                 .parse::<Lid>()
                 .map_err(|e| KeyRackError::Storage(format!("parse lid: {e}")))?;
@@ -336,35 +337,31 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn get_hsm_connection(&self, connection_id: &str) -> Result<HsmConnection> {
-        let row = sqlx::query(
-            "SELECT record_json FROM kr_hsm_connections WHERE connection_id = $1",
-        )
-        .bind(connection_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| KeyRackError::Storage(format!("get_hsm: {e}")))?
-        .ok_or_else(|| {
-            KeyRackError::Other(format!("hsm connection not found: {connection_id}"))
-        })?;
+        let row =
+            sqlx::query("SELECT record_json FROM kr_hsm_connections WHERE connection_id = $1")
+                .bind(connection_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| KeyRackError::Storage(format!("get_hsm: {e}")))?
+                .ok_or_else(|| {
+                    KeyRackError::Other(format!("hsm connection not found: {connection_id}"))
+                })?;
 
         let json: serde_json::Value = row
             .try_get("record_json")
             .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
-        serde_json::from_value(json)
-            .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
+        serde_json::from_value(json).map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
     }
 
     async fn update_hsm_connection(&self, conn_rec: &HsmConnection) -> Result<()> {
         let json = serde_json::to_value(conn_rec)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        sqlx::query(
-            "UPDATE kr_hsm_connections SET record_json = $1 WHERE connection_id = $2",
-        )
-        .bind(&json)
-        .bind(&conn_rec.connection_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| KeyRackError::Storage(format!("update_hsm: {e}")))?;
+        sqlx::query("UPDATE kr_hsm_connections SET record_json = $1 WHERE connection_id = $2")
+            .bind(&json)
+            .bind(&conn_rec.connection_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KeyRackError::Storage(format!("update_hsm: {e}")))?;
         Ok(())
     }
 
@@ -413,37 +410,30 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn get_rotation_job(&self, job_id: &str) -> Result<RotationJob> {
-        let row = sqlx::query(
-            "SELECT record_json FROM kr_rotation_jobs WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| KeyRackError::Storage(format!("get_job: {e}")))?
-        .ok_or_else(|| {
-            KeyRackError::Other(format!("rotation job not found: {job_id}"))
-        })?;
+        let row = sqlx::query("SELECT record_json FROM kr_rotation_jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| KeyRackError::Storage(format!("get_job: {e}")))?
+            .ok_or_else(|| KeyRackError::Other(format!("rotation job not found: {job_id}")))?;
 
         let json: serde_json::Value = row
             .try_get("record_json")
             .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
-        serde_json::from_value(json)
-            .map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
+        serde_json::from_value(json).map_err(|e| KeyRackError::Storage(format!("deserialize: {e}")))
     }
 
     async fn update_rotation_job(&self, job: &RotationJob) -> Result<()> {
         let json = serde_json::to_value(job)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let s = state_str(job.state)?;
-        sqlx::query(
-            "UPDATE kr_rotation_jobs SET record_json = $1, state = $2 WHERE job_id = $3",
-        )
-        .bind(&json)
-        .bind(&s)
-        .bind(&job.job_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| KeyRackError::Storage(format!("update_job: {e}")))?;
+        sqlx::query("UPDATE kr_rotation_jobs SET record_json = $1, state = $2 WHERE job_id = $3")
+            .bind(&json)
+            .bind(&s)
+            .bind(&job.job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KeyRackError::Storage(format!("update_job: {e}")))?;
         Ok(())
     }
 
@@ -454,12 +444,10 @@ impl StorageBackend for PostgresStorage {
         let rows = match state_filter {
             Some(state) => {
                 let s = state_str(state)?;
-                sqlx::query(
-                    "SELECT record_json FROM kr_rotation_jobs WHERE state = $1",
-                )
-                .bind(&s)
-                .fetch_all(&self.pool)
-                .await
+                sqlx::query("SELECT record_json FROM kr_rotation_jobs WHERE state = $1")
+                    .bind(&s)
+                    .fetch_all(&self.pool)
+                    .await
             }
             None => {
                 sqlx::query("SELECT record_json FROM kr_rotation_jobs")

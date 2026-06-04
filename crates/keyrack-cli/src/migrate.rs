@@ -19,10 +19,8 @@
 // Alternative commercial licensing is available; contact the Licensor.
 
 use clap::{Args, Subcommand};
-use keyrack_core::migration::{
-    self, MigrationAction, MigrationEntry, MigrationPlan,
-};
 use keyrack_core::key::{KeyRecord, KeyState};
+use keyrack_core::migration::{self, MigrationAction, MigrationEntry, MigrationPlan};
 use keyrack_core::storage::{KeyFilter, StorageBackend};
 
 #[derive(Args)]
@@ -136,9 +134,7 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
             output,
             storage,
         } => plan_migration(&from_canonicalization, &to, &output, &storage).await,
-        MigrateCommand::Apply { plan_file, storage } => {
-            apply_migration(&plan_file, &storage).await
-        }
+        MigrateCommand::Apply { plan_file, storage } => apply_migration(&plan_file, &storage).await,
         MigrateCommand::Rollback { plan_file, storage } => {
             rollback_migration(&plan_file, &storage).await
         }
@@ -196,10 +192,9 @@ async fn plan_migration(
     output: &std::path::Path,
     storage_path: &str,
 ) -> anyhow::Result<()> {
-    let from_version = migration::parse_canon_version(from_str)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let to_version = migration::parse_canon_version(to_str)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let from_version =
+        migration::parse_canon_version(from_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let to_version = migration::parse_canon_version(to_str).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if from_version == to_version {
         anyhow::bail!("source and target canonicalization versions are the same");
@@ -213,11 +208,7 @@ async fn plan_migration(
 
     for record in &all_keys {
         if record.canonicalization_version == from_version {
-            let new_lid = migration::rederive_lid(
-                &record.lid,
-                &record.identity_tags,
-                to_version,
-            );
+            let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version);
             entries.push(MigrationEntry {
                 old_lid: record.lid.to_string(),
                 new_lid: Some(new_lid.to_string()),
@@ -245,7 +236,11 @@ async fn plan_migration(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    let actionable = plan.entries.iter().filter(|e| e.action == MigrationAction::RederiveLid).count();
+    let actionable = plan
+        .entries
+        .iter()
+        .filter(|e| e.action == MigrationAction::RederiveLid)
+        .count();
     let skipped = plan.entries.len() - actionable;
 
     let json = serde_json::to_string_pretty(&plan)?;
@@ -262,10 +257,7 @@ async fn plan_migration(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn apply_migration(
-    plan_file: &std::path::Path,
-    storage_path: &str,
-) -> anyhow::Result<()> {
+async fn apply_migration(plan_file: &std::path::Path, storage_path: &str) -> anyhow::Result<()> {
     let plan_json = std::fs::read_to_string(plan_file)
         .map_err(|e| anyhow::anyhow!("cannot read plan file: {e}"))?;
     let mut plan: MigrationPlan = serde_json::from_str(&plan_json)?;
@@ -285,7 +277,9 @@ async fn apply_migration(
             continue;
         }
 
-        let old_lid: keyrack_core::lid::Lid = entry.old_lid.parse()
+        let old_lid: keyrack_core::lid::Lid = entry
+            .old_lid
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid LID '{}': {e}", entry.old_lid))?;
 
         let record = match db.get_key(&old_lid).await {
@@ -335,10 +329,7 @@ async fn apply_migration(
     Ok(())
 }
 
-async fn rollback_migration(
-    plan_file: &std::path::Path,
-    storage_path: &str,
-) -> anyhow::Result<()> {
+async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> anyhow::Result<()> {
     let plan_json = std::fs::read_to_string(plan_file)
         .map_err(|e| anyhow::anyhow!("cannot read plan file: {e}"))?;
     let plan: MigrationPlan = serde_json::from_str(&plan_json)?;
@@ -464,31 +455,45 @@ async fn plan_rule_change(
     for record in &all_keys {
         let attrs = record.identity_tags.as_map();
 
-        let old_parent = old_registry.match_rule(attrs)
+        let old_parent = old_registry
+            .match_rule(attrs)
             .and_then(|m| m.rule.resolve_parent(&m.bindings));
-        let new_parent = new_registry.match_rule(attrs)
+        let new_parent = new_registry
+            .match_rule(attrs)
             .and_then(|m| m.rule.resolve_parent(&m.bindings));
 
-        if old_parent != new_parent {
+        if old_parent == new_parent {
             entries.push(RuleChangeEntry {
                 key_lid: record.lid.to_string(),
-                old_parent_lid: record.parent_lid.as_ref().map(|l| l.to_string()),
-                new_parent_lid: None, // Computed at apply time from new rules
-                action: RuleChangeAction::Rewrap,
+                old_parent_lid: record
+                    .parent_lid
+                    .as_ref()
+                    .map(std::string::ToString::to_string),
+                new_parent_lid: record
+                    .parent_lid
+                    .as_ref()
+                    .map(std::string::ToString::to_string),
+                action: RuleChangeAction::Skip,
                 applied: false,
             });
         } else {
             entries.push(RuleChangeEntry {
                 key_lid: record.lid.to_string(),
-                old_parent_lid: record.parent_lid.as_ref().map(|l| l.to_string()),
-                new_parent_lid: record.parent_lid.as_ref().map(|l| l.to_string()),
-                action: RuleChangeAction::Skip,
+                old_parent_lid: record
+                    .parent_lid
+                    .as_ref()
+                    .map(std::string::ToString::to_string),
+                new_parent_lid: None, // Computed at apply time from new rules
+                action: RuleChangeAction::Rewrap,
                 applied: false,
             });
         }
     }
 
-    let rewrap_count = entries.iter().filter(|e| e.action == RuleChangeAction::Rewrap).count();
+    let rewrap_count = entries
+        .iter()
+        .filter(|e| e.action == RuleChangeAction::Rewrap)
+        .count();
     let skip_count = entries.len() - rewrap_count;
 
     let plan = RuleChangePlan {
@@ -558,7 +563,9 @@ async fn apply_rule_change(
             continue;
         }
 
-        let key_lid: keyrack_core::lid::Lid = plan.entries[i].key_lid.parse()
+        let key_lid: keyrack_core::lid::Lid = plan.entries[i]
+            .key_lid
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid LID '{}': {e}", plan.entries[i].key_lid))?;
 
         let record = match db.get_key(&key_lid).await {
@@ -572,18 +579,15 @@ async fn apply_rule_change(
 
         // Resolve the new parent LID from the new rules
         let attrs = record.identity_tags.as_map();
-        let new_parent_lid = match keyrack_core::resolver::resolve_chain(
-            &new_registry,
-            attrs,
-            &resolver_config,
-        ) {
-            Ok(chain) if chain.len() >= 2 => {
-                Some(chain[1].clone())
-            }
-            _ => None,
-        };
+        let new_parent_lid =
+            match keyrack_core::resolver::resolve_chain(&new_registry, attrs, &resolver_config) {
+                Ok(chain) if chain.len() >= 2 => Some(chain[1]),
+                _ => None,
+            };
 
-        let new_parent_str = new_parent_lid.as_ref().map(|l| l.to_string());
+        let new_parent_str = new_parent_lid
+            .as_ref()
+            .map(std::string::ToString::to_string);
 
         // TODO(crypto): This only updates `parent_lid` metadata in the
         // database. A full rule-change migration must also rewrap the key
@@ -645,12 +649,11 @@ async fn rollback_rule_change(
             continue;
         }
 
-        let key_lid: keyrack_core::lid::Lid = match entry.key_lid.parse() {
-            Ok(l) => l,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
+        let key_lid: keyrack_core::lid::Lid = if let Ok(l) = entry.key_lid.parse() {
+            l
+        } else {
+            skipped += 1;
+            continue;
         };
 
         let record = match db.get_key(&key_lid).await {

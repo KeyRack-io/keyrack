@@ -39,25 +39,25 @@ pub fn proto_to_key_spec(spec: proto::KeySpec) -> Option<keyrack_core::key::KeyS
     match spec {
         proto::KeySpec::Aes256 => Some(keyrack_core::key::KeySpec::Aes256),
         proto::KeySpec::Ed25519 => Some(keyrack_core::key::KeySpec::Ed25519),
-        proto::KeySpec::Rsa2048 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
-            key_size: 2048,
-        }),
-        proto::KeySpec::Rsa3072 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
-            key_size: 3072,
-        }),
-        proto::KeySpec::Rsa4096 => Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 {
-            key_size: 4096,
-        }),
+        proto::KeySpec::Rsa2048 => {
+            Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 })
+        }
+        proto::KeySpec::Rsa3072 => {
+            Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 })
+        }
+        proto::KeySpec::Rsa4096 => {
+            Some(keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 })
+        }
         proto::KeySpec::EcdsaP256 => Some(keyrack_core::key::KeySpec::EcdsaP256Sha256),
-        proto::KeySpec::RsaPss2048 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
-            key_size: 2048,
-        }),
-        proto::KeySpec::RsaPss3072 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
-            key_size: 3072,
-        }),
-        proto::KeySpec::RsaPss4096 => Some(keyrack_core::key::KeySpec::RsaPssSha256 {
-            key_size: 4096,
-        }),
+        proto::KeySpec::RsaPss2048 => {
+            Some(keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 })
+        }
+        proto::KeySpec::RsaPss3072 => {
+            Some(keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 3072 })
+        }
+        proto::KeySpec::RsaPss4096 => {
+            Some(keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 })
+        }
         proto::KeySpec::Unspecified => None,
     }
 }

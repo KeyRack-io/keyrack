@@ -22,7 +22,8 @@ fn main() {
     println!();
     println!("Integration code (requires running keyrack-service):");
     println!();
-    println!(r#"
+    println!(
+        r#"
     // Connect to KeyRack
     let mut client = KeyServiceClient::connect("http://localhost:50051").await?;
 
@@ -50,5 +51,6 @@ fn main() {
     }}).await?;
 
     let plaintext = resp.into_inner().plaintext;
-    "#);
+    "#
+    );
 }

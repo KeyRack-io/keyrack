@@ -289,7 +289,8 @@ impl RuleRegistry {
         for ns in config.namespaces {
             if !seen_names.insert(ns.name.clone()) {
                 return Err(crate::error::KeyRackError::Other(format!(
-                    "duplicate namespace: {}", ns.name
+                    "duplicate namespace: {}",
+                    ns.name
                 )));
             }
 
@@ -348,7 +349,9 @@ impl RuleRegistry {
                         if let Some(m) = self.match_rule(&current) {
                             match &m.rule.parent {
                                 ParentRef::Pattern(next) => {
-                                    current = m.rule.resolve_parent(&m.bindings)
+                                    current = m
+                                        .rule
+                                        .resolve_parent(&m.bindings)
                                         .unwrap_or_else(|| next.clone());
                                 }
                                 _ => break,
@@ -460,9 +463,10 @@ mod tests {
                         ("kind".into(), "user-kek".into()),
                         ("user".into(), "$U".into()),
                     ]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "app-root".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([(
+                        "kind".into(),
+                        "app-root".into(),
+                    )])),
                     priority: 0,
                     key_spec: None,
                 },
@@ -542,9 +546,7 @@ mod tests {
                 },
                 RoutingRule {
                     match_pattern: BTreeMap::from([("kind".into(), "dek".into())]),
-                    parent: ParentRef::Pattern(BTreeMap::from([
-                        ("kind".into(), "kek".into()),
-                    ])),
+                    parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "kek".into())])),
                     priority: 20,
                     key_spec: None,
                 },
@@ -683,12 +685,10 @@ mod tests {
 
         // After crossing attachment: use namespace attachment context
         let attachment = root_m.namespace.attachment.as_ref().unwrap();
-        let infra_attrs: BTreeMap<String, String> = [
-            ("kind".into(), "tenant-root".into()),
-        ]
-        .into_iter()
-        .chain(attachment.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .collect();
+        let infra_attrs: BTreeMap<String, String> = [("kind".into(), "tenant-root".into())]
+            .into_iter()
+            .chain(attachment.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect();
         let infra_m = reg.match_rule(&infra_attrs).unwrap();
         assert_eq!(infra_m.namespace.name, "_infrastructure_");
         let infra_parent = infra_m.rule.resolve_parent(&infra_m.bindings).unwrap();

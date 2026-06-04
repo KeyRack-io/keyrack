@@ -40,7 +40,9 @@ use async_trait::async_trait;
 use der::Decode;
 use jsonwebtoken::jwk::JwkSet;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
@@ -123,7 +125,7 @@ impl AuthenticatorChain {
         for authn in &self.authenticators {
             match authn.authenticate(metadata).await {
                 Ok(Some(result)) => return Ok(result),
-                Ok(None) => {},
+                Ok(None) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -183,7 +185,6 @@ impl Authenticator for BootstrapTokenAuthenticator {
         }
 
         let candidate_hash: [u8; 32] = blake3::hash(token.as_bytes()).into();
-        use subtle::ConstantTimeEq;
         if candidate_hash.ct_eq(&self.token_hash).unwrap_u8() != 1 {
             return Err(AuthnError::InvalidCredential(
                 "bootstrap token mismatch".into(),
@@ -232,12 +233,10 @@ impl MtlsAuthenticator {
                 der::asn1::Utf8StringRef::try_from(val)
                     .map(|s| s.as_str().to_owned())
                     .or_else(|_| {
-                        der::asn1::PrintableStringRef::try_from(val)
-                            .map(|s| s.as_str().to_owned())
+                        der::asn1::PrintableStringRef::try_from(val).map(|s| s.as_str().to_owned())
                     })
                     .or_else(|_| {
-                        der::asn1::Ia5StringRef::try_from(val)
-                            .map(|s| s.as_str().to_owned())
+                        der::asn1::Ia5StringRef::try_from(val).map(|s| s.as_str().to_owned())
                     })
                     .ok()
             })
@@ -262,17 +261,14 @@ impl Authenticator for MtlsAuthenticator {
         let mut attributes = BTreeMap::<String, AttributeValue>::new();
 
         // Extract serial number (hex-encoded).
-        let serial = cert
-            .tbs_certificate
-            .serial_number
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        attributes.insert(
-            "serial_number".into(),
-            AttributeValue::String(serial),
+        let serial = cert.tbs_certificate.serial_number.as_bytes().iter().fold(
+            String::new(),
+            |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            },
         );
+        attributes.insert("serial_number".into(), AttributeValue::String(serial));
 
         // Extract Common Name from Subject.
         let cn = Self::extract_cn(&cert);
@@ -285,17 +281,16 @@ impl Authenticator for MtlsAuthenticator {
         if let Some(extensions) = &cert.tbs_certificate.extensions {
             const SAN_OID: der::oid::ObjectIdentifier =
                 der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
-            for ext in extensions.iter() {
+            for ext in extensions {
                 if ext.extn_id != SAN_OID {
                     continue;
                 }
-                let san =
-                    SubjectAltName::from_der(ext.extn_value.as_bytes()).map_err(|e| {
-                        AuthnError::InvalidCredential(format!(
-                            "failed to parse SubjectAltName extension: {e}"
-                        ))
-                    })?;
-                for name in san.0.iter() {
+                let san = SubjectAltName::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    AuthnError::InvalidCredential(format!(
+                        "failed to parse SubjectAltName extension: {e}"
+                    ))
+                })?;
+                for name in &san.0 {
                     match name {
                         GeneralName::UniformResourceIdentifier(uri) => {
                             let uri_str = uri.as_str();
@@ -309,7 +304,10 @@ impl Authenticator for MtlsAuthenticator {
                             }
                         }
                         GeneralName::DnsName(dns) => {
-                            tracing::debug!(dns_san = dns.as_str(), "found DNS SAN (not used as principal)");
+                            tracing::debug!(
+                                dns_san = dns.as_str(),
+                                "found DNS SAN (not used as principal)"
+                            );
                         }
                         _ => {}
                     }
@@ -425,7 +423,7 @@ impl Authenticator for ForwardedIdentityAuthenticator {
 /// token's `kid` is not found in the cache, the JWKS is refreshed once
 /// before returning an error.
 ///
-/// Supported algorithms: RS256, RS384, RS512, ES256, ES384, EdDSA.
+/// Supported algorithms: RS256, RS384, RS512, ES256, ES384, `EdDSA`.
 pub struct JwtAuthenticator {
     jwks_url: String,
     jwks: Arc<RwLock<JwkSet>>,
@@ -460,11 +458,7 @@ impl JwtAuthenticator {
     ///
     /// Useful for tests and environments where the JWKS is loaded from a
     /// local file or embedded in configuration.
-    pub fn from_jwks(
-        jwks: JwkSet,
-        jwks_url: &str,
-        issuer: Option<&str>,
-    ) -> Self {
+    pub fn from_jwks(jwks: JwkSet, jwks_url: &str, issuer: Option<&str>) -> Self {
         Self {
             jwks_url: jwks_url.to_owned(),
             jwks: Arc::new(RwLock::new(jwks)),
@@ -476,6 +470,7 @@ impl JwtAuthenticator {
 
     /// Set a namespace prefix for custom claims to extract into principal
     /// attributes (e.g. `"https://myapp.example.com/"`).
+    #[must_use]
     pub fn with_claims_namespace(mut self, ns: impl Into<String>) -> Self {
         self.claims_namespace = Some(ns.into());
         self
@@ -527,7 +522,7 @@ impl JwtAuthenticator {
                 }
             }
             AlgorithmParameters::OctetKeyPair(_) => Ok(Algorithm::EdDSA),
-            _ => Err(AuthnError::InvalidCredential(
+            AlgorithmParameters::OctetKey(_) => Err(AuthnError::InvalidCredential(
                 "unsupported JWK algorithm type".into(),
             )),
         }
@@ -574,10 +569,9 @@ impl JwtAuthenticator {
 
         let algorithm = Self::resolve_algorithm(&header, jwk)?;
 
-        let decoding_key =
-            jsonwebtoken::DecodingKey::from_jwk(jwk).map_err(|e| {
-                AuthnError::InvalidCredential(format!("cannot build decoding key from JWK: {e}"))
-            })?;
+        let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk).map_err(|e| {
+            AuthnError::InvalidCredential(format!("cannot build decoding key from JWK: {e}"))
+        })?;
 
         let mut validation = jsonwebtoken::Validation::new(algorithm);
         validation.validate_exp = true;
@@ -589,9 +583,8 @@ impl JwtAuthenticator {
             validation.set_issuer(&[iss]);
         }
 
-        jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation).map_err(
-            |e| AuthnError::InvalidCredential(format!("JWT validation failed: {e}")),
-        )
+        jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
+            .map_err(|e| AuthnError::InvalidCredential(format!("JWT validation failed: {e}")))
     }
 
     fn extract_attributes(
@@ -599,9 +592,8 @@ impl JwtAuthenticator {
         namespace: Option<&str>,
     ) -> BTreeMap<String, AttributeValue> {
         let mut attrs = BTreeMap::new();
-        let obj = match claims.as_object() {
-            Some(o) => o,
-            None => return attrs,
+        let Some(obj) = claims.as_object() else {
+            return attrs;
         };
 
         if let Some(serde_json::Value::String(iss)) = obj.get("iss") {
@@ -674,22 +666,19 @@ impl Authenticator for JwtAuthenticator {
         let token_data = {
             let jwks = self.jwks.read().await;
             let maybe_jwk = jwks.find(kid);
-            match maybe_jwk {
-                Some(jwk) => {
-                    Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
-                }
-                None => {
-                    drop(jwks);
-                    tracing::debug!(kid, "kid not found in JWKS cache, refreshing");
-                    self.refresh_jwks().await?;
-                    let jwks = self.jwks.read().await;
-                    let jwk = jwks.find(kid).ok_or_else(|| {
-                        AuthnError::InvalidCredential(format!(
-                            "no JWK found for kid `{kid}` after refresh"
-                        ))
-                    })?;
-                    Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
-                }
+            if let Some(jwk) = maybe_jwk {
+                Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
+            } else {
+                drop(jwks);
+                tracing::debug!(kid, "kid not found in JWKS cache, refreshing");
+                self.refresh_jwks().await?;
+                let jwks = self.jwks.read().await;
+                let jwk = jwks.find(kid).ok_or_else(|| {
+                    AuthnError::InvalidCredential(format!(
+                        "no JWK found for kid `{kid}` after refresh"
+                    ))
+                })?;
+                Self::validate_and_decode(token, jwk, self.required_issuer.as_deref())?
             }
         };
 
@@ -697,9 +686,7 @@ impl Authenticator for JwtAuthenticator {
             .claims
             .get("sub")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AuthnError::InvalidCredential("JWT missing `sub` claim".into())
-            })?
+            .ok_or_else(|| AuthnError::InvalidCredential("JWT missing `sub` claim".into()))?
             .to_owned();
 
         let attributes =
@@ -738,10 +725,8 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_token_mismatch() {
-        let authn = BootstrapTokenAuthenticator::new(
-            "correct-token",
-            std::time::Duration::from_secs(3600),
-        );
+        let authn =
+            BootstrapTokenAuthenticator::new("correct-token", std::time::Duration::from_secs(3600));
         let mut metadata = RequestMetadata::default();
         metadata
             .headers
@@ -753,10 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_token_no_header_skips() {
-        let authn = BootstrapTokenAuthenticator::new(
-            "token",
-            std::time::Duration::from_secs(3600),
-        );
+        let authn = BootstrapTokenAuthenticator::new("token", std::time::Duration::from_secs(3600));
         let metadata = RequestMetadata::default();
         let result = authn.authenticate(&metadata).await.unwrap();
         assert!(result.is_none());
@@ -764,10 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_token_expired() {
-        let authn = BootstrapTokenAuthenticator::new(
-            "token",
-            std::time::Duration::from_secs(0),
-        );
+        let authn = BootstrapTokenAuthenticator::new("token", std::time::Duration::from_secs(0));
         // Sleep a tiny bit to ensure it's expired
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 

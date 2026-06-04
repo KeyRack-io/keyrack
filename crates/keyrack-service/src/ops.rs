@@ -31,38 +31,36 @@
 //! integration test suite (which asserts event counts).
 
 use crate::state::ServiceState;
-use keyrack_core::audit::{
-    AuditAction, AuditEvent, AuditPrincipal, AuditResource, AuditResult,
+use keyrack_core::audit::{AuditAction, AuditEvent, AuditPrincipal, AuditResource, AuditResult};
+use keyrack_core::pdp::{
+    AuthzRequest, Decision, Principal, RequestContext, Resource, PDP_API_VERSION,
 };
-use keyrack_core::pdp::{AuthzRequest, Decision, Principal, RequestContext, Resource, PDP_API_VERSION};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Generate a new request ID (UUIDv7 for monotonic time-ordering).
+/// Generate a new request ID (`UUIDv7` for monotonic time-ordering).
 pub fn new_request_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-/// Extract x-request-id from gRPC metadata, falling back to a generated UUIDv7.
+/// Extract x-request-id from gRPC metadata, falling back to a generated `UUIDv7`.
 pub fn extract_request_id_grpc<T>(request: &tonic::Request<T>) -> String {
     request
         .metadata()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(new_request_id)
+        .map_or_else(new_request_id, ToOwned::to_owned)
 }
 
-/// Extract x-request-id from HTTP headers, falling back to a generated UUIDv7.
+/// Extract x-request-id from HTTP headers, falling back to a generated `UUIDv7`.
 pub fn extract_request_id_rest(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(new_request_id)
+        .map_or_else(new_request_id, ToOwned::to_owned)
 }
 
 /// Extension type inserted into tonic requests by the TLS interceptor
@@ -104,7 +102,12 @@ impl OpContext {
         }
     }
 
-    pub fn resource(action: AuditAction, principal: Principal, resource_id: &str, resource_type: &str) -> Self {
+    pub fn resource(
+        action: AuditAction,
+        principal: Principal,
+        resource_id: &str,
+        resource_type: &str,
+    ) -> Self {
         Self {
             action,
             principal,
@@ -150,7 +153,13 @@ where
     tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize(state, &ctx).await {
-        emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
+        emit_audit(
+            state,
+            &ctx,
+            AuditResult::Denied,
+            Some(keyrack_core::audit::EventType::AuthorizationDenied),
+        )
+        .await;
         crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
         return Err(denied);
     }
@@ -190,13 +199,19 @@ async fn emit_audit(
     )
     .with_request_id(ctx.request_id.clone());
 
-    let tenant = ctx.principal.attributes.get("tenant_id")
+    let tenant = ctx
+        .principal
+        .attributes
+        .get("tenant_id")
         .or_else(|| ctx.principal.attributes.get("domain_id"))
         .and_then(|v| match v {
             keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
             _ => None,
         });
-    let project = ctx.principal.attributes.get("project_id")
+    let project = ctx
+        .principal
+        .attributes
+        .get("project_id")
         .and_then(|v| match v {
             keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
             _ => None,
@@ -225,7 +240,7 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
         resource: Resource {
             id: ctx.resource_id.clone(),
             resource_type: ctx.resource_type.clone(),
-            attributes: Default::default(),
+            attributes: std::collections::BTreeMap::default(),
         },
         context: RequestContext::default(),
     };
@@ -243,8 +258,15 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
         }
         Decision::Forbid | Decision::Indeterminate => {
             crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons: String = response.reasons.iter()
-                .map(|r| r.human_message.as_deref().or(r.reason_code.as_deref()).unwrap_or(&r.policy_id))
+            let reasons: String = response
+                .reasons
+                .iter()
+                .map(|r| {
+                    r.human_message
+                        .as_deref()
+                        .or(r.reason_code.as_deref())
+                        .unwrap_or(&r.policy_id)
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             Err(tonic::Status::permission_denied(format!(
@@ -263,13 +285,21 @@ pub async fn execute_rest<F, Fut, T>(
 ) -> Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
 where
     F: FnOnce(Arc<ServiceState>) -> Fut,
-    Fut: std::future::Future<Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>>,
+    Fut: std::future::Future<
+        Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>,
+    >,
 {
     let start = Instant::now();
     tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize_rest(state, &ctx).await {
-        emit_audit(state, &ctx, AuditResult::Denied, Some(keyrack_core::audit::EventType::AuthorizationDenied)).await;
+        emit_audit(
+            state,
+            &ctx,
+            AuditResult::Denied,
+            Some(keyrack_core::audit::EventType::AuthorizationDenied),
+        )
+        .await;
         crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
         return Err(denied);
     }
@@ -301,7 +331,7 @@ async fn authorize_rest(
         resource: Resource {
             id: ctx.resource_id.clone(),
             resource_type: ctx.resource_type.clone(),
-            attributes: Default::default(),
+            attributes: std::collections::BTreeMap::default(),
         },
         context: RequestContext::default(),
     };
@@ -323,8 +353,15 @@ async fn authorize_rest(
         }
         Decision::Forbid | Decision::Indeterminate => {
             crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons: String = response.reasons.iter()
-                .map(|r| r.human_message.as_deref().or(r.reason_code.as_deref()).unwrap_or(&r.policy_id))
+            let reasons: String = response
+                .reasons
+                .iter()
+                .map(|r| {
+                    r.human_message
+                        .as_deref()
+                        .or(r.reason_code.as_deref())
+                        .unwrap_or(&r.policy_id)
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             Err(rest_error(
@@ -352,39 +389,61 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
     match action {
         AuditAction::CreateKey => EventType::KeyCreated,
         AuditAction::RotateKey => EventType::KeyRotated,
-        AuditAction::EnableKey | AuditAction::DisableKey => EventType::KeyStateChanged,
-        AuditAction::ScheduleKeyDeletion | AuditAction::CancelKeyDeletion => EventType::KeyStateChanged,
+        AuditAction::EnableKey
+        | AuditAction::DisableKey
+        | AuditAction::ScheduleKeyDeletion
+        | AuditAction::CancelKeyDeletion
+        | AuditAction::UpdateKey => EventType::KeyStateChanged,
         AuditAction::ReportKeyCompromise => EventType::KeyCompromised,
-        AuditAction::UpdateKey => EventType::KeyStateChanged,
 
-        AuditAction::GetKey | AuditAction::DescribeKey | AuditAction::ListKeys
-        | AuditAction::ListKeyVersions | AuditAction::GetKeyVersion
-        | AuditAction::GetKeyDependents | AuditAction::GetKeyAncestors
-        | AuditAction::GetKeyRotationStatus | AuditAction::GetKeyRotationHistory
+        AuditAction::GetKey
+        | AuditAction::DescribeKey
+        | AuditAction::ListKeys
+        | AuditAction::ListKeyVersions
+        | AuditAction::GetKeyVersion
+        | AuditAction::GetKeyDependents
+        | AuditAction::GetKeyAncestors
+        | AuditAction::GetKeyRotationStatus
+        | AuditAction::GetKeyRotationHistory
         | AuditAction::GetKeyRotationPolicy => EventType::KeyRead,
 
-        AuditAction::Encrypt | AuditAction::Decrypt | AuditAction::Sign | AuditAction::Verify
-        | AuditAction::GenerateRandom | AuditAction::GenerateDataKey
-        | AuditAction::GenerateDataKeyWithoutPlaintext | AuditAction::ReEncrypt => EventType::CryptoOperation,
+        AuditAction::Encrypt
+        | AuditAction::Decrypt
+        | AuditAction::Sign
+        | AuditAction::Verify
+        | AuditAction::GenerateRandom
+        | AuditAction::GenerateDataKey
+        | AuditAction::GenerateDataKeyWithoutPlaintext
+        | AuditAction::ReEncrypt => EventType::CryptoOperation,
 
-        AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => EventType::TagMutation,
-        AuditAction::CreateAlias | AuditAction::DeleteAlias | AuditAction::ListAliases => EventType::AliasMutation,
+        AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => {
+            EventType::TagMutation
+        }
+        AuditAction::CreateAlias | AuditAction::DeleteAlias | AuditAction::ListAliases => {
+            EventType::AliasMutation
+        }
 
-        AuditAction::CreateHsmConnection | AuditAction::DeleteHsmConnection
-        | AuditAction::GetHsmConnection | AuditAction::ListHsmConnections
+        AuditAction::CreateHsmConnection
+        | AuditAction::DeleteHsmConnection
+        | AuditAction::GetHsmConnection
+        | AuditAction::ListHsmConnections
         | AuditAction::GetHsmConnectionStatus => EventType::HsmConnectionMutation,
 
-        AuditAction::EnableKeyRotation | AuditAction::DisableKeyRotation
+        AuditAction::EnableKeyRotation
+        | AuditAction::DisableKeyRotation
         | AuditAction::SetKeyRotationPolicy => EventType::RotationPolicyChanged,
 
-        AuditAction::ListRotationJobs | AuditAction::AcknowledgeRotationJob
-        | AuditAction::CompleteRotationJob | AuditAction::FailRotationJob => EventType::RotationJobStateChanged,
+        AuditAction::ListRotationJobs
+        | AuditAction::AcknowledgeRotationJob
+        | AuditAction::CompleteRotationJob
+        | AuditAction::FailRotationJob
+        | AuditAction::RotationJobExpired => EventType::RotationJobStateChanged,
 
-        AuditAction::RegisterNamespace | AuditAction::ListNamespaces
+        AuditAction::RegisterNamespace
+        | AuditAction::ListNamespaces
         | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
-        AuditAction::RotationJobExpired => EventType::RotationJobStateChanged,
         AuditAction::KeyDestroyed => EventType::KeyDeleted,
     }
 }
@@ -439,7 +498,7 @@ pub async fn extract_principal_rest(
     use keyrack_core::authn::RequestMetadata;
 
     let mut meta = RequestMetadata::default();
-    for (key, value) in headers.iter() {
+    for (key, value) in headers {
         if let Ok(v) = value.to_str() {
             meta.headers.insert(key.as_str().to_owned(), v.to_owned());
         }

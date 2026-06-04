@@ -190,7 +190,10 @@ mod tests {
         job.transition_to(RotationJobState::Acknowledged).unwrap();
         job.fail("re-wrap failed: HSM timeout").unwrap();
         assert_eq!(job.state, RotationJobState::Failed);
-        assert_eq!(job.failure_reason.as_deref(), Some("re-wrap failed: HSM timeout"));
+        assert_eq!(
+            job.failure_reason.as_deref(),
+            Some("re-wrap failed: HSM timeout")
+        );
     }
 
     #[test]

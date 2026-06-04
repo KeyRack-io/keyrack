@@ -124,11 +124,7 @@ impl NatsInvalidationSink {
 
 #[async_trait]
 impl InvalidationSink for NatsInvalidationSink {
-    async fn invalidate_key(
-        &self,
-        lid: &Lid,
-        timeout: Duration,
-    ) -> Result<Vec<SubscriberAck>> {
+    async fn invalidate_key(&self, lid: &Lid, timeout: Duration) -> Result<Vec<SubscriberAck>> {
         let subject = format!("kms.cache.invalidate.{lid}");
         let payload = serde_json::json!({
             "lid": lid.to_string(),
@@ -139,12 +135,7 @@ impl InvalidationSink for NatsInvalidationSink {
         // Use NATS request-reply: one response per subscriber.
         // In production, JetStream with consumer groups would be
         // preferred; this uses core NATS request for simplicity.
-        match tokio::time::timeout(
-            timeout,
-            self.client.request(subject, payload.into()),
-        )
-        .await
-        {
+        match tokio::time::timeout(timeout, self.client.request(subject, payload.into())).await {
             Ok(Ok(reply)) => {
                 let subscriber_id = reply
                     .headers

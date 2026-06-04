@@ -43,11 +43,11 @@ pub async fn deletion_worker(state: Arc<ServiceState>, cancel: CancellationToken
     tracing::info!("deletion worker started (interval: {SCAN_INTERVAL:?})");
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("deletion worker shutting down");
                 return;
             }
-            _ = tokio::time::sleep(SCAN_INTERVAL) => {}
+            () = tokio::time::sleep(SCAN_INTERVAL) => {}
         }
 
         if let Err(e) = run_deletion_scan(&state).await {
@@ -66,9 +66,7 @@ async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::erro
 
     let mut destroyed = 0u64;
     for record in &page.items {
-        let past_due = record
-            .scheduled_deletion_at
-            .is_some_and(|t| now >= t);
+        let past_due = record.scheduled_deletion_at.is_some_and(|t| now >= t);
         if !past_due {
             continue;
         }
@@ -111,11 +109,11 @@ pub async fn rotation_expiry_worker(state: Arc<ServiceState>, cancel: Cancellati
     tracing::info!("rotation expiry worker started (interval: {SCAN_INTERVAL:?})");
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("rotation expiry worker shutting down");
                 return;
             }
-            _ = tokio::time::sleep(SCAN_INTERVAL) => {}
+            () = tokio::time::sleep(SCAN_INTERVAL) => {}
         }
 
         if let Err(e) = run_rotation_expiry_scan(&state).await {
@@ -124,9 +122,7 @@ pub async fn rotation_expiry_worker(state: Arc<ServiceState>, cancel: Cancellati
     }
 }
 
-async fn run_rotation_expiry_scan(
-    state: &ServiceState,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_rotation_expiry_scan(state: &ServiceState) -> Result<(), Box<dyn std::error::Error>> {
     let now = chrono::Utc::now();
     let mut expired = 0u64;
 

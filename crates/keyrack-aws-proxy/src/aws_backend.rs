@@ -68,9 +68,9 @@ impl AwsKmsBackend {
     }
 
     fn kms_url(&self) -> String {
-        self.endpoint.clone().unwrap_or_else(|| {
-            format!("https://kms.{}.amazonaws.com", self.region)
-        })
+        self.endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://kms.{}.amazonaws.com", self.region))
     }
 
     fn kms_host(&self) -> String {
@@ -171,12 +171,9 @@ impl crate::KmsBackend for AwsKmsBackend {
             KmsProxyError::UpstreamError(format!("failed to build signable request: {e}"))
         })?;
 
-        let (signing_instructions, _signature) =
-            sign(signable_request, &signing_params.into())
-                .map_err(|e| {
-                    KmsProxyError::UpstreamError(format!("SigV4 signing failed: {e}"))
-                })?
-                .into_parts();
+        let (signing_instructions, _signature) = sign(signable_request, &signing_params.into())
+            .map_err(|e| KmsProxyError::UpstreamError(format!("SigV4 signing failed: {e}")))?
+            .into_parts();
 
         // ── Build & send the real request ──────────────────────────
         let mut request = self
@@ -187,8 +184,8 @@ impl crate::KmsBackend for AwsKmsBackend {
             .body(body_bytes);
 
         for (name, value) in signing_instructions.headers() {
-            let name: &str = name.as_ref();
-            let value: &str = value.as_ref();
+            let name: &str = name;
+            let value: &str = value;
             request = request.header(name, value);
         }
 
@@ -198,15 +195,11 @@ impl crate::KmsBackend for AwsKmsBackend {
 
         let status = response.status();
         let response_body: Value = response.json().await.map_err(|e| {
-            KmsProxyError::UpstreamError(format!(
-                "failed to parse AWS KMS response body: {e}"
-            ))
+            KmsProxyError::UpstreamError(format!("failed to parse AWS KMS response body: {e}"))
         })?;
 
         if !status.is_success() {
-            let error_type = response_body["__type"]
-                .as_str()
-                .unwrap_or("UnknownError");
+            let error_type = response_body["__type"].as_str().unwrap_or("UnknownError");
             let message = response_body["Message"]
                 .as_str()
                 .or_else(|| response_body["message"].as_str())

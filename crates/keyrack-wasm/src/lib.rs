@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! KeyRack WASM bindings.
+//! `KeyRack` WASM bindings.
 //!
 //! Exposes the pure-Rust [`SoftwareProvider`] via `wasm-bindgen` so
 //! browser and Node.js code can perform encrypt/decrypt/sign/verify
@@ -43,7 +43,7 @@ use keyrack_core::provider::software::SoftwareProvider;
 use keyrack_core::provider::{CryptoProvider, SigningAlgorithm};
 use wasm_bindgen::prelude::*;
 
-/// KeyRack client for WASM environments.
+/// `KeyRack` client for WASM environments.
 ///
 /// Uses the pure-Rust `SoftwareProvider` under the hood. All key
 /// material lives in WASM linear memory and is dropped when the
@@ -51,6 +51,12 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct WasmKeyRack {
     provider: SoftwareProvider,
+}
+
+impl Default for WasmKeyRack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[wasm_bindgen]
@@ -70,8 +76,11 @@ impl WasmKeyRack {
     #[wasm_bindgen(js_name = "generateKey")]
     pub async fn generate_key(&self, spec: &str) -> Result<String, JsError> {
         let key_spec = parse_key_spec(spec)?;
-        let handle = self.provider.generate_key(&key_spec).await
-            .map_err(to_js_error)?;
+        let handle = self
+            .provider
+            .generate_key(&key_spec)
+            .await
+            .map_err(|e| to_js_error(&e))?;
         Ok(handle.key_id)
     }
 
@@ -89,8 +98,11 @@ impl WasmKeyRack {
             key_id: key_id.to_string(),
             key_spec: KeySpec::Aes256,
         };
-        let output = self.provider.encrypt(&handle, plaintext, aad).await
-            .map_err(to_js_error)?;
+        let output = self
+            .provider
+            .encrypt(&handle, plaintext, aad)
+            .await
+            .map_err(|e| to_js_error(&e))?;
         Ok(output.ciphertext)
     }
 
@@ -105,18 +117,17 @@ impl WasmKeyRack {
             key_id: key_id.to_string(),
             key_spec: KeySpec::Aes256,
         };
-        let pt = self.provider.decrypt(&handle, ciphertext, aad).await
-            .map_err(to_js_error)?;
+        let pt = self
+            .provider
+            .decrypt(&handle, ciphertext, aad)
+            .await
+            .map_err(|e| to_js_error(&e))?;
         Ok(pt.expose().clone())
     }
 
     /// Sign `message` using Ed25519.
     #[wasm_bindgen(js_name = "signEd25519")]
-    pub async fn sign_ed25519(
-        &self,
-        key_id: &str,
-        message: &[u8],
-    ) -> Result<Vec<u8>, JsError> {
+    pub async fn sign_ed25519(&self, key_id: &str, message: &[u8]) -> Result<Vec<u8>, JsError> {
         let handle = keyrack_core::provider::KeyHandle {
             key_id: key_id.to_string(),
             key_spec: KeySpec::Ed25519,
@@ -124,7 +135,7 @@ impl WasmKeyRack {
         self.provider
             .sign(&handle, SigningAlgorithm::Ed25519, message)
             .await
-            .map_err(to_js_error)
+            .map_err(|e| to_js_error(&e))
     }
 
     /// Verify an Ed25519 signature.
@@ -142,16 +153,12 @@ impl WasmKeyRack {
         self.provider
             .verify(&handle, SigningAlgorithm::Ed25519, message, signature)
             .await
-            .map_err(to_js_error)
+            .map_err(|e| to_js_error(&e))
     }
 
     /// Sign `message` using ECDSA P-256 SHA-256.
     #[wasm_bindgen(js_name = "signEcdsaP256")]
-    pub async fn sign_ecdsa_p256(
-        &self,
-        key_id: &str,
-        message: &[u8],
-    ) -> Result<Vec<u8>, JsError> {
+    pub async fn sign_ecdsa_p256(&self, key_id: &str, message: &[u8]) -> Result<Vec<u8>, JsError> {
         let handle = keyrack_core::provider::KeyHandle {
             key_id: key_id.to_string(),
             key_spec: KeySpec::EcdsaP256Sha256,
@@ -159,7 +166,7 @@ impl WasmKeyRack {
         self.provider
             .sign(&handle, SigningAlgorithm::EcdsaP256Sha256, message)
             .await
-            .map_err(to_js_error)
+            .map_err(|e| to_js_error(&e))
     }
 
     /// Verify an ECDSA P-256 SHA-256 signature.
@@ -175,16 +182,24 @@ impl WasmKeyRack {
             key_spec: KeySpec::EcdsaP256Sha256,
         };
         self.provider
-            .verify(&handle, SigningAlgorithm::EcdsaP256Sha256, message, signature)
+            .verify(
+                &handle,
+                SigningAlgorithm::EcdsaP256Sha256,
+                message,
+                signature,
+            )
             .await
-            .map_err(to_js_error)
+            .map_err(|e| to_js_error(&e))
     }
 
     /// Generate cryptographically secure random bytes.
     #[wasm_bindgen(js_name = "generateRandom")]
     pub async fn generate_random(&self, length: u32) -> Result<Vec<u8>, JsError> {
-        let result = self.provider.generate_random(length as usize).await
-            .map_err(to_js_error)?;
+        let result = self
+            .provider
+            .generate_random(length as usize)
+            .await
+            .map_err(|e| to_js_error(&e))?;
         Ok(result.expose().clone())
     }
 
@@ -195,7 +210,10 @@ impl WasmKeyRack {
             key_id: key_id.to_string(),
             key_spec: KeySpec::Aes256,
         };
-        self.provider.destroy_key(&handle).await.map_err(to_js_error)
+        self.provider
+            .destroy_key(&handle)
+            .await
+            .map_err(|e| to_js_error(&e))
     }
 
     /// Compute a Logical ID (LID) from a set of attributes (JSON object).
@@ -204,9 +222,8 @@ impl WasmKeyRack {
     /// round-trip.
     #[wasm_bindgen(js_name = "computeLid")]
     pub fn compute_lid(&self, attrs_json: &str) -> Result<String, JsError> {
-        let attrs: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(attrs_json)
-                .map_err(|e| JsError::new(&format!("invalid JSON: {e}")))?;
+        let attrs: std::collections::BTreeMap<String, String> = serde_json::from_str(attrs_json)
+            .map_err(|e| JsError::new(&format!("invalid JSON: {e}")))?;
         let mut attr_set = keyrack_core::attr::AttributeSet::new();
         for (k, v) in &attrs {
             attr_set.insert(k, keyrack_core::attr::AttributeValue::String(v.clone()));
@@ -215,10 +232,8 @@ impl WasmKeyRack {
             keyrack_core::canon::CanonicalizationVersion::V1,
             &attr_set,
         );
-        let lid = keyrack_core::lid::Lid::derive(
-            keyrack_core::canon::CanonicalizationVersion::V1,
-            &form,
-        );
+        let lid =
+            keyrack_core::lid::Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &form);
         Ok(lid.to_string())
     }
 }
@@ -235,7 +250,7 @@ fn parse_key_spec(s: &str) -> Result<KeySpec, JsError> {
     }
 }
 
-fn to_js_error(e: keyrack_core::error::KeyRackError) -> JsError {
+fn to_js_error(e: &keyrack_core::error::KeyRackError) -> JsError {
     JsError::new(&e.to_string())
 }
 
@@ -257,9 +272,15 @@ mod tests {
         let kr = WasmKeyRack::new();
         let key_id = kr.generate_key("ED25519").await.unwrap();
         let sig = kr.sign_ed25519(&key_id, b"test message").await.unwrap();
-        let valid = kr.verify_ed25519(&key_id, b"test message", &sig).await.unwrap();
+        let valid = kr
+            .verify_ed25519(&key_id, b"test message", &sig)
+            .await
+            .unwrap();
         assert!(valid);
-        let invalid = kr.verify_ed25519(&key_id, b"wrong message", &sig).await.unwrap();
+        let invalid = kr
+            .verify_ed25519(&key_id, b"wrong message", &sig)
+            .await
+            .unwrap();
         assert!(!invalid);
     }
 

@@ -83,7 +83,9 @@ impl CedarEngine {
                 .map_err(|e| format!("invalid request: {e}"))?;
 
         let ps = self.policy_set.read().await;
-        let response = self.authorizer.is_authorized(&cedar_request, &ps, &entities);
+        let response = self
+            .authorizer
+            .is_authorized(&cedar_request, &ps, &entities);
 
         let decision = match response.decision() {
             cedar_policy::Decision::Allow => Decision::Permit,

@@ -22,10 +22,13 @@ use keyrack_service::config::ServiceConfig;
 use keyrack_service::grpc::KeyServiceImpl;
 use keyrack_service::proto::key_service_server::KeyServiceServer;
 use keyrack_service::state::ServiceState;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
+
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,9 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("mTLS enabled: client certificates will be validated");
             }
 
-            builder = builder
-                .tls_config(tls)
-                .expect("invalid TLS configuration");
+            builder = builder.tls_config(tls).expect("invalid TLS configuration");
             tracing::info!("TLS enabled on gRPC server");
 
             // TODO: Extract peer certificates from the TLS connection into
@@ -132,18 +133,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     shutdown_signal().await;
 
-    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     tracing::info!("initiating graceful shutdown (drain timeout: {DRAIN_TIMEOUT:?})");
     cancel.cancel();
 
-    match tokio::time::timeout(DRAIN_TIMEOUT, async {
+    if let Ok(()) = tokio::time::timeout(DRAIN_TIMEOUT, async {
         let _ = grpc_handle.await;
         let _ = rest_handle.await;
         let _ = deletion_handle.await;
         let _ = rotation_expiry_handle.await;
-    }).await {
-        Ok(_) => tracing::info!("all servers and workers drained"),
-        Err(_) => tracing::warn!("drain timeout reached, forcing shutdown"),
+    })
+    .await
+    {
+        tracing::info!("all servers and workers drained");
+    } else {
+        tracing::warn!("drain timeout reached, forcing shutdown");
     }
 
     tracing::info!("flushing audit sink");
@@ -171,8 +174,8 @@ async fn build_authenticators(
     config: &keyrack_service::config::AuthnConfig,
 ) -> Result<Vec<Box<dyn keyrack_core::authn::Authenticator>>, Box<dyn std::error::Error>> {
     use keyrack_core::authn::{
-        BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator,
-        InsecureAuthenticator, JwtAuthenticator, MtlsAuthenticator,
+        BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator, InsecureAuthenticator,
+        JwtAuthenticator, MtlsAuthenticator,
     };
     use keyrack_service::config::AuthnConfig;
 
@@ -181,10 +184,13 @@ async fn build_authenticators(
             tracing::warn!("authentication disabled (insecure mode) — dev/test only");
             Ok(vec![Box::new(InsecureAuthenticator)])
         }
-        AuthnConfig::Mtls => {
-            Ok(vec![Box::new(MtlsAuthenticator)])
-        }
-        AuthnConfig::Jwt { jwks_url, issuer, audience, claims_namespace } => {
+        AuthnConfig::Mtls => Ok(vec![Box::new(MtlsAuthenticator)]),
+        AuthnConfig::Jwt {
+            jwks_url,
+            issuer,
+            audience,
+            claims_namespace,
+        } => {
             if let Some(aud) = audience {
                 tracing::info!(
                     audience = %aud,
@@ -192,7 +198,8 @@ async fn build_authenticators(
                      the `aud` claim is available in principal attributes for PDP enforcement"
                 );
             }
-            let mut jwt_auth = JwtAuthenticator::new(jwks_url, issuer.as_deref()).await
+            let mut jwt_auth = JwtAuthenticator::new(jwks_url, issuer.as_deref())
+                .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     format!("JWT authenticator init failed: {e}").into()
                 })?;
@@ -211,9 +218,7 @@ async fn build_authenticators(
                 std::time::Duration::from_secs(*max_age_secs),
             ))])
         }
-        AuthnConfig::ForwardedIdentity => {
-            Ok(vec![Box::new(ForwardedIdentityAuthenticator)])
-        }
+        AuthnConfig::ForwardedIdentity => Ok(vec![Box::new(ForwardedIdentityAuthenticator)]),
         AuthnConfig::Chain { authenticators } => {
             let mut all: Vec<Box<dyn keyrack_core::authn::Authenticator>> = Vec::new();
             for sub in authenticators {
@@ -240,21 +245,22 @@ async fn build_state(
         StorageConfig::Memory => Arc::new(keyrack_sqlite::SqliteStorage::in_memory()?),
     };
 
-    let storage: Arc<dyn keyrack_core::storage::StorageBackend> = if let Some(cache_cfg) = &config.cache {
-        let ttl = std::time::Duration::from_secs(cache_cfg.ttl_secs);
-        tracing::info!(
-            max_capacity = cache_cfg.max_capacity,
-            ttl_secs = cache_cfg.ttl_secs,
-            "key record cache enabled"
-        );
-        Arc::new(keyrack_service::cache::CachingStorage::new(
-            storage,
-            cache_cfg.max_capacity,
-            ttl,
-        ))
-    } else {
-        storage
-    };
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        if let Some(cache_cfg) = &config.cache {
+            let ttl = std::time::Duration::from_secs(cache_cfg.ttl_secs);
+            tracing::info!(
+                max_capacity = cache_cfg.max_capacity,
+                ttl_secs = cache_cfg.ttl_secs,
+                "key record cache enabled"
+            );
+            Arc::new(keyrack_service::cache::CachingStorage::new(
+                storage,
+                cache_cfg.max_capacity,
+                ttl,
+            ))
+        } else {
+            storage
+        };
 
     let provider: Arc<dyn keyrack_core::provider::CryptoProvider> = match &config.provider {
         ProviderConfig::Software => {
@@ -282,16 +288,14 @@ async fn build_state(
             vault_addr,
             vault_token,
             mount_path,
-        } => {
-            Arc::new(
-                keyrack_vault::VaultTransitProvider::new(
-                    vault_addr,
-                    vault_token,
-                    mount_path.as_deref(),
-                )
-                .await?,
+        } => Arc::new(
+            keyrack_vault::VaultTransitProvider::new(
+                vault_addr,
+                vault_token,
+                mount_path.as_deref(),
             )
-        }
+            .await?,
+        ),
     };
 
     let provider_class_enum = match &config.provider {
@@ -349,7 +353,9 @@ async fn build_state(
             Arc::new(keyrack_service::pdp_http::HttpPdpClient::new(
                 endpoint,
                 std::time::Duration::from_millis(*timeout_ms),
-                None, None, None,
+                None,
+                None,
+                None,
             )?)
         }
     };
@@ -368,46 +374,52 @@ async fn build_state(
         };
 
         if config.sign_audit_events {
-            let signer = match &config.audit_signing_key_path {
-                Some(path) => {
-                    let key_path = std::path::Path::new(path);
-                    let signing_key = if key_path.exists() {
-                        let bytes = std::fs::read(key_path)
-                            .map_err(|e| -> Box<dyn std::error::Error> {
-                                format!("failed to read audit signing key at {path}: {e}").into()
-                            })?;
-                        if bytes.len() != 32 {
-                            return Err(format!(
-                                "audit signing key at {path} must be exactly 32 bytes, got {}",
-                                bytes.len()
-                            ).into());
-                        }
-                        let mut seed = [0u8; 32];
-                        seed.copy_from_slice(&bytes);
-                        ed25519_dalek::SigningKey::from_bytes(&seed)
-                    } else {
-                        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-                        if let Some(parent) = key_path.parent() {
-                            std::fs::create_dir_all(parent).ok();
-                        }
-                        std::fs::write(key_path, key.to_bytes())
-                            .map_err(|e| -> Box<dyn std::error::Error> {
-                                format!("failed to persist audit signing key to {path}: {e}").into()
-                            })?;
-                        tracing::info!(%path, "generated and persisted new audit signing key");
-                        key
-                    };
-                    keyrack_core::audit::AuditSigner::new(signing_key)
-                }
-                None => {
-                    tracing::info!("using ephemeral audit signing key (will not persist across restarts)");
-                    keyrack_core::audit::AuditSigner::generate()
-                }
+            let signer = if let Some(path) = &config.audit_signing_key_path {
+                let key_path = std::path::Path::new(path);
+                let signing_key = if key_path.exists() {
+                    let bytes =
+                        std::fs::read(key_path).map_err(|e| -> Box<dyn std::error::Error> {
+                            format!("failed to read audit signing key at {path}: {e}").into()
+                        })?;
+                    if bytes.len() != 32 {
+                        return Err(format!(
+                            "audit signing key at {path} must be exactly 32 bytes, got {}",
+                            bytes.len()
+                        )
+                        .into());
+                    }
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+                    ed25519_dalek::SigningKey::from_bytes(&seed)
+                } else {
+                    let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+                    if let Some(parent) = key_path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::write(key_path, key.to_bytes()).map_err(
+                        |e| -> Box<dyn std::error::Error> {
+                            format!("failed to persist audit signing key to {path}: {e}").into()
+                        },
+                    )?;
+                    tracing::info!(%path, "generated and persisted new audit signing key");
+                    key
+                };
+                keyrack_core::audit::AuditSigner::new(signing_key)
+            } else {
+                tracing::info!(
+                    "using ephemeral audit signing key (will not persist across restarts)"
+                );
+                keyrack_core::audit::AuditSigner::generate()
             };
             let vk = signer.verifying_key();
-            let vk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let vk_hex: String = vk.as_bytes().iter().fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
             tracing::info!(verifying_key = %vk_hex, "audit event signing enabled");
-            Arc::new(keyrack_core::audit::SigningAuditSink::new(base_sink, signer))
+            Arc::new(keyrack_core::audit::SigningAuditSink::new(
+                base_sink, signer,
+            ))
         } else {
             Arc::from(base_sink)
         }
@@ -446,9 +458,8 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => { tracing::info!("received SIGINT, shutting down"); }
             _ = sigterm.recv() => { tracing::info!("received SIGTERM, shutting down"); }

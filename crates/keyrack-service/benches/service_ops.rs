@@ -26,7 +26,7 @@
 //!
 //! Run: cargo bench -p keyrack-service
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use keyrack_core::attr::{AttributeSet, AttributeValue};
 use keyrack_core::canon::{canonicalize, CanonicalizationVersion};
 use keyrack_core::key::KeySpec;
@@ -37,9 +37,7 @@ fn bench_encrypt_software(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let provider = SoftwareProvider::new();
 
-    let handle = rt.block_on(async {
-        provider.generate_key(&KeySpec::Aes256).await.unwrap()
-    });
+    let handle = rt.block_on(async { provider.generate_key(&KeySpec::Aes256).await.unwrap() });
 
     let plaintext = vec![0u8; 256];
     let aad = b"benchmark-context";
@@ -56,16 +54,13 @@ fn bench_decrypt_software(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let provider = SoftwareProvider::new();
 
-    let handle = rt.block_on(async {
-        provider.generate_key(&KeySpec::Aes256).await.unwrap()
-    });
+    let handle = rt.block_on(async { provider.generate_key(&KeySpec::Aes256).await.unwrap() });
 
     let plaintext = vec![0u8; 256];
     let aad = b"benchmark-context";
 
-    let ciphertext = rt.block_on(async {
-        provider.encrypt(&handle, &plaintext, aad).await.unwrap()
-    });
+    let ciphertext =
+        rt.block_on(async { provider.encrypt(&handle, &plaintext, aad).await.unwrap() });
 
     c.bench_function("decrypt AES-256-GCM (256 bytes, software)", |b| {
         b.to_async(&rt).iter(|| async {
@@ -82,25 +77,19 @@ fn bench_encrypt_payload_sizes(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let provider = SoftwareProvider::new();
 
-    let handle = rt.block_on(async {
-        provider.generate_key(&KeySpec::Aes256).await.unwrap()
-    });
+    let handle = rt.block_on(async { provider.generate_key(&KeySpec::Aes256).await.unwrap() });
 
     let aad = b"bench";
 
     let mut group = c.benchmark_group("encrypt_by_size");
     for size in [64, 256, 1024, 4096, 16384] {
         let plaintext = vec![0u8; size];
-        group.bench_with_input(
-            BenchmarkId::from_parameter(size),
-            &plaintext,
-            |b, pt| {
-                b.to_async(&rt).iter(|| async {
-                    let result = provider.encrypt(&handle, pt, aad).await.unwrap();
-                    criterion::black_box(result);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(size), &plaintext, |b, pt| {
+            b.to_async(&rt).iter(|| async {
+                let result = provider.encrypt(&handle, pt, aad).await.unwrap();
+                criterion::black_box(result);
+            });
+        });
     }
     group.finish();
 }
@@ -109,9 +98,7 @@ fn bench_sign_ed25519(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let provider = SoftwareProvider::new();
 
-    let handle = rt.block_on(async {
-        provider.generate_key(&KeySpec::Ed25519).await.unwrap()
-    });
+    let handle = rt.block_on(async { provider.generate_key(&KeySpec::Ed25519).await.unwrap() });
 
     let message = b"benchmark signing payload for ed25519";
 

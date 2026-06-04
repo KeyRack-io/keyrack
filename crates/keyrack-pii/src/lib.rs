@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! PII tokenization helpers for KeyRack.
+//! PII tokenization helpers for `KeyRack`.
 //!
 //! Provides deterministic, non-reversible tokenization of personally
 //! identifiable information (PII) using BLAKE3 keyed hashing with a

@@ -61,7 +61,7 @@ impl Preset {
         match self {
             Self::Email => value.trim().to_lowercase(),
             Self::Ssn | Self::Phone | Self::CreditCard => {
-                value.chars().filter(|c| c.is_ascii_digit()).collect()
+                value.chars().filter(char::is_ascii_digit).collect()
             }
             Self::IpAddress => normalize_ip(value),
             Self::Raw => value.to_string(),
@@ -84,7 +84,10 @@ mod tests {
 
     #[test]
     fn email_lowercased() {
-        assert_eq!(Preset::Email.normalize("Alice@Example.COM"), "alice@example.com");
+        assert_eq!(
+            Preset::Email.normalize("Alice@Example.COM"),
+            "alice@example.com"
+        );
     }
 
     #[test]
@@ -99,12 +102,18 @@ mod tests {
 
     #[test]
     fn credit_card_digits_only() {
-        assert_eq!(Preset::CreditCard.normalize("4111 1111 1111 1111"), "4111111111111111");
+        assert_eq!(
+            Preset::CreditCard.normalize("4111 1111 1111 1111"),
+            "4111111111111111"
+        );
     }
 
     #[test]
     fn ip_v4_normalized() {
-        assert_eq!(Preset::IpAddress.normalize("  192.168.1.1  "), "192.168.1.1");
+        assert_eq!(
+            Preset::IpAddress.normalize("  192.168.1.1  "),
+            "192.168.1.1"
+        );
     }
 
     #[test]

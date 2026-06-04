@@ -61,10 +61,7 @@ const TAG_LIST_OF_STRING: u8 = 0x04;
 const TAG_RECORD: u8 = 0x05;
 
 /// Canonicalize an attribute set under the given version.
-pub fn canonicalize(
-    version: CanonicalizationVersion,
-    attrs: &AttributeSet,
-) -> CanonicalForm {
+pub fn canonicalize(version: CanonicalizationVersion, attrs: &AttributeSet) -> CanonicalForm {
     match version {
         CanonicalizationVersion::V1 => canonicalize_v1(attrs),
     }

@@ -57,7 +57,10 @@ macro_rules! provider_conformance_tests {
             let ct = provider.encrypt(&handle, plaintext, aad).await.unwrap();
             assert_ne!(ct.ciphertext.as_slice(), plaintext);
 
-            let pt = provider.decrypt(&handle, &ct.ciphertext, aad).await.unwrap();
+            let pt = provider
+                .decrypt(&handle, &ct.ciphertext, aad)
+                .await
+                .unwrap();
             assert_eq!(pt.expose().as_slice(), plaintext);
         }
 
@@ -74,7 +77,9 @@ macro_rules! provider_conformance_tests {
                 .await
                 .unwrap();
 
-            let result = provider.decrypt(&handle, &ct.ciphertext, b"aad-wrong").await;
+            let result = provider
+                .decrypt(&handle, &ct.ciphertext, b"aad-wrong")
+                .await;
             assert!(result.is_err());
         }
 
@@ -164,10 +169,7 @@ macro_rules! provider_conformance_tests {
             let key_b = provider.generate_key(&KeySpec::Aes256).await.unwrap();
 
             let plaintext = b"re-encrypt conformance test";
-            let ct_a = provider
-                .encrypt(&key_a, plaintext, b"aad-a")
-                .await
-                .unwrap();
+            let ct_a = provider.encrypt(&key_a, plaintext, b"aad-a").await.unwrap();
 
             let ct_b = provider
                 .re_encrypt(&key_a, &ct_a.ciphertext, b"aad-a", &key_b, b"aad-b")

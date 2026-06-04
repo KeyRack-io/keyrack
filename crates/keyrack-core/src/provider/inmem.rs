@@ -29,7 +29,9 @@
 
 use crate::error::Result;
 use crate::key::KeySpec;
-use crate::provider::{CryptoProvider, EncryptOutput, KeyHandle, ProviderCapabilities, SigningAlgorithm};
+use crate::provider::{
+    CryptoProvider, EncryptOutput, KeyHandle, ProviderCapabilities, SigningAlgorithm,
+};
 use crate::sensitive::Sensitive;
 use async_trait::async_trait;
 
@@ -97,7 +99,9 @@ impl CryptoProvider for InMemoryProvider {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
-        self.inner.verify(handle, algorithm, message, signature).await
+        self.inner
+            .verify(handle, algorithm, message, signature)
+            .await
     }
 
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>> {
@@ -125,7 +129,10 @@ mod tests {
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
 
         let ct = provider.encrypt(&handle, b"test", b"").await.unwrap();
-        let pt = provider.decrypt(&handle, &ct.ciphertext, b"").await.unwrap();
+        let pt = provider
+            .decrypt(&handle, &ct.ciphertext, b"")
+            .await
+            .unwrap();
         assert_eq!(pt.expose().as_slice(), b"test");
     }
 

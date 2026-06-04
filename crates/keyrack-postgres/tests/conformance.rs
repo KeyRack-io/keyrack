@@ -29,8 +29,8 @@
 use keyrack_postgres::PostgresStorage;
 
 async fn make_store() -> PostgresStorage {
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set for live PostgreSQL tests");
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live PostgreSQL tests");
     PostgresStorage::connect(&url)
         .await
         .expect("failed to connect to PostgreSQL")

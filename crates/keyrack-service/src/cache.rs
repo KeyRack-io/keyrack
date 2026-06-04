@@ -70,7 +70,7 @@ impl CachingStorage {
     }
 
     /// Invalidate all cached entries.
-    pub async fn invalidate_all(&self) {
+    pub fn invalidate_all(&self) {
         self.key_cache.invalidate_all();
     }
 

@@ -27,7 +27,9 @@
 //! 5. REST crypto handlers are concrete (not 501 stubs).
 
 use keyrack_core::audit::{AuditEvent, AuditSink};
-use keyrack_core::pdp::{AlwaysAllow, AlwaysDeny, AuthzRequest, AuthzResponse, PolicyDecisionPoint};
+use keyrack_core::pdp::{
+    AlwaysAllow, AlwaysDeny, AuthzRequest, AuthzResponse, PolicyDecisionPoint,
+};
 use keyrack_core::provider::inmem::InMemoryProvider;
 use keyrack_service::proto;
 use keyrack_service::proto::key_service_server::KeyService;
@@ -95,15 +97,12 @@ fn build_test_state_with(
     pdp: Arc<dyn PolicyDecisionPoint>,
     audit: Arc<dyn AuditSink>,
 ) -> Arc<ServiceState> {
-    let storage = Arc::new(
-        keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"),
-    );
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
     let provider = Arc::new(InMemoryProvider::new());
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::InsecureAuthenticator),
     ]));
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
     Arc::new(ServiceState {
         storage,
@@ -141,8 +140,14 @@ async fn create_key_calls_pdp() {
     });
 
     let resp = svc.create_key(req).await;
-    assert!(resp.is_ok(), "create_key should succeed with AlwaysAllow PDP");
-    assert!(pdp.count() >= 1, "PDP must be called at least once for CreateKey");
+    assert!(
+        resp.is_ok(),
+        "create_key should succeed with AlwaysAllow PDP"
+    );
+    assert!(
+        pdp.count() >= 1,
+        "PDP must be called at least once for CreateKey"
+    );
 }
 
 #[tokio::test]
@@ -158,7 +163,11 @@ async fn encrypt_calls_pdp() {
         ..Default::default()
     });
     let _ = svc.encrypt(req).await;
-    assert!(pdp.count() >= 2, "PDP must be called for CreateKey + Encrypt (got {})", pdp.count());
+    assert!(
+        pdp.count() >= 2,
+        "PDP must be called for CreateKey + Encrypt (got {})",
+        pdp.count()
+    );
 }
 
 #[tokio::test]
@@ -180,7 +189,10 @@ async fn denied_pdp_blocks_create_key() {
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 
     // Audit should still emit even for denied operations
-    assert!(audit.event_count() >= 1, "audit event must still be emitted for denied ops");
+    assert!(
+        audit.event_count() >= 1,
+        "audit event must still be emitted for denied ops"
+    );
 }
 
 #[tokio::test]
@@ -225,7 +237,10 @@ async fn denied_pdp_blocks_tag_resource() {
 
     let req = Request::new(proto::TagResourceRequest {
         key_id: "lid_".to_owned() + &"ab".repeat(32),
-        tags: vec![proto::Tag { key: "env".into(), value: "test".into() }],
+        tags: vec![proto::Tag {
+            key: "env".into(),
+            value: "test".into(),
+        }],
     });
     let resp = svc.tag_resource(req).await;
     assert!(resp.is_err());
@@ -247,7 +262,11 @@ async fn create_key_emits_audit_event() {
         ..Default::default()
     });
     let _ = svc.create_key(req).await.expect("should succeed");
-    assert_eq!(audit.event_count(), 1, "exactly one audit event for one CreateKey");
+    assert_eq!(
+        audit.event_count(),
+        1,
+        "exactly one audit event for one CreateKey"
+    );
 
     let events = audit.events();
     assert_eq!(
@@ -272,7 +291,11 @@ async fn encrypt_decrypt_emits_audit_events() {
         ..Default::default()
     });
     let enc_resp = svc.encrypt(enc_req).await.expect("encrypt should succeed");
-    assert_eq!(audit.event_count(), initial_count + 1, "encrypt must emit audit event");
+    assert_eq!(
+        audit.event_count(),
+        initial_count + 1,
+        "encrypt must emit audit event"
+    );
 
     let events = audit.events();
     let enc_event = events.last().unwrap();
@@ -284,7 +307,11 @@ async fn encrypt_decrypt_emits_audit_events() {
         ..Default::default()
     });
     let _ = svc.decrypt(dec_req).await.expect("decrypt should succeed");
-    assert_eq!(audit.event_count(), initial_count + 2, "decrypt must emit audit event");
+    assert_eq!(
+        audit.event_count(),
+        initial_count + 2,
+        "decrypt must emit audit event"
+    );
 }
 
 #[tokio::test]
@@ -293,9 +320,19 @@ async fn multiple_operations_emit_correct_event_count() {
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
     let key = create_aes_key(&svc).await;
-    let _ = svc.get_key(Request::new(proto::GetKeyRequest { key_id: key.clone() })).await;
-    let _ = svc.describe_key(Request::new(proto::DescribeKeyRequest { key_id: key.clone() })).await;
-    let _ = svc.disable_key(Request::new(proto::DisableKeyRequest { key_id: key })).await;
+    let _ = svc
+        .get_key(Request::new(proto::GetKeyRequest {
+            key_id: key.clone(),
+        }))
+        .await;
+    let _ = svc
+        .describe_key(Request::new(proto::DescribeKeyRequest {
+            key_id: key.clone(),
+        }))
+        .await;
+    let _ = svc
+        .disable_key(Request::new(proto::DisableKeyRequest { key_id: key }))
+        .await;
 
     // CreateKey + GetKey + DescribeKey + DisableKey = 4
     assert_eq!(audit.event_count(), 4, "4 operations = 4 audit events");
@@ -459,7 +496,11 @@ async fn sign_verify_with_pdp_and_audit() {
 
     assert!(verify_resp.into_inner().signature_valid);
     assert_eq!(pdp.count(), 3, "Create + Sign + Verify = 3 PDP calls");
-    assert_eq!(audit.event_count(), 3, "Create + Sign + Verify = 3 audit events");
+    assert_eq!(
+        audit.event_count(),
+        3,
+        "Create + Sign + Verify = 3 audit events"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -496,7 +537,11 @@ async fn alias_operations_with_pdp_and_audit() {
         .expect("delete alias");
 
     assert_eq!(pdp.count() - initial_pdp, 3, "3 alias ops = 3 PDP calls");
-    assert_eq!(audit.event_count() - initial_audit, 3, "3 alias ops = 3 audit events");
+    assert_eq!(
+        audit.event_count() - initial_audit,
+        3,
+        "3 alias ops = 3 audit events"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -523,8 +568,13 @@ async fn encrypt_with_ec_emits_audit_with_hash() {
         .expect("encrypt with EC");
 
     let events = audit.events();
-    let encrypt_event = events.iter().find(|e| e.action == keyrack_core::audit::AuditAction::Encrypt);
-    assert!(encrypt_event.is_some(), "should have an Encrypt audit event");
+    let encrypt_event = events
+        .iter()
+        .find(|e| e.action == keyrack_core::audit::AuditAction::Encrypt);
+    assert!(
+        encrypt_event.is_some(),
+        "should have an Encrypt audit event"
+    );
     assert!(
         encrypt_event.unwrap().encryption_context_hash.is_some(),
         "Encrypt with EC must include encryption_context_hash in audit"
@@ -551,7 +601,10 @@ async fn list_key_versions() {
         .expect("list versions");
 
     let versions = resp.into_inner().versions;
-    assert!(!versions.is_empty(), "new key should have at least one version");
+    assert!(
+        !versions.is_empty(),
+        "new key should have at least one version"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -572,7 +625,10 @@ async fn namespace_operations_call_pdp_and_audit() {
         .expect("register namespace");
 
     assert!(pdp.count() >= 1, "PDP must be called for RegisterNamespace");
-    assert!(audit.event_count() >= 1, "audit event must be emitted for RegisterNamespace");
+    assert!(
+        audit.event_count() >= 1,
+        "audit event must be emitted for RegisterNamespace"
+    );
 
     let _ = svc
         .list_namespaces(Request::new(proto::ListNamespacesRequest::default()))
@@ -600,7 +656,10 @@ async fn describe_key_returns_full_metadata() {
         .await
         .expect("describe key");
 
-    let meta = resp.into_inner().metadata.expect("metadata must be present");
+    let meta = resp
+        .into_inner()
+        .metadata
+        .expect("metadata must be present");
     assert_eq!(meta.key_id, key);
     assert_eq!(meta.description, "test key");
     assert_eq!(meta.key_spec, i32::from(proto::KeySpec::Aes256));
@@ -627,8 +686,14 @@ async fn generate_data_key_returns_both_keys() {
         .expect("generate data key");
 
     let inner = resp.into_inner();
-    assert!(!inner.plaintext_data_key.is_empty(), "plaintext key must be non-empty");
-    assert!(!inner.encrypted_data_key.is_empty(), "encrypted key must be non-empty");
+    assert!(
+        !inner.plaintext_data_key.is_empty(),
+        "plaintext key must be non-empty"
+    );
+    assert!(
+        !inner.encrypted_data_key.is_empty(),
+        "encrypted key must be non-empty"
+    );
     assert_eq!(inner.key_id, key);
 }
 

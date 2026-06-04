@@ -43,9 +43,7 @@ async fn main() -> anyhow::Result<()> {
             ("purpose".to_string(), purpose.to_string()),
         ]);
 
-        let matched = registry
-            .match_rule(&attrs)
-            .expect("should match a rule");
+        let matched = registry.match_rule(&attrs).expect("should match a rule");
 
         println!(
             "service={service}, purpose={purpose} → namespace: {}, bindings: {:?}",

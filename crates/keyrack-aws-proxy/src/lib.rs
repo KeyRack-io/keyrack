@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{body::Bytes, Json, Router};
@@ -64,7 +64,12 @@ impl IntoResponse for KmsProxyError {
                 keyrack_aws_common::error_response("ValidationException", &e.to_string()),
             ),
         };
-        (status, [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)], Json(body)).into_response()
+        (
+            status,
+            [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)],
+            Json(body),
+        )
+            .into_response()
     }
 }
 
@@ -103,10 +108,7 @@ pub trait MetadataStore: Send + Sync {
         response: &serde_json::Value,
     ) -> Result<(), KmsProxyError>;
 
-    async fn get_key_metadata(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<KeyMetadata>, KmsProxyError>;
+    async fn get_key_metadata(&self, key_id: &str) -> Result<Option<KeyMetadata>, KmsProxyError>;
 
     async fn list_tracked_keys(&self) -> Result<Vec<KeyMetadata>, KmsProxyError>;
 }
@@ -194,10 +196,7 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(())
     }
 
-    async fn get_key_metadata(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<KeyMetadata>, KmsProxyError> {
+    async fn get_key_metadata(&self, key_id: &str) -> Result<Option<KeyMetadata>, KmsProxyError> {
         let store = self.keys.lock().await;
         Ok(store.get(key_id).cloned())
     }
@@ -258,7 +257,11 @@ pub async fn proxy_handler(
         }
     }
 
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)], Json(response)))
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, AMZ_JSON_CONTENT_TYPE)],
+        Json(response),
+    ))
 }
 
 /// Extracts the key ID from the request body or response, depending on
@@ -313,7 +316,9 @@ async fn admin_get_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, KmsProxyError> {
     match state.metadata.get_key_metadata(&key_id).await? {
-        Some(meta) => Ok((StatusCode::OK, Json(serde_json::to_value(meta).unwrap())).into_response()),
+        Some(meta) => {
+            Ok((StatusCode::OK, Json(serde_json::to_value(meta).unwrap())).into_response())
+        }
         None => Ok((
             StatusCode::NOT_FOUND,
             Json(keyrack_aws_common::error_response(
@@ -432,10 +437,7 @@ mod tests {
         let action = keyrack_aws_common::KmsAction::Encrypt;
         let req = serde_json::json!({ "KeyId": "my-key" });
         let resp = serde_json::json!({});
-        assert_eq!(
-            extract_key_id(&action, &req, &resp),
-            Some("my-key".into())
-        );
+        assert_eq!(extract_key_id(&action, &req, &resp), Some("my-key".into()));
     }
 
     #[test]

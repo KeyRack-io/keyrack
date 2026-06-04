@@ -20,7 +20,10 @@
 
 //! KMIP message construction and response parsing.
 
-use crate::ttlv::*;
+use crate::ttlv::{
+    byte_string, enumeration, integer, object_type, operation, structure, tag, text_string,
+    TtlvItem, TtlvType, TtlvValue,
+};
 
 const KMIP_VERSION_MAJOR: i32 = 2;
 const KMIP_VERSION_MINOR: i32 = 1;
@@ -65,14 +68,8 @@ pub fn create_symmetric_key(algorithm: u32, key_length: i32) -> TtlvItem {
                 tag::TEMPLATE_ATTRIBUTE,
                 vec![
                     attribute("Cryptographic Algorithm", TtlvValue::Enumeration(algorithm)),
-                    attribute(
-                        "Cryptographic Length",
-                        TtlvValue::Integer(key_length),
-                    ),
-                    attribute(
-                        "Cryptographic Usage Mask",
-                        TtlvValue::Integer(usage_mask),
-                    ),
+                    attribute("Cryptographic Length", TtlvValue::Integer(key_length)),
+                    attribute("Cryptographic Usage Mask", TtlvValue::Integer(usage_mask)),
                 ],
             ),
         ],
@@ -91,19 +88,12 @@ pub fn create_asymmetric_key(algorithm: u32, key_length: i32) -> TtlvItem {
                 tag::TEMPLATE_ATTRIBUTE,
                 vec![
                     attribute("Cryptographic Algorithm", TtlvValue::Enumeration(algorithm)),
-                    attribute(
-                        "Cryptographic Length",
-                        TtlvValue::Integer(key_length),
-                    ),
-                    attribute(
-                        "Cryptographic Usage Mask",
-                        TtlvValue::Integer(usage_mask),
-                    ),
+                    attribute("Cryptographic Length", TtlvValue::Integer(key_length)),
+                    attribute("Cryptographic Usage Mask", TtlvValue::Integer(usage_mask)),
                 ],
             ),
         ],
-    )
-    ;
+    );
     wrap_request(operation::CREATE, payload)
 }
 
@@ -208,10 +198,7 @@ pub fn destroy_request(unique_id: &str) -> TtlvItem {
 
 /// Build a KMIP RNG Retrieve request.
 pub fn rng_retrieve_request(length: i32) -> TtlvItem {
-    let payload = structure(
-        tag::REQUEST_PAYLOAD,
-        vec![integer(tag::DATA, length)],
-    );
+    let payload = structure(tag::REQUEST_PAYLOAD, vec![integer(tag::DATA, length)]);
     wrap_request(operation::RNG_RETRIEVE, payload)
 }
 
@@ -252,7 +239,7 @@ pub fn parse_response(msg: &TtlvItem) -> Result<KmipResponse, String> {
 
     let status = batch_item
         .find(tag::RESULT_STATUS)
-        .and_then(|i| i.as_enum())
+        .and_then(super::ttlv::TtlvItem::as_enum)
         .ok_or("no ResultStatus in response")?;
 
     let message = batch_item

@@ -252,7 +252,8 @@ mod tests {
 
         async fn list_children(&self, parent: &Lid) -> Result<Vec<KeyRecord>> {
             let keys = self.keys.lock().unwrap();
-            Ok(keys.values()
+            Ok(keys
+                .values()
                 .filter(|r| r.parent_lid.as_ref() == Some(parent))
                 .cloned()
                 .collect())
@@ -294,10 +295,9 @@ mod tests {
 
         async fn get_hsm_connection(&self, connection_id: &str) -> Result<HsmConnection> {
             let conns = self.hsm_conns.lock().unwrap();
-            conns
-                .get(connection_id)
-                .cloned()
-                .ok_or_else(|| KeyRackError::Other(format!("hsm connection not found: {connection_id}")))
+            conns.get(connection_id).cloned().ok_or_else(|| {
+                KeyRackError::Other(format!("hsm connection not found: {connection_id}"))
+            })
         }
 
         async fn update_hsm_connection(&self, conn: &HsmConnection) -> Result<()> {
@@ -373,7 +373,10 @@ mod tests {
         let mut stale_update = stale.clone();
         stale_update.occ_version += 1;
         let err = store.update_key(&stale_update).await;
-        assert!(matches!(err, Err(KeyRackError::OptimisticConcurrencyConflict { .. })));
+        assert!(matches!(
+            err,
+            Err(KeyRackError::OptimisticConcurrencyConflict { .. })
+        ));
     }
 
     #[tokio::test]

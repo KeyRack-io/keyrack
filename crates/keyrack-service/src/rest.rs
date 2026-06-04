@@ -86,11 +86,15 @@ impl From<&KeyRecord> for KeyResponse {
             scheduled_deletion_at: r.scheduled_deletion_at,
             parent_lid: r.parent_lid.as_ref().map(ToString::to_string),
             current_key_version: r.current_key_version,
-            key_versions: r.key_versions.iter().map(|v| KeyVersionResponse {
-                version_number: v.version_number,
-                created_at: v.created_at,
-                is_primary: v.is_primary,
-            }).collect(),
+            key_versions: r
+                .key_versions
+                .iter()
+                .map(|v| KeyVersionResponse {
+                    version_number: v.version_number,
+                    created_at: v.created_at,
+                    is_primary: v.is_primary,
+                })
+                .collect(),
         }
     }
 }
@@ -115,9 +119,18 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/:key_id/describe", get(describe_key))
         .route("/v1/keys/:key_id/actions-enable", post(enable_key))
         .route("/v1/keys/:key_id/actions-disable", post(disable_key))
-        .route("/v1/keys/:key_id/actions-schedule-deletion", post(schedule_key_deletion))
-        .route("/v1/keys/:key_id/actions-cancel-deletion", post(cancel_key_deletion))
-        .route("/v1/keys/:key_id/actions-report-compromise", post(report_key_compromise))
+        .route(
+            "/v1/keys/:key_id/actions-schedule-deletion",
+            post(schedule_key_deletion),
+        )
+        .route(
+            "/v1/keys/:key_id/actions-cancel-deletion",
+            post(cancel_key_deletion),
+        )
+        .route(
+            "/v1/keys/:key_id/actions-report-compromise",
+            post(report_key_compromise),
+        )
         .route("/v1/keys/:key_id/actions-rotate", post(rotate_key));
 
     // Crypto operation routes: gated behind the `crypto-endpoints` feature.
@@ -127,13 +140,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/:key_id/actions-decrypt", post(decrypt))
         .route("/v1/keys/:key_id/actions-sign", post(sign))
         .route("/v1/keys/:key_id/actions-verify", post(verify))
-        .route("/v1/keys/:key_id/actions-generate-data-key", post(generate_data_key))
+        .route(
+            "/v1/keys/:key_id/actions-generate-data-key",
+            post(generate_data_key),
+        )
         .route("/v1/keys/:key_id/actions-re-encrypt", post(re_encrypt))
         .route("/v1/generate-random", post(generate_random));
 
     r
         // ── Tags ────────────────────────────────────────────
-        .route("/v1/keys/:key_id/tags", get(list_resource_tags).post(tag_resource).delete(untag_resource))
+        .route(
+            "/v1/keys/:key_id/tags",
+            get(list_resource_tags)
+                .post(tag_resource)
+                .delete(untag_resource),
+        )
         // ── Aliases ─────────────────────────────────────────
         .route("/v1/aliases", get(list_aliases).post(create_alias))
         .route("/v1/aliases/:alias_name", delete(delete_alias))
@@ -145,16 +166,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn echo_request_id(
-    req: axum::extract::Request,
-    next: middleware::Next,
-) -> impl IntoResponse {
+async fn echo_request_id(req: axum::extract::Request, next: middleware::Next) -> impl IntoResponse {
     let request_id = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(ops::new_request_id);
+        .map_or_else(ops::new_request_id, ToOwned::to_owned);
 
     let mut response = next.run(req).await;
     if let Ok(val) = axum::http::HeaderValue::from_str(&request_id) {
@@ -169,10 +186,16 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
-        KeyRackError::InvalidStateTransition { .. } => (StatusCode::CONFLICT, "InvalidStateTransition"),
-        KeyRackError::OperationNotPermitted { .. } => (StatusCode::FORBIDDEN, "OperationNotPermitted"),
+        KeyRackError::InvalidStateTransition { .. } => {
+            (StatusCode::CONFLICT, "InvalidStateTransition")
+        }
+        KeyRackError::OperationNotPermitted { .. } => {
+            (StatusCode::FORBIDDEN, "OperationNotPermitted")
+        }
         KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
-        KeyRackError::EncryptionContextMismatch => (StatusCode::BAD_REQUEST, "EncryptionContextMismatch"),
+        KeyRackError::EncryptionContextMismatch => {
+            (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
+        }
         KeyRackError::AuthorizationDenied { .. } => (StatusCode::FORBIDDEN, "AuthorizationDenied"),
         KeyRackError::DepthLimitExceeded { .. } => (StatusCode::BAD_REQUEST, "DepthLimitExceeded"),
         KeyRackError::CycleDetected { .. } => (StatusCode::BAD_REQUEST, "CycleDetected"),
@@ -182,24 +205,41 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
 }
 
 fn transition_err(from: keyrack_core::key::KeyState, to: keyrack_core::key::KeyState) -> RestError {
-    ops::rest_error(StatusCode::CONFLICT, "InvalidStateTransition", &format!("cannot transition from {from} to {to}"))
+    ops::rest_error(
+        StatusCode::CONFLICT,
+        "InvalidStateTransition",
+        &format!("cannot transition from {from} to {to}"),
+    )
 }
 
 /// Generate a unique LID (mirrors grpc.rs logic).
 fn generate_key_lid() -> (keyrack_core::lid::Lid, keyrack_core::attr::AttributeSet) {
     let mut attrs = keyrack_core::attr::AttributeSet::new();
-    attrs.insert("_keyrack_key_id", keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()));
-    let canonical = keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
-    let lid = keyrack_core::lid::Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &canonical);
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
     (lid, attrs)
 }
 
 #[cfg(feature = "crypto-endpoints")]
-fn build_ec(map: &serde_json::Map<String, serde_json::Value>) -> Option<keyrack_core::encryption_context::EncryptionContext> {
-    if map.is_empty() { return None; }
+fn build_ec(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<keyrack_core::encryption_context::EncryptionContext> {
+    if map.is_empty() {
+        return None;
+    }
     let mut ec = keyrack_core::encryption_context::EncryptionContext::new();
     for (k, v) in map {
-        if let Some(s) = v.as_str() { ec.insert(k, s); }
+        if let Some(s) = v.as_str() {
+            ec.insert(k, s);
+        }
     }
     Some(ec)
 }
@@ -292,15 +332,12 @@ async fn get_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::GetKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn describe_key(
@@ -312,15 +349,12 @@ async fn describe_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::DescribeKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn update_key(
@@ -333,21 +367,22 @@ async fn update_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::UpdateKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
-                desc.clone_into(&mut record.description);
-            }
-            record.occ_version += 1;
-            record.updated_at = chrono::Utc::now();
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+            desc.clone_into(&mut record.description);
+        }
+        record.occ_version += 1;
+        record.updated_at = chrono::Utc::now();
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn list_keys(
@@ -359,19 +394,25 @@ async fn list_keys(
     let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
     op_ctx.resource_type = "Key".into();
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let filter = keyrack_core::storage::KeyFilter { user_tags: vec![], state: None, limit: Some(100), cursor: None };
-            let page = state.storage.list_keys(&filter).await.map_err(map_core_err)?;
-            let resp = KeyListResponse {
-                items: page.items.iter().map(KeyResponse::from).collect(),
-                next_cursor: page.next_cursor,
-            };
-            Ok(Json(serde_json::to_value(&resp).unwrap_or_default()))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let filter = keyrack_core::storage::KeyFilter {
+            user_tags: vec![],
+            state: None,
+            limit: Some(100),
+            cursor: None,
+        };
+        let page = state
+            .storage
+            .list_keys(&filter)
+            .await
+            .map_err(map_core_err)?;
+        let resp = KeyListResponse {
+            items: page.items.iter().map(KeyResponse::from).collect(),
+            next_cursor: page.next_cursor,
+        };
+        Ok(Json(serde_json::to_value(&resp).unwrap_or_default()))
+    })
+    .await
 }
 
 async fn enable_key(
@@ -383,17 +424,20 @@ async fn enable_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::EnableKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            record.transition_to(keyrack_core::key::KeyState::Enabled).map_err(|(f, t)| transition_err(f, t))?;
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        record
+            .transition_to(keyrack_core::key::KeyState::Enabled)
+            .map_err(|(f, t)| transition_err(f, t))?;
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn disable_key(
@@ -405,17 +449,20 @@ async fn disable_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::DisableKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        record
+            .transition_to(keyrack_core::key::KeyState::Disabled)
+            .map_err(|(f, t)| transition_err(f, t))?;
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn schedule_key_deletion(
@@ -428,20 +475,29 @@ async fn schedule_key_deletion(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            let days = body.get("grace_period_days").and_then(serde_json::Value::as_u64).unwrap_or(7);
-            record.transition_to(keyrack_core::key::KeyState::PendingDeletion).map_err(|(f, t)| transition_err(f, t))?;
-            #[allow(clippy::cast_possible_wrap)]
-            { record.scheduled_deletion_at = Some(chrono::Utc::now() + chrono::Duration::days(days as i64)); }
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let days = body
+            .get("grace_period_days")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(7);
+        record
+            .transition_to(keyrack_core::key::KeyState::PendingDeletion)
+            .map_err(|(f, t)| transition_err(f, t))?;
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            record.scheduled_deletion_at =
+                Some(chrono::Utc::now() + chrono::Duration::days(days as i64));
+        }
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn cancel_key_deletion(
@@ -453,21 +509,28 @@ async fn cancel_key_deletion(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if record.state != keyrack_core::key::KeyState::PendingDeletion {
-                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidStateTransition", "can only cancel deletion from PendingDeletion"));
-            }
-            record.transition_to(keyrack_core::key::KeyState::Disabled).map_err(|(f, t)| transition_err(f, t))?;
-            record.scheduled_deletion_at = None;
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if record.state != keyrack_core::key::KeyState::PendingDeletion {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidStateTransition",
+                "can only cancel deletion from PendingDeletion",
+            ));
+        }
+        record
+            .transition_to(keyrack_core::key::KeyState::Disabled)
+            .map_err(|(f, t)| transition_err(f, t))?;
+        record.scheduled_deletion_at = None;
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn report_key_compromise(
@@ -479,23 +542,29 @@ async fn report_key_compromise(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::ReportKeyCompromise, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            let old_state = record.state.to_string();
-            record.transition_to(keyrack_core::key::KeyState::Compromised).map_err(|(f, t)| transition_err(f, t))?;
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            if let Some(nats) = &state.nats_publisher {
-                if let Err(e) = nats.publish_state_changed(&lid, &old_state, "compromised").await {
-                    tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
-                }
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let old_state = record.state.to_string();
+        record
+            .transition_to(keyrack_core::key::KeyState::Compromised)
+            .map_err(|(f, t)| transition_err(f, t))?;
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        if let Some(nats) = &state.nats_publisher {
+            if let Err(e) = nats
+                .publish_state_changed(&lid, &old_state, "compromised")
+                .await
+            {
+                tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
             }
-            Ok(key_json(&record))
-        },
-    ).await
+        }
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 async fn rotate_key(
@@ -507,31 +576,44 @@ async fn rotate_key(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if record.state != keyrack_core::key::KeyState::Enabled {
-                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key must be Enabled to rotate"));
-            }
-            let handle = state.provider.generate_key(&record.key_spec).await.map_err(map_core_err)?;
-            let new_version = record.current_key_version + 1;
-            for v in &mut record.key_versions { v.is_primary = false; }
-            record.key_versions.push(keyrack_core::key::KeyVersionRecord {
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if record.state != keyrack_core::key::KeyState::Enabled {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "key must be Enabled to rotate",
+            ));
+        }
+        let handle = state
+            .provider
+            .generate_key(&record.key_spec)
+            .await
+            .map_err(map_core_err)?;
+        let new_version = record.current_key_version + 1;
+        for v in &mut record.key_versions {
+            v.is_primary = false;
+        }
+        record
+            .key_versions
+            .push(keyrack_core::key::KeyVersionRecord {
                 version_number: new_version,
                 key_handle: handle,
                 created_at: chrono::Utc::now(),
                 is_primary: true,
             });
-            record.current_key_version = new_version;
-            record.occ_version += 1;
-            record.updated_at = chrono::Utc::now();
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(key_json(&record))
-        },
-    ).await
+        record.current_key_version = new_version;
+        record.occ_version += 1;
+        record.updated_at = chrono::Utc::now();
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(key_json(&record))
+    })
+    .await
 }
 
 // ── Crypto action handlers ──────────────────────────────────────────
@@ -546,7 +628,8 @@ async fn encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let ec_hash = body.get("encryption_context")
+    let ec_hash = body
+        .get("encryption_context")
         .and_then(|v| v.as_object())
         .and_then(build_ec)
         .as_ref()
@@ -554,32 +637,59 @@ async fn encrypt(
     let mut op_ctx = OpContext::key(AuditAction::Encrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if !record.state.permits_encrypt() {
-                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in Enabled state"));
-            }
-            let plaintext_b64 = body.get("plaintext").and_then(|v| v.as_str()).unwrap_or("");
-            let plaintext = base64_decode(plaintext_b64)?;
-            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let primary = record.key_versions.iter().find(|v| v.is_primary)
-                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
-            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
-            let aad = header.build_aad(&ec_aad);
-            let output = state.provider.encrypt(&primary.key_handle, &plaintext, &aad).await.map_err(map_core_err)?;
-            let blob = header.wrap_payload(&output.ciphertext);
-            Ok(Json(serde_json::json!({
-                "ciphertext_blob": base64_encode(&blob),
-                "key_id": record.lid.to_string(),
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if !record.state.permits_encrypt() {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "key not in Enabled state",
+            ));
+        }
+        let plaintext_b64 = body.get("plaintext").and_then(|v| v.as_str()).unwrap_or("");
+        let plaintext = base64_decode(plaintext_b64)?;
+        let ec = body
+            .get("encryption_context")
+            .and_then(|v| v.as_object())
+            .and_then(build_ec);
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let ec_aad = ec
+            .as_ref()
+            .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+            .unwrap_or_default();
+        let ec_hash = ec.as_ref().map_or(
+            [0u8; 32],
+            keyrack_core::encryption_context::EncryptionContext::hash,
+        );
+        let header = keyrack_core::header::CiphertextHeader::new(
+            record.lid,
+            record.current_key_version,
+            ec_hash,
+        );
+        let aad = header.build_aad(&ec_aad);
+        let output = state
+            .provider
+            .encrypt(&primary.key_handle, &plaintext, &aad)
+            .await
+            .map_err(map_core_err)?;
+        let blob = header.wrap_payload(&output.ciphertext);
+        Ok(Json(serde_json::json!({
+            "ciphertext_blob": base64_encode(&blob),
+            "key_id": record.lid.to_string(),
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -591,7 +701,8 @@ async fn decrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let ec_hash = body.get("encryption_context")
+    let ec_hash = body
+        .get("encryption_context")
         .and_then(|v| v.as_object())
         .and_then(build_ec)
         .as_ref()
@@ -599,37 +710,68 @@ async fn decrypt(
     let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if !record.state.permits_decrypt() {
-                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in state for decrypt"));
-            }
-            let blob_b64 = body.get("ciphertext_blob").and_then(|v| v.as_str()).unwrap_or("");
-            let blob = base64_decode(blob_b64)?;
-            let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
-                .map_err(|e| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string()))?;
-            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-            if ec_hash != header.encryption_context_hash {
-                return Err(ops::rest_error(StatusCode::BAD_REQUEST, "EncryptionContextMismatch", "encryption context mismatch"));
-            }
-            let version_handle = record.key_versions.iter()
-                .find(|v| v.version_number == header.key_version)
-                .map(|v| &v.key_handle)
-                .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "key version not found"))?;
-            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let aad = header.build_aad(&ec_aad);
-            let plaintext = state.provider.decrypt(version_handle, ciphertext, &aad).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({
-                "plaintext": base64_encode(plaintext.expose()),
-                "key_id": record.lid.to_string(),
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if !record.state.permits_decrypt() {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "key not in state for decrypt",
+            ));
+        }
+        let blob_b64 = body
+            .get("ciphertext_blob")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let blob = base64_decode(blob_b64)?;
+        let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
+            .map_err(|e| {
+                ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
+            })?;
+        let ec = body
+            .get("encryption_context")
+            .and_then(|v| v.as_object())
+            .and_then(build_ec);
+        let ec_hash = ec.as_ref().map_or(
+            [0u8; 32],
+            keyrack_core::encryption_context::EncryptionContext::hash,
+        );
+        if ec_hash != header.encryption_context_hash {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "EncryptionContextMismatch",
+                "encryption context mismatch",
+            ));
+        }
+        let version_handle = record
+            .key_versions
+            .iter()
+            .find(|v| v.version_number == header.key_version)
+            .map(|v| &v.key_handle)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::NOT_FOUND,
+                    "VersionNotFound",
+                    "key version not found",
+                )
+            })?;
+        let ec_aad = ec
+            .as_ref()
+            .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+            .unwrap_or_default();
+        let aad = header.build_aad(&ec_aad);
+        let plaintext = state
+            .provider
+            .decrypt(version_handle, ciphertext, &aad)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "plaintext": base64_encode(plaintext.expose()),
+            "key_id": record.lid.to_string(),
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -643,32 +785,51 @@ async fn sign(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            let alg_str = body.get("signing_algorithm").and_then(|v| v.as_str()).unwrap_or("");
-            let alg = match alg_str {
-                "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
-                "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
-                "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
-                "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
-                _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
-            };
-            let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let message = base64_decode(message_b64)?;
-            let primary = record.key_versions.iter().find(|v| v.is_primary)
-                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
-            let signature = state.provider.sign(&primary.key_handle, alg, &message).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({
-                "signature": base64_encode(&signature),
-                "key_id": record.lid.to_string(),
-                "signing_algorithm": alg_str,
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let alg_str = body
+            .get("signing_algorithm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let alg = match alg_str {
+            "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
+            "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
+            "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+            "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
+            _ => {
+                return Err(ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidAlgorithm",
+                    &format!("unknown signing_algorithm: {alg_str}"),
+                ))
+            }
+        };
+        let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let message = base64_decode(message_b64)?;
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let signature = state
+            .provider
+            .sign(&primary.key_handle, alg, &message)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "signature": base64_encode(&signature),
+            "key_id": record.lid.to_string(),
+            "signing_algorithm": alg_str,
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -682,31 +843,51 @@ async fn verify(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            let alg_str = body.get("signing_algorithm").and_then(|v| v.as_str()).unwrap_or("");
-            let alg = match alg_str {
-                "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
-                "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
-                "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
-                "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
-                _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidAlgorithm", &format!("unknown signing_algorithm: {alg_str}"))),
-            };
-            let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
-            let signature = base64_decode(body.get("signature").and_then(|v| v.as_str()).unwrap_or(""))?;
-            let primary = record.key_versions.iter().find(|v| v.is_primary)
-                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
-            let valid = state.provider.verify(&primary.key_handle, alg, &message, &signature).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({
-                "signature_valid": valid,
-                "key_id": record.lid.to_string(),
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let alg_str = body
+            .get("signing_algorithm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let alg = match alg_str {
+            "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
+            "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
+            "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
+            "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
+            _ => {
+                return Err(ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidAlgorithm",
+                    &format!("unknown signing_algorithm: {alg_str}"),
+                ))
+            }
+        };
+        let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let signature =
+            base64_decode(body.get("signature").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let valid = state
+            .provider
+            .verify(&primary.key_handle, alg, &message, &signature)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "signature_valid": valid,
+            "key_id": record.lid.to_string(),
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -718,7 +899,8 @@ async fn generate_data_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let ec_hash = body.get("encryption_context")
+    let ec_hash = body
+        .get("encryption_context")
         .and_then(|v| v.as_object())
         .and_then(build_ec)
         .as_ref()
@@ -726,32 +908,62 @@ async fn generate_data_key(
     let mut op_ctx = OpContext::key(AuditAction::GenerateDataKey, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if !record.state.permits_encrypt() {
-                return Err(ops::rest_error(StatusCode::CONFLICT, "InvalidState", "key not in Enabled state"));
-            }
-            let primary = record.key_versions.iter().find(|v| v.is_primary)
-                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "no primary version"))?;
-            let ec = body.get("encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let ec_aad = ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let ec_hash = ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-            let header = keyrack_core::header::CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
-            let aad = header.build_aad(&ec_aad);
-            #[allow(clippy::cast_possible_truncation)]
-            let dek_len = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
-            let output = state.provider.generate_data_key(&primary.key_handle, dek_len, &aad).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({
-                "plaintext_data_key": base64_encode(&output.plaintext_key.into_inner()),
-                "encrypted_data_key": base64_encode(&header.wrap_payload(&output.encrypted_key)),
-                "key_id": record.lid.to_string(),
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if !record.state.permits_encrypt() {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "key not in Enabled state",
+            ));
+        }
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let ec = body
+            .get("encryption_context")
+            .and_then(|v| v.as_object())
+            .and_then(build_ec);
+        let ec_aad = ec
+            .as_ref()
+            .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+            .unwrap_or_default();
+        let ec_hash = ec.as_ref().map_or(
+            [0u8; 32],
+            keyrack_core::encryption_context::EncryptionContext::hash,
+        );
+        let header = keyrack_core::header::CiphertextHeader::new(
+            record.lid,
+            record.current_key_version,
+            ec_hash,
+        );
+        let aad = header.build_aad(&ec_aad);
+        #[allow(clippy::cast_possible_truncation)]
+        let dek_len = body
+            .get("number_of_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(32) as usize;
+        let output = state
+            .provider
+            .generate_data_key(&primary.key_handle, dek_len, &aad)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "plaintext_data_key": base64_encode(&output.plaintext_key.into_inner()),
+            "encrypted_data_key": base64_encode(&header.wrap_payload(&output.encrypted_key)),
+            "key_id": record.lid.to_string(),
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -763,8 +975,13 @@ async fn re_encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let dst_key_id = body.get("destination_key_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    let ec_hash = body.get("destination_encryption_context")
+    let dst_key_id = body
+        .get("destination_key_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let ec_hash = body
+        .get("destination_encryption_context")
         .and_then(|v| v.as_object())
         .and_then(build_ec)
         .as_ref()
@@ -772,39 +989,94 @@ async fn re_encrypt(
     let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let src_lid = parse_lid_rest(&key_id)?;
-            let dst_lid = parse_lid_rest(&dst_key_id)?;
-            let src_record = state.storage.get_key(&src_lid).await.map_err(map_core_err)?;
-            let dst_record = state.storage.get_key(&dst_lid).await.map_err(map_core_err)?;
-            let blob_b64 = body.get("ciphertext_blob").and_then(|v| v.as_str()).unwrap_or("");
-            let blob = base64_decode(blob_b64)?;
-            let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
-                .map_err(|e| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string()))?;
-            let src_ec = body.get("source_encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let dst_ec = body.get("destination_encryption_context").and_then(|v| v.as_object()).and_then(build_ec);
-            let src_version = src_record.key_versions.iter().find(|v| v.version_number == header.key_version)
-                .ok_or_else(|| ops::rest_error(StatusCode::NOT_FOUND, "VersionNotFound", "source key version not found"))?;
-            let src_ec_aad = src_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let src_aad = header.build_aad(&src_ec_aad);
-            let plaintext = state.provider.decrypt(&src_version.key_handle, ciphertext, &src_aad).await.map_err(map_core_err)?;
-            let dst_primary = dst_record.key_versions.iter().find(|v| v.is_primary)
-                .ok_or_else(|| ops::rest_error(StatusCode::INTERNAL_SERVER_ERROR, "NoVersion", "dest has no primary"))?;
-            let dst_ec_hash = dst_ec.as_ref().map_or([0u8; 32], keyrack_core::encryption_context::EncryptionContext::hash);
-            let new_header = keyrack_core::header::CiphertextHeader::new(dst_record.lid, dst_record.current_key_version, dst_ec_hash);
-            let dst_ec_aad = dst_ec.as_ref().map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes).unwrap_or_default();
-            let dst_aad = new_header.build_aad(&dst_ec_aad);
-            let output = state.provider.encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({
-                "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
-                "source_key_id": src_record.lid.to_string(),
-                "destination_key_id": dst_record.lid.to_string(),
-            })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let src_lid = parse_lid_rest(&key_id)?;
+        let dst_lid = parse_lid_rest(&dst_key_id)?;
+        let src_record = state
+            .storage
+            .get_key(&src_lid)
+            .await
+            .map_err(map_core_err)?;
+        let dst_record = state
+            .storage
+            .get_key(&dst_lid)
+            .await
+            .map_err(map_core_err)?;
+        let blob_b64 = body
+            .get("ciphertext_blob")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let blob = base64_decode(blob_b64)?;
+        let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
+            .map_err(|e| {
+                ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
+            })?;
+        let src_ec = body
+            .get("source_encryption_context")
+            .and_then(|v| v.as_object())
+            .and_then(build_ec);
+        let dst_ec = body
+            .get("destination_encryption_context")
+            .and_then(|v| v.as_object())
+            .and_then(build_ec);
+        let src_version = src_record
+            .key_versions
+            .iter()
+            .find(|v| v.version_number == header.key_version)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::NOT_FOUND,
+                    "VersionNotFound",
+                    "source key version not found",
+                )
+            })?;
+        let src_ec_aad = src_ec
+            .as_ref()
+            .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+            .unwrap_or_default();
+        let src_aad = header.build_aad(&src_ec_aad);
+        let plaintext = state
+            .provider
+            .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+            .await
+            .map_err(map_core_err)?;
+        let dst_primary = dst_record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "dest has no primary",
+                )
+            })?;
+        let dst_ec_hash = dst_ec.as_ref().map_or(
+            [0u8; 32],
+            keyrack_core::encryption_context::EncryptionContext::hash,
+        );
+        let new_header = keyrack_core::header::CiphertextHeader::new(
+            dst_record.lid,
+            dst_record.current_key_version,
+            dst_ec_hash,
+        );
+        let dst_ec_aad = dst_ec
+            .as_ref()
+            .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
+            .unwrap_or_default();
+        let dst_aad = new_header.build_aad(&dst_ec_aad);
+        let output = state
+            .provider
+            .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
+            "source_key_id": src_record.lid.to_string(),
+            "destination_key_id": dst_record.lid.to_string(),
+        })))
+    })
+    .await
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -817,16 +1089,22 @@ async fn generate_random(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::resource(AuditAction::GenerateRandom, principal, "", "System");
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            #[allow(clippy::cast_possible_truncation)]
-            let n = body.get("number_of_bytes").and_then(serde_json::Value::as_u64).unwrap_or(32) as usize;
-            let random = state.provider.generate_random(n).await.map_err(map_core_err)?;
-            Ok(Json(serde_json::json!({ "random_bytes": base64_encode(random.expose()) })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        #[allow(clippy::cast_possible_truncation)]
+        let n = body
+            .get("number_of_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(32) as usize;
+        let random = state
+            .provider
+            .generate_random(n)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(
+            serde_json::json!({ "random_bytes": base64_encode(random.expose()) }),
+        ))
+    })
+    .await
 }
 
 // ── Tags ────────────────────────────────────────────────────────────
@@ -840,16 +1118,17 @@ async fn list_resource_tags(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::ListResourceTags, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            let tags: Vec<_> = record.user_tags.iter().map(|(k, v)| serde_json::json!({"key": k, "value": v})).collect();
-            Ok(Json(serde_json::json!({ "tags": tags })))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let tags: Vec<_> = record
+            .user_tags
+            .iter()
+            .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+            .collect();
+        Ok(Json(serde_json::json!({ "tags": tags })))
+    })
+    .await
 }
 
 async fn tag_resource(
@@ -862,25 +1141,29 @@ async fn tag_resource(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::TagResource, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if let Some(tags) = body.get("tags").and_then(|v| v.as_array()) {
-                for tag in tags {
-                    if let (Some(k), Some(v)) = (tag.get("key").and_then(|v| v.as_str()), tag.get("value").and_then(|v| v.as_str())) {
-                        record.user_tags.set(k, v);
-                    }
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if let Some(tags) = body.get("tags").and_then(|v| v.as_array()) {
+            for tag in tags {
+                if let (Some(k), Some(v)) = (
+                    tag.get("key").and_then(|v| v.as_str()),
+                    tag.get("value").and_then(|v| v.as_str()),
+                ) {
+                    record.user_tags.set(k, v);
                 }
             }
-            record.occ_version += 1;
-            record.updated_at = chrono::Utc::now();
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(StatusCode::NO_CONTENT)
-        },
-    ).await
+        }
+        record.occ_version += 1;
+        record.updated_at = chrono::Utc::now();
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 async fn untag_resource(
@@ -893,23 +1176,26 @@ async fn untag_resource(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::key(AuditAction::UntagResource, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let lid = parse_lid_rest(&key_id)?;
-            let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-            if let Some(keys) = body.get("tag_keys").and_then(|v| v.as_array()) {
-                for key in keys {
-                    if let Some(k) = key.as_str() { record.user_tags.remove(k); }
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        if let Some(keys) = body.get("tag_keys").and_then(|v| v.as_array()) {
+            for key in keys {
+                if let Some(k) = key.as_str() {
+                    record.user_tags.remove(k);
                 }
             }
-            record.occ_version += 1;
-            record.updated_at = chrono::Utc::now();
-            state.storage.update_key(&record).await.map_err(map_core_err)?;
-            Ok(StatusCode::NO_CONTENT)
-        },
-    ).await
+        }
+        record.occ_version += 1;
+        record.updated_at = chrono::Utc::now();
+        state
+            .storage
+            .update_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 // ── Aliases ─────────────────────────────────────────────────────────
@@ -921,24 +1207,35 @@ async fn create_alias(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let alias_name = body.get("alias_name").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let alias_name = body
+        .get("alias_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
     let mut op_ctx = OpContext::alias(AuditAction::CreateAlias, principal, &alias_name);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            let target_key_id = body.get("target_key_id").and_then(|v| v.as_str()).unwrap_or("");
-            let lid = parse_lid_rest(target_key_id)?;
-            let alias = keyrack_core::storage::AliasRecord {
-                alias_name: alias_name.clone(),
-                target_lid: lid,
-                created_at: chrono::Utc::now(),
-            };
-            state.storage.create_alias(&alias).await.map_err(map_core_err)?;
-            Ok((StatusCode::CREATED, Json(serde_json::json!({ "alias_name": alias_name, "target_key_id": target_key_id }))))
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let target_key_id = body
+            .get("target_key_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lid = parse_lid_rest(target_key_id)?;
+        let alias = keyrack_core::storage::AliasRecord {
+            alias_name: alias_name.clone(),
+            target_lid: lid,
+            created_at: chrono::Utc::now(),
+        };
+        state
+            .storage
+            .create_alias(&alias)
+            .await
+            .map_err(map_core_err)?;
+        Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "alias_name": alias_name, "target_key_id": target_key_id })),
+        ))
+    })
+    .await
 }
 
 async fn list_aliases(
@@ -969,14 +1266,15 @@ async fn delete_alias(
     let principal = ops::extract_principal_rest(&state, &headers).await;
     let mut op_ctx = OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name);
     op_ctx.request_id = request_id;
-    ops::execute_rest(
-        &state,
-        op_ctx,
-        |state| async move {
-            state.storage.delete_alias(&alias_name).await.map_err(map_core_err)?;
-            Ok(StatusCode::NO_CONTENT)
-        },
-    ).await
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        state
+            .storage
+            .delete_alias(&alias_name)
+            .await
+            .map_err(map_core_err)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 // ── Health / Readiness / Metrics ────────────────────────────────────
@@ -987,28 +1285,41 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let caps = state.provider.capabilities();
     let provider_ok = !caps.key_specs.is_empty();
 
-    let status = if storage_ok && provider_ok { "ok" } else { "degraded" };
+    let status = if storage_ok && provider_ok {
+        "ok"
+    } else {
+        "degraded"
+    };
     let code = if storage_ok && provider_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (code, Json(serde_json::json!({
-        "status": status,
-        "components": {
-            "storage": if storage_ok { "ok" } else { "error" },
-            "provider": if provider_ok { "ok" } else { "error" },
-        }
-    })))
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "components": {
+                "storage": if storage_ok { "ok" } else { "error" },
+                "provider": if provider_ok { "ok" } else { "error" },
+            }
+        })),
+    )
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let storage_ok = state.storage.ping().await.is_ok();
     if storage_ok {
-        (StatusCode::OK, Json(serde_json::json!({ "status": "ready", "storage": "ok" })))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready", "storage": "ok" })),
+        )
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "status": "not_ready", "storage": "error" })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "not_ready", "storage": "error" })),
+        )
     }
 }
 
@@ -1019,7 +1330,13 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn parse_lid_rest(s: &str) -> Result<keyrack_core::lid::Lid, RestError> {
-    s.parse().map_err(|_| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeyId", &format!("invalid key_id: {s}")))
+    s.parse().map_err(|_| {
+        ops::rest_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidKeyId",
+            &format!("invalid key_id: {s}"),
+        )
+    })
 }
 
 #[cfg(feature = "crypto-endpoints")]
@@ -1031,6 +1348,13 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(feature = "crypto-endpoints")]
 fn base64_decode(s: &str) -> Result<Vec<u8>, RestError> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(s)
-        .map_err(|_| ops::rest_error(StatusCode::BAD_REQUEST, "InvalidBase64", "invalid base64 encoding"))
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|_| {
+            ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidBase64",
+                "invalid base64 encoding",
+            )
+        })
 }

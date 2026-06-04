@@ -140,12 +140,7 @@ mod tests {
 
     #[test]
     fn status_transitions() {
-        let mut conn = HsmConnection::new(
-            "conn-2",
-            HsmProviderType::Hsm,
-            "/dev/hsm",
-            "test",
-        );
+        let mut conn = HsmConnection::new("conn-2", HsmProviderType::Hsm, "/dev/hsm", "test");
 
         conn.update_status(HsmConnectionStatus::Degraded);
         assert_eq!(conn.status, HsmConnectionStatus::Degraded);
