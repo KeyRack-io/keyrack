@@ -1,0 +1,27 @@
+name: E2E (release-gated)
+
+# Heavy end-to-end demo stacks are gated on release tags, not every PR, to keep
+# the fast CI lane fast. A failure here blocks the release.
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+jobs:
+  demos:
+    name: Demo stacks E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run FOSS demo stacks end-to-end
+        run: ./scripts/run-demos-ci.sh
+
+  # Conformance (AWS KMS shim vs real aws-sdk-kms) plugs in here at Phase 2.
+  # It lives in keyrack-commercial; this lane is the gating point once that
+  # compose profile exists. See keyrack-internal/docs/architecture/conformance.md.
