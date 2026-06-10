@@ -32,12 +32,11 @@
 
 use crate::attr::{AttributeSet, AttributeValue};
 use crate::error::{KeyRackError, Result};
-use crate::key::{
-    KeyOrigin, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord, ProviderClass,
-};
+use crate::key::{KeyOrigin, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord};
 use crate::lid::Lid;
-use crate::provider::CryptoProvider;
+use crate::registry::ProviderRegistry;
 use crate::resolver::{resolve_chain, ResolverConfig};
+use crate::routing::ProviderRouter;
 use crate::rule::RuleRegistry;
 use crate::storage::StorageBackend;
 use crate::tags::{IdentityTags, UserTags};
@@ -99,25 +98,28 @@ impl Drop for InflightGuard<'_> {
 /// Lazy provisioner with single-flight coalescing.
 pub struct LazyProvisioner {
     storage: Arc<dyn StorageBackend>,
-    provider: Arc<dyn CryptoProvider>,
+    providers: Arc<dyn ProviderRegistry>,
     rules: Arc<RuleRegistry>,
     config: ProvisionConfig,
     inflight: Mutex<HashMap<Lid, Waiter>>,
+    router: ProviderRouter,
 }
 
 impl LazyProvisioner {
     pub fn new(
         storage: Arc<dyn StorageBackend>,
-        provider: Arc<dyn CryptoProvider>,
+        providers: Arc<dyn ProviderRegistry>,
         rules: Arc<RuleRegistry>,
         config: ProvisionConfig,
+        router: ProviderRouter,
     ) -> Self {
         Self {
             storage,
-            provider,
+            providers,
             rules,
             config,
             inflight: Mutex::new(HashMap::new()),
+            router,
         }
     }
 
@@ -239,13 +241,20 @@ impl LazyProvisioner {
             .and_then(|m| m.rule.key_spec.clone())
             .unwrap_or_else(|| self.config.default_key_spec.clone());
 
-        let key_handle = self.provider.generate_key(&key_spec).await?;
-
         let now = chrono::Utc::now();
         let mut identity_attrs = AttributeSet::new();
         for (k, v) in attrs {
             identity_attrs.insert(k, AttributeValue::String(v.clone()));
         }
+        let identity_tags = IdentityTags::from_attribute_set(&identity_attrs);
+
+        // Route the new key to the appropriate provider based on identity tags.
+        let provider_name = self.router.select(&identity_tags);
+        let entry = self
+            .providers
+            .resolve(&provider_name)
+            .map_err(|e| KeyRackError::Other(format!("provider routing failed: {e}")))?;
+        let key_handle = entry.provider.generate_key(&key_spec).await?;
 
         let record = KeyRecord {
             lid: *lid,
@@ -257,8 +266,9 @@ impl LazyProvisioner {
             key_usage: self.config.default_key_usage,
             key_spec,
             origin: KeyOrigin::KeyRack,
-            provider_class: ProviderClass::Software,
-            identity_tags: IdentityTags::from_attribute_set(&identity_attrs),
+            provider_class: entry.class,
+            provider_ref: Some(provider_name.clone()),
+            identity_tags,
             user_tags: UserTags::new(),
             created_at: now,
             updated_at: now,
@@ -267,6 +277,7 @@ impl LazyProvisioner {
             key_versions: vec![KeyVersionRecord {
                 version_number: 1,
                 key_handle,
+                provider_ref: Some(provider_name.clone()),
                 created_at: now,
                 is_primary: true,
             }],
@@ -307,9 +318,12 @@ enum KeyProvisionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key::ProviderRef;
     use crate::provider::inmem::InMemoryProvider;
+    use crate::routing::ProviderRouter;
     use crate::rule::*;
     use crate::storage::StorageBackend;
+    use std::sync::Arc;
 
     fn test_registry() -> RuleRegistry {
         let mut reg = RuleRegistry::new();
@@ -478,15 +492,20 @@ mod tests {
 
     #[tokio::test]
     async fn provision_creates_full_chain() {
+        use crate::key::ProviderClass;
+        use crate::registry::{ProviderEntry, StaticProviderRegistry};
+        use crate::key::ProviderRef;
         let storage = build_memory_storage();
-        let provider: Arc<dyn CryptoProvider> = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(InMemoryProvider::new());
+        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
             Arc::clone(&storage),
-            provider,
+            registry,
             rules,
             ProvisionConfig::default(),
+            ProviderRouter::new(vec![], ProviderRef::new("default")),
         );
 
         let attrs = BTreeMap::from([
@@ -509,15 +528,19 @@ mod tests {
 
     #[tokio::test]
     async fn provision_idempotent() {
+        use crate::key::ProviderClass;
+        use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
-        let provider: Arc<dyn CryptoProvider> = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(InMemoryProvider::new());
+        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
             Arc::clone(&storage),
-            provider,
+            registry,
             rules,
             ProvisionConfig::default(),
+            ProviderRouter::new(vec![], ProviderRef::new("default")),
         );
 
         let attrs = BTreeMap::from([
@@ -535,15 +558,19 @@ mod tests {
 
     #[tokio::test]
     async fn provision_shares_parent_keys() {
+        use crate::key::ProviderClass;
+        use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
-        let provider: Arc<dyn CryptoProvider> = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(InMemoryProvider::new());
+        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
             Arc::clone(&storage),
-            provider,
+            registry,
             rules,
             ProvisionConfig::default(),
+            ProviderRouter::new(vec![], ProviderRef::new("default")),
         );
 
         let alice_attrs = BTreeMap::from([
@@ -570,15 +597,19 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_provision_single_flight() {
+        use crate::key::ProviderClass;
+        use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
-        let provider: Arc<dyn CryptoProvider> = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(InMemoryProvider::new());
+        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
         let rules = Arc::new(test_registry());
 
         let prov = Arc::new(LazyProvisioner::new(
             Arc::clone(&storage),
-            provider,
+            registry,
             rules,
             ProvisionConfig::default(),
+            ProviderRouter::new(vec![], ProviderRef::new("default")),
         ));
 
         let attrs = BTreeMap::from([
@@ -608,15 +639,19 @@ mod tests {
 
     #[tokio::test]
     async fn parent_lid_is_set_correctly() {
+        use crate::key::ProviderClass;
+        use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
-        let provider: Arc<dyn CryptoProvider> = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(InMemoryProvider::new());
+        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
             Arc::clone(&storage),
-            provider,
+            registry,
             rules,
             ProvisionConfig::default(),
+            ProviderRouter::new(vec![], ProviderRef::new("default")),
         );
 
         let attrs = BTreeMap::from([

@@ -1,0 +1,28 @@
+services:
+  keyrack:
+    build:
+      context: ../..
+      dockerfile: demos/06-provider-routing/Dockerfile
+    environment:
+      KEYRACK_CONFIG: /config/keyrack.yaml
+      RUST_LOG: info,keyrack_service=debug
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  demo:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      keyrack:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: /bin/sh
+    command: ["/scripts/run-demo.sh"]

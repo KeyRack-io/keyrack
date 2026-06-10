@@ -37,7 +37,9 @@ use keyrack_core::provider::{
     ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroizing;
 
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
@@ -78,6 +80,36 @@ fn map_pkcs11_error(context: &str, e: &cryptoki::error::Error) -> KeyRackError {
     }
 }
 
+/// Process-wide registry of initialized PKCS#11 modules, keyed by library
+/// path.
+///
+/// PKCS#11 permits `C_Initialize` only once per library per process. Multiple
+/// providers backed by the same library (e.g. several tokens / HSM partitions
+/// driven by one vendor `.so`) must therefore share a single initialized
+/// context and select different slots. Without sharing, constructing the
+/// second provider fails with `CKR_CRYPTOKI_ALREADY_INITIALIZED`.
+///
+/// `Pkcs11` is internally reference-counted, so cloning the stored handle is
+/// cheap and all clones drive the same initialized module.
+fn shared_module(lib_path: &str) -> Result<Pkcs11> {
+    static MODULES: OnceLock<Mutex<HashMap<String, Pkcs11>>> = OnceLock::new();
+    let modules = MODULES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = modules
+        .lock()
+        .map_err(|_| KeyRackError::Provider("PKCS#11 module registry poisoned".into()))?;
+
+    if let Some(ctx) = guard.get(lib_path) {
+        return Ok(ctx.clone());
+    }
+
+    let ctx = Pkcs11::new(Path::new(lib_path))
+        .map_err(|e| KeyRackError::Provider(format!("load PKCS#11 lib: {e}")))?;
+    ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .map_err(|e| KeyRackError::Provider(format!("C_Initialize: {e}")))?;
+    guard.insert(lib_path.to_owned(), ctx.clone());
+    Ok(ctx)
+}
+
 /// Configuration for constructing a [`Pkcs11Provider`].
 #[derive(Clone)]
 pub struct Pkcs11ProviderConfig {
@@ -101,11 +133,10 @@ impl Pkcs11Provider {
     /// Create a new provider by loading the PKCS#11 shared library,
     /// finding the token by label, and verifying connectivity.
     pub fn new(config: &Pkcs11ProviderConfig) -> Result<Self> {
-        let ctx = Pkcs11::new(Path::new(&config.lib_path))
-            .map_err(|e| KeyRackError::Provider(format!("load PKCS#11 lib: {e}")))?;
-
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .map_err(|e| KeyRackError::Provider(format!("C_Initialize: {e}")))?;
+        // Share one initialized module per library path so several providers
+        // (e.g. one per tenant token) can be backed by the same `.so` without
+        // a second `C_Initialize` failing with ALREADY_INITIALIZED.
+        let ctx = shared_module(&config.lib_path)?;
 
         let slot = find_slot_by_label(&ctx, &config.token_label)?;
 

@@ -20,10 +20,11 @@
 
 //! Shared application state injected into every gRPC handler.
 
+use crate::routing::ProviderRouter;
 use keyrack_core::audit::AuditSink;
 use keyrack_core::authn::AuthenticatorChain;
 use keyrack_core::pdp::PolicyDecisionPoint;
-use keyrack_core::provider::CryptoProvider;
+use keyrack_core::registry::ProviderRegistry;
 use keyrack_core::storage::StorageBackend;
 use keyrack_nats::NatsStateChangedPublisher;
 use std::sync::Arc;
@@ -35,14 +36,17 @@ use std::sync::Arc;
 /// at startup.
 pub struct ServiceState {
     pub storage: Arc<dyn StorageBackend>,
-    pub provider: Arc<dyn CryptoProvider>,
+    /// Registry of all configured named providers. Replaces the old single
+    /// `provider` + `provider_class` fields.
+    pub providers: Arc<dyn ProviderRegistry>,
+    /// Routes new key creation to a specific provider based on identity tags.
+    pub provider_router: ProviderRouter,
     pub pdp: Arc<dyn PolicyDecisionPoint>,
     pub audit: Arc<dyn AuditSink>,
     pub authn: Arc<AuthenticatorChain>,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub max_plaintext_bytes: usize,
     pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
-    pub provider_class: keyrack_core::key::ProviderClass,
 }
 
 impl ServiceState {

@@ -18,34 +18,4 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! `KeyRack` core library.
-//!
-//! Types, traits, canonicalization, LID derivation, rule engine, resolver,
-//! providers (software, in-memory), audit sinks, and `Sensitive<T>`.
-
-#![forbid(unsafe_code)]
-
-pub mod attr;
-pub mod audit;
-pub mod authn;
-pub mod canon;
-pub mod cascade;
-pub mod encryption_context;
-pub mod error;
-pub mod header;
-pub mod hsm;
-pub mod key;
-pub mod lid;
-pub mod lint;
-pub mod migration;
-pub mod pdp;
-pub mod provider;
-pub mod provisioner;
-pub mod registry;
-pub mod resolver;
-pub mod rotation;
-pub mod routing;
-pub mod rule;
-pub mod sensitive;
-pub mod storage;
-pub mod tags;
+pub use keyrack_core::routing::ProviderRouter;

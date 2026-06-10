@@ -168,13 +168,17 @@ fn transition_err(from: KeyState, to: KeyState) -> DomainError {
     DomainError::FailedPrecondition(format!("cannot transition from {from} to {to}"))
 }
 
-/// Generate a unique LID for a new key.
-///
-/// Seeds the attribute set with a UUID so that every `CreateKey` call
-/// produces a distinct LID even when the caller supplies no identity
-/// attributes.
-pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
+/// Generate a unique LID seeded with caller-supplied identity attributes.
+/// The random `_keyrack_key_id` guarantees a distinct LID per call even when
+/// attributes repeat (keys stay unique/opaque); the caller attributes enrich
+/// `identity_tags` so routing rules can match on them.
+pub fn generate_key_lid_from_attrs(
+    caller_attrs: std::collections::BTreeMap<String, String>,
+) -> (Lid, keyrack_core::attr::AttributeSet) {
     let mut attrs = keyrack_core::attr::AttributeSet::new();
+    for (k, v) in caller_attrs {
+        attrs.insert(&k, keyrack_core::attr::AttributeValue::String(v));
+    }
     attrs.insert(
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
@@ -185,12 +189,23 @@ pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
     (lid, attrs)
 }
 
+/// Generate a unique LID for a new key.
+///
+/// Seeds the attribute set with a UUID so that every `CreateKey` call
+/// produces a distinct LID even when the caller supplies no identity
+/// attributes.
+pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
+    generate_key_lid_from_attrs(std::collections::BTreeMap::new())
+}
+
 // ── Key lifecycle ───────────────────────────────────────────────────
 
 pub struct CreateKeyInput {
     pub key_spec: KeySpec,
     pub description: Option<String>,
     pub parent_key_id: Option<String>,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    pub namespace: String,
 }
 
 pub async fn create_key(
@@ -207,13 +222,35 @@ pub async fn create_key(
         );
     }
 
-    let handle = state
+    let mut caller_attrs = input.attributes.clone();
+    let namespace = input.namespace.clone();
+    let requested_provider = caller_attrs.remove("keyrack.provider");
+    if !namespace.is_empty() {
+        caller_attrs.insert("namespace".to_string(), namespace);
+    }
+    let (lid, attrs) = generate_key_lid_from_attrs(caller_attrs);
+    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+
+    // Route new key to the appropriate provider based on identity tags.
+    let provider_name = state.provider_router.select(&identity_tags);
+    if let Some(req_provider) = &requested_provider {
+        if req_provider != provider_name.as_str() {
+            return Err(DomainError::FailedPrecondition(format!(
+                "requested provider '{req_provider}' but routing policy selected '{}'",
+                provider_name.as_str()
+            )));
+        }
+    }
+    let entry = state
+        .providers
+        .resolve(&provider_name)
+        .map_err(DomainError::from)?;
+
+    let handle = entry
         .provider
         .generate_key(&input.key_spec)
         .await
         .map_err(DomainError::from)?;
-
-    let (lid, attrs) = generate_key_lid();
 
     let parent_lid = input
         .parent_key_id
@@ -238,8 +275,9 @@ pub async fn create_key(
         key_usage,
         key_spec: input.key_spec,
         origin: keyrack_core::key::KeyOrigin::KeyRack,
-        provider_class: state.provider_class,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        provider_class: entry.class,
+        provider_ref: Some(provider_name.clone()),
+        identity_tags,
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -248,6 +286,7 @@ pub async fn create_key(
         key_versions: vec![KeyVersionRecord {
             version_number: 1,
             key_handle: handle,
+            provider_ref: Some(provider_name.clone()),
             created_at: now,
             is_primary: true,
         }],
@@ -540,11 +579,21 @@ pub async fn rotate_key(
         ));
     }
 
-    let new_handle = state
+    // Resolve the provider for the current primary version BEFORE pushing
+    // the new version, so resolution uses the existing binding.
+    let entry = state
+        .providers
+        .resolve_for_primary(&record)
+        .map_err(DomainError::from)?;
+
+    let new_handle = entry
         .provider
         .generate_key(&record.key_spec)
         .await
         .map_err(DomainError::from)?;
+
+    // The new version inherits the key's record-level provider binding.
+    let new_version_provider_ref = record.provider_ref.clone();
     let new_version = record.current_key_version + 1;
     for v in &mut record.key_versions {
         v.is_primary = false;
@@ -552,6 +601,7 @@ pub async fn rotate_key(
     record.key_versions.push(KeyVersionRecord {
         version_number: new_version,
         key_handle: new_handle,
+        provider_ref: new_version_provider_ref,
         created_at: chrono::Utc::now(),
         is_primary: true,
     });
@@ -666,6 +716,11 @@ pub mod crypto {
             .find(|v| v.is_primary)
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
+        let entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(DomainError::from)?;
+
         let ec_aad = input
             .encryption_context
             .as_ref()
@@ -680,7 +735,7 @@ pub mod crypto {
         let header = CiphertextHeader::new(record.lid, record.current_key_version, ec_hash);
         let aad = header.build_aad(&ec_aad);
 
-        let output = state
+        let output = entry
             .provider
             .encrypt(&primary.key_handle, &input.plaintext, &aad)
             .await
@@ -738,12 +793,16 @@ pub mod crypto {
             ));
         }
 
-        let version_handle = record
+        let version_record = record
             .key_versions
             .iter()
             .find(|v| v.version_number == header.key_version)
-            .map(|v| &v.key_handle)
             .ok_or_else(|| DomainError::NotFound("key version not found".into()))?;
+
+        let entry = state
+            .providers
+            .resolve_for_version(&record, header.key_version)
+            .map_err(DomainError::from)?;
 
         let ec_aad = input
             .encryption_context
@@ -753,9 +812,9 @@ pub mod crypto {
 
         let aad = header.build_aad(&ec_aad);
 
-        let plaintext = state
+        let plaintext = entry
             .provider
-            .decrypt(version_handle, ciphertext, &aad)
+            .decrypt(&version_record.key_handle, ciphertext, &aad)
             .await
             .map_err(DomainError::from)?;
 
@@ -806,18 +865,21 @@ pub mod crypto {
             .find(|v| v.version_number == header.key_version)
             .ok_or_else(|| DomainError::NotFound("source key version not found".into()))?;
 
+        let src_entry = state
+            .providers
+            .resolve_for_version(&src_record, header.key_version)
+            .map_err(DomainError::from)?;
+        let dst_entry = state
+            .providers
+            .resolve_for_primary(&dst_record)
+            .map_err(DomainError::from)?;
+
         let src_ec_aad = input
             .source_encryption_context
             .as_ref()
             .map(EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let src_aad = header.build_aad(&src_ec_aad);
-
-        let plaintext = state
-            .provider
-            .decrypt(&src_version.key_handle, ciphertext, &src_aad)
-            .await
-            .map_err(DomainError::from)?;
 
         let dst_primary = dst_record
             .key_versions
@@ -840,11 +902,33 @@ pub mod crypto {
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
 
-        let output = state
-            .provider
-            .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
-            .await
-            .map_err(DomainError::from)?;
+        // Same-provider path: use atomic re_encrypt (no plaintext leaves provider).
+        // Cross-provider path: decrypt on source, re-encrypt on destination
+        // (plaintext transits service memory).
+        let output = if Arc::ptr_eq(&src_entry.provider, &dst_entry.provider) {
+            src_entry
+                .provider
+                .re_encrypt(
+                    &src_version.key_handle,
+                    ciphertext,
+                    &src_aad,
+                    &dst_primary.key_handle,
+                    &dst_aad,
+                )
+                .await
+                .map_err(DomainError::from)?
+        } else {
+            let plaintext = src_entry
+                .provider
+                .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                .await
+                .map_err(DomainError::from)?;
+            dst_entry
+                .provider
+                .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                .await
+                .map_err(DomainError::from)?
+        };
 
         Ok(ReEncryptOutput {
             ciphertext_blob: new_header.wrap_payload(&output.ciphertext),
@@ -889,7 +973,12 @@ pub mod crypto {
             .find(|v| v.is_primary)
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
-        let signature = state
+        let entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(DomainError::from)?;
+
+        let signature = entry
             .provider
             .sign(&primary.key_handle, input.signing_algorithm, &input.message)
             .await
@@ -939,7 +1028,12 @@ pub mod crypto {
             .find(|v| v.is_primary)
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
-        let valid = state
+        let entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(DomainError::from)?;
+
+        let valid = entry
             .provider
             .verify(
                 &primary.key_handle,
@@ -994,6 +1088,11 @@ pub mod crypto {
             .find(|v| v.is_primary)
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
+        let entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(DomainError::from)?;
+
         let ec_aad = input
             .encryption_context
             .as_ref()
@@ -1010,7 +1109,7 @@ pub mod crypto {
 
         let dek_len = dek_length(input.key_spec.as_ref(), input.number_of_bytes);
 
-        let output = state
+        let output = entry
             .provider
             .generate_data_key(&primary.key_handle, dek_len, &aad)
             .await
@@ -1044,6 +1143,8 @@ pub mod crypto {
         length: usize,
     ) -> Result<Vec<u8>, DomainError> {
         let random = state
+            .providers
+            .default_entry()
             .provider
             .generate_random(length)
             .await

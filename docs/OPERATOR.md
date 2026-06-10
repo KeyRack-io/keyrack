@@ -154,6 +154,58 @@ provider:
   type: in_memory
 ```
 
+### Multiple providers and routing
+
+The single `provider:` block above is shorthand for one provider named
+`default`. To back keys with more than one provider (e.g. multi-tenant HYOK,
+or migrating keys between HSMs), use the `providers:` list instead. Each entry
+has a `name` plus the same fields the single `provider:` block accepts:
+
+```yaml
+providers:
+  - name: shared-soft
+    type: software
+  - name: tenant-acme
+    type: kmip
+    host: "kmip.acme.internal"
+    port: 5696
+    client_cert: "/etc/keyrack/tls/acme-client.pem"
+    client_key: "/etc/keyrack/tls/acme-client-key.pem"
+
+# Provider used for new keys when no routing rule matches.
+# Required whenever more than one provider is configured.
+default_provider: shared-soft
+
+# Ordered rules; the first whose `match` tags are ALL present (AND logic)
+# wins. Matched against the new key's identity tags.
+provider_routing:
+  - match:
+      tenant: acme
+    provider: tenant-acme
+```
+
+Notes:
+
+- **Backward compatible.** A lone `provider:` block keeps working unchanged; it
+  is equivalent to a single provider named `default`. Do not set both
+  `provider:` and `providers:`.
+- **Routing is by identity tag, not by request choice.** A new key is routed to
+  a provider based on its identity tags. Callers populate those tags via the
+  `attributes` (and `namespace`) fields on `CreateKey`; a routing rule then
+  matches on them. With no caller attributes, keys go to `default_provider`.
+- **Binding is per key version and permanent.** The selected provider is
+  persisted on the key (and each version). Reads, decrypts, and signatures
+  always use the provider that minted that version — routing rules are never
+  re-evaluated for existing keys. This is what lets a key migrate backends
+  (BYOK ↔ HYOK) via `rotate_key`: the new version can land on a different
+  provider while old ciphertext keeps decrypting on the original.
+- **Optional fail-closed assertion.** A caller may set the reserved attribute
+  `keyrack.provider` to assert the expected target. If it does not match what
+  the routing policy selects, `CreateKey` is rejected. The assertion never
+  overrides policy — it only guards against silent misplacement (the reserved
+  key is stripped before identity derivation, so it never affects the key's
+  identity or LID).
+
 ---
 
 ## Authorization (PDP)

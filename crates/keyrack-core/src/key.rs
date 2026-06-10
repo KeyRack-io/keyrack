@@ -139,6 +139,49 @@ pub enum ProviderClass {
     VaultTransit,
 }
 
+/// Name of a configured crypto provider, used as a routing key.
+///
+/// This is a SIDE PROPERTY of a key/version: it selects which configured
+/// [`CryptoProvider`](crate::provider::CryptoProvider) backs the material.
+/// It MUST NOT participate in LID derivation — logical key identity stays
+/// independent of the physical backend so that keys can migrate between
+/// providers/HSMs (BYOK <-> HYOK) without their identity, or the LID
+/// pinned into existing ciphertext headers, changing.
+///
+/// `None` on a record/version means "use the registry default provider".
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProviderRef(pub String);
+
+impl ProviderRef {
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ProviderRef {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for ProviderRef {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// Where the key material originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +204,15 @@ pub struct KeyVersionRecord {
     pub version_number: u64,
     /// Provider-side handle to the material for this version.
     pub key_handle: KeyHandle,
+    /// Which configured provider backs THIS version's material.
+    ///
+    /// Per-version (not just per-key) so a single logical key can
+    /// straddle two backends during an HSM-to-HSM migration: old
+    /// versions stay on the source provider while a newly rotated
+    /// version lives on the destination. `None` => inherit the key's
+    /// default binding, falling back to the registry default.
+    #[serde(default)]
+    pub provider_ref: Option<ProviderRef>,
     /// When this version was created (initial creation or rotation).
     pub created_at: DateTime<Utc>,
     /// Whether this version is the current primary for encrypt/sign.
@@ -192,6 +244,12 @@ pub struct KeyRecord {
     pub key_spec: KeySpec,
     pub origin: KeyOrigin,
     pub provider_class: ProviderClass,
+    /// Default provider binding for NEW versions of this key, chosen by
+    /// routing rules at creation time. Side property — never part of the
+    /// LID. `None` => registry default. Individual versions may override
+    /// via [`KeyVersionRecord::provider_ref`] (e.g. mid-migration).
+    #[serde(default)]
+    pub provider_ref: Option<ProviderRef>,
     pub identity_tags: IdentityTags,
     pub user_tags: UserTags,
     pub created_at: DateTime<Utc>,
@@ -236,10 +294,22 @@ impl KeyRecord {
             .iter()
             .find(|v| v.version_number == version_number)
     }
+
+    /// Resolve the effective provider binding for a given key version.
+    ///
+    /// Resolution order: the version's own `provider_ref`, then the
+    /// key's default `provider_ref`. `None` means the caller should fall
+    /// back to the registry's default provider.
+    #[must_use]
+    pub fn effective_provider_ref(&self, version_number: u64) -> Option<&ProviderRef> {
+        self.get_version(version_number)
+            .and_then(|v| v.provider_ref.as_ref())
+            .or(self.provider_ref.as_ref())
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -352,6 +422,60 @@ mod tests {
         assert!(record.get_version(999).is_none());
     }
 
+    #[test]
+    fn provider_ref_defaults_to_none_for_legacy_records() {
+        // A record serialized before provider routing existed has no
+        // `provider_ref` on the record or its versions. It must still
+        // deserialize, defaulting both to `None` (=> registry default).
+        let mut record = make_test_record(KeyState::Enabled);
+        record.provider_ref = None;
+        let json = serde_json::to_string(&record).unwrap();
+
+        // Strip the fields entirely to simulate an older on-disk blob.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("provider_ref");
+        if let Some(versions) = obj.get_mut("key_versions").and_then(|v| v.as_array_mut()) {
+            for v in versions {
+                v.as_object_mut().unwrap().remove("provider_ref");
+            }
+        }
+        let legacy = serde_json::to_string(&value).unwrap();
+
+        let parsed: KeyRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(parsed.provider_ref, None);
+        assert!(parsed.key_versions.iter().all(|v| v.provider_ref.is_none()));
+        assert_eq!(parsed.effective_provider_ref(1), None);
+    }
+
+    #[test]
+    fn effective_provider_ref_resolution_order() {
+        let mut record = make_test_record(KeyState::Enabled);
+
+        // No binding anywhere => None (registry default).
+        assert_eq!(record.effective_provider_ref(1), None);
+
+        // Key-level default applies when the version has none.
+        record.provider_ref = Some(ProviderRef::new("default-hsm"));
+        assert_eq!(
+            record.effective_provider_ref(1),
+            Some(&ProviderRef::new("default-hsm"))
+        );
+
+        // Version-level binding overrides the key default (migration case).
+        record.key_versions[0].provider_ref = Some(ProviderRef::new("tenant-hsm"));
+        assert_eq!(
+            record.effective_provider_ref(1),
+            Some(&ProviderRef::new("tenant-hsm"))
+        );
+
+        // Unknown version falls back to the key default.
+        assert_eq!(
+            record.effective_provider_ref(999),
+            Some(&ProviderRef::new("default-hsm"))
+        );
+    }
+
     pub(crate) fn make_test_record(state: KeyState) -> KeyRecord {
         use crate::attr::{AttributeSet, AttributeValue};
         use crate::canon::{canonicalize, CanonicalizationVersion};
@@ -372,6 +496,7 @@ mod tests {
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
             provider_class: ProviderClass::Software,
+            provider_ref: None,
             identity_tags: IdentityTags::from_attribute_set(&attrs),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
@@ -384,6 +509,7 @@ mod tests {
                     key_id: "test-handle".into(),
                     key_spec: KeySpec::Aes256,
                 },
+                provider_ref: None,
                 created_at: Utc::now(),
                 is_primary: true,
             }],

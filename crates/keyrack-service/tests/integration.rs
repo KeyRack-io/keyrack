@@ -97,8 +97,14 @@ fn build_test_state_with(
     pdp: Arc<dyn PolicyDecisionPoint>,
     audit: Arc<dyn AuditSink>,
 ) -> Arc<ServiceState> {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
     let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
     let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::InsecureAuthenticator),
     ]));
@@ -106,14 +112,14 @@ fn build_test_state_with(
     let metrics_handle = recorder.handle();
     Arc::new(ServiceState {
         storage,
-        provider,
+        providers,
+        provider_router,
         pdp,
         audit,
         authn,
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
-        provider_class: keyrack_core::key::ProviderClass::Software,
     })
 }
 
@@ -695,6 +701,513 @@ async fn generate_data_key_returns_both_keys() {
         "encrypted key must be non-empty"
     );
     assert_eq!(inner.key_id, key);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Provider Routing Tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// Build a two-provider ServiceState with optional routing rules.
+/// Provider "default" is an InMemoryProvider; "tenant-b" is another InMemoryProvider.
+fn build_two_provider_state(
+    routing_rules: Vec<(std::collections::BTreeMap<String, String>, keyrack_core::key::ProviderRef)>,
+) -> Arc<ServiceState> {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{ProviderEntry, StaticProviderRegistry};
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_tenant_b = Arc::new(InMemoryProvider::new());
+
+    let registry = Arc::new(
+        StaticProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("default"),
+                    ProviderEntry {
+                        provider: prov_default,
+                        class: ProviderClass::InMemory,
+                    },
+                ),
+                (
+                    ProviderRef::new("tenant-b"),
+                    ProviderEntry {
+                        provider: prov_tenant_b,
+                        class: ProviderClass::InMemory,
+                    },
+                ),
+            ],
+            ProviderRef::new("default"),
+        )
+        .expect("valid registry"),
+    );
+
+    let default_ref = ProviderRef::new("default");
+    let provider_router = ProviderRouter::new(routing_rules, default_ref);
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> =
+        Arc::new(keyrack_core::pdp::AlwaysAllow);
+    let audit: Arc<dyn AuditSink> = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    })
+}
+
+/// 1. Key with no matching rule → default provider; encrypt/decrypt round-trips.
+#[tokio::test]
+async fn routing_no_match_uses_default_provider() {
+    use keyrack_core::key::ProviderRef;
+    let state = build_two_provider_state(vec![]);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let key_id = create_aes_key(&svc).await;
+
+    // The record should be bound to the "default" provider.
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("valid lid");
+    let record = state.storage.get_key(&lid).await.expect("key exists");
+    assert_eq!(record.provider_ref, Some(ProviderRef::new("default")));
+    assert_eq!(record.key_versions[0].provider_ref, Some(ProviderRef::new("default")));
+
+    // Encrypt/decrypt round-trip.
+    let pt = b"hello routing";
+    let enc = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: pt.to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("encrypt ok")
+        .into_inner();
+
+    let dec = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: key_id.clone(),
+            ciphertext_blob: enc.ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect("decrypt ok")
+        .into_inner();
+
+    assert_eq!(dec.plaintext, pt.to_vec());
+}
+
+/// 2. Key whose identity tags match a routing rule → bound to "tenant-b"; round-trips.
+///
+/// This exercises the router selection + provider binding directly through the
+/// domain layer with controlled attrs. (The full create-handler path is covered
+/// end-to-end by `routing_create_with_attributes_routes_to_tenant_b`.)
+#[tokio::test]
+async fn routing_matching_rule_selects_tenant_b() {
+    use keyrack_core::key::ProviderRef;
+    use keyrack_core::registry::ProviderRegistry;
+    use std::collections::BTreeMap;
+
+    // Rule: if identity tag `tenant` == `acme`, use "tenant-b".
+    let mut match_tags = BTreeMap::new();
+    match_tags.insert("tenant".into(), "acme".into());
+    let state = build_two_provider_state(vec![(match_tags, ProviderRef::new("tenant-b"))]);
+
+    // Build identity tags that match the rule.
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "tenant",
+        keyrack_core::attr::AttributeValue::String("acme".into()),
+    );
+    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+
+    let selected = state.provider_router.select(&identity_tags);
+    assert_eq!(selected, ProviderRef::new("tenant-b"));
+
+    // Resolve the provider and generate a key on it.
+    let entry = state
+        .providers
+        .resolve(&selected)
+        .expect("tenant-b resolves");
+    let handle = entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .expect("generate_key ok");
+
+    // Build a record manually with the correct provider binding.
+    let now = chrono::Utc::now();
+    let mut attrs2 = keyrack_core::attr::AttributeSet::new();
+    attrs2.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    attrs2.insert(
+        "tenant",
+        keyrack_core::attr::AttributeValue::String("acme".into()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs2,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: entry.class,
+        provider_ref: Some(selected.clone()),
+        identity_tags: identity_tags.clone(),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "routing test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(selected.clone()),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.expect("created");
+
+    // Verify the record is bound to tenant-b.
+    let fetched = state.storage.get_key(&lid).await.expect("found");
+    assert_eq!(fetched.provider_ref, Some(ProviderRef::new("tenant-b")));
+    assert_eq!(
+        fetched.key_versions[0].provider_ref,
+        Some(ProviderRef::new("tenant-b"))
+    );
+
+    // Encrypt/decrypt via the domain layer.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let pt = b"tenant-b secret";
+    let enc = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: pt.to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("encrypt ok")
+        .into_inner();
+
+    let dec = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: lid.to_string(),
+            ciphertext_blob: enc.ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect("decrypt ok")
+        .into_inner();
+
+    assert_eq!(dec.plaintext, pt.to_vec());
+}
+
+/// 2b. End-to-end: creating a key through the gRPC handler with caller-supplied
+/// `attributes` that match a routing rule binds the new key to the routed
+/// provider. Proves identity enrichment makes routing reachable via the API.
+#[tokio::test]
+async fn routing_create_with_attributes_routes_to_tenant_b() {
+    use keyrack_core::key::ProviderRef;
+    use std::collections::BTreeMap;
+
+    let mut match_tags = BTreeMap::new();
+    match_tags.insert("tenant".into(), "acme".into());
+    let state = build_two_provider_state(vec![(match_tags, ProviderRef::new("tenant-b"))]);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("tenant".to_string(), "acme".to_string());
+
+    let key_id = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "routed key".into(),
+            attributes,
+            ..Default::default()
+        }))
+        .await
+        .expect("create_key ok")
+        .into_inner()
+        .metadata
+        .expect("metadata")
+        .key_id;
+
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("valid lid");
+    let record = state.storage.get_key(&lid).await.expect("key exists");
+    assert_eq!(record.provider_ref, Some(ProviderRef::new("tenant-b")));
+    assert_eq!(
+        record.key_versions[0].provider_ref,
+        Some(ProviderRef::new("tenant-b"))
+    );
+}
+
+/// 2c. The optional `keyrack.provider` assertion is fail-closed: if the caller
+/// asserts a provider that does not match what routing policy selects, the
+/// create call is rejected (the assertion never overrides policy).
+#[tokio::test]
+async fn routing_provider_assertion_mismatch_fails() {
+    // No routing rules → everything routes to "default".
+    let state = build_two_provider_state(vec![]);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let mut attributes = std::collections::HashMap::new();
+    // Assert "tenant-b" while policy will select "default" → must fail.
+    attributes.insert("keyrack.provider".to_string(), "tenant-b".to_string());
+
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "asserted key".into(),
+            attributes,
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("assertion mismatch must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// 3. A version whose `provider_ref` names an unknown provider → ProviderUnavailable.
+#[tokio::test]
+async fn routing_unknown_provider_yields_unavailable() {
+    use keyrack_core::key::ProviderRef;
+    let state = build_two_provider_state(vec![]);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let key_id = create_aes_key(&svc).await;
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("valid lid");
+
+    // Corrupt the record to reference a nonexistent provider.
+    let mut record = state.storage.get_key(&lid).await.expect("found");
+    record.provider_ref = Some(ProviderRef::new("ghost-provider"));
+    record.key_versions[0].provider_ref = Some(ProviderRef::new("ghost-provider"));
+    record.occ_version += 1;
+    record.updated_at = chrono::Utc::now();
+    state.storage.update_key(&record).await.expect("updated");
+
+    // Encrypt should yield an error because ghost-provider doesn't exist.
+    let result = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: b"test".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+
+    assert!(result.is_err(), "should fail with ProviderUnavailable");
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unavailable,
+        "expected Unavailable status, got: {:?}",
+        status
+    );
+}
+
+/// 4. Legacy record (provider_ref: None) resolves to default and round-trips.
+#[tokio::test]
+async fn routing_legacy_record_none_provider_ref_uses_default() {
+    use keyrack_core::key::ProviderRef;
+    use keyrack_core::registry::ProviderRegistry;
+    let state = build_two_provider_state(vec![]);
+
+    // Create a record with no provider_ref (simulating old stored data).
+    let default_entry = state.providers.default_entry();
+    let handle = default_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .expect("generate_key");
+
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+
+    // provider_ref: None on both record and version (legacy format).
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: None,
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "legacy".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: None,
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.expect("created");
+
+    // Verify: effective_provider_ref returns None (uses registry default).
+    let fetched = state.storage.get_key(&lid).await.expect("found");
+    assert_eq!(fetched.provider_ref, None);
+    assert_eq!(fetched.key_versions[0].provider_ref, None);
+    assert_eq!(fetched.effective_provider_ref(1), None);
+
+    // Encrypt/decrypt should still work via the default provider.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let pt = b"legacy record test";
+    let enc = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: pt.to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("encrypt ok")
+        .into_inner();
+    let dec = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: lid.to_string(),
+            ciphertext_blob: enc.ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect("decrypt ok")
+        .into_inner();
+    assert_eq!(dec.plaintext, pt.to_vec());
+}
+
+/// 5. Migration: create key on "default", add new version on "tenant-b",
+///    verify old ciphertext (pinned to v1 on default) still decrypts,
+///    and new encrypt uses v2 on tenant-b.
+#[tokio::test]
+async fn routing_cross_version_migration() {
+    use keyrack_core::key::ProviderRef;
+    use keyrack_core::registry::ProviderRegistry;
+    let state = build_two_provider_state(vec![]);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Step 1: create on default provider.
+    let key_id = create_aes_key(&svc).await;
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("valid lid");
+
+    // Step 2: encrypt with v1 (on default).
+    let pt_v1 = b"v1 plaintext";
+    let enc_v1 = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: pt_v1.to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("encrypt v1")
+        .into_inner();
+
+    // Step 3: generate v2 material on "tenant-b" and make it primary.
+    let tenant_b_entry = state
+        .providers
+        .resolve(&ProviderRef::new("tenant-b"))
+        .expect("resolve tenant-b");
+    let v2_handle = tenant_b_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .expect("generate v2");
+
+    let mut record = state.storage.get_key(&lid).await.expect("found");
+    for v in &mut record.key_versions {
+        v.is_primary = false;
+    }
+    let v2_num = record.current_key_version + 1;
+    record.key_versions.push(keyrack_core::key::KeyVersionRecord {
+        version_number: v2_num,
+        key_handle: v2_handle,
+        provider_ref: Some(ProviderRef::new("tenant-b")),
+        created_at: chrono::Utc::now(),
+        is_primary: true,
+    });
+    record.current_key_version = v2_num;
+    record.occ_version += 1;
+    record.updated_at = chrono::Utc::now();
+    state.storage.update_key(&record).await.expect("updated");
+
+    // Step 4: new encrypt uses v2 (tenant-b).
+    let pt_v2 = b"v2 plaintext";
+    let enc_v2 = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: pt_v2.to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("encrypt v2")
+        .into_inner();
+    assert_eq!(enc_v2.key_version, v2_num as u32);
+
+    // Step 5: old v1 ciphertext still decrypts on default provider.
+    let dec_v1 = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: key_id.clone(),
+            ciphertext_blob: enc_v1.ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect("decrypt v1")
+        .into_inner();
+    assert_eq!(dec_v1.plaintext, pt_v1.to_vec());
+
+    // Step 6: new v2 ciphertext decrypts on tenant-b provider.
+    let dec_v2 = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: key_id.clone(),
+            ciphertext_blob: enc_v2.ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect("decrypt v2")
+        .into_inner();
+    assert_eq!(dec_v2.plaintext, pt_v2.to_vec());
 }
 
 // ═══════════════════════════════════════════════════════════════════

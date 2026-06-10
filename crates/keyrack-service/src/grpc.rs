@@ -71,23 +71,6 @@ fn build_encryption_context(
     Some(ec)
 }
 
-/// Generate a unique LID for a new key by seeding the attribute set
-/// with a UUID.  This ensures every `CreateKey` produces a distinct
-/// LID even when the caller does not supply identity attributes.
-fn generate_key_lid() -> (keyrack_core::lid::Lid, keyrack_core::attr::AttributeSet) {
-    let mut attrs = keyrack_core::attr::AttributeSet::new();
-    attrs.insert(
-        "_keyrack_key_id",
-        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
-    );
-    let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
-    let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &canonical,
-    );
-    (lid, attrs)
-}
 
 #[tonic::async_trait]
 impl KeyService for KeyServiceImpl {
@@ -166,7 +149,11 @@ impl KeyService for KeyServiceImpl {
 
                 let aad = header.build_aad(&ec_aad);
 
-                let output = state
+                let enc_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let output = enc_entry
                     .provider
                     .encrypt(&primary_version.key_handle, &req.plaintext, &aad)
                     .await
@@ -242,12 +229,16 @@ impl KeyService for KeyServiceImpl {
                     return Err(Status::invalid_argument("encryption context mismatch"));
                 }
 
-                let version_handle = record
+                let version_record = record
                     .key_versions
                     .iter()
                     .find(|v| v.version_number == header.key_version)
-                    .map(|v| &v.key_handle)
                     .ok_or_else(|| Status::not_found("key version not found"))?;
+
+                let dec_entry = state
+                    .providers
+                    .resolve_for_version(&record, header.key_version)
+                    .map_err(convert::error_to_status)?;
 
                 let ec_aad = ec
                     .as_ref()
@@ -256,9 +247,9 @@ impl KeyService for KeyServiceImpl {
 
                 let aad = header.build_aad(&ec_aad);
 
-                let plaintext = state
+                let plaintext = dec_entry
                     .provider
-                    .decrypt(version_handle, ciphertext, &aad)
+                    .decrypt(&version_record.key_handle, ciphertext, &aad)
                     .await
                     .map_err(convert::error_to_status)?;
 
@@ -334,10 +325,13 @@ impl KeyService for KeyServiceImpl {
                     .unwrap_or_default();
                 let src_aad = header.build_aad(&src_ec_aad);
 
-                let plaintext = state
-                    .provider
-                    .decrypt(&src_version.key_handle, ciphertext, &src_aad)
-                    .await
+                let src_re_entry = state
+                    .providers
+                    .resolve_for_version(&src_record, header.key_version)
+                    .map_err(convert::error_to_status)?;
+                let dst_re_entry = state
+                    .providers
+                    .resolve_for_primary(&dst_record)
                     .map_err(convert::error_to_status)?;
 
                 let dst_primary = dst_record
@@ -363,11 +357,26 @@ impl KeyService for KeyServiceImpl {
                     .unwrap_or_default();
                 let dst_aad = new_header.build_aad(&dst_ec_aad);
 
-                let output = state
-                    .provider
-                    .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
+                    src_re_entry.provider.re_encrypt(
+                        &src_version.key_handle,
+                        ciphertext,
+                        &src_aad,
+                        &dst_primary.key_handle,
+                        &dst_aad,
+                    ).await.map_err(convert::error_to_status)?
+                } else {
+                    let plaintext = src_re_entry
+                        .provider
+                        .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                        .await
+                        .map_err(convert::error_to_status)?;
+                    dst_re_entry
+                        .provider
+                        .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                        .await
+                        .map_err(convert::error_to_status)?
+                };
 
                 Ok(Response::new(proto::ReEncryptResponse {
                     ciphertext_blob: new_header.wrap_payload(&output.ciphertext),
@@ -446,7 +455,11 @@ impl KeyService for KeyServiceImpl {
                 let aad = header.build_aad(&ec_aad);
                 let dek_len = dek_length_from_spec(req.key_spec);
 
-                let output = state
+                let gdek_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let output = gdek_entry
                     .provider
                     .generate_data_key(&primary.key_handle, dek_len, &aad)
                     .await
@@ -526,7 +539,11 @@ impl KeyService for KeyServiceImpl {
                 );
                 let aad = header.build_aad(&ec_aad);
                 let dek_len = dek_length_from_spec(req.key_spec);
-                let output = state
+                let gdkwp_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let output = gdkwp_entry
                     .provider
                     .generate_data_key(&primary.key_handle, dek_len, &aad)
                     .await
@@ -561,6 +578,8 @@ impl KeyService for KeyServiceImpl {
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
                 let random_bytes = state
+                    .providers
+                    .default_entry()
                     .provider
                     .generate_random(req.number_of_bytes as usize)
                     .await
@@ -614,7 +633,11 @@ impl KeyService for KeyServiceImpl {
                     .iter()
                     .find(|v| v.is_primary)
                     .ok_or_else(|| Status::internal("no primary key version"))?;
-                let signature = state
+                let sign_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let signature = sign_entry
                     .provider
                     .sign(&primary_version.key_handle, alg, &req.message)
                     .await
@@ -669,7 +692,11 @@ impl KeyService for KeyServiceImpl {
                     .iter()
                     .find(|v| v.is_primary)
                     .ok_or_else(|| Status::internal("no primary key version"))?;
-                let valid = state
+                let verify_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let valid = verify_entry
                     .provider
                     .verify(
                         &primary_version.key_handle,
@@ -717,9 +744,29 @@ impl KeyService for KeyServiceImpl {
                     );
                 }
 
-                let handle = state.provider.generate_key(&spec).await.map_err(convert::error_to_status)?;
+                let mut caller_attrs: std::collections::BTreeMap<String, String> =
+                    req.attributes.clone().into_iter().collect();
+                let namespace = req.namespace.clone();
+                let requested_provider = caller_attrs.remove("keyrack.provider");
+                if !namespace.is_empty() {
+                    caller_attrs.insert("namespace".to_string(), namespace);
+                }
+                let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
+                let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
 
-                let (lid, attrs) = generate_key_lid();
+                // Route new key to the appropriate provider.
+                let provider_name = state.provider_router.select(&identity_tags);
+                if let Some(req_provider) = &requested_provider {
+                    if req_provider != provider_name.as_str() {
+                        return Err(Status::failed_precondition(format!(
+                            "requested provider '{req_provider}' but routing policy selected '{}'",
+                            provider_name.as_str()
+                        )));
+                    }
+                }
+                let entry = state.providers.resolve(&provider_name).map_err(convert::error_to_status)?;
+
+                let handle = entry.provider.generate_key(&spec).await.map_err(convert::error_to_status)?;
 
                 let parent_lid = req.parent_key_id
                     .as_deref()
@@ -743,8 +790,9 @@ impl KeyService for KeyServiceImpl {
                     key_usage,
                     key_spec: spec,
                     origin: keyrack_core::key::KeyOrigin::KeyRack,
-                    provider_class: state.provider_class,
-                    identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+                    provider_class: entry.class,
+                    provider_ref: Some(provider_name.clone()),
+                    identity_tags,
                     user_tags: keyrack_core::tags::UserTags::new(),
                     created_at: now,
                     updated_at: now,
@@ -753,6 +801,7 @@ impl KeyService for KeyServiceImpl {
                     key_versions: vec![keyrack_core::key::KeyVersionRecord {
                         version_number: 1,
                         key_handle: handle,
+                        provider_ref: Some(provider_name.clone()),
                         created_at: now,
                         is_primary: true,
                     }],
@@ -1169,11 +1218,16 @@ impl KeyService for KeyServiceImpl {
             if record.state != keyrack_core::key::KeyState::Enabled {
                 return Err(Status::failed_precondition("key must be Enabled to rotate"));
             }
-            let new_handle = state
+            let rot_entry = state
+                .providers
+                .resolve_for_primary(&record)
+                .map_err(convert::error_to_status)?;
+            let new_handle = rot_entry
                 .provider
                 .generate_key(&record.key_spec)
                 .await
                 .map_err(convert::error_to_status)?;
+            let new_version_provider_ref = record.provider_ref.clone();
             let new_version = record.current_key_version + 1;
             for v in &mut record.key_versions {
                 v.is_primary = false;
@@ -1183,6 +1237,7 @@ impl KeyService for KeyServiceImpl {
                 .push(keyrack_core::key::KeyVersionRecord {
                     version_number: new_version,
                     key_handle: new_handle,
+                    provider_ref: new_version_provider_ref,
                     created_at: chrono::Utc::now(),
                     is_primary: true,
                 });

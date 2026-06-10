@@ -58,6 +58,9 @@ struct KeyResponse {
     key_usage: keyrack_core::key::KeyUsage,
     origin: keyrack_core::key::KeyOrigin,
     provider_class: keyrack_core::key::ProviderClass,
+    /// Name of the configured provider this key is bound to (routing target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_ref: Option<String>,
     description: String,
     user_tags: keyrack_core::tags::UserTags,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -79,6 +82,7 @@ impl From<&KeyRecord> for KeyResponse {
             key_usage: r.key_usage,
             origin: r.origin,
             provider_class: r.provider_class,
+            provider_ref: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
             description: r.description.clone(),
             user_tags: r.user_tags.clone(),
             created_at: r.created_at,
@@ -212,21 +216,6 @@ fn transition_err(from: keyrack_core::key::KeyState, to: keyrack_core::key::KeyS
     )
 }
 
-/// Generate a unique LID (mirrors grpc.rs logic).
-fn generate_key_lid() -> (keyrack_core::lid::Lid, keyrack_core::attr::AttributeSet) {
-    let mut attrs = keyrack_core::attr::AttributeSet::new();
-    attrs.insert(
-        "_keyrack_key_id",
-        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
-    );
-    let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
-    let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &canonical,
-    );
-    (lid, attrs)
-}
 
 #[cfg(feature = "crypto-endpoints")]
 fn build_ec(
@@ -278,8 +267,44 @@ async fn create_key(
                      Consider RSA-3072+ or ECDSA P-256 for new keys."
                 );
             }
-            let handle = state.provider.generate_key(&spec).await.map_err(map_core_err)?;
-            let (lid, attrs) = generate_key_lid();
+            let mut caller_attrs: std::collections::BTreeMap<String, String> = body
+                .get("attributes")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let namespace = body
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let requested_provider = caller_attrs.remove("keyrack.provider");
+            if !namespace.is_empty() {
+                caller_attrs.insert("namespace".to_string(), namespace);
+            }
+            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
+            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+
+            // Route new key to the appropriate provider.
+            let provider_name = state.provider_router.select(&identity_tags);
+            if let Some(req_provider) = &requested_provider {
+                if req_provider != provider_name.as_str() {
+                    return Err(ops::rest_error(
+                        StatusCode::CONFLICT,
+                        "ProviderMismatch",
+                        &format!(
+                            "requested provider '{req_provider}' but routing policy selected '{}'",
+                            provider_name.as_str()
+                        ),
+                    ));
+                }
+            }
+            let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
+
+            let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
 
             let parent_lid = body.get("parent_key_id")
                 .and_then(|v| v.as_str())
@@ -303,8 +328,9 @@ async fn create_key(
                 key_usage,
                 key_spec: spec,
                 origin: keyrack_core::key::KeyOrigin::KeyRack,
-                provider_class: state.provider_class,
-                identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+                provider_class: entry.class,
+                provider_ref: Some(provider_name.clone()),
+                identity_tags,
                 user_tags: keyrack_core::tags::UserTags::new(),
                 created_at: now,
                 updated_at: now,
@@ -313,6 +339,7 @@ async fn create_key(
                 key_versions: vec![keyrack_core::key::KeyVersionRecord {
                     version_number: 1,
                     key_handle: handle,
+                    provider_ref: Some(provider_name.clone()),
                     created_at: now,
                     is_primary: true,
                 }],
@@ -586,11 +613,16 @@ async fn rotate_key(
                 "key must be Enabled to rotate",
             ));
         }
-        let handle = state
+        let rot_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let handle = rot_entry
             .provider
             .generate_key(&record.key_spec)
             .await
             .map_err(map_core_err)?;
+        let new_version_provider_ref = record.provider_ref.clone();
         let new_version = record.current_key_version + 1;
         for v in &mut record.key_versions {
             v.is_primary = false;
@@ -600,6 +632,7 @@ async fn rotate_key(
             .push(keyrack_core::key::KeyVersionRecord {
                 version_number: new_version,
                 key_handle: handle,
+                provider_ref: new_version_provider_ref,
                 created_at: chrono::Utc::now(),
                 is_primary: true,
             });
@@ -678,7 +711,11 @@ async fn encrypt(
             ec_hash,
         );
         let aad = header.build_aad(&ec_aad);
-        let output = state
+        let enc_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let output = enc_entry
             .provider
             .encrypt(&primary.key_handle, &plaintext, &aad)
             .await
@@ -744,11 +781,10 @@ async fn decrypt(
                 "encryption context mismatch",
             ));
         }
-        let version_handle = record
+        let version_record = record
             .key_versions
             .iter()
             .find(|v| v.version_number == header.key_version)
-            .map(|v| &v.key_handle)
             .ok_or_else(|| {
                 ops::rest_error(
                     StatusCode::NOT_FOUND,
@@ -756,14 +792,18 @@ async fn decrypt(
                     "key version not found",
                 )
             })?;
+        let dec_entry = state
+            .providers
+            .resolve_for_version(&record, header.key_version)
+            .map_err(map_core_err)?;
         let ec_aad = ec
             .as_ref()
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let aad = header.build_aad(&ec_aad);
-        let plaintext = state
+        let plaintext = dec_entry
             .provider
-            .decrypt(version_handle, ciphertext, &aad)
+            .decrypt(&version_record.key_handle, ciphertext, &aad)
             .await
             .map_err(map_core_err)?;
         Ok(Json(serde_json::json!({
@@ -818,7 +858,11 @@ async fn sign(
                     "no primary version",
                 )
             })?;
-        let signature = state
+        let sign_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let signature = sign_entry
             .provider
             .sign(&primary.key_handle, alg, &message)
             .await
@@ -877,7 +921,11 @@ async fn verify(
                     "no primary version",
                 )
             })?;
-        let valid = state
+        let verify_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let valid = verify_entry
             .provider
             .verify(&primary.key_handle, alg, &message, &signature)
             .await
@@ -952,7 +1000,11 @@ async fn generate_data_key(
             .get("number_of_bytes")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(32) as usize;
-        let output = state
+        let gdek_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let output = gdek_entry
             .provider
             .generate_data_key(&primary.key_handle, dek_len, &aad)
             .await
@@ -1035,10 +1087,13 @@ async fn re_encrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let src_aad = header.build_aad(&src_ec_aad);
-        let plaintext = state
-            .provider
-            .decrypt(&src_version.key_handle, ciphertext, &src_aad)
-            .await
+        let src_re_entry = state
+            .providers
+            .resolve_for_version(&src_record, header.key_version)
+            .map_err(map_core_err)?;
+        let dst_re_entry = state
+            .providers
+            .resolve_for_primary(&dst_record)
             .map_err(map_core_err)?;
         let dst_primary = dst_record
             .key_versions
@@ -1065,11 +1120,26 @@ async fn re_encrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
-        let output = state
-            .provider
-            .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
-            .await
-            .map_err(map_core_err)?;
+        let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
+            src_re_entry.provider.re_encrypt(
+                &src_version.key_handle,
+                ciphertext,
+                &src_aad,
+                &dst_primary.key_handle,
+                &dst_aad,
+            ).await.map_err(map_core_err)?
+        } else {
+            let plaintext = src_re_entry
+                .provider
+                .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                .await
+                .map_err(map_core_err)?;
+            dst_re_entry
+                .provider
+                .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                .await
+                .map_err(map_core_err)?
+        };
         Ok(Json(serde_json::json!({
             "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
             "source_key_id": src_record.lid.to_string(),
@@ -1096,6 +1166,8 @@ async fn generate_random(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(32) as usize;
         let random = state
+            .providers
+            .default_entry()
             .provider
             .generate_random(n)
             .await
@@ -1282,7 +1354,7 @@ async fn delete_alias(
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let storage_ok = state.storage.ping().await.is_ok();
 
-    let caps = state.provider.capabilities();
+    let caps = state.providers.default_entry().provider.capabilities();
     let provider_ok = !caps.key_specs.is_empty();
 
     let status = if storage_ok && provider_ok {

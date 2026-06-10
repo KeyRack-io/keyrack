@@ -230,12 +230,81 @@ async fn build_authenticators(
     }
 }
 
+async fn build_provider(
+    cfg: &keyrack_service::config::ProviderConfig,
+) -> Result<
+    (
+        Arc<dyn keyrack_core::provider::CryptoProvider>,
+        keyrack_core::key::ProviderClass,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use keyrack_service::config::ProviderConfig;
+    let (provider, class): (Arc<dyn keyrack_core::provider::CryptoProvider>, _) = match cfg {
+        ProviderConfig::Software => (
+            Arc::new(keyrack_core::provider::software::SoftwareProvider::new()),
+            keyrack_core::key::ProviderClass::Software,
+        ),
+        ProviderConfig::InMemory => (
+            Arc::new(keyrack_core::provider::inmem::InMemoryProvider::new()),
+            keyrack_core::key::ProviderClass::InMemory,
+        ),
+        ProviderConfig::Pkcs11 {
+            lib_path,
+            token_label,
+            pin,
+        } => {
+            let pkcs11_config = keyrack_pkcs11::Pkcs11ProviderConfig {
+                lib_path: lib_path.clone(),
+                token_label: token_label.clone(),
+                pin: pin.clone(),
+            };
+            (
+                Arc::new(keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?),
+                keyrack_core::key::ProviderClass::Pkcs11,
+            )
+        }
+        ProviderConfig::Kmip { .. } => {
+            return Err("KMIP provider not yet implemented".into());
+        }
+        ProviderConfig::VaultTransit {
+            vault_addr,
+            vault_token,
+            mount_path,
+        } => (
+            Arc::new(
+                keyrack_vault::VaultTransitProvider::new(
+                    vault_addr,
+                    vault_token,
+                    mount_path.as_deref(),
+                )
+                .await?,
+            ),
+            keyrack_core::key::ProviderClass::VaultTransit,
+        ),
+    };
+    Ok((provider, class))
+}
+
+fn provider_class_str(class: keyrack_core::key::ProviderClass) -> &'static str {
+    match class {
+        keyrack_core::key::ProviderClass::Software => "software",
+        keyrack_core::key::ProviderClass::InMemory => "in_memory",
+        keyrack_core::key::ProviderClass::Pkcs11 => "pkcs11",
+        keyrack_core::key::ProviderClass::Kmip => "kmip",
+        keyrack_core::key::ProviderClass::VaultTransit => "vault_transit",
+    }
+}
+
 async fn build_state(
     config: &ServiceConfig,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServiceState, Box<dyn std::error::Error>> {
     use keyrack_core::authn::AuthenticatorChain;
-    use keyrack_service::config::{AuditConfig, PdpConfig, ProviderConfig, StorageConfig};
+    use keyrack_core::key::ProviderRef;
+    use keyrack_core::registry::{ProviderEntry, ProviderRegistry, StaticProviderRegistry};
+    use keyrack_service::config::{AuditConfig, PdpConfig, StorageConfig};
+    use keyrack_service::routing::ProviderRouter;
 
     let storage: Arc<dyn keyrack_core::storage::StorageBackend> = match &config.storage {
         StorageConfig::Sqlite { path } => Arc::new(keyrack_sqlite::SqliteStorage::open(path)?),
@@ -262,59 +331,52 @@ async fn build_state(
             storage
         };
 
-    let provider: Arc<dyn keyrack_core::provider::CryptoProvider> = match &config.provider {
-        ProviderConfig::Software => {
-            Arc::new(keyrack_core::provider::software::SoftwareProvider::new())
-        }
-        ProviderConfig::InMemory => {
-            Arc::new(keyrack_core::provider::inmem::InMemoryProvider::new())
-        }
-        ProviderConfig::Pkcs11 {
-            lib_path,
-            token_label,
-            pin,
-        } => {
-            let pkcs11_config = keyrack_pkcs11::Pkcs11ProviderConfig {
-                lib_path: lib_path.clone(),
-                token_label: token_label.clone(),
-                pin: pin.clone(),
-            };
-            Arc::new(keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?)
-        }
-        ProviderConfig::Kmip { .. } => {
-            return Err("KMIP provider not yet implemented".into());
-        }
-        ProviderConfig::VaultTransit {
-            vault_addr,
-            vault_token,
-            mount_path,
-        } => Arc::new(
-            keyrack_vault::VaultTransitProvider::new(
-                vault_addr,
-                vault_token,
-                mount_path.as_deref(),
-            )
-            .await?,
-        ),
-    };
+    // Build the provider registry from the resolved named-provider list.
+    let (named_providers, default_name) = config
+        .resolved_providers()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let provider_class_enum = match &config.provider {
-        ProviderConfig::Software => keyrack_core::key::ProviderClass::Software,
-        ProviderConfig::InMemory => keyrack_core::key::ProviderClass::InMemory,
-        ProviderConfig::Pkcs11 { .. } => keyrack_core::key::ProviderClass::Pkcs11,
-        ProviderConfig::Kmip { .. } => keyrack_core::key::ProviderClass::Kmip,
-        ProviderConfig::VaultTransit { .. } => keyrack_core::key::ProviderClass::VaultTransit,
-    };
-    let provider_class = match &config.provider {
-        ProviderConfig::Software => "software",
-        ProviderConfig::InMemory => "in_memory",
-        ProviderConfig::Pkcs11 { .. } => "pkcs11",
-        ProviderConfig::Kmip { .. } => "kmip",
-        ProviderConfig::VaultTransit { .. } => "vault_transit",
-    };
-    if config.provider_deny.iter().any(|d| d == provider_class) {
-        return Err(format!("provider class '{provider_class}' is in the deny list").into());
+    let mut entries: Vec<(ProviderRef, ProviderEntry)> = Vec::new();
+    for np in &named_providers {
+        let (provider, class) = build_provider(&np.provider).await?;
+        let class_str = provider_class_str(class);
+        if config.provider_deny.iter().any(|d| d == class_str) {
+            return Err(format!(
+                "provider '{}' class '{class_str}' is in the deny list",
+                np.name
+            )
+            .into());
+        }
+        tracing::info!(name = %np.name, class = class_str, "registered provider");
+        entries.push((ProviderRef::new(np.name.clone()), ProviderEntry { provider, class }));
     }
+
+    let default_ref = ProviderRef::new(default_name.clone());
+    let registry = StaticProviderRegistry::new(entries, default_ref.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+    // Build the provider router from routing rules.
+    let router_rules: Vec<(std::collections::BTreeMap<String, String>, ProviderRef)> = config
+        .provider_routing
+        .iter()
+        .map(|rule| (rule.match_tags.clone(), ProviderRef::new(rule.provider.clone())))
+        .collect();
+
+    // Validate that every rule's provider exists in the registry.
+    for rule in &config.provider_routing {
+        let pref = ProviderRef::new(rule.provider.clone());
+        registry
+            .resolve(&pref)
+            .map_err(|_| -> Box<dyn std::error::Error> {
+                format!(
+                    "provider_routing rule references unknown provider '{}'",
+                    rule.provider
+                )
+                .into()
+            })?;
+    }
+
+    let provider_router = ProviderRouter::new(router_rules, default_ref);
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = match &config.pdp {
         PdpConfig::AlwaysAllow => Arc::new(keyrack_core::pdp::AlwaysAllow),
@@ -443,14 +505,14 @@ async fn build_state(
 
     Ok(ServiceState {
         storage,
-        provider,
+        providers: Arc::new(registry),
+        provider_router,
         pdp,
         audit,
         authn,
         metrics_handle,
         max_plaintext_bytes: config.max_plaintext_bytes,
         nats_publisher,
-        provider_class: provider_class_enum,
     })
 }
 

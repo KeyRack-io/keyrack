@@ -82,6 +82,8 @@ storage:
 
 provider:
   type: software        # or: pkcs11, kmip, vault_transit, in_memory
+                        # for multi-tenant HYOK / multiple backends, use a
+                        # `providers:` list + `provider_routing` (see OPERATOR.md)
 
 pdp:
   type: http

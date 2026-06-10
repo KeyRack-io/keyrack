@@ -33,8 +33,25 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Legacy single-provider config. Kept for back-compat: if `providers`
+    /// is empty, this field is used to synthesize one "default" provider.
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    /// Named providers for multi-provider routing. Supersedes the single
+    /// `provider` field when non-empty.
+    #[serde(default)]
+    pub providers: Vec<NamedProvider>,
+
+    /// Name of the default provider to use for new keys when no routing
+    /// rule matches. Required when `providers` has more than one entry.
+    #[serde(default)]
+    pub default_provider: Option<String>,
+
+    /// Routing rules that assign new keys to specific providers based on
+    /// their identity tags. Rules are evaluated in order; the first match wins.
+    #[serde(default)]
+    pub provider_routing: Vec<ProviderRoutingRule>,
 
     #[serde(default)]
     pub pdp: PdpConfig,
@@ -77,6 +94,43 @@ pub struct ServiceConfig {
     pub audit_signing_key_path: Option<String>,
 }
 
+/// A named provider entry in the `providers` list.
+///
+/// The `name` field is the routing key; the remaining fields describe the
+/// provider type (via `#[serde(flatten)]` from [`ProviderConfig`]).
+///
+/// YAML example:
+/// ```yaml
+/// providers:
+///   - name: default
+///     type: software
+///   - name: tenant-hsm
+///     type: pkcs11
+///     lib_path: /usr/lib/pkcs11.so
+///     token_label: TenantToken
+///     pin: 1234
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedProvider {
+    pub name: String,
+    #[serde(flatten)]
+    pub provider: ProviderConfig,
+}
+
+/// A single provider-routing rule.
+///
+/// If ALL tags in `match_tags` are present with the specified values on a
+/// new key's identity tags, the key is assigned to `provider`. Rules are
+/// evaluated in order; the first match wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRoutingRule {
+    /// Identity-tag predicate. All entries must match (AND logic).
+    #[serde(rename = "match", default)]
+    pub match_tags: std::collections::BTreeMap<String, String>,
+    /// Name of the provider to use when this rule matches.
+    pub provider: String,
+}
+
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
@@ -84,6 +138,9 @@ impl Default for ServiceConfig {
             rest_addr: default_rest_addr(),
             storage: StorageConfig::default(),
             provider: ProviderConfig::default(),
+            providers: Vec::new(),
+            default_provider: None,
+            provider_routing: Vec::new(),
             pdp: PdpConfig::default(),
             audit: AuditConfig::default(),
             sign_audit_events: false,
@@ -96,6 +153,58 @@ impl Default for ServiceConfig {
             cache: None,
             audit_signing_key_path: None,
         }
+    }
+}
+
+impl ServiceConfig {
+    /// Resolve the canonical list of named providers and the default name.
+    ///
+    /// - If `providers` is empty: synthesises one `NamedProvider` named
+    ///   `"default"` from the legacy `provider` field.
+    /// - Otherwise: validates uniqueness and resolves the default name
+    ///   (`default_provider` if set, or the sole provider name if there is
+    ///   exactly one).
+    ///
+    /// Returns `Err(String)` on misconfiguration.
+    pub fn resolved_providers(&self) -> Result<(Vec<NamedProvider>, String), String> {
+        if self.providers.is_empty() {
+            let synthetic = NamedProvider {
+                name: "default".into(),
+                provider: self.provider.clone(),
+            };
+            return Ok((vec![synthetic], "default".into()));
+        }
+
+        // Validate uniqueness.
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.providers {
+            if !seen.insert(p.name.clone()) {
+                return Err(format!("duplicate provider name: '{}'", p.name));
+            }
+        }
+
+        let default_name = match &self.default_provider {
+            Some(name) => name.clone(),
+            None => {
+                if self.providers.len() == 1 {
+                    self.providers[0].name.clone()
+                } else {
+                    return Err(
+                        "default_provider must be set when more than one provider is configured"
+                            .into(),
+                    );
+                }
+            }
+        };
+
+        if !seen.contains(&default_name) {
+            return Err(format!(
+                "default_provider '{}' is not among the configured providers",
+                default_name
+            ));
+        }
+
+        Ok((self.providers.clone(), default_name))
     }
 }
 
@@ -331,6 +440,7 @@ impl ServiceConfig {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +460,9 @@ mod tests {
                 database_url: "postgres://localhost/keyrack".into(),
             },
             provider: ProviderConfig::Software,
+            providers: Vec::new(),
+            default_provider: None,
+            provider_routing: Vec::new(),
             pdp: PdpConfig::AlwaysAllow,
             audit: AuditConfig::Stdout,
             sign_audit_events: false,
@@ -365,5 +478,69 @@ mod tests {
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();
         assert_eq!(parsed.grpc_addr, "0.0.0.0:50051");
+    }
+
+    #[test]
+    fn single_provider_back_compat() {
+        let yaml = "provider:\n  type: software\n";
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+        let (providers, default) = config.resolved_providers().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "default");
+        assert_eq!(default, "default");
+        assert!(matches!(providers[0].provider, ProviderConfig::Software));
+    }
+
+    #[test]
+    fn multi_provider_with_routing() {
+        let yaml = r#"
+provider:
+  type: software
+providers:
+  - name: default
+    type: software
+  - name: tenant-b
+    type: in_memory
+default_provider: default
+provider_routing:
+  - match:
+      tenant: acme
+    provider: tenant-b
+"#;
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+        let (providers, default) = config.resolved_providers().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(default, "default");
+        assert_eq!(config.provider_routing.len(), 1);
+        assert_eq!(
+            config.provider_routing[0].match_tags.get("tenant"),
+            Some(&"acme".to_string())
+        );
+        assert_eq!(config.provider_routing[0].provider, "tenant-b");
+    }
+
+    #[test]
+    fn resolved_providers_requires_default_for_multiple() {
+        let yaml = r#"
+providers:
+  - name: a
+    type: software
+  - name: b
+    type: in_memory
+"#;
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+        assert!(config.resolved_providers().is_err());
+    }
+
+    #[test]
+    fn resolved_providers_rejects_unknown_default() {
+        let yaml = r#"
+providers:
+  - name: a
+    type: software
+default_provider: missing
+"#;
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+        assert!(config.resolved_providers().is_err());
     }
 }

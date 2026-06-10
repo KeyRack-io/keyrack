@@ -1,0 +1,47 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+# Two PKCS#11 providers backed by the SAME SoftHSM2 library, each bound to a
+# different token (HSM partition). This is the multi-partition HYOK shape: one
+# vendor library, several tenant tokens.
+providers:
+  - name: hsm-tenant-a
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: tenant-a
+    pin: "1234"
+  - name: hsm-tenant-b
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: tenant-b
+    pin: "5678"
+
+# New keys go here when no routing rule matches.
+default_provider: hsm-tenant-a
+
+# Ordered rules; the first whose `match` tags are all present (AND) wins.
+# Matched against the new key's identity tags, which callers populate via the
+# `attributes` field on CreateKey.
+provider_routing:
+  - match:
+      tenant: tenant-a
+    provider: hsm-tenant-a
+  - match:
+      tenant: tenant-b
+    provider: hsm-tenant-b
+
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout
+
+authn:
+  type: insecure
+
+cache:
+  max_capacity: 1000
+  ttl_secs: 60
