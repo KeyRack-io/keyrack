@@ -168,15 +168,19 @@ The same operations are available over gRPC on port 50051.
 
 ## Demos
 
-Five runnable demos (each a `docker compose up` away):
+Four runnable FOSS demos (each a `docker compose up` away):
 
 | Demo | What it shows | Provider |
 |------|--------------|----------|
-| [01-foss-vault](../demos/01-foss-vault/) | Key lifecycle with Vault Transit | Vault |
-| [02-foss-softhsm](../demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
-| [03-aws-kms-shim](../demos/03-aws-kms-shim/) | Unmodified boto3 client | AWS KMS shim |
-| [04-hyok-full-stack](../demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
-| [05-hyok-aws-shim](../demos/05-hyok-aws-shim/) | Enterprise path: boto3 → HYOK | AWS KMS shim + full stack |
+| [01-foss-vault](demos/01-foss-vault/) | Key lifecycle with Vault Transit | Vault |
+| [02-foss-softhsm](demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
+| [04-hyok-full-stack](demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
+| [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across HSM partitions | 2× SoftHSM tokens |
+
+Run them all with a pass/fail summary via [`run-foss-demos.sh`](../run-foss-demos.sh) at the repo root.
+
+The AWS KMS shim demos (`03-aws-kms-shim`, `05-hyok-aws-shim`) ship with the
+commercial extensions under `keyrack-commercial/demos/`.
 
 ## License
 

@@ -85,6 +85,42 @@ barbican_endpoint = http://keyrack-barbican-shim:9311
 Cinder, Nova, and Manila talk to what they think is Barbican. No
 OpenStack code is modified.
 
+## Backend / provider migration (BYOK ↔ HYOK)
+
+The shim phases above move your *callers*. A separate axis moves where a key's
+*material* lives — e.g. from a KeyRack-managed software/Vault backend (BYOK) to
+a customer-owned HSM (HYOK), or between HSM partitions. KeyRack treats logical
+key identity (LID) as independent of the physical backend, so a key can change
+providers without its `key_id` — or the header-pinned references in existing
+ciphertext — changing.
+
+What ships today (see [OPERATOR.md → Multiple providers and routing](../OPERATOR.md)):
+
+- **Multiple named providers + routing rules.** One service fronts many
+  backends; new keys are routed to a provider by their identity tags
+  (e.g. `tenant`), with a fail-closed `keyrack.provider` assertion for callers
+  that want to pin a target. Runnable reference:
+  [`demos/06-provider-routing`](../../demos/06-provider-routing/) routes across
+  two SoftHSM tokens.
+- **Per-version provider binding.** Each key *version* records its backend, so a
+  single logical key can straddle two providers (old versions on A, new on B) —
+  the foundation for re-key-style migration.
+- **Cross-provider `ReEncrypt`.** When source and destination keys live on
+  different providers, KeyRack decrypts on the source and re-encrypts on the
+  destination (same-provider stays a single in-provider op).
+
+Because HSM key material is non-extractable, "move key A → HSM B" is a **re-key**,
+not a byte-copy: a new version is generated on B and becomes primary; old
+ciphertext keeps decrypting on A (its header pins the version); data is
+re-wrapped/re-encrypted over time, then A is retired — no big-bang re-encryption.
+Literal byte-movement is only possible for explicitly wrapped/extractable
+material via the BYOK import path.
+
+Next step (not yet shipped): `rotate_key` with an optional target provider so an
+in-place re-key onto a different backend is a single primitive; today the new
+version inherits the key's current provider. A bulk re-wrap/re-encrypt sweep
+builds on that.
+
 ## Fit rating
 
 **Excellent for AWS KMS users. Good for OpenStack/Barbican users.
@@ -118,8 +154,12 @@ the same pattern.
 | GCP KMS shim | 2-3 weeks | Medium — smaller target audience |
 | Azure Key Vault shim | 2-3 weeks | Medium — smaller target audience |
 | Vault Transit shim | 1-2 weeks | Medium — HashiCorp users |
-| Migration tooling (bulk re-encrypt) | 1-2 weeks | High — needed for phase 2→3 |
-| Migration guide documentation | 2-3 days | Very high — the #1 thing brownfield users need |
+| `rotate_key` with target provider (in-place re-key onto a different backend) | days | High — completes the BYOK↔HYOK primitive |
+| Bulk re-wrap / re-encrypt sweep (orchestrate phase 2→3) | 1-2 weeks | High — needed at scale |
+
+Already shipped (previously listed as missing): multiple named providers +
+routing, per-version provider binding, and cross-provider `ReEncrypt` — the
+foundations for backend/provider migration. See the section above.
 
 ## Strategic note
 

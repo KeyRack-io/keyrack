@@ -14,6 +14,17 @@ This folder maps out who needs KeyRack and how well we serve them today.
 | 06 | [Brownfield Migration](06-brownfield-migration.md) | Excellent (AWS) | AWS KMS shim or Barbican shim |
 | 07 | [Crypto Agility / PQC](07-crypto-agility.md) | Good (framework) | Provider abstraction + rotation protocol |
 
+## "Migration" means four different things here
+
+KeyRack uses the word *migration* for four distinct axes — don't conflate them:
+
+| Axis | What moves | Where it's documented | Runnable reference |
+|---|---|---|---|
+| **Onboarding** from a cloud KMS | your *callers* (point an SDK at a shim) | [06-brownfield-migration](06-brownfield-migration.md) | AWS KMS shim demos (`keyrack-commercial/demos/03,05`) |
+| **Backend / provider** (BYOK ↔ HYOK, HSM-to-HSM) | where a key's *material* lives | [OPERATOR.md → Multiple providers and routing](../OPERATOR.md), [06-brownfield-migration](06-brownfield-migration.md#backend--provider-migration-byok--hyok) | [`demos/06-provider-routing`](../../demos/06-provider-routing/) |
+| **Algorithm / crypto agility** (incl. PQC) | the *algorithm* a key uses | [07-crypto-agility](07-crypto-agility.md) | — (PQC algorithms pending) |
+| **Identity** (rule / canonicalization changes) | a key's *parent / LID* | [MIGRATION.md](../../MIGRATION.md) | — (design + `keyrack migrate` CLI) |
+
 ## Key takeaways
 
 1. **Strongest wedge: AWS KMS shim for brownfield.** Zero code changes,

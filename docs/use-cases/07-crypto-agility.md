@@ -80,6 +80,13 @@ The same key hierarchy can span multiple providers:
 - Hardware HSM (PKCS#11 / KMIP) for production
 - Future PQC provider when hardware supports it
 
+This is no longer just conceptual: KeyRack can be configured with multiple named
+providers and route new keys to them by identity tag, and each key version
+records its backend so a key can move providers without changing its identity.
+See [OPERATOR.md → Multiple providers and routing](../OPERATOR.md) and the
+[backend/provider migration](06-brownfield-migration.md#backend--provider-migration-byok--hyok)
+notes. (Selecting a *PQC* provider this way still waits on PQC algorithm support.)
+
 ## Fit rating
 
 **Good conceptually. The framework is right; PQC algorithms aren't

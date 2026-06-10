@@ -220,7 +220,10 @@ wait "$BG_PID" 2>/dev/null || true
 step "Background operation log (post-rotation):"
 cat "$BG_LOG"
 
-BG_ERRORS=$(grep -c "FAILED\|MISMATCH" "$BG_LOG" 2>/dev/null || echo "0")
+# `grep -c` prints the count but exits 1 on zero matches; `|| true` keeps the
+# printed "0" without a `set -e` abort or a spurious second value.
+BG_ERRORS=$(grep -c "FAILED\|MISMATCH" "$BG_LOG" 2>/dev/null || true)
+BG_ERRORS=${BG_ERRORS:-0}
 if [ "$BG_ERRORS" = "0" ]; then
   ok "Zero errors during rotation — zero downtime confirmed"
 else
