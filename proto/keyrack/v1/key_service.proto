@@ -662,6 +662,7 @@ enum RotationJobState {
 
 message RotationJobMetadata {
   string job_id = 1;
+  // LID of the parent key whose rotation triggered this job.
   string key_id = 2;
   uint32 from_version = 3;
   uint32 to_version = 4;
@@ -669,6 +670,9 @@ message RotationJobMetadata {
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp expires_at = 7;
   optional string failure_reason = 8;
+  // LID of the dependent key that must re-wrap in response to the parent
+  // rotation. This is the key a cooperating consumer acts on.
+  string dependent_key_id = 9;
 }
 
 message ListRotationJobsRequest {

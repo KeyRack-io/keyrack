@@ -2306,5 +2306,6 @@ fn rotation_job_to_proto(job: &keyrack_core::rotation::RotationJob) -> proto::Ro
         created_at: Some(convert::datetime_to_timestamp(&job.created_at)),
         expires_at: Some(convert::datetime_to_timestamp(&job.expires_at)),
         failure_reason: job.failure_reason.clone(),
+        dependent_key_id: job.dependent_lid.to_string(),
     }
 }
