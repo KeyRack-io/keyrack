@@ -1,0 +1,32 @@
+services:
+  keyrack:
+    build:
+      context: ../..
+      dockerfile: demos/09-audit-tamper-evidence/Dockerfile.keyrack
+    environment:
+      KEYRACK_CONFIG: /config/keyrack.yaml
+      RUST_LOG: info
+    volumes:
+      - ./config:/config:ro
+      - audit-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  demo:
+    build:
+      context: ../..
+      dockerfile: demos/09-audit-tamper-evidence/Dockerfile.keyrack
+    depends_on:
+      keyrack:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - audit-data:/data
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/run-demo.sh"]
+
+volumes:
+  audit-data:

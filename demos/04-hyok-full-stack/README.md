@@ -70,8 +70,11 @@ An unknown principal (`tenant-b-intruder`) receives an implicit DENY — no matc
 Every KeyRack operation emits a signed audit event to NATS. To observe them:
 
 ```bash
-# Subscribe to all audit events
-docker compose exec nats nats sub "kms.audit.>"
+# Subscribe to all audit events using a nats-box one-off container
+# (the nats:alpine image does not include the nats CLI)
+docker run --rm --network "$(basename $PWD)_default" \
+  natsio/nats-box:latest \
+  nats sub --server nats://nats:4222 "kms.audit.>"
 
 # In another terminal, trigger operations:
 curl -X POST http://localhost:8080/v1/keys \
@@ -94,15 +97,20 @@ The most important property of HYOK: when a tenant revokes HSM access, KeyRack's
 
 ```bash
 # 1. Verify encrypt works
+# The REST API returns the token's access_token field
 TOKEN=$(curl -s -X POST http://localhost:9000/token \
-  -d '{"sub":"tenant-a-admin","tenant_id":"tenant-a"}' | jq -r .access_token)
+  -H "Content-Type: application/json" \
+  -d '{"sub":"tenant-a-admin","tenant_id":"tenant-a"}' \
+  | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
 
-KEY_ID=$(curl -s -X POST http://localhost:8080/v1/keys \
+# The REST API returns the key's LID in the "lid" field (not "key_id")
+KEY_LID=$(curl -s -X POST http://localhost:8080/v1/keys \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"key_spec":"AES_256"}' | jq -r .key_id)
+  -d '{"key_spec":"AES_256"}' \
+  | sed -n 's/.*"lid":"\([^"]*\)".*/\1/p')
 
-curl -s -X POST "http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt" \
+curl -s -X POST "http://localhost:8080/v1/keys/$KEY_LID/actions-encrypt" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"plaintext":"aGVsbG8="}'
@@ -112,7 +120,7 @@ curl -s -X POST "http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt" \
 docker compose exec keyrack rm -rf /var/lib/softhsm/tokens/*
 
 # 3. Immediate retry — may still work (cache hit)
-curl -s -X POST "http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt" \
+curl -s -X POST "http://localhost:8080/v1/keys/$KEY_LID/actions-encrypt" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"plaintext":"aGVsbG8="}'
@@ -120,7 +128,7 @@ curl -s -X POST "http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt" \
 
 # 4. Wait > 10 seconds, retry — FAILS
 sleep 12
-curl -s -X POST "http://localhost:8080/v1/keys/$KEY_ID/actions-encrypt" \
+curl -s -X POST "http://localhost:8080/v1/keys/$KEY_LID/actions-encrypt" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"plaintext":"aGVsbG8="}'

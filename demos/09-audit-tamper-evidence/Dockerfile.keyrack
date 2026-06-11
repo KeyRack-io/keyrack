@@ -1,0 +1,46 @@
+# Multi-stage build for demo 09.
+# Produces a Debian image with:
+#   keyrack-service  — the KeyRack gRPC + REST server
+#   keyrack-cedar-pdp — Cedar PDP binary (bundled for consistency)
+#   keyrack           — the CLI (used by the demo for `audit verify`)
+#
+# Build context must be the repo root (../.. relative to this file).
+
+# ── Build stage ───────────────────────────────────────────────────────
+FROM rust:1-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libprotobuf-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY proto/ proto/
+COPY examples/ examples/
+
+RUN cargo build --release \
+    -p keyrack-service \
+    -p keyrack-cedar-pdp \
+    -p keyrack-cli \
+    --quiet
+
+# ── Runtime stage ─────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/keyrack-service   /usr/local/bin/
+COPY --from=builder /build/target/release/keyrack-cedar-pdp /usr/local/bin/
+COPY --from=builder /build/target/release/keyrack            /usr/local/bin/
+
+EXPOSE 50051 8080
+
+ENV KEYRACK_CONFIG=/config/keyrack.yaml
+
+ENTRYPOINT ["keyrack-service"]

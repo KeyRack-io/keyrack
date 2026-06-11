@@ -1,0 +1,8 @@
+# Demo image: alpine + curl + jq + grpcurl (from fullstorydev distroless image).
+# Used as the `demo` service in docker-compose.yml.
+
+FROM fullstorydev/grpcurl:latest AS grpcurl-binary
+
+FROM alpine:3.20
+RUN apk add --no-cache curl jq
+COPY --from=grpcurl-binary /bin/grpcurl /usr/local/bin/grpcurl

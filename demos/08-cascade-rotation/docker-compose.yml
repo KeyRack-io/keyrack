@@ -1,0 +1,32 @@
+services:
+  keyrack:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.service
+    environment:
+      KEYRACK_CONFIG: /config/keyrack.yaml
+      RUST_LOG: info
+    volumes:
+      - ./config:/config:ro
+      - keyrack-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    depends_on:
+      keyrack:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - ../../proto:/proto:ro
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/run-demo.sh"]
+
+volumes:
+  keyrack-data:

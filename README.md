@@ -168,7 +168,7 @@ The same operations are available over gRPC on port 50051.
 
 ## Demos
 
-Four runnable FOSS demos (each a `docker compose up` away):
+Six runnable FOSS demos (each a `docker compose up` away):
 
 | Demo | What it shows | Provider |
 |------|--------------|----------|
@@ -176,6 +176,8 @@ Four runnable FOSS demos (each a `docker compose up` away):
 | [02-foss-softhsm](demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
 | [04-hyok-full-stack](demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
 | [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across HSM partitions | 2× SoftHSM tokens |
+| [08-cascade-rotation](demos/08-cascade-rotation/) | Hierarchical cascade rotation + cooperative ack/complete | Software |
+| [09-audit-tamper-evidence](demos/09-audit-tamper-evidence/) | Ed25519-signed + BLAKE3 hash-chained audit log verification | Software |
 
 Run them all with a pass/fail summary via [`run-foss-demos.sh`](../run-foss-demos.sh) at the repo root.
 

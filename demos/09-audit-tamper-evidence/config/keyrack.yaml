@@ -1,0 +1,25 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: memory
+
+provider:
+  type: software
+
+pdp:
+  type: always_allow
+
+audit:
+  type: file
+  path: /data/audit.log
+
+sign_audit_events: true
+audit_signing_key_path: /data/audit-signing.key
+
+authn:
+  type: insecure
+
+cache:
+  max_capacity: 1000
+  ttl_secs: 60
