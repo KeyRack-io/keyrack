@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod audit;
 mod lint;
 mod migrate;
 mod provision;
@@ -33,7 +34,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "keyrack",
-    about = "KeyRack CLI — lint, provision, admin, migrate",
+    about = "KeyRack CLI — lint, provision, admin, migrate, audit",
     version
 )]
 struct Cli {
@@ -54,6 +55,9 @@ enum Commands {
 
     /// Canonicalization migration utilities.
     Migrate(migrate::MigrateArgs),
+
+    /// Audit log verification and analysis.
+    Audit(audit::AuditArgs),
 }
 
 #[tokio::main]
@@ -73,5 +77,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Provision(args) => provision::run(args).await,
         Commands::Admin(args) => admin::run(args).await,
         Commands::Migrate(args) => migrate::run(args).await,
+        Commands::Audit(args) => audit::run(args),
     }
 }

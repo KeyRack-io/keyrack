@@ -2588,6 +2588,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "ed25519-dalek",
  "keyrack-core",
  "keyrack-service",
  "keyrack-sqlite",
