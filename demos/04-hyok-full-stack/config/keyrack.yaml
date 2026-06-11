@@ -2,7 +2,8 @@ grpc_addr: "0.0.0.0:50051"
 rest_addr: "0.0.0.0:8080"
 
 storage:
-  type: memory
+  type: postgres
+  database_url: postgres://keyrack:keyrack@postgres:5432/keyrack
 
 provider:
   type: pkcs11

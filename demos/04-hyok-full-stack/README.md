@@ -8,6 +8,7 @@ Production-realistic **Hold Your Own Key** deployment demonstrating the full Key
 | **AuthZ** | Cedar PDP with tenant-isolation policies |
 | **Audit** | Signed events delivered to NATS JetStream |
 | **HSM** | SoftHSM2 (PKCS#11) simulating a tenant-controlled HSM |
+| **Storage** | PostgreSQL (durable metadata; survives service restarts) |
 | **HYOK Disconnect** | Bounded lockout via cache TTL (10s) |
 
 ## Architecture
@@ -48,6 +49,7 @@ docker compose up --build
 
 | Service | Port | Role |
 |---------|------|------|
+| `postgres` | — | Durable key/metadata storage (`kr_*` tables) |
 | `nats` | 4222, 8222 | Audit event bus (JetStream) |
 | `jwt-issuer` | 9000 | Minimal RSA JWT issuer with JWKS endpoint |
 | `cedar-pdp` | 8181 | Cedar policy evaluation (deny-by-default) |
@@ -133,6 +135,21 @@ t<10s   Cache still valid   → encrypt ✓
 t>10s   Cache expired       → encrypt ✗ (LOCKOUT)
 ```
 
+### 5. Restart Survival (durable storage)
+
+This demo stores metadata in **PostgreSQL** (not in-memory), and the SoftHSM
+token lives in a named volume, so keys and ciphertext survive a service restart.
+
+**Automated test** (run from host):
+
+```bash
+./scripts/restart-survival.sh
+```
+
+It creates a key, encrypts, restarts **only** the `keyrack` service, then proves
+the key still resolves (GET 200) and the pre-restart ciphertext still decrypts.
+With the old in-memory storage this failed; with Postgres it survives.
+
 ## Configuration
 
 ### Cache TTL
@@ -164,4 +181,4 @@ docker compose down -v
 | Single PKCS#11 token | Per-tenant HSM partitions or separate appliances |
 | Permit-by-principal-UID policies | Attribute-based Cedar policies with entity stores |
 | Minimal JWT issuer | Keycloak, Auth0, Azure AD, etc. |
-| In-memory key storage | PostgreSQL with encryption at rest |
+| Single-node PostgreSQL | HA PostgreSQL (replication/failover) with encryption at rest |

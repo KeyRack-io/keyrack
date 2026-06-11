@@ -1,4 +1,18 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: keyrack
+      POSTGRES_PASSWORD: keyrack
+      POSTGRES_DB: keyrack
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keyrack -d keyrack"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
   nats:
     image: nats:alpine
     command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
@@ -45,6 +59,8 @@ services:
       context: ../..
       dockerfile: demos/04-hyok-full-stack/Dockerfile.keyrack
     depends_on:
+      postgres:
+        condition: service_healthy
       nats:
         condition: service_healthy
       jwt-issuer:
@@ -79,3 +95,4 @@ services:
 
 volumes:
   hsm-tokens:
+  pg-data:

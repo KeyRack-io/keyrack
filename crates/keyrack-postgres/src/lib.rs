@@ -37,7 +37,7 @@ use keyrack_core::lid::Lid;
 use keyrack_core::rotation::{RotationJob, RotationJobState};
 use keyrack_core::storage::{AliasRecord, KeyFilter, Page, StorageBackend};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Row};
 
 const CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS kr_keys (
@@ -76,8 +76,10 @@ impl PostgresStorage {
             .await
             .map_err(|e| KeyRackError::Storage(format!("connect: {e}")))?;
 
-        sqlx::query(CREATE_TABLES)
-            .execute(&pool)
+        // CREATE_TABLES is multiple statements; the prepared-statement path
+        // (`sqlx::query`) rejects that on Postgres, so use the unprepared
+        // simple-query path via `Executor::execute`.
+        pool.execute(CREATE_TABLES)
             .await
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
 
@@ -87,8 +89,7 @@ impl PostgresStorage {
 
     /// Create from an existing pool (useful for testing).
     pub async fn from_pool(pool: PgPool) -> Result<Self> {
-        sqlx::query(CREATE_TABLES)
-            .execute(&pool)
+        pool.execute(CREATE_TABLES)
             .await
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
         Ok(Self { pool })
