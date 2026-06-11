@@ -215,7 +215,7 @@ mod tests {
             let keys = self.keys.lock().unwrap();
             keys.get(&lid.to_string())
                 .cloned()
-                .ok_or_else(|| KeyRackError::KeyNotFound(lid.clone()))
+                .ok_or(KeyRackError::KeyNotFound(*lid))
         }
 
         async fn update_key(&self, record: &KeyRecord) -> Result<()> {
@@ -227,11 +227,11 @@ mod tests {
                     Ok(())
                 }
                 Some(existing) => Err(KeyRackError::OptimisticConcurrencyConflict {
-                    lid: record.lid.clone(),
+                    lid: record.lid,
                     expected: record.occ_version - 1,
                     actual: existing.occ_version,
                 }),
-                None => Err(KeyRackError::KeyNotFound(record.lid.clone())),
+                None => Err(KeyRackError::KeyNotFound(record.lid)),
             }
         }
 
@@ -274,7 +274,7 @@ mod tests {
             let aliases = self.aliases.lock().unwrap();
             aliases
                 .get(alias_name)
-                .map(|a| a.target_lid.clone())
+                .map(|a| a.target_lid)
                 .ok_or_else(|| KeyRackError::Other(format!("alias not found: {alias_name}")))
         }
 
@@ -390,7 +390,7 @@ mod tests {
 
         let alias = AliasRecord {
             alias_name: "alias/prod/root".into(),
-            target_lid: record.lid.clone(),
+            target_lid: record.lid,
             created_at: chrono::Utc::now(),
         };
         store.create_alias(&alias).await.unwrap();

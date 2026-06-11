@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trip() {
         let lid = test_lid();
-        let header = CiphertextHeader::new(lid.clone(), 42, ZERO_CONTEXT_HASH);
+        let header = CiphertextHeader::new(lid, 42, ZERO_CONTEXT_HASH);
 
         let encoded = header.encode();
         assert_eq!(encoded.len(), HEADER_SIZE);

@@ -408,6 +408,7 @@ pub fn byte_string(tag: u32, val: Vec<u8>) -> TtlvItem {
 }
 
 #[cfg(test)]
+#[allow(clippy::unreadable_literal)] // KMIP tags are conventionally written without separators
 mod tests {
     use super::*;
 

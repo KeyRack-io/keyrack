@@ -71,7 +71,6 @@ fn build_encryption_context(
     Some(ec)
 }
 
-
 #[tonic::async_trait]
 impl KeyService for KeyServiceImpl {
     // ── Cryptographic operations ────────────────────────────────────
@@ -357,26 +356,31 @@ impl KeyService for KeyServiceImpl {
                     .unwrap_or_default();
                 let dst_aad = new_header.build_aad(&dst_ec_aad);
 
-                let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
-                    src_re_entry.provider.re_encrypt(
-                        &src_version.key_handle,
-                        ciphertext,
-                        &src_aad,
-                        &dst_primary.key_handle,
-                        &dst_aad,
-                    ).await.map_err(convert::error_to_status)?
-                } else {
-                    let plaintext = src_re_entry
-                        .provider
-                        .decrypt(&src_version.key_handle, ciphertext, &src_aad)
-                        .await
-                        .map_err(convert::error_to_status)?;
-                    dst_re_entry
-                        .provider
-                        .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
-                        .await
-                        .map_err(convert::error_to_status)?
-                };
+                let output =
+                    if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
+                        src_re_entry
+                            .provider
+                            .re_encrypt(
+                                &src_version.key_handle,
+                                ciphertext,
+                                &src_aad,
+                                &dst_primary.key_handle,
+                                &dst_aad,
+                            )
+                            .await
+                            .map_err(convert::error_to_status)?
+                    } else {
+                        let plaintext = src_re_entry
+                            .provider
+                            .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                            .await
+                            .map_err(convert::error_to_status)?;
+                        dst_re_entry
+                            .provider
+                            .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                            .await
+                            .map_err(convert::error_to_status)?
+                    };
 
                 Ok(Response::new(proto::ReEncryptResponse {
                     ciphertext_blob: new_header.wrap_payload(&output.ciphertext),

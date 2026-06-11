@@ -103,7 +103,10 @@ fn build_test_state_with(
 
     let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
     let provider = Arc::new(InMemoryProvider::new());
-    let providers = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
     let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::InsecureAuthenticator),
@@ -707,10 +710,13 @@ async fn generate_data_key_returns_both_keys() {
 // Provider Routing Tests
 // ═══════════════════════════════════════════════════════════════════
 
-/// Build a two-provider ServiceState with optional routing rules.
-/// Provider "default" is an InMemoryProvider; "tenant-b" is another InMemoryProvider.
+/// Build a two-provider `ServiceState` with optional routing rules.
+/// Provider "default" is an `InMemoryProvider`; "tenant-b" is another `InMemoryProvider`.
 fn build_two_provider_state(
-    routing_rules: Vec<(std::collections::BTreeMap<String, String>, keyrack_core::key::ProviderRef)>,
+    routing_rules: Vec<(
+        std::collections::BTreeMap<String, String>,
+        keyrack_core::key::ProviderRef,
+    )>,
 ) -> Arc<ServiceState> {
     use keyrack_core::key::{ProviderClass, ProviderRef};
     use keyrack_core::registry::{ProviderEntry, StaticProviderRegistry};
@@ -781,7 +787,10 @@ async fn routing_no_match_uses_default_provider() {
     let lid: keyrack_core::lid::Lid = key_id.parse().expect("valid lid");
     let record = state.storage.get_key(&lid).await.expect("key exists");
     assert_eq!(record.provider_ref, Some(ProviderRef::new("default")));
-    assert_eq!(record.key_versions[0].provider_ref, Some(ProviderRef::new("default")));
+    assert_eq!(
+        record.key_versions[0].provider_ref,
+        Some(ProviderRef::new("default"))
+    );
 
     // Encrypt/decrypt round-trip.
     let pt = b"hello routing";
@@ -816,7 +825,6 @@ async fn routing_no_match_uses_default_provider() {
 #[tokio::test]
 async fn routing_matching_rule_selects_tenant_b() {
     use keyrack_core::key::ProviderRef;
-    use keyrack_core::registry::ProviderRegistry;
     use std::collections::BTreeMap;
 
     // Rule: if identity tag `tenant` == `acme`, use "tenant-b".
@@ -992,7 +1000,7 @@ async fn routing_provider_assertion_mismatch_fails() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// 3. A version whose `provider_ref` names an unknown provider → ProviderUnavailable.
+/// 3. A version whose `provider_ref` names an unknown provider → `ProviderUnavailable`.
 #[tokio::test]
 async fn routing_unknown_provider_yields_unavailable() {
     use keyrack_core::key::ProviderRef;
@@ -1024,16 +1032,13 @@ async fn routing_unknown_provider_yields_unavailable() {
     assert_eq!(
         status.code(),
         tonic::Code::Unavailable,
-        "expected Unavailable status, got: {:?}",
-        status
+        "expected Unavailable status, got: {status:?}"
     );
 }
 
-/// 4. Legacy record (provider_ref: None) resolves to default and round-trips.
+/// 4. Legacy record (`provider_ref`: None) resolves to default and round-trips.
 #[tokio::test]
 async fn routing_legacy_record_none_provider_ref_uses_default() {
-    use keyrack_core::key::ProviderRef;
-    use keyrack_core::registry::ProviderRegistry;
     let state = build_two_provider_state(vec![]);
 
     // Create a record with no provider_ref (simulating old stored data).
@@ -1050,10 +1055,8 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -1124,7 +1127,6 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
 #[tokio::test]
 async fn routing_cross_version_migration() {
     use keyrack_core::key::ProviderRef;
-    use keyrack_core::registry::ProviderRegistry;
     let state = build_two_provider_state(vec![]);
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
 
@@ -1160,13 +1162,15 @@ async fn routing_cross_version_migration() {
         v.is_primary = false;
     }
     let v2_num = record.current_key_version + 1;
-    record.key_versions.push(keyrack_core::key::KeyVersionRecord {
-        version_number: v2_num,
-        key_handle: v2_handle,
-        provider_ref: Some(ProviderRef::new("tenant-b")),
-        created_at: chrono::Utc::now(),
-        is_primary: true,
-    });
+    record
+        .key_versions
+        .push(keyrack_core::key::KeyVersionRecord {
+            version_number: v2_num,
+            key_handle: v2_handle,
+            provider_ref: Some(ProviderRef::new("tenant-b")),
+            created_at: chrono::Utc::now(),
+            is_primary: true,
+        });
     record.current_key_version = v2_num;
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();

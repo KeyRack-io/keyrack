@@ -29,10 +29,10 @@
 //!   [x] Sensitive<T> redaction
 //!   [x] Key state machine transitions
 //!   [x] Tags model: identity immutability, user CRUD
-//!   [x] KeyRecord lifecycle (create → enable → disable → pending_deletion → destroy)
+//!   [x] `KeyRecord` lifecycle (create → enable → disable → `pending_deletion` → destroy)
 //!   [x] Software provider encrypt/decrypt round-trip (AES-256-GCM)
 //!   [x] Software provider sign/verify round-trip (Ed25519, ECDSA P-256, RSA)
-//!   [x] InMemory provider parity
+//!   [x] `InMemory` provider parity
 //!   [x] Ciphertext header encode/decode round-trip
 //!   [x] Encryption context (AAD) hash determinism and binding
 //!   [x] Audit event schema, sinks, and fan-out
@@ -60,7 +60,7 @@ use std::collections::BTreeMap;
 /// Full identity pipeline: attrs → canonical form → LID → string → parse → same LID.
 ///
 /// Simulates the path a real request takes: a caller presents an attribute
-/// set describing a key, KeyRack canonicalizes it, derives the LID, and the
+/// set describing a key, `KeyRack` canonicalizes it, derives the LID, and the
 /// LID round-trips through serialization boundaries (API responses, storage,
 /// audit events) without corruption.
 #[test]
@@ -211,7 +211,7 @@ fn identity_pipeline_distinct_keys() {
 // ────────────────────────────────────────────────────────────────────
 
 /// Sensitive<T> must never leak plaintext through Debug or Display,
-/// but must allow controlled access via expose().
+/// but must allow controlled access via `expose()`.
 #[test]
 fn sensitive_redaction_e2e() {
     let secret_key = vec![0xDE, 0xAD, 0xBE, 0xEF];
@@ -239,7 +239,7 @@ fn sensitive_redaction_e2e() {
 // ────────────────────────────────────────────────────────────────────
 
 /// Walk the full happy-path lifecycle:
-///   creating → enabled → disabled → enabled → pending_deletion → destroyed
+///   creating → enabled → disabled → enabled → `pending_deletion` → destroyed
 #[test]
 fn key_state_machine_full_lifecycle() {
     assert!(KeyState::Creating.can_transition_to(KeyState::Enabled));
@@ -250,7 +250,7 @@ fn key_state_machine_full_lifecycle() {
     assert!(KeyState::Destroyed.valid_transitions().is_empty());
 }
 
-/// Cancel deletion: pending_deletion → disabled → enabled
+/// Cancel deletion: `pending_deletion` → disabled → enabled
 #[test]
 fn key_state_machine_cancel_deletion() {
     assert!(KeyState::PendingDeletion.can_transition_to(KeyState::Disabled));
@@ -280,7 +280,7 @@ fn key_state_operation_permissions() {
     assert!(!KeyState::Destroyed.permits_decrypt());
 }
 
-/// KeyRecord transitions bump version and update timestamp.
+/// `KeyRecord` transitions bump version and update timestamp.
 #[test]
 fn key_record_transition_bumps_version() {
     let mut record = make_test_record(KeyState::Enabled);
@@ -305,7 +305,7 @@ fn key_record_invalid_transition_is_noop() {
     assert_eq!(record.occ_version, snap);
 }
 
-/// KeyState round-trips through JSON.
+/// `KeyState` round-trips through JSON.
 #[test]
 fn key_state_serde_round_trip() {
     for state in &[
@@ -386,7 +386,7 @@ fn tags_serde_round_trip() {
 // Integrated: full key lifecycle with tags
 // ────────────────────────────────────────────────────────────────────
 
-/// Full lifecycle: create attributes → derive LID → create KeyRecord →
+/// Full lifecycle: create attributes → derive LID → create `KeyRecord` →
 /// walk through state transitions → verify tag immutability along the way.
 #[test]
 fn full_key_lifecycle_with_tags() {
@@ -401,7 +401,7 @@ fn full_key_lifecycle_with_tags() {
     user_tags.set("environment", "dev");
 
     let mut record = KeyRecord {
-        lid: lid.clone(),
+        lid,
         canonicalization_version: CanonicalizationVersion::V1,
         parent_lid: None,
         occ_version: 1,
@@ -539,7 +539,7 @@ async fn provider_sign_verify_all_v1_algorithms() {
     }
 }
 
-/// InMemoryProvider produces the same results as SoftwareProvider.
+/// `InMemoryProvider` produces the same results as `SoftwareProvider`.
 #[tokio::test]
 async fn provider_inmem_parity() {
     let provider = InMemoryProvider::new();
@@ -566,7 +566,7 @@ async fn provider_inmem_parity() {
         .unwrap());
 }
 
-/// generate_random produces the requested length, and two calls differ.
+/// `generate_random` produces the requested length, and two calls differ.
 #[tokio::test]
 async fn provider_generate_random() {
     let provider = SoftwareProvider::new();
@@ -606,7 +606,7 @@ fn ciphertext_header_round_trip() {
     ctx.insert("tenant", "acme");
     let ctx_hash = ctx.hash();
 
-    let header = CiphertextHeader::new(lid.clone(), 7, ctx_hash);
+    let header = CiphertextHeader::new(lid, 7, ctx_hash);
     let encoded = header.encode();
     assert_eq!(encoded.len(), HEADER_SIZE);
 
@@ -635,7 +635,7 @@ fn ciphertext_header_no_context() {
     assert_eq!(decoded.encryption_context_hash, ZERO_CONTEXT_HASH);
 }
 
-/// wrap_payload / unwrap_payload: header + ciphertext survive the round-trip.
+/// `wrap_payload` / `unwrap_payload`: header + ciphertext survive the round-trip.
 #[test]
 fn ciphertext_header_wrap_unwrap_payload() {
     let lid = {
@@ -682,7 +682,7 @@ fn encryption_context_different_values_different_hash() {
     assert_ne!(a.hash(), b.hash());
 }
 
-/// Integrated test: encrypt with AAD from EncryptionContext, wrap in
+/// Integrated test: encrypt with AAD from `EncryptionContext`, wrap in
 /// header, unwrap, verify context hash, decrypt with same AAD.
 #[tokio::test]
 async fn integrated_encrypt_with_header_and_context() {
@@ -702,7 +702,7 @@ async fn integrated_encrypt_with_header_and_context() {
     let plaintext = b"secret volume DEK";
     let ct = provider.encrypt(&handle, plaintext, &aad).await.unwrap();
 
-    let header = CiphertextHeader::new(lid.clone(), 1, ctx_hash);
+    let header = CiphertextHeader::new(lid, 1, ctx_hash);
     let blob = header.wrap_payload(&ct.ciphertext);
 
     // Simulate storage → retrieval → decrypt.

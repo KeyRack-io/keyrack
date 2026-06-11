@@ -199,8 +199,7 @@ impl ServiceConfig {
 
         if !seen.contains(&default_name) {
             return Err(format!(
-                "default_provider '{}' is not among the configured providers",
-                default_name
+                "default_provider '{default_name}' is not among the configured providers"
             ));
         }
 
@@ -440,7 +439,6 @@ impl ServiceConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,7 +491,7 @@ mod tests {
 
     #[test]
     fn multi_provider_with_routing() {
-        let yaml = r#"
+        let yaml = r"
 provider:
   type: software
 providers:
@@ -506,7 +504,7 @@ provider_routing:
   - match:
       tenant: acme
     provider: tenant-b
-"#;
+";
         let config = ServiceConfig::from_yaml(yaml).unwrap();
         let (providers, default) = config.resolved_providers().unwrap();
         assert_eq!(providers.len(), 2);
@@ -521,25 +519,25 @@ provider_routing:
 
     #[test]
     fn resolved_providers_requires_default_for_multiple() {
-        let yaml = r#"
+        let yaml = r"
 providers:
   - name: a
     type: software
   - name: b
     type: in_memory
-"#;
+";
         let config = ServiceConfig::from_yaml(yaml).unwrap();
         assert!(config.resolved_providers().is_err());
     }
 
     #[test]
     fn resolved_providers_rejects_unknown_default() {
-        let yaml = r#"
+        let yaml = r"
 providers:
   - name: a
     type: software
 default_provider: missing
-"#;
+";
         let config = ServiceConfig::from_yaml(yaml).unwrap();
         assert!(config.resolved_providers().is_err());
     }

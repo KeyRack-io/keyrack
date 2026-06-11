@@ -416,7 +416,7 @@ mod tests {
                 let keys = self.keys.lock().unwrap();
                 keys.get(&lid.to_string())
                     .cloned()
-                    .ok_or_else(|| KeyRackError::KeyNotFound(lid.clone()))
+                    .ok_or(KeyRackError::KeyNotFound(*lid))
             }
             async fn update_key(&self, record: &KeyRecord) -> Result<()> {
                 let mut keys = self.keys.lock().unwrap();
@@ -493,11 +493,14 @@ mod tests {
     #[tokio::test]
     async fn provision_creates_full_chain() {
         use crate::key::ProviderClass;
-        use crate::registry::{ProviderEntry, StaticProviderRegistry};
         use crate::key::ProviderRef;
+        use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
         let provider = Arc::new(InMemoryProvider::new());
-        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+        let registry = Arc::new(StaticProviderRegistry::single(
+            provider,
+            ProviderClass::InMemory,
+        ));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
@@ -532,7 +535,10 @@ mod tests {
         use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
         let provider = Arc::new(InMemoryProvider::new());
-        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+        let registry = Arc::new(StaticProviderRegistry::single(
+            provider,
+            ProviderClass::InMemory,
+        ));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
@@ -562,7 +568,10 @@ mod tests {
         use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
         let provider = Arc::new(InMemoryProvider::new());
-        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+        let registry = Arc::new(StaticProviderRegistry::single(
+            provider,
+            ProviderClass::InMemory,
+        ));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(
@@ -601,7 +610,10 @@ mod tests {
         use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
         let provider = Arc::new(InMemoryProvider::new());
-        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+        let registry = Arc::new(StaticProviderRegistry::single(
+            provider,
+            ProviderClass::InMemory,
+        ));
         let rules = Arc::new(test_registry());
 
         let prov = Arc::new(LazyProvisioner::new(
@@ -643,7 +655,10 @@ mod tests {
         use crate::registry::StaticProviderRegistry;
         let storage = build_memory_storage();
         let provider = Arc::new(InMemoryProvider::new());
-        let registry = Arc::new(StaticProviderRegistry::single(provider, ProviderClass::InMemory));
+        let registry = Arc::new(StaticProviderRegistry::single(
+            provider,
+            ProviderClass::InMemory,
+        ));
         let rules = Arc::new(test_registry());
 
         let prov = LazyProvisioner::new(

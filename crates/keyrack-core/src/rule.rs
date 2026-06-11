@@ -750,13 +750,13 @@ namespaces:
 
     #[test]
     fn from_yaml_duplicate_namespace_rejected() {
-        let yaml = r#"
+        let yaml = r"
 namespaces:
   - name: dup
     routing_rules: []
   - name: dup
     routing_rules: []
-"#;
+";
         let err = RuleRegistry::from_yaml(yaml);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -765,12 +765,12 @@ namespaces:
 
     #[test]
     fn from_yaml_bad_max_depth() {
-        let yaml = r#"
+        let yaml = r"
 namespaces:
   - name: test
     max_depth: 0
     routing_rules: []
-"#;
+";
         let err = RuleRegistry::from_yaml(yaml);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -779,7 +779,7 @@ namespaces:
 
     #[test]
     fn from_yaml_duplicate_rule_rejected() {
-        let yaml = r#"
+        let yaml = r"
 namespaces:
   - name: test
     routing_rules:
@@ -789,7 +789,7 @@ namespaces:
       - match_pattern:
           kind: root
         parent: null
-"#;
+";
         let err = RuleRegistry::from_yaml(yaml);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());

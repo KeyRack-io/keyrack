@@ -21,7 +21,7 @@
 //! Provider registry: resolves which [`CryptoProvider`] backs a given key
 //! version.
 //!
-//! KeyRack can be configured with several named providers (e.g. a software
+//! `KeyRack` can be configured with several named providers (e.g. a software
 //! default plus one HSM per tenant). Each [`KeyRecord`]/[`KeyVersionRecord`]
 //! carries an optional [`ProviderRef`] selecting one of them; `None` means
 //! "use the default". The registry turns that binding into a concrete
@@ -141,9 +141,10 @@ impl StaticProviderRegistry {
 
 impl ProviderRegistry for StaticProviderRegistry {
     fn resolve(&self, name: &ProviderRef) -> Result<ProviderEntry> {
-        self.providers.get(name).cloned().ok_or_else(|| {
-            KeyRackError::ProviderUnavailable(format!("unknown provider '{name}'"))
-        })
+        self.providers
+            .get(name)
+            .cloned()
+            .ok_or_else(|| KeyRackError::ProviderUnavailable(format!("unknown provider '{name}'")))
     }
 
     fn default_entry(&self) -> ProviderEntry {
@@ -235,8 +236,10 @@ mod tests {
 
     #[test]
     fn single_provider_back_compat() {
-        let reg =
-            StaticProviderRegistry::single(Arc::new(InMemoryProvider::new()), ProviderClass::Software);
+        let reg = StaticProviderRegistry::single(
+            Arc::new(InMemoryProvider::new()),
+            ProviderClass::Software,
+        );
         assert_eq!(reg.default_ref(), &ProviderRef::new("default"));
         let record = make_test_record(KeyState::Enabled);
         // A legacy record with no binding resolves to the single default.

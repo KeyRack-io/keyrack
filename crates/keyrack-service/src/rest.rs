@@ -216,7 +216,6 @@ fn transition_err(from: keyrack_core::key::KeyState, to: keyrack_core::key::KeyS
     )
 }
 
-
 #[cfg(feature = "crypto-endpoints")]
 fn build_ec(
     map: &serde_json::Map<String, serde_json::Value>,
@@ -1121,13 +1120,17 @@ async fn re_encrypt(
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
         let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
-            src_re_entry.provider.re_encrypt(
-                &src_version.key_handle,
-                ciphertext,
-                &src_aad,
-                &dst_primary.key_handle,
-                &dst_aad,
-            ).await.map_err(map_core_err)?
+            src_re_entry
+                .provider
+                .re_encrypt(
+                    &src_version.key_handle,
+                    ciphertext,
+                    &src_aad,
+                    &dst_primary.key_handle,
+                    &dst_aad,
+                )
+                .await
+                .map_err(map_core_err)?
         } else {
             let plaintext = src_re_entry
                 .provider

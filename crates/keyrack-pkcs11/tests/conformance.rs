@@ -18,12 +18,12 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! PKCS#11 provider conformance tests against SoftHSM2.
+//! PKCS#11 provider conformance tests against `SoftHSM2`.
 //!
 //! These tests require the `softhsm-tests` feature and the following
 //! environment variables:
 //!
-//! - `KMS_PKCS11_LIB` — path to the SoftHSM shared library
+//! - `KMS_PKCS11_LIB` — path to the `SoftHSM` shared library
 //! - `KMS_PKCS11_TOKEN_LABEL` — initialized token label
 //! - `KMS_PKCS11_PIN` — user PIN for the token
 //!

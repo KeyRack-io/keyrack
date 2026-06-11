@@ -348,7 +348,10 @@ async fn build_state(
             .into());
         }
         tracing::info!(name = %np.name, class = class_str, "registered provider");
-        entries.push((ProviderRef::new(np.name.clone()), ProviderEntry { provider, class }));
+        entries.push((
+            ProviderRef::new(np.name.clone()),
+            ProviderEntry { provider, class },
+        ));
     }
 
     let default_ref = ProviderRef::new(default_name.clone());
@@ -359,7 +362,12 @@ async fn build_state(
     let router_rules: Vec<(std::collections::BTreeMap<String, String>, ProviderRef)> = config
         .provider_routing
         .iter()
-        .map(|rule| (rule.match_tags.clone(), ProviderRef::new(rule.provider.clone())))
+        .map(|rule| {
+            (
+                rule.match_tags.clone(),
+                ProviderRef::new(rule.provider.clone()),
+            )
+        })
         .collect();
 
     // Validate that every rule's provider exists in the registry.

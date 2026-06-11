@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! PostgreSQL conformance tests — require a live database.
+//! `PostgreSQL` conformance tests — require a live database.
 //!
 //! Enable with: `cargo test -p keyrack-postgres --features live-tests`
 //!
