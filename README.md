@@ -179,6 +179,12 @@ Four runnable FOSS demos (each a `docker compose up` away):
 
 Run them all with a pass/fail summary via [`run-foss-demos.sh`](../run-foss-demos.sh) at the repo root.
 
+Plus a Kubernetes demo (needs `kind` + `kubectl`, not docker compose):
+
+| Demo | What it shows | Platform |
+|------|--------------|----------|
+| [07-k8s-sidecar](demos/07-k8s-sidecar/) | App + KeyRack sidecar in one pod (localhost), Postgres + Cedar | kind |
+
 The AWS KMS shim demos (`03-aws-kms-shim`, `05-hyok-aws-shim`) ship with the
 commercial extensions under `keyrack-commercial/demos/`.
 

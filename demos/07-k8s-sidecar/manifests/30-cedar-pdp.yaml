@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cedar-pdp
+  namespace: keyrack-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: cedar-pdp }
+  template:
+    metadata:
+      labels: { app: cedar-pdp }
+    spec:
+      containers:
+        - name: cedar-pdp
+          image: keyrack-service:demo
+          imagePullPolicy: IfNotPresent
+          command: ["keyrack-cedar-pdp"]
+          env:
+            - { name: CEDAR_POLICY_PATH, value: /config/policies.cedar }
+            - { name: CEDAR_PDP_ADDR, value: "[::]:8181" }
+            - { name: RUST_LOG, value: info }
+          ports:
+            - containerPort: 8181
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8181 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - { name: policy, mountPath: /config }
+      volumes:
+        - name: policy
+          configMap:
+            name: cedar-policy
+            items:
+              - { key: policies.cedar, path: policies.cedar }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cedar-pdp
+  namespace: keyrack-demo
+spec:
+  selector: { app: cedar-pdp }
+  ports:
+    - port: 8181
+      targetPort: 8181

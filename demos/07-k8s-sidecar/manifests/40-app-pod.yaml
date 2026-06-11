@@ -1,0 +1,50 @@
+# Sidecar-in-a-pod: the keyrack-service runs as a native sidecar (init container
+# with restartPolicy: Always, GA since k8s 1.29). The app is the main container;
+# it reaches keyrack over localhost (shared pod network namespace) and runs to
+# completion, after which the sidecar is auto-terminated and the pod Succeeds.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: keyrack-sidecar-demo
+  namespace: keyrack-demo
+  labels: { app: keyrack-sidecar-demo }
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: keyrack
+      image: keyrack-service:demo
+      imagePullPolicy: IfNotPresent
+      restartPolicy: Always          # <-- native sidecar
+      env:
+        - { name: KEYRACK_CONFIG, value: /config/keyrack.yaml }
+        - { name: RUST_LOG, value: "info,keyrack_service=debug" }
+      ports:
+        - containerPort: 8080
+        - containerPort: 50051
+      startupProbe:                   # app waits until this passes
+        httpGet: { path: /healthz, port: 8080 }
+        periodSeconds: 2
+        failureThreshold: 60
+      readinessProbe:
+        httpGet: { path: /readyz, port: 8080 }
+        periodSeconds: 5
+      volumeMounts:
+        - { name: config, mountPath: /config }
+  containers:
+    - name: app
+      image: keyrack-service:demo     # reused only for its shell + curl
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "/scripts/verify.sh"]
+      volumeMounts:
+        - { name: verify, mountPath: /scripts }
+  volumes:
+    - name: config
+      configMap:
+        name: keyrack-config
+        items:
+          - { key: keyrack.yaml, path: keyrack.yaml }
+    - name: verify
+      configMap:
+        name: app-verify
+        items:
+          - { key: verify.sh, path: verify.sh }

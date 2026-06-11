@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keyrack-config
+  namespace: keyrack-demo
+data:
+  keyrack.yaml: |
+    grpc_addr: "0.0.0.0:50051"
+    rest_addr: "0.0.0.0:8080"
+    storage:
+      type: postgres
+      database_url: postgres://keyrack:keyrack@postgres:5432/keyrack
+    provider:
+      type: software
+    pdp:
+      type: http
+      endpoint: http://cedar-pdp:8181/v1/authorize
+      timeout_ms: 5000
+    audit:
+      type: stdout
+    authn:
+      type: insecure
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cedar-policy
+  namespace: keyrack-demo
+data:
+  # Permissive policy for demo simplicity — every op still routes through the
+  # Cedar PDP (the authorization path is real), it just permits all here.
+  # See demo 04 for tenant-isolation policies.
+  policies.cedar: |
+    permit(principal, action, resource);
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-verify
+  namespace: keyrack-demo
+data:
+  verify.sh: |
+    #!/bin/sh
+    # Runs in the APP container. Talks to the keyrack sidecar over localhost,
+    # proving the sidecar-in-a-pod topology (shared network namespace).
+    set -e
+    BASE=http://localhost:8080
+    echo "app: waiting for keyrack sidecar on localhost:8080..."
+    i=0
+    while [ "$i" -lt 60 ]; do
+      curl -sf "$BASE/healthz" >/dev/null 2>&1 && break
+      i=$((i+1)); sleep 1
+    done
+    curl -sf "$BASE/healthz" >/dev/null || { echo "✗ sidecar never became healthy"; exit 1; }
+    echo "✓ reached keyrack over localhost (sidecar in the same pod)"
+
+    LID=$(curl -sf -X POST "$BASE/v1/keys" -H 'Content-Type: application/json' \
+      -d '{"key_spec":"AES_256","description":"k8s sidecar demo"}' \
+      | sed -n 's/.*"lid":"\([^"]*\)".*/\1/p')
+    [ -n "$LID" ] || { echo "✗ create failed"; exit 1; }
+    echo "✓ created key $LID (metadata -> Postgres service)"
+
+    PT=$(printf 'hello-from-the-app-container' | base64)
+    CT=$(curl -sf -X POST "$BASE/v1/keys/$LID/actions-encrypt" -H 'Content-Type: application/json' \
+      -d "{\"plaintext\":\"$PT\"}" | sed -n 's/.*"ciphertext_blob":"\([^"]*\)".*/\1/p')
+    [ -n "$CT" ] || { echo "✗ encrypt failed"; exit 1; }
+    echo "✓ encrypted via sidecar (authorized through Cedar PDP)"
+
+    DEC=$(curl -sf -X POST "$BASE/v1/keys/$LID/actions-decrypt" -H 'Content-Type: application/json' \
+      -d "{\"ciphertext_blob\":\"$CT\"}" | sed -n 's/.*"plaintext":"\([^"]*\)".*/\1/p')
+    OUT=$(printf '%s' "$DEC" | base64 -d 2>/dev/null || true)
+    [ "$OUT" = "hello-from-the-app-container" ] || { echo "✗ decrypt round-trip mismatch"; exit 1; }
+    echo "✓ decrypt round-trip OK"
+    echo "ALL CHECKS PASSED"
