@@ -1,0 +1,32 @@
+grpc_addr: "0.0.0.0:50051"
+rest_addr: "0.0.0.0:8080"
+
+storage:
+  type: sqlite
+  path: /data/keyrack.db
+
+provider:
+  type: software
+
+# Authorization: external Cedar PDP. Deny-by-default; only principals named in
+# the policy are permitted. The principal id is the client cert's CN.
+pdp:
+  type: http
+  endpoint: http://cedar-pdp:8181/v1/authorize
+  timeout_ms: 5000
+
+audit:
+  type: stdout
+
+# Authentication: mutual TLS. The peer certificate's CN (or SPIFFE SAN) becomes
+# the principal id. With no recognised credential the request is rejected
+# (fail-closed) rather than downgraded to an anonymous principal.
+authn:
+  type: mtls
+
+# Mutual TLS on the gRPC server. ca_cert makes client certificates mandatory and
+# is the trust anchor used to validate them.
+tls:
+  server_cert: /certs/server.pem
+  server_key: /certs/server-key.pem
+  ca_cert: /certs/ca.pem

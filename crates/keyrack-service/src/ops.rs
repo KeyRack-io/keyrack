@@ -460,12 +460,17 @@ pub fn default_principal() -> Principal {
 
 /// Extract the authenticated principal from a tonic gRPC request.
 ///
-/// Reads standard headers (`authorization`, plus peer certs if available)
-/// and runs them through the configured authenticator chain.
+/// Reads standard headers (`authorization`) plus the mTLS peer certificate
+/// chain, and runs them through the configured authenticator chain.
+///
+/// **Fails closed:** if the configured authenticators recognise no valid
+/// credential, the request is rejected with `Unauthenticated` rather than
+/// downgraded to an anonymous principal. The insecure authenticator never
+/// errors, so dev/test deployments (no real authn) are unaffected.
 pub async fn extract_principal_grpc<T>(
     state: &Arc<ServiceState>,
     request: &tonic::Request<T>,
-) -> Principal {
+) -> Result<Principal, tonic::Status> {
     use keyrack_core::authn::RequestMetadata;
 
     let mut meta = RequestMetadata::default();
@@ -477,15 +482,22 @@ pub async fn extract_principal_grpc<T>(
         }
     }
 
+    // Peer certificates for mTLS identity. Tests may inject them directly via a
+    // `PeerCertificates` request extension; in production they come from the TLS
+    // connection (tonic populates peer certs when serving with a client CA).
     if let Some(certs) = request.extensions().get::<PeerCertificates>() {
         meta.peer_certificates.clone_from(&certs.0);
+    } else if let Some(certs) = request.peer_certs() {
+        meta.peer_certificates = certs.iter().map(|c| c.as_ref().to_vec()).collect();
     }
 
     match state.authn.authenticate(&meta).await {
-        Ok(result) => result.principal,
+        Ok(result) => Ok(result.principal),
         Err(e) => {
-            tracing::warn!(error = %e, "authentication failed, using default principal");
-            default_principal()
+            tracing::warn!(error = %e, "authentication failed; rejecting request");
+            Err(tonic::Status::unauthenticated(format!(
+                "authentication failed: {e}"
+            )))
         }
     }
 }

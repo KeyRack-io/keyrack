@@ -1,0 +1,6 @@
+# One-shot cert generator: writes the demo PKI into the shared `certs` volume.
+FROM alpine:3.20
+RUN apk add --no-cache openssl
+COPY scripts/gen-certs.sh /gen-certs.sh
+RUN chmod +x /gen-certs.sh
+ENTRYPOINT ["/bin/sh", "/gen-certs.sh"]

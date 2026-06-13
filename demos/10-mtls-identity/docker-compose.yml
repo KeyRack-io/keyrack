@@ -1,0 +1,65 @@
+services:
+  # One-shot: generate the demo PKI into the shared `certs` volume, then exit.
+  certgen:
+    build:
+      context: .
+      dockerfile: Dockerfile.certgen
+    volumes:
+      - certs:/certs
+
+  cedar-pdp:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.service
+    entrypoint: ["keyrack-cedar-pdp"]
+    environment:
+      CEDAR_POLICY_PATH: /config/policies.cedar
+      CEDAR_PDP_ADDR: "[::]:8181"
+      RUST_LOG: info
+    volumes:
+      - ./config/cedar-policy.cedar:/config/policies.cedar:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  keyrack:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.service
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+      cedar-pdp:
+        condition: service_healthy
+    environment:
+      KEYRACK_CONFIG: /config/keyrack.yaml
+      RUST_LOG: info,keyrack_service=debug
+    volumes:
+      - ./config:/config:ro
+      - certs:/certs:ro
+      - keyrack-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    depends_on:
+      keyrack:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - ../../proto:/proto:ro
+      - certs:/certs:ro
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/run-demo.sh"]
+
+volumes:
+  certs:
+  keyrack-data:

@@ -4,9 +4,9 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
-Toward `0.2.0` (stable). Pending: enforce mTLS-derived identity end-to-end
-(peer-certificate propagation + fail-closed authentication + integration test +
-demo). See _Known limitations_ under `0.2.0-beta.1`.
+Toward `0.2.0` (stable). Pending: extend fail-closed authentication to the REST
+surface, and add an in-process mTLS integration test alongside the
+`10-mtls-identity` demo.
 
 ## [0.2.0-beta.1] — 2026-06-13
 
@@ -23,7 +23,8 @@ CI, an AGPL-3.0 relicense, and assorted hardening since `alpha.1`.
   verification of an audit log).
 - `dependent_key_id` on rotation-job metadata (additive gRPC/REST field).
 - Demos: `06-provider-routing`, `07-k8s-sidecar` (native sidecar-in-a-pod),
-  `08-cascade-rotation`, `09-audit-tamper-evidence`.
+  `08-cascade-rotation`, `09-audit-tamper-evidence`,
+  `10-mtls-identity` (mTLS certificate identity → Cedar authorization).
 - Release-gated E2E CI lane that runs the demo compose stacks on `v*` tags.
 
 ### Changed
@@ -33,6 +34,17 @@ CI, an AGPL-3.0 relicense, and assorted hardening since `alpha.1`.
 - Demo 04 now runs on PostgreSQL and demonstrates restart survival.
 - Phase-2 hardening across the domain layer, authentication, audit, and cache;
   PKCS#11 fixes including shared-module-per-`lib_path` (enables multi-token).
+
+### Security
+
+- **mTLS identity is now enforced end to end (gRPC).** The peer certificate is
+  propagated from the TLS connection to the authenticator, so
+  `MtlsAuthenticator` derives the principal (CN / SPIFFE SAN) that the PDP and
+  audit layers see. Authentication now **fails closed**: when the configured
+  authenticators recognise no valid credential, the gRPC request is rejected
+  with `Unauthenticated` rather than silently downgraded to an anonymous
+  principal. (The insecure authenticator never errors, so dev/test deployments
+  are unaffected.) Demonstrated and regression-tested by demo `10-mtls-identity`.
 
 ### Fixed
 
@@ -45,13 +57,9 @@ CI, an AGPL-3.0 relicense, and assorted hardening since `alpha.1`.
 
 ### Known limitations
 
-- **mTLS identity is not yet enforced.** Transport-level mTLS (client-cert
-  validation against `tls.ca_cert`) works, but the peer certificate is not yet
-  propagated to the authenticator, and authentication currently **fails open to
-  an anonymous principal**. Use bootstrap-token or JWT authentication (which
-  gate correctly) for now; do **not** rely on mTLS for authorization. End-to-end
-  enforcement (peer-cert propagation + fail-closed authn + integration test) is
-  tracked for `0.2.0` stable.
+- The REST surface (which does not carry mTLS) still falls back to an anonymous
+  principal on authentication error; gRPC fail-closed semantics will be extended
+  to REST in a follow-up. mTLS-gated authorization runs over gRPC.
 
 ## [0.1.0-alpha.1] — 2026-05-13
 

@@ -41,7 +41,10 @@ impl KeyServiceImpl {
         Self { state }
     }
 
-    async fn principal<T>(&self, request: &Request<T>) -> keyrack_core::pdp::Principal {
+    async fn principal<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<keyrack_core::pdp::Principal, Status> {
         ops::extract_principal_grpc(&self.state, request).await
     }
 
@@ -92,7 +95,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -184,7 +187,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -274,7 +277,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let src_key_id = req.source_key_id.clone();
 
@@ -405,7 +408,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -492,7 +495,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -609,7 +612,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -669,7 +672,7 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
-            let principal = self.principal(&request).await;
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
@@ -727,7 +730,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::CreateKeyRequest>,
     ) -> Result<Response<proto::CreateKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
 
         let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
@@ -831,7 +834,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyRequest>,
     ) -> Result<Response<proto::GetKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::GetKey, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -854,7 +857,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DescribeKeyRequest>,
     ) -> Result<Response<proto::DescribeKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::DescribeKey, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -877,7 +880,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::UpdateKeyRequest>,
     ) -> Result<Response<proto::UpdateKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::UpdateKey, principal, &key_id);
@@ -951,7 +954,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::EnableKeyRequest>,
     ) -> Result<Response<proto::EnableKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::EnableKey, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -993,7 +996,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DisableKeyRequest>,
     ) -> Result<Response<proto::DisableKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::DisableKey, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1082,7 +1085,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ScheduleKeyDeletionRequest>,
     ) -> Result<Response<proto::ScheduleKeyDeletionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
@@ -1127,7 +1130,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::CancelKeyDeletionRequest>,
     ) -> Result<Response<proto::CancelKeyDeletionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1166,7 +1169,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ReportKeyCompromiseRequest>,
     ) -> Result<Response<proto::ReportKeyCompromiseResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::ReportKeyCompromise, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1208,7 +1211,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::RotateKeyRequest>,
     ) -> Result<Response<proto::RotateKeyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1318,7 +1321,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListKeyVersionsRequest>,
     ) -> Result<Response<proto::ListKeyVersionsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::ListKeyVersions, principal, &key_id);
@@ -1348,7 +1351,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyVersionRequest>,
     ) -> Result<Response<proto::GetKeyVersionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::GetKeyVersion, principal, &key_id);
@@ -1382,7 +1385,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::EnableKeyRotationRequest>,
     ) -> Result<Response<proto::EnableKeyRotationResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::EnableKeyRotation, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1412,7 +1415,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DisableKeyRotationRequest>,
     ) -> Result<Response<proto::DisableKeyRotationResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::DisableKeyRotation, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1442,7 +1445,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyRotationStatusRequest>,
     ) -> Result<Response<proto::GetKeyRotationStatusResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationStatus, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1476,7 +1479,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyRotationHistoryRequest>,
     ) -> Result<Response<proto::GetKeyRotationHistoryResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationHistory, principal, &key_id);
@@ -1511,7 +1514,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::GetKeyRotationPolicyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::GetKeyRotationPolicy, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1543,7 +1546,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::SetKeyRotationPolicyRequest>,
     ) -> Result<Response<proto::SetKeyRotationPolicyResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::SetKeyRotationPolicy, principal, &key_id);
@@ -1590,7 +1593,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyDependentsRequest>,
     ) -> Result<Response<proto::GetKeyDependentsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::GetKeyDependents, principal, &key_id);
@@ -1634,7 +1637,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetKeyAncestorsRequest>,
     ) -> Result<Response<proto::GetKeyAncestorsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::GetKeyAncestors, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1681,7 +1684,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::CreateAliasRequest>,
     ) -> Result<Response<proto::CreateAliasResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let alias_name = req.alias_name.clone();
         let mut op_ctx = OpContext::alias(AuditAction::CreateAlias, principal, &alias_name);
@@ -1711,7 +1714,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DeleteAliasRequest>,
     ) -> Result<Response<proto::DeleteAliasResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let alias_name = request.into_inner().alias_name;
         let mut op_ctx = OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name);
         op_ctx.request_id = request_id;
@@ -1761,7 +1764,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::TagResourceRequest>,
     ) -> Result<Response<proto::TagResourceResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::TagResource, principal, &key_id);
@@ -1793,7 +1796,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::UntagResourceRequest>,
     ) -> Result<Response<proto::UntagResourceResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
         let mut op_ctx = OpContext::key(AuditAction::UntagResource, principal, &key_id);
@@ -1825,7 +1828,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListResourceTagsRequest>,
     ) -> Result<Response<proto::ListResourceTagsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::ListResourceTags, principal, &key_id);
         op_ctx.request_id = request_id;
@@ -1856,7 +1859,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::CreateHsmConnectionRequest>,
     ) -> Result<Response<proto::CreateHsmConnectionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let mut op_ctx = OpContext::resource(
             AuditAction::CreateHsmConnection,
@@ -1889,7 +1892,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetHsmConnectionRequest>,
     ) -> Result<Response<proto::GetHsmConnectionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let conn_id = request.into_inner().connection_id;
         let mut op_ctx = OpContext::resource(
             AuditAction::GetHsmConnection,
@@ -1916,7 +1919,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListHsmConnectionsRequest>,
     ) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let _req = request.into_inner();
         let mut op_ctx = OpContext::resource(
             AuditAction::ListHsmConnections,
@@ -1945,7 +1948,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DeleteHsmConnectionRequest>,
     ) -> Result<Response<proto::DeleteHsmConnectionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let conn_id = request.into_inner().connection_id;
         let mut op_ctx = OpContext::resource(
             AuditAction::DeleteHsmConnection,
@@ -1970,7 +1973,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::GetHsmConnectionStatusRequest>,
     ) -> Result<Response<proto::GetHsmConnectionStatusResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let conn_id = request.into_inner().connection_id;
         let mut op_ctx = OpContext::resource(
             AuditAction::GetHsmConnectionStatus,
@@ -2003,7 +2006,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::RegisterNamespaceRequest>,
     ) -> Result<Response<proto::RegisterNamespaceResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let name = req.name.clone();
         let mut op_ctx = OpContext::resource(
@@ -2025,7 +2028,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListNamespacesRequest>,
     ) -> Result<Response<proto::ListNamespacesResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let _req = request.into_inner();
         let mut op_ctx =
             OpContext::resource(AuditAction::ListNamespaces, principal, "*", "Namespace");
@@ -2043,7 +2046,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::DescribeNamespaceRequest>,
     ) -> Result<Response<proto::DescribeNamespaceResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let name = request.into_inner().name;
         let mut op_ctx = OpContext::resource(
             AuditAction::DescribeNamespace,
@@ -2068,7 +2071,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListRotationJobsRequest>,
     ) -> Result<Response<proto::ListRotationJobsResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let mut op_ctx =
             OpContext::resource(AuditAction::ListRotationJobs, principal, "*", "RotationJob");
@@ -2101,7 +2104,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::AcknowledgeRotationJobRequest>,
     ) -> Result<Response<proto::AcknowledgeRotationJobResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let job_id = request.into_inner().job_id;
         let mut op_ctx = OpContext::resource(
             AuditAction::AcknowledgeRotationJob,
@@ -2137,7 +2140,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::CompleteRotationJobRequest>,
     ) -> Result<Response<proto::CompleteRotationJobResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let job_id = request.into_inner().job_id;
         let mut op_ctx = OpContext::resource(
             AuditAction::CompleteRotationJob,
@@ -2173,7 +2176,7 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::FailRotationJobRequest>,
     ) -> Result<Response<proto::FailRotationJobResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let principal = self.principal(&request).await;
+        let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let job_id = req.job_id.clone();
         let mut op_ctx = OpContext::resource(

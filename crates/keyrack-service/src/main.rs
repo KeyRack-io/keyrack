@@ -103,10 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder = builder.tls_config(tls).expect("invalid TLS configuration");
             tracing::info!("TLS enabled on gRPC server");
 
-            // TODO: Extract peer certificates from the TLS connection into
-            // PeerCertificates request extensions so MtlsAuthenticator can
-            // derive identity. Transport-level mTLS validation is active; this
-            // only affects identity propagation to the PDP/audit layer.
+            // Peer certificates reach the authenticator via
+            // `tonic::Request::peer_certs()` in `ops::extract_principal_grpc`,
+            // so `MtlsAuthenticator` can derive the principal (CN / SPIFFE SAN)
+            // for the PDP and audit layers.
         }
 
         if let Some(ka) = &config.grpc_keepalive {
