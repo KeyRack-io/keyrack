@@ -25,6 +25,7 @@ keyrack-kmip = { workspace = true }
 keyrack-vault = { workspace = true }
 
 tonic = { version = "0.12", features = ["tls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 prost = "0.13"
 prost-types = "0.13"
 tokio = { workspace = true }

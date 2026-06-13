@@ -41,19 +41,26 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest=auto tags `:latest` only for the highest NON-prerelease
+          # semver tag, so prereleases (e.g. 0.2.0-beta.1) never become latest.
+          flavor: |
+            latest=auto
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
+            type=raw,value=edge,enable={{is_default_branch}}
 
+      # Publish on every push to main (`:edge`, `:main`, `:sha-...`) and on
+      # release tags (`:1.2.3`, `:1.2`, `:latest`). PRs build only, no push.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

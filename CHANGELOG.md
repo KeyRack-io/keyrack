@@ -2,9 +2,56 @@
 
 All notable changes to KeyRack will be documented in this file.
 
-## [0.1.0] — Unreleased
+## [Unreleased]
 
-Full release — follows alpha once integration tests pass.
+Toward `0.2.0` (stable). Pending: enforce mTLS-derived identity end-to-end
+(peer-certificate propagation + fail-closed authentication + integration test +
+demo). See _Known limitations_ under `0.2.0-beta.1`.
+
+## [0.2.0-beta.1] — 2026-06-13
+
+First beta. Adds provider routing, more differentiator demos, release-gated E2E
+CI, an AGPL-3.0 relicense, and assorted hardening since `alpha.1`.
+
+### Added
+
+- **Provider routing** — multi-provider registry with tag-based routing and
+  per-key/per-version provider binding (`ProviderRef`). Foundation for
+  multi-tenant HYOK and per-node backends. Single-provider configs remain
+  backward-compatible (serde-default `provider_ref`, no storage migration).
+- `keyrack audit verify` CLI subcommand (Ed25519 + BLAKE3 hash-chain
+  verification of an audit log).
+- `dependent_key_id` on rotation-job metadata (additive gRPC/REST field).
+- Demos: `06-provider-routing`, `07-k8s-sidecar` (native sidecar-in-a-pod),
+  `08-cascade-rotation`, `09-audit-tamper-evidence`.
+- Release-gated E2E CI lane that runs the demo compose stacks on `v*` tags.
+
+### Changed
+
+- **License: relicensed to AGPL-3.0-or-later** (from BSL-1.1). Alternative
+  commercial licensing remains available.
+- Demo 04 now runs on PostgreSQL and demonstrates restart survival.
+- Phase-2 hardening across the domain layer, authentication, audit, and cache;
+  PKCS#11 fixes including shared-module-per-`lib_path` (enables multi-token).
+
+### Fixed
+
+- **TLS/mTLS startup panic.** Install the rustls `aws_lc_rs` default
+  `CryptoProvider` at service startup. Under rustls 0.23 the process-wide crypto
+  provider must be installed before the first TLS handshake; without it
+  `keyrack-service` panicked whenever a `tls` block was configured. TLS and mTLS
+  handshakes now start correctly.
+- PostgreSQL multi-statement schema initialization.
+
+### Known limitations
+
+- **mTLS identity is not yet enforced.** Transport-level mTLS (client-cert
+  validation against `tls.ca_cert`) works, but the peer certificate is not yet
+  propagated to the authenticator, and authentication currently **fails open to
+  an anonymous principal**. Use bootstrap-token or JWT authentication (which
+  gate correctly) for now; do **not** rely on mTLS for authorization. End-to-end
+  enforcement (peer-cert propagation + fail-closed authn + integration test) is
+  tracked for `0.2.0` stable.
 
 ## [0.1.0-alpha.1] — 2026-05-13
 
