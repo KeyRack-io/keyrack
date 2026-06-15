@@ -235,7 +235,9 @@ async fn build_authenticators(
 }
 
 async fn build_provider(
+    name: &str,
     cfg: &keyrack_service::config::ProviderConfig,
+    audit: &Arc<dyn keyrack_core::audit::AuditSink>,
 ) -> Result<
     (
         Arc<dyn keyrack_core::provider::CryptoProvider>,
@@ -257,11 +259,23 @@ async fn build_provider(
             lib_path,
             token_label,
             pin,
+            pin_ref,
         } => {
+            // Resolve the PIN from exactly one of inline `pin` or a `pin_ref`
+            // secret reference (resolved under KEYRACK_SECRET_ROOT). Emits a
+            // secret_access audit event for reference resolution.
+            let resolved_pin = keyrack_service::secret_ref::resolve_pkcs11_pin(
+                name,
+                pin.as_ref(),
+                pin_ref.as_deref(),
+                "construct",
+                audit,
+            )
+            .await?;
             let pkcs11_config = keyrack_pkcs11::Pkcs11ProviderConfig {
                 lib_path: lib_path.clone(),
                 token_label: token_label.clone(),
-                pin: pin.clone(),
+                pin: resolved_pin.expose().to_string(),
             };
             (
                 Arc::new(keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?),
@@ -300,6 +314,74 @@ fn provider_class_str(class: keyrack_core::key::ProviderClass) -> &'static str {
     }
 }
 
+/// Build the audit sink (stdout/file/NATS), optionally wrapped in an Ed25519
+/// signing sink for tamper-evident hash chaining.
+async fn build_audit_sink(
+    config: &ServiceConfig,
+) -> Result<Arc<dyn keyrack_core::audit::AuditSink>, Box<dyn std::error::Error>> {
+    use keyrack_service::config::AuditConfig;
+
+    let base_sink: Box<dyn keyrack_core::audit::AuditSink> = match &config.audit {
+        AuditConfig::Stdout => Box::new(keyrack_core::audit::StdoutSink),
+        AuditConfig::File { path } => Box::new(keyrack_core::audit::FileSink::new(path)),
+        AuditConfig::Nats { url } => {
+            let mut sink = keyrack_nats::NatsAuditSink::connect(url).await?;
+            if let Some(nats_cfg) = &config.nats_notify {
+                sink = sink.with_prefix(&nats_cfg.audit_subject_prefix);
+            }
+            Box::new(sink)
+        }
+    };
+
+    if !config.sign_audit_events {
+        return Ok(Arc::from(base_sink));
+    }
+
+    let signer = if let Some(path) = &config.audit_signing_key_path {
+        let key_path = std::path::Path::new(path);
+        let signing_key = if key_path.exists() {
+            let bytes = std::fs::read(key_path).map_err(|e| -> Box<dyn std::error::Error> {
+                format!("failed to read audit signing key at {path}: {e}").into()
+            })?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "audit signing key at {path} must be exactly 32 bytes, got {}",
+                    bytes.len()
+                )
+                .into());
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        } else {
+            let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(key_path, key.to_bytes()).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!("failed to persist audit signing key to {path}: {e}").into()
+                },
+            )?;
+            tracing::info!(%path, "generated and persisted new audit signing key");
+            key
+        };
+        keyrack_core::audit::AuditSigner::new(signing_key)
+    } else {
+        tracing::info!("using ephemeral audit signing key (will not persist across restarts)");
+        keyrack_core::audit::AuditSigner::generate()
+    };
+    let vk = signer.verifying_key();
+    let vk_hex: String = vk.as_bytes().iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    tracing::info!(verifying_key = %vk_hex, "audit event signing enabled");
+    Ok(Arc::new(keyrack_core::audit::SigningAuditSink::new(
+        base_sink, signer,
+    )))
+}
+
 async fn build_state(
     config: &ServiceConfig,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
@@ -307,7 +389,7 @@ async fn build_state(
     use keyrack_core::authn::AuthenticatorChain;
     use keyrack_core::key::ProviderRef;
     use keyrack_core::registry::{ProviderEntry, ProviderRegistry, StaticProviderRegistry};
-    use keyrack_service::config::{AuditConfig, PdpConfig, StorageConfig};
+    use keyrack_service::config::{PdpConfig, StorageConfig};
     use keyrack_service::routing::ProviderRouter;
 
     let storage: Arc<dyn keyrack_core::storage::StorageBackend> = match &config.storage {
@@ -335,6 +417,10 @@ async fn build_state(
             storage
         };
 
+    // Build the audit sink before providers so that PKCS#11 `pin_ref`
+    // resolution can emit `secret_access` events during provider construction.
+    let audit = build_audit_sink(config).await?;
+
     // Build the provider registry from the resolved named-provider list.
     let (named_providers, default_name) = config
         .resolved_providers()
@@ -342,7 +428,7 @@ async fn build_state(
 
     let mut entries: Vec<(ProviderRef, ProviderEntry)> = Vec::new();
     for np in &named_providers {
-        let (provider, class) = build_provider(&np.provider).await?;
+        let (provider, class) = build_provider(&np.name, &np.provider, &audit).await?;
         let class_str = provider_class_str(class);
         if config.provider_deny.iter().any(|d| d == class_str) {
             return Err(format!(
@@ -431,71 +517,6 @@ async fn build_state(
                 None,
                 None,
             )?)
-        }
-    };
-
-    let audit: Arc<dyn keyrack_core::audit::AuditSink> = {
-        let base_sink: Box<dyn keyrack_core::audit::AuditSink> = match &config.audit {
-            AuditConfig::Stdout => Box::new(keyrack_core::audit::StdoutSink),
-            AuditConfig::File { path } => Box::new(keyrack_core::audit::FileSink::new(path)),
-            AuditConfig::Nats { url } => {
-                let mut sink = keyrack_nats::NatsAuditSink::connect(url).await?;
-                if let Some(nats_cfg) = &config.nats_notify {
-                    sink = sink.with_prefix(&nats_cfg.audit_subject_prefix);
-                }
-                Box::new(sink)
-            }
-        };
-
-        if config.sign_audit_events {
-            let signer = if let Some(path) = &config.audit_signing_key_path {
-                let key_path = std::path::Path::new(path);
-                let signing_key = if key_path.exists() {
-                    let bytes =
-                        std::fs::read(key_path).map_err(|e| -> Box<dyn std::error::Error> {
-                            format!("failed to read audit signing key at {path}: {e}").into()
-                        })?;
-                    if bytes.len() != 32 {
-                        return Err(format!(
-                            "audit signing key at {path} must be exactly 32 bytes, got {}",
-                            bytes.len()
-                        )
-                        .into());
-                    }
-                    let mut seed = [0u8; 32];
-                    seed.copy_from_slice(&bytes);
-                    ed25519_dalek::SigningKey::from_bytes(&seed)
-                } else {
-                    let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-                    if let Some(parent) = key_path.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    std::fs::write(key_path, key.to_bytes()).map_err(
-                        |e| -> Box<dyn std::error::Error> {
-                            format!("failed to persist audit signing key to {path}: {e}").into()
-                        },
-                    )?;
-                    tracing::info!(%path, "generated and persisted new audit signing key");
-                    key
-                };
-                keyrack_core::audit::AuditSigner::new(signing_key)
-            } else {
-                tracing::info!(
-                    "using ephemeral audit signing key (will not persist across restarts)"
-                );
-                keyrack_core::audit::AuditSigner::generate()
-            };
-            let vk = signer.verifying_key();
-            let vk_hex: String = vk.as_bytes().iter().fold(String::new(), |mut acc, b| {
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-            tracing::info!(verifying_key = %vk_hex, "audit event signing enabled");
-            Arc::new(keyrack_core::audit::SigningAuditSink::new(
-                base_sink, signer,
-            ))
-        } else {
-            Arc::from(base_sink)
         }
     };
 

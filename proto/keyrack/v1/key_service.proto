@@ -651,6 +651,26 @@ message CreateHsmConnectionRequest {
   string tls_cert_pem = 3;
   string tls_key_pem = 4;
   optional string tls_ca_pem = 5;
+
+  // DRAFT SKETCH (Stage 2 / HSM PIN custody, target 0.3.0) -- NOT YET WIRED.
+  // Shared with the design partner for adapter pre-flight; field numbers and
+  // shape are non-binding until the ADR is locked. See
+  // keyrack-internal/docs/architecture/adr-0001-hsm-pin-custody.md.
+  //
+  // Self-service runtime registration adds PKCS#11 connection config as an
+  // additive oneof at field 6 (HYOK/KMIP keeps endpoint + tls_* at 2-5).
+  // INVARIANT: PIN is a reference only ("file:<path>" resolved KeyRack-side
+  // under KEYRACK_SECRET_ROOT, default /etc/keyrack/secrets/), never PIN bytes
+  // on the wire. AWS/Barbican shims send none -> unaffected.
+  //
+  //   message Pkcs11ConnectionConfig {
+  //     string lib_path    = 1;
+  //     string token_label = 2;
+  //     string pin_ref     = 3;  // "file:<path>"; never the PIN itself
+  //   }
+  //   oneof connection_config {
+  //     Pkcs11ConnectionConfig pkcs11 = 6;
+  //   }
 }
 
 message CreateHsmConnectionResponse {

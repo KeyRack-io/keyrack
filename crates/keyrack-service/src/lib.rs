@@ -38,6 +38,7 @@ pub mod pdp_grpc;
 pub mod pdp_http;
 pub mod rest;
 pub mod routing;
+pub mod secret_ref;
 pub mod state;
 pub mod workers;
 

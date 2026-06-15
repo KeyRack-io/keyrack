@@ -46,6 +46,7 @@ pub mod resolver;
 pub mod rotation;
 pub mod routing;
 pub mod rule;
+pub mod secret;
 pub mod sensitive;
 pub mod storage;
 pub mod tags;

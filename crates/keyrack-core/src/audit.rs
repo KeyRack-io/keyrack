@@ -175,6 +175,11 @@ pub enum AuditAction {
     RotationJobExpired,
     #[serde(rename = "kms:KeyDestroyed")]
     KeyDestroyed,
+
+    // Secret-reference custody (HSM PIN custody / Scope B). Emitted when a
+    // provider secret reference (e.g. a PKCS#11 `pin_ref`) is resolved.
+    #[serde(rename = "kms:AccessSecret")]
+    AccessSecret,
 }
 
 impl std::fmt::Display for AuditAction {
@@ -203,6 +208,7 @@ pub enum EventType {
     KeyCompromised,
     CascadeDisable,
     AuthorizationDenied,
+    SecretAccess,
 }
 
 /// Outcome of the audited operation.
@@ -898,6 +904,7 @@ mod tests {
             AuditAction::CompleteRotationJob,
             AuditAction::FailRotationJob,
             AuditAction::CascadeDisable,
+            AuditAction::AccessSecret,
         ];
 
         for action in &actions {

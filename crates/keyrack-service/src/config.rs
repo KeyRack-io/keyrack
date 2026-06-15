@@ -20,6 +20,7 @@
 
 //! Service configuration loaded from YAML or environment variables.
 
+use keyrack_core::secret::SecretString;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +109,9 @@ pub struct ServiceConfig {
 ///     type: pkcs11
 ///     lib_path: /usr/lib/pkcs11.so
 ///     token_label: TenantToken
-///     pin: 1234
+///     # Either an inline `pin:` (dev/single-HSM) or a `pin_ref:` reference
+///     # resolved under KEYRACK_SECRET_ROOT (production). Exactly one.
+///     pin_ref: "file:tenant-hsm.pin"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedProvider {
@@ -244,7 +247,16 @@ pub enum ProviderConfig {
     Pkcs11 {
         lib_path: String,
         token_label: String,
-        pin: String,
+        /// Inline PIN (Model A back-compat). Held in a redacting secret type so
+        /// it never leaks via `Debug`/`Serialize`. Mutually exclusive with
+        /// `pin_ref`; exactly one must be set.
+        #[serde(default)]
+        pin: Option<SecretString>,
+        /// Secret reference to the PIN, e.g. `"file:tenant-a.pin"`, resolved
+        /// KeyRack-side under the `KEYRACK_SECRET_ROOT` allowlist root. The
+        /// reference is not itself a secret. Mutually exclusive with `pin`.
+        #[serde(default)]
+        pin_ref: Option<String>,
     },
     Kmip {
         host: String,
