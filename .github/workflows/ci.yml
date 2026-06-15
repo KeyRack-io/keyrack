@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Run JS actions on Node 24 (forced default from 2026-06-16). Drop once all
+  # actions ship Node 24 runtimes natively.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   check:

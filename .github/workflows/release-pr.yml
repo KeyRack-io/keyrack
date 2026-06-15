@@ -12,6 +12,11 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
 
+env:
+  # Run JS actions on Node 24 (forced default from 2026-06-16). Drop once all
+  # actions ship Node 24 runtimes natively.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   e2e:
     name: E2E gate (release PR)
