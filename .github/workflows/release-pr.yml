@@ -1,0 +1,42 @@
+name: Release candidate
+
+# Pre-merge validation for RELEASE pull requests. Add the `release` label to a
+# PR (e.g. the changelog/version-bump PR) to run the full E2E demo suite and a
+# multi-arch image build (no push) BEFORE merge. Merge only when green, then tag
+# the merged commit — release.yml re-runs E2E as the hard gate before publish.
+#
+# Normal PRs are unaffected (the jobs are skipped without the label), so the
+# fast lane in ci.yml stays fast.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  e2e:
+    name: E2E gate (release PR)
+    if: contains(github.event.pull_request.labels.*.name, 'release')
+    uses: ./.github/workflows/e2e.yml
+
+  image-build:
+    name: Image build (no push)
+    if: contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build multi-arch image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

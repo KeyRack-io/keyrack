@@ -1,12 +1,13 @@
-name: E2E (release-gated)
+name: E2E demos
 
-# Heavy end-to-end demo stacks are gated on release tags, not every PR, to keep
-# the fast CI lane fast. A failure here blocks the release.
+# The heavy end-to-end demo stacks. Exposed as a REUSABLE workflow so it can be
+# invoked as a hard gate by:
+#   - release.yml      (on a v* tag, BEFORE the image is published)
+#   - release-pr.yml   (on a PR labeled `release`, BEFORE merge)
+# and run manually via workflow_dispatch. It is deliberately NOT on the per-PR
+# fast lane (ci.yml) to keep that lane fast.
 on:
-  push:
-    tags: ["v*"]
-  release:
-    types: [published]
+  workflow_call: {}
   workflow_dispatch: {}
 
 jobs:
