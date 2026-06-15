@@ -261,7 +261,8 @@ pub async fn create_key(
 
     let now = chrono::Utc::now();
     let key_usage = match input.key_spec {
-        KeySpec::Aes256 => KeyUsage::EncryptDecrypt,
+        KeySpec::Aes256 | KeySpec::Aes128 => KeyUsage::EncryptDecrypt,
+        KeySpec::Hmac256 => KeyUsage::GenerateVerifyMac,
         _ => KeyUsage::SignVerify,
     };
 

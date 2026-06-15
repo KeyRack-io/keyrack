@@ -27,8 +27,10 @@ serde_yaml = "0.9"
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.8"
 subtle = "2"
 

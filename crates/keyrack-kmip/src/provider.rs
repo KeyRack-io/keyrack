@@ -138,22 +138,28 @@ impl KmipProvider {
         Ok(())
     }
 
-    fn key_spec_to_kmip(spec: &KeySpec) -> (u32, i32, bool) {
-        match spec {
+    fn key_spec_to_kmip(spec: &KeySpec) -> Result<(u32, i32, bool)> {
+        Ok(match spec {
             KeySpec::Aes256 => (ttlv::crypto_algorithm::AES, 256, true),
             KeySpec::Ed25519 => (ttlv::crypto_algorithm::ED25519, 256, false),
             KeySpec::EcdsaP256Sha256 => (ttlv::crypto_algorithm::ECDSA, 256, false),
             KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {
                 (ttlv::crypto_algorithm::RSA, *key_size as i32, false)
             }
-        }
+            // TODO(proto-align): wire P-384/SHA-384-512/HMAC into kmip.
+            other => {
+                return Err(KeyRackError::Provider(format!(
+                    "unsupported key spec for kmip: {other:?}"
+                )))
+            }
+        })
     }
 }
 
 #[async_trait]
 impl CryptoProvider for KmipProvider {
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
-        let (algorithm, key_length, is_symmetric) = Self::key_spec_to_kmip(spec);
+        let (algorithm, key_length, is_symmetric) = Self::key_spec_to_kmip(spec)?;
 
         let request = if is_symmetric {
             messages::create_symmetric_key(algorithm, key_length)
@@ -418,18 +424,18 @@ mod tests {
 
     #[test]
     fn key_spec_mapping() {
-        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Aes256);
+        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Aes256).unwrap();
         assert_eq!(alg, crate::ttlv::crypto_algorithm::AES);
         assert_eq!(len, 256);
         assert!(sym);
 
-        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Ed25519);
+        let (alg, len, sym) = KmipProvider::key_spec_to_kmip(&KeySpec::Ed25519).unwrap();
         assert_eq!(alg, crate::ttlv::crypto_algorithm::ED25519);
         assert_eq!(len, 256);
         assert!(!sym);
 
         let (alg, len, sym) =
-            KmipProvider::key_spec_to_kmip(&KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 });
+            KmipProvider::key_spec_to_kmip(&KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 }).unwrap();
         assert_eq!(alg, crate::ttlv::crypto_algorithm::RSA);
         assert_eq!(len, 4096);
         assert!(!sym);

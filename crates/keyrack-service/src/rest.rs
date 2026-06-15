@@ -144,6 +144,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys/:key_id/actions-decrypt", post(decrypt))
         .route("/v1/keys/:key_id/actions-sign", post(sign))
         .route("/v1/keys/:key_id/actions-verify", post(verify))
+        .route("/v1/keys/:key_id/actions-generate-mac", post(generate_mac))
+        .route("/v1/keys/:key_id/actions-verify-mac", post(verify_mac))
         .route(
             "/v1/keys/:key_id/actions-generate-data-key",
             post(generate_data_key),
@@ -258,6 +260,9 @@ async fn create_key(
                 "RSA_PSS_2048" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 },
                 "RSA_PSS_3072" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 3072 },
                 "RSA_PSS_4096" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 },
+                "ECC_NIST_P384" => keyrack_core::key::KeySpec::EcdsaP384,
+                "HMAC_256" => keyrack_core::key::KeySpec::Hmac256,
+                "AES_128" => keyrack_core::key::KeySpec::Aes128,
                 _ => return Err(ops::rest_error(StatusCode::BAD_REQUEST, "InvalidKeySpec", &format!("unknown key_spec: {spec_str}"))),
             };
             if matches!(&spec, keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 } | keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 }) {
@@ -313,7 +318,12 @@ async fn create_key(
 
             let now = chrono::Utc::now();
             let key_usage = match spec {
-                keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
+                keyrack_core::key::KeySpec::Aes256 | keyrack_core::key::KeySpec::Aes128 => {
+                    keyrack_core::key::KeyUsage::EncryptDecrypt
+                }
+                keyrack_core::key::KeySpec::Hmac256 => {
+                    keyrack_core::key::KeyUsage::GenerateVerifyMac
+                }
                 _ => keyrack_core::key::KeyUsage::SignVerify,
             };
             let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_owned();
@@ -831,19 +841,15 @@ async fn sign(
             .get("signing_algorithm")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let alg = match alg_str {
-            "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
-            "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
-            "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
-            "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
-            _ => {
-                return Err(ops::rest_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidAlgorithm",
-                    &format!("unknown signing_algorithm: {alg_str}"),
-                ))
-            }
-        };
+        let alg = parse_signing_algorithm(alg_str)?;
+        let use_digest = parse_message_type_is_digest(&body)?;
+        if use_digest && alg == keyrack_core::provider::SigningAlgorithm::Ed25519 {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "DIGEST message type is invalid for Ed25519",
+            ));
+        }
         let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let message = base64_decode(message_b64)?;
         let primary = record
@@ -861,11 +867,21 @@ async fn sign(
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
-        let signature = sign_entry
-            .provider
-            .sign(&primary.key_handle, alg, &message)
-            .await
-            .map_err(map_core_err)?;
+        let signature = if use_digest {
+            sign_entry
+                .provider
+                .sign_digest(&primary.key_handle, alg, &message)
+                .await
+                .map_err(|e| {
+                    ops::rest_error(StatusCode::BAD_REQUEST, "InvalidArgument", &e.to_string())
+                })?
+        } else {
+            sign_entry
+                .provider
+                .sign(&primary.key_handle, alg, &message)
+                .await
+                .map_err(map_core_err)?
+        };
         Ok(Json(serde_json::json!({
             "signature": base64_encode(&signature),
             "key_id": record.lid.to_string(),
@@ -893,19 +909,15 @@ async fn verify(
             .get("signing_algorithm")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let alg = match alg_str {
-            "ED25519" => keyrack_core::provider::SigningAlgorithm::Ed25519,
-            "ECDSA_P256_SHA256" => keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha256,
-            "RSA_PKCS1_V15_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha256,
-            "RSA_PSS_SHA256" => keyrack_core::provider::SigningAlgorithm::RsaPssSha256,
-            _ => {
-                return Err(ops::rest_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidAlgorithm",
-                    &format!("unknown signing_algorithm: {alg_str}"),
-                ))
-            }
-        };
+        let alg = parse_signing_algorithm(alg_str)?;
+        let use_digest = parse_message_type_is_digest(&body)?;
+        if use_digest && alg == keyrack_core::provider::SigningAlgorithm::Ed25519 {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "DIGEST message type is invalid for Ed25519",
+            ));
+        }
         let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
         let signature =
             base64_decode(body.get("signature").and_then(|v| v.as_str()).unwrap_or(""))?;
@@ -924,14 +936,183 @@ async fn verify(
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
-        let valid = verify_entry
-            .provider
-            .verify(&primary.key_handle, alg, &message, &signature)
-            .await
-            .map_err(map_core_err)?;
+        let valid = if use_digest {
+            verify_entry
+                .provider
+                .verify_digest(&primary.key_handle, alg, &message, &signature)
+                .await
+                .map_err(|e| {
+                    ops::rest_error(StatusCode::BAD_REQUEST, "InvalidArgument", &e.to_string())
+                })?
+        } else {
+            verify_entry
+                .provider
+                .verify(&primary.key_handle, alg, &message, &signature)
+                .await
+                .map_err(map_core_err)?
+        };
         Ok(Json(serde_json::json!({
             "signature_valid": valid,
             "key_id": record.lid.to_string(),
+        })))
+    })
+    .await
+}
+
+#[cfg(feature = "crypto-endpoints")]
+fn parse_signing_algorithm(s: &str) -> Result<keyrack_core::provider::SigningAlgorithm, RestError> {
+    use keyrack_core::provider::SigningAlgorithm as A;
+    Ok(match s {
+        "ED25519" => A::Ed25519,
+        "ECDSA_P256_SHA256" => A::EcdsaP256Sha256,
+        "ECDSA_P256_SHA384" => A::EcdsaP256Sha384,
+        "ECDSA_P384_SHA384" => A::EcdsaP384Sha384,
+        "RSA_PKCS1_V15_SHA256" => A::RsaPkcs1v15Sha256,
+        "RSA_PKCS1_V15_SHA384" => A::RsaPkcs1v15Sha384,
+        "RSA_PKCS1_V15_SHA512" => A::RsaPkcs1v15Sha512,
+        "RSA_PSS_SHA256" => A::RsaPssSha256,
+        "RSA_PSS_SHA384" => A::RsaPssSha384,
+        "RSA_PSS_SHA512" => A::RsaPssSha512,
+        _ => {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidAlgorithm",
+                &format!("unknown signing_algorithm: {s}"),
+            ))
+        }
+    })
+}
+
+/// Parse the optional `message_type` field. Defaults to RAW; returns
+/// `true` when DIGEST was requested.
+#[cfg(feature = "crypto-endpoints")]
+fn parse_message_type_is_digest(body: &serde_json::Value) -> Result<bool, RestError> {
+    match body
+        .get("message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("RAW")
+    {
+        "RAW" | "MESSAGE_TYPE_UNSPECIFIED" => Ok(false),
+        "DIGEST" => Ok(true),
+        other => Err(ops::rest_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            &format!("unknown message_type: {other}"),
+        )),
+    }
+}
+
+#[cfg(feature = "crypto-endpoints")]
+fn parse_mac_algorithm(s: &str) -> Result<keyrack_core::provider::MacAlgorithm, RestError> {
+    use keyrack_core::provider::MacAlgorithm as M;
+    Ok(match s {
+        "HMAC_SHA_256" => M::HmacSha256,
+        "HMAC_SHA_384" => M::HmacSha384,
+        "HMAC_SHA_512" => M::HmacSha512,
+        _ => {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidAlgorithm",
+                &format!("unknown mac_algorithm: {s}"),
+            ))
+        }
+    })
+}
+
+#[cfg(feature = "crypto-endpoints")]
+async fn generate_mac(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
+    op_ctx.request_id = request_id;
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let alg_str = body
+            .get("mac_algorithm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let alg = parse_mac_algorithm(alg_str)?;
+        let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let mac_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let mac = mac_entry
+            .provider
+            .generate_mac(&primary.key_handle, alg, &message)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "mac": base64_encode(&mac),
+            "key_id": record.lid.to_string(),
+            "mac_algorithm": alg_str,
+        })))
+    })
+    .await
+}
+
+#[cfg(feature = "crypto-endpoints")]
+async fn verify_mac(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
+    op_ctx.request_id = request_id;
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let lid = parse_lid_rest(&key_id)?;
+        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let alg_str = body
+            .get("mac_algorithm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let alg = parse_mac_algorithm(alg_str)?;
+        let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let mac = base64_decode(body.get("mac").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let primary = record
+            .key_versions
+            .iter()
+            .find(|v| v.is_primary)
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "NoVersion",
+                    "no primary version",
+                )
+            })?;
+        let mac_entry = state
+            .providers
+            .resolve_for_primary(&record)
+            .map_err(map_core_err)?;
+        let mac_valid = mac_entry
+            .provider
+            .verify_mac(&primary.key_handle, alg, &message, &mac)
+            .await
+            .map_err(map_core_err)?;
+        Ok(Json(serde_json::json!({
+            "mac_valid": mac_valid,
+            "key_id": record.lid.to_string(),
+            "mac_algorithm": alg_str,
         })))
     })
     .await

@@ -489,6 +489,7 @@ async fn sign_verify_with_pdp_and_audit() {
             key_id: key_id.clone(),
             message: b"data-to-sign".to_vec(),
             signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+            message_type: proto::MessageType::Raw.into(),
         }))
         .await
         .expect("sign");
@@ -499,6 +500,7 @@ async fn sign_verify_with_pdp_and_audit() {
             message: b"data-to-sign".to_vec(),
             signature: sign_resp.into_inner().signature,
             signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+            message_type: proto::MessageType::Raw.into(),
         }))
         .await
         .expect("verify");

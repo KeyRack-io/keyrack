@@ -67,8 +67,39 @@ pub struct KeyHandle {
 pub enum SigningAlgorithm {
     Ed25519,
     EcdsaP256Sha256,
+    EcdsaP256Sha384,
+    EcdsaP384Sha384,
     RsaPkcs1v15Sha256,
+    RsaPkcs1v15Sha384,
+    RsaPkcs1v15Sha512,
     RsaPssSha256,
+    RsaPssSha384,
+    RsaPssSha512,
+}
+
+impl SigningAlgorithm {
+    /// Output length in bytes of this algorithm's message digest.
+    /// `None` for Ed25519 (no separate pre-hash step).
+    #[must_use]
+    pub fn digest_len(&self) -> Option<usize> {
+        match self {
+            Self::Ed25519 => None,
+            Self::EcdsaP256Sha256 | Self::RsaPkcs1v15Sha256 | Self::RsaPssSha256 => Some(32),
+            Self::EcdsaP256Sha384
+            | Self::EcdsaP384Sha384
+            | Self::RsaPkcs1v15Sha384
+            | Self::RsaPssSha384 => Some(48),
+            Self::RsaPkcs1v15Sha512 | Self::RsaPssSha512 => Some(64),
+        }
+    }
+}
+
+/// Algorithm selector for symmetric MAC operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MacAlgorithm {
+    HmacSha256,
+    HmacSha384,
+    HmacSha512,
 }
 
 /// Algorithm selector for encryption operations.
@@ -85,6 +116,8 @@ pub enum CryptoOperation {
     Decrypt,
     Sign,
     Verify,
+    GenerateMac,
+    VerifyMac,
     GenerateRandom,
     GenerateDataKey,
     ReEncrypt,
@@ -173,6 +206,68 @@ pub trait CryptoProvider: Send + Sync {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool>;
+
+    /// Sign a caller-supplied pre-computed `digest` (KMS `MessageType=DIGEST`).
+    ///
+    /// Unlike [`sign`](Self::sign), the server does NOT hash `digest`; it is
+    /// signed as-is. `digest` length must match the algorithm's hash output.
+    /// Invalid for Ed25519 (no separate pre-hash step).
+    ///
+    /// Default: unsupported. Providers that can sign a raw digest override this.
+    async fn sign_digest(
+        &self,
+        _handle: &KeyHandle,
+        _algorithm: SigningAlgorithm,
+        _digest: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(crate::error::KeyRackError::Provider(
+            "digest signing not supported by this provider".into(),
+        ))
+    }
+
+    /// Verify a `signature` over a caller-supplied pre-computed `digest`.
+    ///
+    /// Default: unsupported. Providers that support digest signing override.
+    async fn verify_digest(
+        &self,
+        _handle: &KeyHandle,
+        _algorithm: SigningAlgorithm,
+        _digest: &[u8],
+        _signature: &[u8],
+    ) -> Result<bool> {
+        Err(crate::error::KeyRackError::Provider(
+            "digest verification not supported by this provider".into(),
+        ))
+    }
+
+    /// Compute a symmetric MAC over `message` (HMAC keys).
+    ///
+    /// Default: unsupported. MAC-capable providers override this.
+    async fn generate_mac(
+        &self,
+        _handle: &KeyHandle,
+        _algorithm: MacAlgorithm,
+        _message: &[u8],
+    ) -> Result<Vec<u8>> {
+        Err(crate::error::KeyRackError::Provider(
+            "MAC generation not supported by this provider".into(),
+        ))
+    }
+
+    /// Verify a symmetric MAC over `message` in constant time.
+    ///
+    /// Default: unsupported. MAC-capable providers override this.
+    async fn verify_mac(
+        &self,
+        _handle: &KeyHandle,
+        _algorithm: MacAlgorithm,
+        _message: &[u8],
+        _mac: &[u8],
+    ) -> Result<bool> {
+        Err(crate::error::KeyRackError::Provider(
+            "MAC verification not supported by this provider".into(),
+        ))
+    }
 
     /// Generate `length` bytes of cryptographically secure random data.
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>>;

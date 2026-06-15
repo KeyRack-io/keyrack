@@ -411,6 +411,8 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::Decrypt
         | AuditAction::Sign
         | AuditAction::Verify
+        | AuditAction::GenerateMac
+        | AuditAction::VerifyMac
         | AuditAction::GenerateRandom
         | AuditAction::GenerateDataKey
         | AuditAction::GenerateDataKeyWithoutPlaintext

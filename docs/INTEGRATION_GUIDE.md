@@ -250,3 +250,93 @@ the cost of more backend lookups.
 - [ ] Log level set appropriately (`RUST_LOG=keyrack_service=info`)
 - [ ] Metrics endpoint exposed for Prometheus scraping
 - [ ] Backup strategy for storage (SQLite/Postgres) and audit signing key
+
+---
+
+## 6. Cryptographic operation semantics (gRPC/REST clients)
+
+This section pins down the wire-level details that an adapter author needs to
+get byte-for-byte correct. They are part of the `keyrack.v1` proto contract.
+
+### 6.1 Sign / Verify — message vs. digest
+
+`SignRequest`/`VerifyRequest` carry a `message` field plus a `message_type`:
+
+| `message_type` | Meaning |
+|---|---|
+| `RAW` (or unset) | `message` is the full message. **KeyRack hashes it server-side** with the algorithm's hash, then signs. |
+| `DIGEST` | `message` is a **pre-computed digest**. KeyRack signs it as-is (no hashing). Its length must equal the algorithm's hash output (SHA-256→32, SHA-384→48, SHA-512→64 bytes). |
+
+Use `DIGEST` for the standard KMS workflow where the (potentially large) message
+is hashed by the caller and only the digest reaches the KMS — this matches AWS
+KMS, GCP Cloud KMS, and Azure Key Vault.
+
+`DIGEST` is **invalid for `ED25519_PURE`** (Ed25519 signs the full message by
+construction); such a request is rejected with `INVALID_ARGUMENT`. For Ed25519,
+always send the full message with `message_type = RAW`.
+
+Migration note for adapters that previously sent a pre-hashed value in `message`
+with the default (RAW) type: that produced a hash-of-a-hash. Set
+`message_type = DIGEST`.
+
+### 6.2 Encryption context (AAD)
+
+`encryption_context` is a `map<string,string>`. **Pass the structured map; do not
+pre-hash it.** KeyRack canonicalizes the map and uses it directly as AES-GCM AAD,
+and stores a BLAKE3 hash of the same canonical form in the ciphertext header for
+decrypt-time verification.
+
+Canonical encoding (entries **sorted by key**, lexicographic byte order; all
+lengths little-endian `u32`):
+
+```text
+for each (key, value) in sorted(context):
+    u32_le(key.len()) || key_bytes || u32_le(value.len()) || value_bytes
+```
+
+- The concatenation above is the **AES-GCM AAD**.
+- The **header hash** is `BLAKE3(AAD_bytes)`; an **empty** context hashes to the
+  all-zero 32-byte sentinel (distinct from `BLAKE3("")`).
+- Decrypt must supply the **same** context (same pairs); a mismatch fails with
+  `EncryptionContextMismatch` (`INVALID_ARGUMENT`).
+
+If your envelope layer historically hashed the context into a 32-byte AAD before
+the backend call, drop that step and forward the map — KeyRack owns the binding.
+
+### 6.3 MAC (HMAC)
+
+`GenerateMac` / `VerifyMac` operate on `HMAC_256` keys (`KeyUsage =
+GENERATE_VERIFY_MAC`). `mac_algorithm` selects `HMAC_SHA_256/384/512`. `VerifyMac`
+compares in constant time and returns `mac_valid`.
+
+### 6.4 Algorithm & key-spec coverage
+
+| KeySpec | Usage | Algorithms |
+|---|---|---|
+| `AES_256`, `AES_128` | Encrypt/Decrypt | AES-GCM |
+| `ED25519` | Sign/Verify | `ED25519_PURE` (RAW only) |
+| `ECDSA_P256` | Sign/Verify | `ECDSA_P256_SHA256`, `ECDSA_P256_SHA384` |
+| `ECC_NIST_P384` | Sign/Verify | `ECDSA_P384_SHA384` |
+| `RSA_*` | Sign/Verify | `RSA_PKCS1_V15_SHA{256,384,512}` |
+| `RSA_PSS_*` | Sign/Verify | `RSA_PSS_SHA{256,384,512}` |
+| `HMAC_256` | MAC | `HMAC_SHA_{256,384,512}` |
+
+Provider support varies (the software provider implements all of the above; the
+PKCS#11/KMIP/Vault providers implement a subset). Query `ProviderCapabilities`
+to discover what a given deployment supports.
+
+### 6.5 `CreateKey` minimal form
+
+`key_usage` and `namespace` are optional. With only `key_spec` set, KeyRack
+derives usage from the spec (`AES_*`→ENCRYPT_DECRYPT, `HMAC_256`→GENERATE_VERIFY_MAC,
+asymmetric→SIGN_VERIFY) and treats an empty namespace as "no namespace". A
+provided `key_usage` that conflicts with the spec is rejected.
+
+### 6.6 `KeyState` enum numbering (proto ≥ 0.2)
+
+`KeyState` was renumbered to the conventional ordering
+(`ENABLED = 1, DISABLED = 2, PENDING_DELETION = 3, DESTROYED = 4, CREATING = 5,
+COMPROMISED = 6`). gRPC clients compiled against an earlier proto **must be
+recompiled** against the current `key_service.proto` — the numeric values changed
+on the wire. (Field names are unchanged, so JSON/REST clients keying off the
+state string are unaffected.)
