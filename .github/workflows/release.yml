@@ -1,9 +1,9 @@
 name: Release
 
-# On a version tag, run the full E2E demo suite FIRST, then publish the
-# multi-arch image ONLY if E2E passes. This makes E2E a hard release gate:
-# a failing demo blocks the publish (unlike a parallel workflow, which would
-# let the image ship even on a red E2E run).
+# On a version tag, run the full E2E demo suite FIRST, then PROMOTE the image
+# that docker.yml already built for this commit (published as :sha-<short> on
+# the main push) to the release version tags. No rebuild: the released image is
+# byte-identical to what E2E validated. A failed E2E blocks the promote.
 on:
   push:
     tags: ["v*"]
@@ -18,18 +18,13 @@ jobs:
     uses: ./.github/workflows/e2e.yml
 
   publish:
-    name: Build + push multi-arch image
+    name: Promote image to release tags
     needs: e2e
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -40,27 +35,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
+      - name: Extract release metadata (tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # latest=auto tags `:latest` only for the highest NON-prerelease
-          # semver tag, so prereleases (e.g. 0.2.0-beta.2) never become latest.
+          # latest=auto tags :latest only for the highest NON-prerelease semver,
+          # so prereleases (e.g. 0.2.0-beta.2) never become :latest.
           flavor: |
             latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # docker.yml built this exact commit on the main push and published it as
+      # :sha-<short> (metadata-action type=sha => 7-char short sha).
+      - name: Resolve source image
+        id: src
+        run: echo "ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(echo ${GITHUB_SHA} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for source image
+        run: |
+          for i in $(seq 1 60); do
+            if docker buildx imagetools inspect "${{ steps.src.outputs.ref }}" >/dev/null 2>&1; then
+              echo "found ${{ steps.src.outputs.ref }}"; exit 0
+            fi
+            echo "waiting for ${{ steps.src.outputs.ref }} ($i/60)"; sleep 30
+          done
+          echo "source image ${{ steps.src.outputs.ref }} never appeared"; exit 1
+
+      - name: Promote to release tags
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "${{ steps.src.outputs.ref }}"
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
