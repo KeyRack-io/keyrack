@@ -32,6 +32,7 @@ pub mod config;
 pub mod convert;
 pub mod domain;
 pub mod grpc;
+pub mod hsm_registration;
 pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;

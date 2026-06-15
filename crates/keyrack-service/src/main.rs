@@ -388,7 +388,7 @@ async fn build_state(
 ) -> Result<ServiceState, Box<dyn std::error::Error>> {
     use keyrack_core::authn::AuthenticatorChain;
     use keyrack_core::key::ProviderRef;
-    use keyrack_core::registry::{ProviderEntry, ProviderRegistry, StaticProviderRegistry};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
     use keyrack_service::config::{PdpConfig, StorageConfig};
     use keyrack_service::routing::ProviderRouter;
 
@@ -445,8 +445,21 @@ async fn build_state(
     }
 
     let default_ref = ProviderRef::new(default_name.clone());
-    let registry = StaticProviderRegistry::new(entries, default_ref.clone())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    // Dynamic registry so CreateHsmConnection (Stage 2) and boot rehydration can
+    // add HSM providers at runtime. Seeded with the static-config providers.
+    let providers: Arc<dyn ProviderRegistry> = Arc::new(
+        DynamicProviderRegistry::new(entries, default_ref.clone())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
+    );
+
+    // Rehydrate any persisted HSM connections into the registry. Per-connection
+    // failures are fail-closed (marked degraded) and do not block boot.
+    if let Err(e) =
+        keyrack_service::hsm_registration::rehydrate_hsm_connections(&storage, &providers, &audit)
+            .await
+    {
+        tracing::warn!(error = %e, "HSM connection rehydration could not list connections; continuing");
+    }
 
     // Build the provider router from routing rules.
     let router_rules: Vec<(std::collections::BTreeMap<String, String>, ProviderRef)> = config
@@ -463,7 +476,7 @@ async fn build_state(
     // Validate that every rule's provider exists in the registry.
     for rule in &config.provider_routing {
         let pref = ProviderRef::new(rule.provider.clone());
-        registry
+        providers
             .resolve(&pref)
             .map_err(|_| -> Box<dyn std::error::Error> {
                 format!(
@@ -538,7 +551,7 @@ async fn build_state(
 
     Ok(ServiceState {
         storage,
-        providers: Arc::new(registry),
+        providers,
         provider_router,
         pdp,
         audit,
