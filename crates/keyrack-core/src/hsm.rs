@@ -76,6 +76,18 @@ pub struct HsmConnection {
     pub endpoint: String,
     pub description: String,
 
+    /// PKCS#11 token label (`HSM` provider type, Stage 2 dynamic registration).
+    /// `None` for HYOK and for legacy/interim records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_label: Option<String>,
+
+    /// Reference to the PKCS#11 PIN (`"file:<path>"`), resolved KeyRack-side
+    /// under the `KEYRACK_SECRET_ROOT` allowlist root. **Never** the resolved
+    /// PIN bytes — only the reference is persisted; the PIN is re-resolved from
+    /// the mount on every construction/rehydration. `None` for HYOK / legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_ref: Option<String>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_health_check_at: Option<DateTime<Utc>>,
@@ -97,10 +109,54 @@ impl HsmConnection {
             status: HsmConnectionStatus::Healthy,
             endpoint: endpoint.into(),
             description: description.into(),
+            token_label: None,
+            pin_ref: None,
             created_at: now,
             updated_at: now,
             last_health_check_at: None,
         }
+    }
+
+    /// Attach PKCS#11 token label + PIN reference (Stage 2 `HSM` connections).
+    ///
+    /// `endpoint` carries the PKCS#11 `lib_path`; `pin_ref` is a reference
+    /// (`"file:<path>"`), never the PIN itself.
+    #[must_use]
+    pub fn with_pkcs11(
+        mut self,
+        token_label: impl Into<String>,
+        pin_ref: impl Into<String>,
+    ) -> Self {
+        self.token_label = Some(token_label.into());
+        self.pin_ref = Some(pin_ref.into());
+        self
+    }
+
+    /// PKCS#11 connection parameters `(lib_path, token_label, pin_ref)` if this
+    /// is an `HSM`-type connection with the Stage 2 fields populated.
+    ///
+    /// `lib_path` is [`Self::endpoint`]. Returns `None` for HYOK connections or
+    /// legacy records that predate dynamic PKCS#11 registration.
+    #[must_use]
+    pub fn pkcs11_params(&self) -> Option<(&str, &str, &str)> {
+        if self.provider_type != HsmProviderType::Hsm {
+            return None;
+        }
+        match (self.token_label.as_deref(), self.pin_ref.as_deref()) {
+            (Some(label), Some(reference)) => Some((self.endpoint.as_str(), label, reference)),
+            _ => None,
+        }
+    }
+
+    /// Whether two connections describe the *same* underlying PKCS#11 binding.
+    /// Used by `CreateHsmConnection` idempotency: a re-registration with the
+    /// same id but a different binding is a conflict (ADR-0001 §8).
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.provider_type == other.provider_type
+            && self.endpoint == other.endpoint
+            && self.token_label == other.token_label
+            && self.pin_ref == other.pin_ref
     }
 
     /// Update connection status from a health check probe.
@@ -180,5 +236,84 @@ mod tests {
         assert_eq!(hsm_json, r#""HSM""#);
         let hyok_json = serde_json::to_string(&HsmProviderType::Hyok).unwrap();
         assert_eq!(hyok_json, r#""HYOK""#);
+    }
+
+    #[test]
+    fn pkcs11_params_present_for_hsm_with_fields() {
+        let conn = HsmConnection::new(
+            "conn-pk",
+            HsmProviderType::Hsm,
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "tenant-a HSM",
+        )
+        .with_pkcs11("tenant-a", "file:tenant-a.pin");
+        assert_eq!(
+            conn.pkcs11_params(),
+            Some((
+                "/usr/lib/softhsm/libsofthsm2.so",
+                "tenant-a",
+                "file:tenant-a.pin"
+            ))
+        );
+    }
+
+    #[test]
+    fn pkcs11_params_none_for_hyok_and_legacy() {
+        // HYOK never has PKCS#11 params.
+        let hyok = HsmConnection::new("h", HsmProviderType::Hyok, "kmip://x:5696", "")
+            .with_pkcs11("ignored", "file:ignored.pin");
+        assert_eq!(hyok.pkcs11_params(), None);
+        // Legacy HSM record without the Stage 2 fields.
+        let legacy = HsmConnection::new("l", HsmProviderType::Hsm, "/lib.so", "");
+        assert_eq!(legacy.pkcs11_params(), None);
+    }
+
+    #[test]
+    fn same_binding_detects_conflict() {
+        let a = HsmConnection::new("c", HsmProviderType::Hsm, "/lib.so", "")
+            .with_pkcs11("tok", "file:a.pin");
+        let same = HsmConnection::new("c", HsmProviderType::Hsm, "/lib.so", "desc differs")
+            .with_pkcs11("tok", "file:a.pin");
+        let diff_pin = HsmConnection::new("c", HsmProviderType::Hsm, "/lib.so", "")
+            .with_pkcs11("tok", "file:b.pin");
+        assert!(
+            a.same_binding(&same),
+            "description is not part of the binding"
+        );
+        assert!(
+            !a.same_binding(&diff_pin),
+            "different pin_ref is a conflict"
+        );
+    }
+
+    #[test]
+    fn pin_ref_redacted_field_is_a_reference_not_a_secret() {
+        // The persisted field is a reference; serializing the record is safe.
+        let conn = HsmConnection::new("c", HsmProviderType::Hsm, "/lib.so", "")
+            .with_pkcs11("tok", "file:tenant.pin");
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(json.contains("file:tenant.pin"));
+        // It must never carry resolved PIN bytes — only the reference.
+        assert!(!json.contains("\"pin\""));
+    }
+
+    #[test]
+    fn legacy_record_without_new_fields_deserializes() {
+        // A record persisted before Stage 2 (no token_label/pin_ref keys).
+        let legacy = r#"{
+            "connection_id": "old",
+            "provider_type": "HSM",
+            "status": "healthy",
+            "endpoint": "/usr/lib/pkcs11.so",
+            "description": "legacy",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_health_check_at": null
+        }"#;
+        let parsed: HsmConnection = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.connection_id, "old");
+        assert!(parsed.token_label.is_none());
+        assert!(parsed.pin_ref.is_none());
+        assert_eq!(parsed.pkcs11_params(), None);
     }
 }
