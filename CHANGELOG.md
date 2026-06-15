@@ -8,6 +8,13 @@ Toward `0.2.0` (stable). Pending: extend fail-closed authentication to the REST
 surface, and add an in-process mTLS integration test alongside the
 `10-mtls-identity` demo.
 
+## [0.2.0-beta.2] — 2026-06-15
+
+Proto alignment for the first design-partner integration (Soverita): broader
+signing-algorithm coverage, pre-hashed digest signing, MAC operations, and
+additional key specs. One wire-breaking change (`KeyState` renumber), made now
+while the integrator surface is small.
+
 ### Added
 
 - **Signing algorithm coverage** — `RSA_PKCS1_V15_SHA{384,512}`,
