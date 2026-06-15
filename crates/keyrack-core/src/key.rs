@@ -115,6 +115,8 @@ impl std::fmt::Display for KeyState {
 pub enum KeyUsage {
     EncryptDecrypt,
     SignVerify,
+    /// Symmetric MAC keys (HMAC). Used with `GenerateMac` / `VerifyMac`.
+    GenerateVerifyMac,
 }
 
 /// Cryptographic algorithm / key spec.
@@ -122,10 +124,19 @@ pub enum KeyUsage {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum KeySpec {
     Aes256,
+    Aes128,
     Ed25519,
-    RsaPkcs1v15Sha256 { key_size: u32 },
-    RsaPssSha256 { key_size: u32 },
+    RsaPkcs1v15Sha256 {
+        key_size: u32,
+    },
+    RsaPssSha256 {
+        key_size: u32,
+    },
     EcdsaP256Sha256,
+    /// ECDSA over NIST P-384 (CNSA / PCI). Default digest SHA-384.
+    EcdsaP384,
+    /// HMAC-SHA-256 MAC key (32-byte secret).
+    Hmac256,
 }
 
 /// Which provider class backs this key's material.

@@ -20,6 +20,8 @@ service KeyService {
   rpc GenerateRandom(GenerateRandomRequest) returns (GenerateRandomResponse);
   rpc Sign(SignRequest) returns (SignResponse);
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  rpc GenerateMac(GenerateMacRequest) returns (GenerateMacResponse);
+  rpc VerifyMac(VerifyMacRequest) returns (VerifyMacResponse);
 
   // ── Key lifecycle ─────────────────────────────────────────────────
 
@@ -103,21 +105,31 @@ enum KeySpec {
   RSA_PSS_2048 = 7;
   RSA_PSS_3072 = 8;
   RSA_PSS_4096 = 9;
+  // Added 2026-06 (Soverita proto alignment). Appended to preserve wire values.
+  ECC_NIST_P384 = 10;
+  HMAC_256 = 11;
+  AES_128 = 12;
 }
 
 enum KeyUsage {
   KEY_USAGE_UNSPECIFIED = 0;
   ENCRYPT_DECRYPT = 1;
   SIGN_VERIFY = 2;
+  // For symmetric MAC keys (HMAC). Used with GenerateMac / VerifyMac.
+  GENERATE_VERIFY_MAC = 3;
 }
 
+// NOTE: renumbered 2026-06 to the conventional ordering (most common steady
+// state at 1). This is a WIRE-BREAKING change for gRPC clients compiled against
+// the prior numbering (CREATING=1, ENABLED=2, ...). Recompile all clients,
+// including the commercial AWS KMS / Barbican shims, against this proto.
 enum KeyState {
   KEY_STATE_UNSPECIFIED = 0;
-  CREATING = 1;
-  ENABLED = 2;
-  DISABLED = 3;
-  PENDING_DELETION = 4;
-  DESTROYED = 5;
+  ENABLED = 1;
+  DISABLED = 2;
+  PENDING_DELETION = 3;
+  DESTROYED = 4;
+  CREATING = 5;
   COMPROMISED = 6;
 }
 
@@ -133,6 +145,31 @@ enum SigningAlgorithm {
   RSA_PKCS1_V15_SHA256 = 2;
   ECDSA_P256_SHA256 = 3;
   RSA_PSS_SHA256 = 4;
+  // Added 2026-06 (Soverita proto alignment). Additive; existing values fixed.
+  RSA_PKCS1_V15_SHA384 = 5;
+  RSA_PKCS1_V15_SHA512 = 6;
+  RSA_PSS_SHA384 = 7;
+  RSA_PSS_SHA512 = 8;
+  ECDSA_P256_SHA384 = 9;
+  ECDSA_P384_SHA384 = 10;
+}
+
+// Whether the bytes supplied to Sign/Verify are the raw message (which the
+// server hashes) or a pre-computed digest (signed/verified as-is). Mirrors AWS
+// KMS MessageType. UNSPECIFIED is treated as RAW for backward compatibility.
+// DIGEST is invalid for ED25519_PURE (Ed25519 signs the full message).
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  RAW = 1;
+  DIGEST = 2;
+}
+
+// Symmetric MAC algorithms for GenerateMac / VerifyMac (HMAC keys).
+enum MacAlgorithm {
+  MAC_ALGORITHM_UNSPECIFIED = 0;
+  HMAC_SHA_256 = 1;
+  HMAC_SHA_384 = 2;
+  HMAC_SHA_512 = 3;
 }
 
 // Key metadata visible to callers (identity tags excluded per §5.14).
@@ -245,8 +282,12 @@ message GenerateRandomResponse {
 
 message SignRequest {
   string key_id = 1;
+  // Raw message or a pre-computed digest, per message_type.
   bytes message = 2;
   SigningAlgorithm signing_algorithm = 3;
+  // Added 2026-06. UNSPECIFIED => RAW (server hashes). DIGEST => sign the
+  // supplied bytes directly (the digest must match the algorithm's hash).
+  MessageType message_type = 4;
 }
 
 message SignResponse {
@@ -257,9 +298,13 @@ message SignResponse {
 
 message VerifyRequest {
   string key_id = 1;
+  // Raw message or a pre-computed digest, per message_type.
   bytes message = 2;
   bytes signature = 3;
   SigningAlgorithm signing_algorithm = 4;
+  // Added 2026-06. UNSPECIFIED => RAW (server hashes). DIGEST => verify the
+  // supplied bytes directly.
+  MessageType message_type = 5;
 }
 
 message VerifyResponse {
@@ -268,19 +313,48 @@ message VerifyResponse {
   SigningAlgorithm signing_algorithm = 3;
 }
 
+message GenerateMacRequest {
+  string key_id = 1;
+  bytes message = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
+message GenerateMacResponse {
+  bytes mac = 1;
+  string key_id = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
+message VerifyMacRequest {
+  string key_id = 1;
+  bytes message = 2;
+  bytes mac = 3;
+  MacAlgorithm mac_algorithm = 4;
+}
+
+message VerifyMacResponse {
+  bool mac_valid = 1;
+  string key_id = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Key lifecycle
 // ═══════════════════════════════════════════════════════════════════
 
 message CreateKeyRequest {
   KeySpec key_spec = 1;
-  KeyUsage key_usage = 2;
+  // Optional: the server derives usage from key_spec when unset
+  // (AES/HMAC => symmetric usage; asymmetric => SIGN_VERIFY). Provided values
+  // that conflict with the spec are rejected.
+  optional KeyUsage key_usage = 2;
   string description = 3;
   map<string, string> tags = 4;
   optional string parent_key_id = 5;
   optional string hsm_connection_id = 6;
   map<string, string> attributes = 7;
-  string namespace = 8;
+  // Optional: empty means no namespace.
+  optional string namespace = 8;
 }
 
 message CreateKeyResponse {

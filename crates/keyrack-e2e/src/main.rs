@@ -218,7 +218,7 @@ async fn phase_lifecycle(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32, Str
     match grpc
         .create_key(proto::CreateKeyRequest {
             key_spec: proto::KeySpec::Aes256.into(),
-            key_usage: proto::KeyUsage::EncryptDecrypt.into(),
+            key_usage: Some(proto::KeyUsage::EncryptDecrypt.into()),
             description: "e2e AES-256 test key".into(),
             ..Default::default()
         })
@@ -240,7 +240,7 @@ async fn phase_lifecycle(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32, Str
     match grpc
         .create_key(proto::CreateKeyRequest {
             key_spec: proto::KeySpec::Ed25519.into(),
-            key_usage: proto::KeyUsage::SignVerify.into(),
+            key_usage: Some(proto::KeyUsage::SignVerify.into()),
             description: "e2e Ed25519 test key".into(),
             ..Default::default()
         })
@@ -495,6 +495,7 @@ async fn phase_crypto(
                 key_id: ed_key_id.to_string(),
                 message: message.to_vec(),
                 signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+                message_type: proto::MessageType::Raw.into(),
             })
             .await
         {
@@ -512,6 +513,7 @@ async fn phase_crypto(
                         message: message.to_vec(),
                         signature: sig.signature,
                         signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+                        message_type: proto::MessageType::Raw.into(),
                     })
                     .await
                 {
@@ -873,7 +875,7 @@ async fn phase_hierarchy(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32) {
     let root_id = match grpc
         .create_key(proto::CreateKeyRequest {
             key_spec: proto::KeySpec::Aes256.into(),
-            key_usage: proto::KeyUsage::EncryptDecrypt.into(),
+            key_usage: Some(proto::KeyUsage::EncryptDecrypt.into()),
             description: "e2e hierarchy root".into(),
             ..Default::default()
         })
@@ -897,7 +899,7 @@ async fn phase_hierarchy(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32) {
     match grpc
         .create_key(proto::CreateKeyRequest {
             key_spec: proto::KeySpec::Aes256.into(),
-            key_usage: proto::KeyUsage::EncryptDecrypt.into(),
+            key_usage: Some(proto::KeyUsage::EncryptDecrypt.into()),
             description: "e2e hierarchy child".into(),
             parent_key_id: Some(root_id.clone()),
             ..Default::default()

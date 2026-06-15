@@ -624,6 +624,15 @@ impl KeyService for KeyServiceImpl {
                 let alg = convert::proto_to_signing_algorithm(alg_proto)
                     .ok_or_else(|| Status::invalid_argument("signing algorithm required"))?;
 
+                let message_type = proto::MessageType::try_from(req.message_type)
+                    .unwrap_or(proto::MessageType::Unspecified);
+                let use_digest = matches!(message_type, proto::MessageType::Digest);
+                if use_digest && alg == keyrack_core::provider::SigningAlgorithm::Ed25519 {
+                    return Err(Status::invalid_argument(
+                        "DIGEST message type is invalid for Ed25519",
+                    ));
+                }
+
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
@@ -644,11 +653,19 @@ impl KeyService for KeyServiceImpl {
                     .providers
                     .resolve_for_primary(&record)
                     .map_err(convert::error_to_status)?;
-                let signature = sign_entry
-                    .provider
-                    .sign(&primary_version.key_handle, alg, &req.message)
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let signature = if use_digest {
+                    sign_entry
+                        .provider
+                        .sign_digest(&primary_version.key_handle, alg, &req.message)
+                        .await
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?
+                } else {
+                    sign_entry
+                        .provider
+                        .sign(&primary_version.key_handle, alg, &req.message)
+                        .await
+                        .map_err(convert::error_to_status)?
+                };
                 Ok(Response::new(proto::SignResponse {
                     signature,
                     key_id: record.lid.to_string(),
@@ -683,6 +700,16 @@ impl KeyService for KeyServiceImpl {
                     .unwrap_or(proto::SigningAlgorithm::Unspecified);
                 let alg = convert::proto_to_signing_algorithm(alg_proto)
                     .ok_or_else(|| Status::invalid_argument("signing algorithm required"))?;
+
+                let message_type = proto::MessageType::try_from(req.message_type)
+                    .unwrap_or(proto::MessageType::Unspecified);
+                let use_digest = matches!(message_type, proto::MessageType::Digest);
+                if use_digest && alg == keyrack_core::provider::SigningAlgorithm::Ed25519 {
+                    return Err(Status::invalid_argument(
+                        "DIGEST message type is invalid for Ed25519",
+                    ));
+                }
+
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
@@ -703,20 +730,151 @@ impl KeyService for KeyServiceImpl {
                     .providers
                     .resolve_for_primary(&record)
                     .map_err(convert::error_to_status)?;
-                let valid = verify_entry
-                    .provider
-                    .verify(
-                        &primary_version.key_handle,
-                        alg,
-                        &req.message,
-                        &req.signature,
-                    )
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let valid = if use_digest {
+                    verify_entry
+                        .provider
+                        .verify_digest(
+                            &primary_version.key_handle,
+                            alg,
+                            &req.message,
+                            &req.signature,
+                        )
+                        .await
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?
+                } else {
+                    verify_entry
+                        .provider
+                        .verify(
+                            &primary_version.key_handle,
+                            alg,
+                            &req.message,
+                            &req.signature,
+                        )
+                        .await
+                        .map_err(convert::error_to_status)?
+                };
                 Ok(Response::new(proto::VerifyResponse {
                     signature_valid: valid,
                     key_id: record.lid.to_string(),
                     signing_algorithm: convert::signing_algorithm_to_proto(&alg).into(),
+                }))
+            })
+            .await
+        }
+    }
+
+    async fn generate_mac(
+        &self,
+        request: Request<proto::GenerateMacRequest>,
+    ) -> Result<Response<proto::GenerateMacResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        {
+            let _ = request;
+            return Err(crypto_disabled("GenerateMac"));
+        }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
+            let request_id = Self::request_id(&request);
+            let principal = self.principal(&request).await?;
+            let req = request.into_inner();
+            let key_id = req.key_id.clone();
+
+            let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
+            op_ctx.request_id = request_id;
+            ops::execute(&self.state, op_ctx, |state| async move {
+                let mac_proto = proto::MacAlgorithm::try_from(req.mac_algorithm)
+                    .unwrap_or(proto::MacAlgorithm::Unspecified);
+                let alg = convert::proto_to_mac_algorithm(mac_proto)
+                    .ok_or_else(|| Status::invalid_argument("mac algorithm required"))?;
+                let lid = parse_lid(&key_id)?;
+                let record = state
+                    .storage
+                    .get_key(&lid)
+                    .await
+                    .map_err(convert::error_to_status)?;
+                if !record.state.permits_encrypt() {
+                    return Err(Status::failed_precondition(
+                        "generate_mac not permitted in current state",
+                    ));
+                }
+                let primary_version = record
+                    .key_versions
+                    .iter()
+                    .find(|v| v.is_primary)
+                    .ok_or_else(|| Status::internal("no primary key version"))?;
+                let mac_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let mac = mac_entry
+                    .provider
+                    .generate_mac(&primary_version.key_handle, alg, &req.message)
+                    .await
+                    .map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::GenerateMacResponse {
+                    mac,
+                    key_id: record.lid.to_string(),
+                    mac_algorithm: convert::mac_algorithm_to_proto(&alg).into(),
+                }))
+            })
+            .await
+        }
+    }
+
+    async fn verify_mac(
+        &self,
+        request: Request<proto::VerifyMacRequest>,
+    ) -> Result<Response<proto::VerifyMacResponse>, Status> {
+        #[cfg(not(feature = "crypto-endpoints"))]
+        {
+            let _ = request;
+            return Err(crypto_disabled("VerifyMac"));
+        }
+
+        #[cfg(feature = "crypto-endpoints")]
+        {
+            let request_id = Self::request_id(&request);
+            let principal = self.principal(&request).await?;
+            let req = request.into_inner();
+            let key_id = req.key_id.clone();
+
+            let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
+            op_ctx.request_id = request_id;
+            ops::execute(&self.state, op_ctx, |state| async move {
+                let mac_proto = proto::MacAlgorithm::try_from(req.mac_algorithm)
+                    .unwrap_or(proto::MacAlgorithm::Unspecified);
+                let alg = convert::proto_to_mac_algorithm(mac_proto)
+                    .ok_or_else(|| Status::invalid_argument("mac algorithm required"))?;
+                let lid = parse_lid(&key_id)?;
+                let record = state
+                    .storage
+                    .get_key(&lid)
+                    .await
+                    .map_err(convert::error_to_status)?;
+                if !record.state.permits_decrypt() {
+                    return Err(Status::failed_precondition(
+                        "verify_mac not permitted in current state",
+                    ));
+                }
+                let primary_version = record
+                    .key_versions
+                    .iter()
+                    .find(|v| v.is_primary)
+                    .ok_or_else(|| Status::internal("no primary key version"))?;
+                let mac_entry = state
+                    .providers
+                    .resolve_for_primary(&record)
+                    .map_err(convert::error_to_status)?;
+                let mac_valid = mac_entry
+                    .provider
+                    .verify_mac(&primary_version.key_handle, alg, &req.message, &req.mac)
+                    .await
+                    .map_err(convert::error_to_status)?;
+                Ok(Response::new(proto::VerifyMacResponse {
+                    mac_valid,
+                    key_id: record.lid.to_string(),
+                    mac_algorithm: convert::mac_algorithm_to_proto(&alg).into(),
                 }))
             })
             .await
@@ -753,7 +911,7 @@ impl KeyService for KeyServiceImpl {
 
                 let mut caller_attrs: std::collections::BTreeMap<String, String> =
                     req.attributes.clone().into_iter().collect();
-                let namespace = req.namespace.clone();
+                let namespace = req.namespace.clone().unwrap_or_default();
                 let requested_provider = caller_attrs.remove("keyrack.provider");
                 if !namespace.is_empty() {
                     caller_attrs.insert("namespace".to_string(), namespace);
@@ -783,9 +941,30 @@ impl KeyService for KeyServiceImpl {
 
                 let now = chrono::Utc::now();
                 let key_usage = match spec {
-                    keyrack_core::key::KeySpec::Aes256 => keyrack_core::key::KeyUsage::EncryptDecrypt,
+                    keyrack_core::key::KeySpec::Aes256 | keyrack_core::key::KeySpec::Aes128 => {
+                        keyrack_core::key::KeyUsage::EncryptDecrypt
+                    }
+                    keyrack_core::key::KeySpec::Hmac256 => {
+                        keyrack_core::key::KeyUsage::GenerateVerifyMac
+                    }
                     _ => keyrack_core::key::KeyUsage::SignVerify,
                 };
+
+                // If the caller specified a usage, it must agree with the
+                // spec-derived usage; otherwise the spec-derived usage wins.
+                if let Some(requested) = req.key_usage {
+                    let requested = convert::proto_to_key_usage(
+                        proto::KeyUsage::try_from(requested)
+                            .unwrap_or(proto::KeyUsage::Unspecified),
+                    );
+                    if let Some(requested) = requested {
+                        if requested != key_usage {
+                            return Err(Status::invalid_argument(format!(
+                                "requested key_usage {requested:?} conflicts with spec-derived usage {key_usage:?}"
+                            )));
+                        }
+                    }
+                }
 
                 let record = keyrack_core::key::KeyRecord {
                     lid,

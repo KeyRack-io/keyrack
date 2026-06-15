@@ -176,13 +176,13 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
         let create_resp = client
             .create_key(tonic::Request::new(CreateKeyRequest {
                 key_spec: KeySpec::Aes256.into(),
-                key_usage: 1,
+                key_usage: Some(1),
                 description: format!("provisioned by keyrack-cli for {}", args.namespace),
                 tags: std::collections::HashMap::default(),
                 parent_key_id: None,
                 hsm_connection_id: None,
                 attributes: attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                namespace: args.namespace.clone(),
+                namespace: Some(args.namespace.clone()),
             }))
             .await;
 

@@ -58,6 +58,9 @@ pub fn proto_to_key_spec(spec: proto::KeySpec) -> Option<keyrack_core::key::KeyS
         proto::KeySpec::RsaPss4096 => {
             Some(keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 })
         }
+        proto::KeySpec::EccNistP384 => Some(keyrack_core::key::KeySpec::EcdsaP384),
+        proto::KeySpec::Hmac256 => Some(keyrack_core::key::KeySpec::Hmac256),
+        proto::KeySpec::Aes128 => Some(keyrack_core::key::KeySpec::Aes128),
         proto::KeySpec::Unspecified => None,
     }
 }
@@ -77,6 +80,9 @@ pub fn key_spec_to_proto(spec: &keyrack_core::key::KeySpec) -> proto::KeySpec {
             4096 => proto::KeySpec::RsaPss4096,
             _ => proto::KeySpec::RsaPss2048,
         },
+        keyrack_core::key::KeySpec::EcdsaP384 => proto::KeySpec::EccNistP384,
+        keyrack_core::key::KeySpec::Hmac256 => proto::KeySpec::Hmac256,
+        keyrack_core::key::KeySpec::Aes128 => proto::KeySpec::Aes128,
     }
 }
 
@@ -96,6 +102,24 @@ pub fn proto_to_signing_algorithm(
         proto::SigningAlgorithm::RsaPssSha256 => {
             Some(keyrack_core::provider::SigningAlgorithm::RsaPssSha256)
         }
+        proto::SigningAlgorithm::RsaPkcs1V15Sha384 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha384)
+        }
+        proto::SigningAlgorithm::RsaPkcs1V15Sha512 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha512)
+        }
+        proto::SigningAlgorithm::RsaPssSha384 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPssSha384)
+        }
+        proto::SigningAlgorithm::RsaPssSha512 => {
+            Some(keyrack_core::provider::SigningAlgorithm::RsaPssSha512)
+        }
+        proto::SigningAlgorithm::EcdsaP256Sha384 => {
+            Some(keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha384)
+        }
+        proto::SigningAlgorithm::EcdsaP384Sha384 => {
+            Some(keyrack_core::provider::SigningAlgorithm::EcdsaP384Sha384)
+        }
         proto::SigningAlgorithm::Unspecified => None,
     }
 }
@@ -114,6 +138,60 @@ pub fn signing_algorithm_to_proto(
         keyrack_core::provider::SigningAlgorithm::RsaPssSha256 => {
             proto::SigningAlgorithm::RsaPssSha256
         }
+        keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha384 => {
+            proto::SigningAlgorithm::RsaPkcs1V15Sha384
+        }
+        keyrack_core::provider::SigningAlgorithm::RsaPkcs1v15Sha512 => {
+            proto::SigningAlgorithm::RsaPkcs1V15Sha512
+        }
+        keyrack_core::provider::SigningAlgorithm::RsaPssSha384 => {
+            proto::SigningAlgorithm::RsaPssSha384
+        }
+        keyrack_core::provider::SigningAlgorithm::RsaPssSha512 => {
+            proto::SigningAlgorithm::RsaPssSha512
+        }
+        keyrack_core::provider::SigningAlgorithm::EcdsaP256Sha384 => {
+            proto::SigningAlgorithm::EcdsaP256Sha384
+        }
+        keyrack_core::provider::SigningAlgorithm::EcdsaP384Sha384 => {
+            proto::SigningAlgorithm::EcdsaP384Sha384
+        }
+    }
+}
+
+pub fn proto_to_mac_algorithm(
+    alg: proto::MacAlgorithm,
+) -> Option<keyrack_core::provider::MacAlgorithm> {
+    match alg {
+        proto::MacAlgorithm::HmacSha256 => Some(keyrack_core::provider::MacAlgorithm::HmacSha256),
+        proto::MacAlgorithm::HmacSha384 => Some(keyrack_core::provider::MacAlgorithm::HmacSha384),
+        proto::MacAlgorithm::HmacSha512 => Some(keyrack_core::provider::MacAlgorithm::HmacSha512),
+        proto::MacAlgorithm::Unspecified => None,
+    }
+}
+
+pub fn mac_algorithm_to_proto(alg: &keyrack_core::provider::MacAlgorithm) -> proto::MacAlgorithm {
+    match alg {
+        keyrack_core::provider::MacAlgorithm::HmacSha256 => proto::MacAlgorithm::HmacSha256,
+        keyrack_core::provider::MacAlgorithm::HmacSha384 => proto::MacAlgorithm::HmacSha384,
+        keyrack_core::provider::MacAlgorithm::HmacSha512 => proto::MacAlgorithm::HmacSha512,
+    }
+}
+
+pub fn proto_to_key_usage(usage: proto::KeyUsage) -> Option<keyrack_core::key::KeyUsage> {
+    match usage {
+        proto::KeyUsage::EncryptDecrypt => Some(keyrack_core::key::KeyUsage::EncryptDecrypt),
+        proto::KeyUsage::SignVerify => Some(keyrack_core::key::KeyUsage::SignVerify),
+        proto::KeyUsage::GenerateVerifyMac => Some(keyrack_core::key::KeyUsage::GenerateVerifyMac),
+        proto::KeyUsage::Unspecified => None,
+    }
+}
+
+pub fn key_usage_to_proto(usage: keyrack_core::key::KeyUsage) -> proto::KeyUsage {
+    match usage {
+        keyrack_core::key::KeyUsage::EncryptDecrypt => proto::KeyUsage::EncryptDecrypt,
+        keyrack_core::key::KeyUsage::SignVerify => proto::KeyUsage::SignVerify,
+        keyrack_core::key::KeyUsage::GenerateVerifyMac => proto::KeyUsage::GenerateVerifyMac,
     }
 }
 
@@ -136,10 +214,7 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
     proto::KeyMetadata {
         key_id: record.lid.to_string(),
         key_spec: key_spec_to_proto(&record.key_spec).into(),
-        key_usage: match record.key_spec {
-            keyrack_core::key::KeySpec::Aes256 => proto::KeyUsage::EncryptDecrypt.into(),
-            _ => proto::KeyUsage::SignVerify.into(),
-        },
+        key_usage: key_usage_to_proto(record.key_usage).into(),
         state: key_state_to_proto(&record.state).into(),
         origin: match record.origin {
             keyrack_core::key::KeyOrigin::KeyRack => proto::KeyOrigin::Keyrack.into(),

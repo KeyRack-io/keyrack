@@ -181,8 +181,8 @@ fn parse_vault_errors(body: &str) -> Option<String> {
         .map(|e| e.errors.join("; "))
 }
 
-fn vault_key_type(spec: &KeySpec) -> &'static str {
-    match spec {
+fn vault_key_type(spec: &KeySpec) -> Result<&'static str> {
+    Ok(match spec {
         KeySpec::Aes256 => "aes256-gcm96",
         KeySpec::Ed25519 => "ed25519",
         KeySpec::EcdsaP256Sha256 => "ecdsa-p256",
@@ -193,15 +193,25 @@ fn vault_key_type(spec: &KeySpec) -> &'static str {
                 _ => "rsa-4096",
             }
         }
-    }
+        // TODO(proto-align): wire P-384/SHA-384-512/HMAC into vault-transit.
+        other => {
+            return Err(KeyRackError::Provider(format!(
+                "unsupported key spec for vault-transit: {other:?}"
+            )))
+        }
+    })
 }
 
-fn vault_hash_algorithm(alg: SigningAlgorithm) -> &'static str {
+fn vault_hash_algorithm(alg: SigningAlgorithm) -> Result<&'static str> {
     match alg {
         SigningAlgorithm::Ed25519
         | SigningAlgorithm::EcdsaP256Sha256
         | SigningAlgorithm::RsaPkcs1v15Sha256
-        | SigningAlgorithm::RsaPssSha256 => "sha2-256",
+        | SigningAlgorithm::RsaPssSha256 => Ok("sha2-256"),
+        // TODO(proto-align): wire P-384/SHA-384-512/HMAC into vault-transit.
+        other => Err(KeyRackError::Provider(format!(
+            "unsupported signing algorithm for vault-transit: {other:?}"
+        ))),
     }
 }
 
@@ -321,14 +331,13 @@ struct KeyConfigRequest {
 impl CryptoProvider for VaultTransitProvider {
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
         let key_name = uuid::Uuid::new_v4().to_string();
-        let body = CreateKeyRequest {
-            key_type: vault_key_type(spec),
-        };
+        let key_type = vault_key_type(spec)?;
+        let body = CreateKeyRequest { key_type };
 
         self.vault_post_no_body(&format!("keys/{key_name}"), &body)
             .await?;
 
-        tracing::info!(key_name = %key_name, key_type = vault_key_type(spec), "vault transit key created");
+        tracing::info!(key_name = %key_name, key_type, "vault transit key created");
 
         Ok(KeyHandle {
             key_id: key_name,
@@ -398,7 +407,7 @@ impl CryptoProvider for VaultTransitProvider {
     ) -> Result<Vec<u8>> {
         let body = SignRequest {
             input: B64.encode(message),
-            hash_algorithm: vault_hash_algorithm(algorithm),
+            hash_algorithm: vault_hash_algorithm(algorithm)?,
             signature_algorithm: vault_signature_algorithm(algorithm),
             prehashed: false,
         };
@@ -426,7 +435,7 @@ impl CryptoProvider for VaultTransitProvider {
         let body = VerifyRequest {
             input: B64.encode(message),
             signature: vault_sig,
-            hash_algorithm: vault_hash_algorithm(algorithm),
+            hash_algorithm: vault_hash_algorithm(algorithm)?,
             signature_algorithm: vault_signature_algorithm(algorithm),
             prehashed: false,
         };

@@ -8,6 +8,32 @@ Toward `0.2.0` (stable). Pending: extend fail-closed authentication to the REST
 surface, and add an in-process mTLS integration test alongside the
 `10-mtls-identity` demo.
 
+### Added
+
+- **Signing algorithm coverage** — `RSA_PKCS1_V15_SHA{384,512}`,
+  `RSA_PSS_SHA{384,512}`, `ECDSA_P256_SHA384`, and `ECDSA_P384_SHA384`
+  (`ECC_NIST_P384` key spec) for CNSA-suite / PCI workloads.
+- **Pre-hashed digest signing** — `SignRequest`/`VerifyRequest` gained a
+  `message_type` (`RAW` | `DIGEST`). `DIGEST` signs a caller-supplied digest
+  as-is (the standard KMS workflow; matches AWS/GCP/Azure). `RAW` (default)
+  preserves the previous hash-on-server behaviour. `DIGEST` is rejected for
+  `ED25519_PURE`.
+- **MAC operations** — `GenerateMac`/`VerifyMac` RPCs over `HMAC_256` keys
+  (`HMAC_SHA_{256,384,512}`), with constant-time verification.
+- `AES_128` key spec.
+- `CreateKey` `key_usage` and `namespace` are now optional; usage is derived
+  from the key spec when unset.
+- Documented the encryption-context → AES-GCM AAD derivation and the crypto
+  operation semantics in `docs/INTEGRATION_GUIDE.md` §6.
+
+### Changed
+
+- **BREAKING (proto wire): `KeyState` renumbered** to the conventional ordering
+  (`ENABLED=1, DISABLED=2, PENDING_DELETION=3, DESTROYED=4, CREATING=5,
+  COMPROMISED=6`). gRPC clients must be recompiled against the current
+  `key_service.proto`; enum field names are unchanged (REST/JSON unaffected).
+  Done pre-1.0 while the integrator surface is small.
+
 ## [0.2.0-beta.1] — 2026-06-13
 
 First beta. Adds provider routing, more differentiator demos, release-gated E2E

@@ -411,6 +411,11 @@ fn pkcs11_sign(
                 .map_err(|e| map_pkcs11_error("ECDSA sign", &e))?;
             ecdsa_der::raw_to_der(&raw_sig, P256_COMPONENT_LEN)
         }
+
+        // TODO(proto-align): wire P-384/SHA-384-512/HMAC into pkcs11.
+        other => Err(KeyRackError::Provider(format!(
+            "unsupported signing algorithm for pkcs11: {other:?}"
+        ))),
     }
 }
 
@@ -451,6 +456,13 @@ fn pkcs11_verify(
             let hash = sha256_hash(message);
             let raw_sig = ecdsa_der::der_to_raw(signature, P256_COMPONENT_LEN)?;
             session.verify(&Mechanism::Ecdsa, pub_handle, &hash, &raw_sig)
+        }
+
+        // TODO(proto-align): wire P-384/SHA-384-512/HMAC into pkcs11.
+        other => {
+            return Err(KeyRackError::Provider(format!(
+                "unsupported signing algorithm for pkcs11: {other:?}"
+            )))
         }
     };
 
@@ -648,6 +660,12 @@ impl CryptoProvider for Pkcs11Provider {
                 }
                 KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {
                     generate_rsa_key_pair(session, &label_for_closure, *key_size)?;
+                }
+                // TODO(proto-align): wire P-384/SHA-384-512/HMAC into pkcs11.
+                other => {
+                    return Err(KeyRackError::Provider(format!(
+                        "unsupported key spec for pkcs11: {other:?}"
+                    )));
                 }
             }
             Ok(())

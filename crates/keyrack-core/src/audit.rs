@@ -63,6 +63,10 @@ pub enum AuditAction {
     Sign,
     #[serde(rename = "kms:Verify")]
     Verify,
+    #[serde(rename = "kms:GenerateMac")]
+    GenerateMac,
+    #[serde(rename = "kms:VerifyMac")]
+    VerifyMac,
     #[serde(rename = "kms:GenerateRandom")]
     GenerateRandom,
 
