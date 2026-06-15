@@ -15,6 +15,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: keyrack-io/keyrack-service
+  # Run JS actions on Node 24 (forced default from 2026-06-16). Drop once all
+  # actions ship Node 24 runtimes natively.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
