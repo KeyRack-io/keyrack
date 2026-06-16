@@ -643,34 +643,45 @@ message HsmConnectionMetadata {
   HsmConnectionStatus status = 4;
   google.protobuf.Timestamp created_at = 5;
   optional google.protobuf.Timestamp last_health_check = 6;
+  // Canonical PKCS#11 binding echoed back so callers persist the normalized
+  // form (idempotency is post-normalization equality). Absent for HYOK/legacy.
+  optional string token_label = 7;  // normalized (trimmed, <= 32 bytes)
+  optional string pin_ref = 8;      // scheme-normalized "file:<path>" reference
+}
+
+// PKCS#11 connection config (HSM provider type). Additive oneof variant on
+// CreateHsmConnectionRequest; HYOK/KMIP keeps using endpoint + tls_* instead.
+message Pkcs11ConnectionConfig {
+  string lib_path = 1;
+  // Operator-provided UTF-8 token label. KeyRack normalizes it (trailing
+  // whitespace trimmed, <= 32 bytes UTF-8, non-empty) and echoes the canonical
+  // value in HsmConnectionMetadata.token_label.
+  string token_label = 2;
+  // Reference ONLY: "file:<path>" resolved KeyRack-side under the allowlist
+  // root (KEYRACK_SECRET_ROOT, default /etc/keyrack/secrets/). NEVER PIN bytes.
+  string pin_ref = 3;
 }
 
 message CreateHsmConnectionRequest {
   HsmProviderType provider_type = 1;
-  string endpoint = 2;
-  string tls_cert_pem = 3;
-  string tls_key_pem = 4;
-  optional string tls_ca_pem = 5;
+  string endpoint = 2;             // HYOK/KMIP only
+  string tls_cert_pem = 3;         // HYOK/KMIP only
+  string tls_key_pem = 4;          // HYOK/KMIP only
+  optional string tls_ca_pem = 5;  // HYOK/KMIP only
 
-  // DRAFT SKETCH (Stage 2 / HSM PIN custody, target 0.3.0) -- NOT YET WIRED.
-  // Shared with the design partner for adapter pre-flight; field numbers and
-  // shape are non-binding until the ADR is locked. See
-  // keyrack-internal/docs/architecture/adr-0001-hsm-pin-custody.md.
-  //
-  // Self-service runtime registration adds PKCS#11 connection config as an
-  // additive oneof at field 6 (HYOK/KMIP keeps endpoint + tls_* at 2-5).
-  // INVARIANT: PIN is a reference only ("file:<path>" resolved KeyRack-side
-  // under KEYRACK_SECRET_ROOT, default /etc/keyrack/secrets/), never PIN bytes
-  // on the wire. AWS/Barbican shims send none -> unaffected.
-  //
-  //   message Pkcs11ConnectionConfig {
-  //     string lib_path    = 1;
-  //     string token_label = 2;
-  //     string pin_ref     = 3;  // "file:<path>"; never the PIN itself
-  //   }
-  //   oneof connection_config {
-  //     Pkcs11ConnectionConfig pkcs11 = 6;
-  //   }
+  // Consistency rule (handler-enforced, INVALID_ARGUMENT on violation): when
+  // the pkcs11 variant is set, provider_type MUST be HSM and endpoint/tls_*
+  // MUST be empty. AWS/Barbican shims send no connection_config -> unaffected.
+  oneof connection_config {
+    Pkcs11ConnectionConfig pkcs11 = 6;
+  }
+
+  // Caller-supplied idempotency key + routing reference (general to HSM and
+  // HYOK). For PKCS#11 registration it is required and validated (non-empty,
+  // <= 128 bytes, no control/whitespace-only chars). Re-registering the same
+  // id with an identical normalized binding is idempotent; with a different
+  // binding it is ALREADY_EXISTS.
+  string connection_id = 7;
 }
 
 message CreateHsmConnectionResponse {

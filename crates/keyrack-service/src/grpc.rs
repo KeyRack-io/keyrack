@@ -2048,20 +2048,75 @@ impl KeyService for KeyServiceImpl {
         );
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
-            let conn = keyrack_core::hsm::HsmConnection::new(
-                uuid::Uuid::new_v4().to_string(),
-                hsm_provider_from_proto(req.provider_type()),
-                &req.endpoint,
-                "",
-            );
-            state
-                .storage
-                .create_hsm_connection(&conn)
-                .await
-                .map_err(convert::error_to_status)?;
-            Ok(Response::new(proto::CreateHsmConnectionResponse {
-                metadata: Some(hsm_connection_to_proto(&conn)),
-            }))
+            use crate::hsm_registration::{
+                register_pkcs11_connection, validate_connection_id, RegisterError,
+            };
+
+            let provider_type = req.provider_type();
+            match req.connection_config {
+                // PKCS#11 dynamic registration (HSM PIN custody, Stage 2).
+                Some(proto::create_hsm_connection_request::ConnectionConfig::Pkcs11(cfg)) => {
+                    if provider_type != proto::HsmProviderType::Hsm {
+                        return Err(Status::invalid_argument(
+                            "provider_type must be HSM when pkcs11 connection_config is set",
+                        ));
+                    }
+                    if !req.endpoint.is_empty()
+                        || !req.tls_cert_pem.is_empty()
+                        || !req.tls_key_pem.is_empty()
+                        || req.tls_ca_pem.is_some()
+                    {
+                        return Err(Status::invalid_argument(
+                            "endpoint/tls_* must be empty for PKCS#11 (HSM) connections; \
+                             use the pkcs11 connection_config",
+                        ));
+                    }
+                    let conn = register_pkcs11_connection(
+                        &state.storage,
+                        &state.providers,
+                        &state.audit,
+                        &req.connection_id,
+                        &cfg.lib_path,
+                        &cfg.token_label,
+                        &cfg.pin_ref,
+                        "",
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        RegisterError::Invalid(m) => Status::invalid_argument(m),
+                        RegisterError::Conflict(m) => Status::already_exists(m),
+                        RegisterError::Precondition(m) => Status::failed_precondition(m),
+                        RegisterError::Internal(m) => Status::internal(m),
+                    })?;
+                    Ok(Response::new(proto::CreateHsmConnectionResponse {
+                        metadata: Some(hsm_connection_to_proto(&conn)),
+                    }))
+                }
+                // HYOK / legacy metadata-only connection (no PKCS#11 routing).
+                None => {
+                    let connection_id = if req.connection_id.is_empty() {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        validate_connection_id(&req.connection_id)
+                            .map_err(Status::invalid_argument)?;
+                        req.connection_id.clone()
+                    };
+                    let conn = keyrack_core::hsm::HsmConnection::new(
+                        connection_id,
+                        hsm_provider_from_proto(provider_type),
+                        &req.endpoint,
+                        "",
+                    );
+                    state
+                        .storage
+                        .create_hsm_connection(&conn)
+                        .await
+                        .map_err(convert::error_to_status)?;
+                    Ok(Response::new(proto::CreateHsmConnectionResponse {
+                        metadata: Some(hsm_connection_to_proto(&conn)),
+                    }))
+                }
+            }
         })
         .await
     }
@@ -2443,6 +2498,10 @@ fn hsm_connection_to_proto(
         last_health_check: conn
             .last_health_check_at
             .map(|dt| convert::datetime_to_timestamp(&dt)),
+        // Canonical PKCS#11 binding echoed back so callers persist the
+        // normalized form (ADR-0001 §8.1, Q11). Absent for HYOK/legacy.
+        token_label: conn.token_label.clone(),
+        pin_ref: conn.pin_ref.clone(),
     }
 }
 
