@@ -10,7 +10,7 @@ surface, and add an in-process mTLS integration test alongside the
 
 ## [0.2.0-beta.2] — 2026-06-15
 
-Proto alignment for the first design-partner integration (Soverita): broader
+Proto alignment for the first design-partner integration: broader
 signing-algorithm coverage, pre-hashed digest signing, MAC operations, and
 additional key specs. One wire-breaking change (`KeyState` renumber), made now
 while the integrator surface is small.

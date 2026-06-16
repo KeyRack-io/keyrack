@@ -105,7 +105,7 @@ enum KeySpec {
   RSA_PSS_2048 = 7;
   RSA_PSS_3072 = 8;
   RSA_PSS_4096 = 9;
-  // Added 2026-06 (Soverita proto alignment). Appended to preserve wire values.
+  // Added 2026-06 (design-partner proto alignment). Appended to preserve wire values.
   ECC_NIST_P384 = 10;
   HMAC_256 = 11;
   AES_128 = 12;
@@ -145,7 +145,7 @@ enum SigningAlgorithm {
   RSA_PKCS1_V15_SHA256 = 2;
   ECDSA_P256_SHA256 = 3;
   RSA_PSS_SHA256 = 4;
-  // Added 2026-06 (Soverita proto alignment). Additive; existing values fixed.
+  // Added 2026-06 (design-partner proto alignment). Additive; existing values fixed.
   RSA_PKCS1_V15_SHA384 = 5;
   RSA_PKCS1_V15_SHA512 = 6;
   RSA_PSS_SHA384 = 7;
