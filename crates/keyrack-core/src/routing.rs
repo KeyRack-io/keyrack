@@ -144,6 +144,13 @@ impl ProviderRouter {
     pub fn default_ref(&self) -> &ProviderRef {
         &self.default
     }
+
+    /// Whether operator-configured routing rules are present.
+    /// Used to distinguish "no policy configured" (backward-compat mode) from
+    /// "policy configured but no rule matched" (default-deny).
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
 }
 
 #[cfg(test)]

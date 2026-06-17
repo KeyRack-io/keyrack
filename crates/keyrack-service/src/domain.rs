@@ -46,6 +46,7 @@ pub enum DomainError {
     NotFound(String),
     InvalidArgument(String),
     FailedPrecondition(String),
+    PermissionDenied(String),
     ProviderUnavailable(String),
     Internal(String),
     Core(keyrack_core::error::KeyRackError),
@@ -57,6 +58,7 @@ impl std::fmt::Display for DomainError {
             Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::FailedPrecondition(msg) => write!(f, "failed precondition: {msg}"),
+            Self::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             Self::ProviderUnavailable(msg) => write!(f, "provider unavailable: {msg}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
             Self::Core(e) => write!(f, "{e}"),
@@ -90,6 +92,7 @@ impl DomainError {
             Self::NotFound(msg) => tonic::Status::not_found(msg),
             Self::InvalidArgument(msg) => tonic::Status::invalid_argument(msg),
             Self::FailedPrecondition(msg) => tonic::Status::failed_precondition(msg),
+            Self::PermissionDenied(msg) => tonic::Status::permission_denied(msg),
             Self::ProviderUnavailable(msg) => tonic::Status::unavailable(msg),
             Self::Internal(msg) => tonic::Status::internal(msg),
             Self::Core(e) => {
@@ -122,6 +125,7 @@ impl DomainError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             Self::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
             Self::FailedPrecondition(_) => (StatusCode::CONFLICT, "FailedPrecondition"),
+            Self::PermissionDenied(_) => (StatusCode::FORBIDDEN, "PermissionDenied"),
             Self::ProviderUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
             }
@@ -216,21 +220,25 @@ pub struct CreateKeyInput {
 /// Resolve the provider a new key binds to — the single source of truth shared
 /// by the gRPC, REST, and library (`create_key`) paths.
 ///
-/// Precedence:
-/// 1. `hsm_connection_id` (when non-empty) selects that connection directly and
-///    is **fail-closed**: it must be a currently registered provider, otherwise
-///    resolution fails (the dynamic HSM connections created via
-///    `CreateHsmConnection` are not expressible in the static `provider_routing`
-///    rules, so this explicit selector is how a key targets one).
-/// 2. otherwise the tag-based [`ProviderRouter`] selects by identity tags.
+/// ## Precedence (ADR-0001 Amendment 1)
 ///
-/// `keyrack.provider` (when non-empty) is an **assertion over the final resolved
-/// binding**, whatever produced it (router or `hsm_connection_id`): a mismatch is
-/// rejected rather than silently overridden. This keeps one consistent guardrail
-/// semantic across both explicit inputs.
+/// 1. Evaluate routing rules against identity tags (first match wins).
+/// 2. **Route** pin — authoritative; caller `backend_id` must match or be absent.
+/// 3. **Delegate** — caller may select within the bounded set (or any registered
+///    with `DelegateAny`). If no caller selection → use default.
+/// 4. **Default** (no rule matched):
+///    - If routing rules ARE configured → DEFAULT-DENY: caller `backend_id` that
+///      differs from default is rejected (no delegate authorized it).
+///    - If NO routing rules configured → backward-compat: `backend_id` selects
+///      any registered provider (≈ implicit `delegate *`).
 ///
-/// Every `Err` here is a fail-closed resolution failure (caller maps it to
-/// gRPC `FailedPrecondition` / REST `409`); no key material is produced.
+/// ## Error mapping (A1.6 §3)
+///
+/// - Unknown backend id (not in registry) → `FailedPrecondition`
+/// - Known but policy does not permit selection → `PermissionDenied`
+/// - Route-pin conflict (pin ≠ requested) → `FailedPrecondition` naming both
+///
+/// `keyrack.provider` / `backend_id` assertion: mismatch is `FailedPrecondition`.
 pub fn resolve_create_provider(
     router: &keyrack_core::routing::ProviderRouter,
     providers: &Arc<dyn keyrack_core::registry::ProviderRegistry>,
@@ -238,7 +246,7 @@ pub fn resolve_create_provider(
     requested_provider: Option<&str>,
     hsm_connection_id: Option<&str>,
     backend_id: Option<&str>,
-) -> Result<keyrack_core::key::ProviderRef, String> {
+) -> Result<keyrack_core::key::ProviderRef, DomainError> {
     use keyrack_core::routing::RouteOutcome;
 
     // Reconcile the deprecated hsm_connection_id alias with backend_id.
@@ -248,10 +256,10 @@ pub fn resolve_create_provider(
     ) {
         (Some(bid), Some(hid)) => {
             if bid != hid {
-                return Err(format!(
+                return Err(DomainError::FailedPrecondition(format!(
                     "backend_id '{bid}' and hsm_connection_id '{hid}' disagree; \
                      use backend_id only (hsm_connection_id is deprecated)"
-                ));
+                )));
             }
             Some(bid)
         }
@@ -268,36 +276,33 @@ pub fn resolve_create_provider(
 
     let resolved = match outcome {
         RouteOutcome::Pinned(ref pinned) => {
-            // Route pin is authoritative — caller cannot override.
             if let Some(caller_id) = effective_backend {
                 if caller_id != pinned.as_str() {
-                    return Err(format!(
+                    return Err(DomainError::FailedPrecondition(format!(
                         "routing policy pins provider '{}' but backend_id '{}' was requested \
                          (route rules are authoritative)",
                         pinned.as_str(),
                         caller_id
-                    ));
+                    )));
                 }
             }
             pinned.clone()
         }
         RouteOutcome::Delegated(ref allowed_set) => {
-            // Caller may select within the bounded set.
             match effective_backend {
                 Some(caller_id) => {
                     let pref = keyrack_core::key::ProviderRef::new(caller_id);
-                    if !allowed_set.contains(&pref) {
-                        return Err(format!(
-                            "backend_id '{}' is not permitted by the delegate rule \
-                             (allowed: {:?})",
-                            caller_id,
-                            allowed_set.iter().map(keyrack_core::key::ProviderRef::as_str).collect::<Vec<_>>()
-                        ));
-                    }
                     if !providers.contains(&pref) {
-                        return Err(format!(
+                        return Err(DomainError::FailedPrecondition(format!(
                             "backend_id '{caller_id}' is not a registered provider"
-                        ));
+                        )));
+                    }
+                    if !allowed_set.contains(&pref) {
+                        return Err(DomainError::PermissionDenied(format!(
+                            "backend_id '{caller_id}' is not permitted by the delegate rule \
+                             (allowed: {:?})",
+                            allowed_set.iter().map(keyrack_core::key::ProviderRef::as_str).collect::<Vec<_>>()
+                        )));
                     }
                     pref
                 }
@@ -305,14 +310,13 @@ pub fn resolve_create_provider(
             }
         }
         RouteOutcome::DelegatedAny => {
-            // Caller may select any registered provider.
             match effective_backend {
                 Some(caller_id) => {
                     let pref = keyrack_core::key::ProviderRef::new(caller_id);
                     if !providers.contains(&pref) {
-                        return Err(format!(
+                        return Err(DomainError::FailedPrecondition(format!(
                             "backend_id '{caller_id}' is not a registered provider"
-                        ));
+                        )));
                     }
                     pref
                 }
@@ -320,17 +324,22 @@ pub fn resolve_create_provider(
             }
         }
         RouteOutcome::Default(ref default_provider) => {
-            // No rule matched. Caller selection is DEFAULT-DENY unless a
-            // delegate opens it. With no routing-policy configured, this
-            // degrades to the pre-0.3.0 behavior where backend_id selects
-            // (≈ delegate *) for backward compatibility.
             match effective_backend {
                 Some(caller_id) => {
                     let pref = keyrack_core::key::ProviderRef::new(caller_id);
                     if !providers.contains(&pref) {
-                        return Err(format!(
+                        return Err(DomainError::FailedPrecondition(format!(
                             "backend_id '{caller_id}' is not a registered provider"
-                        ));
+                        )));
+                    }
+                    // DEFAULT-DENY when routing rules are configured:
+                    // a caller backend_id that differs from the default is not
+                    // authorized by any delegate rule.
+                    if router.has_rules() && pref != *default_provider {
+                        return Err(DomainError::PermissionDenied(format!(
+                            "backend_id '{caller_id}' is not authorized: no routing rule \
+                             matched and no delegate permits caller selection"
+                        )));
                     }
                     pref
                 }
@@ -353,10 +362,10 @@ pub fn resolve_create_provider(
                     }
                 }
             };
-            return Err(format!(
+            return Err(DomainError::FailedPrecondition(format!(
                 "requested provider '{req}' but {via} selected '{}'",
                 resolved.as_str()
-            ));
+            )));
         }
     }
     Ok(resolved)
@@ -370,31 +379,138 @@ pub fn resolve_create_provider(
 /// → `PermissionDenied` (fail-closed; the principal IS authenticated).
 /// When the connection has no `scope_owner` → passes (platform-scoped).
 ///
-/// Returns `Ok(())` on pass, `Err(message)` on deny.
+/// Emits a `scope_owner_check` audit event on EVERY evaluation (success,
+/// denied, error) per ADR §5.1.
+///
+/// Returns `Ok(())` on pass, `Err(DomainError::PermissionDenied)` on deny.
 pub async fn check_scope_owner(
     storage: &Arc<dyn keyrack_core::storage::StorageBackend>,
+    audit: &Arc<dyn keyrack_core::audit::AuditSink>,
     provider_name: &keyrack_core::key::ProviderRef,
     principal_scope: Option<&str>,
-) -> Result<(), String> {
+    principal_id: &str,
+    action: &keyrack_core::audit::AuditAction,
+) -> Result<(), DomainError> {
     let Ok(conn) = storage.get_hsm_connection(provider_name.as_str()).await else {
         // Not an HSM connection (static provider or legacy) → no scope check.
         return Ok(());
     };
     let Some(ref required_scope) = conn.scope_owner else {
+        // No scope_owner set → platform-scoped, no check.
         return Ok(());
     };
-    match principal_scope {
-        Some(scope) if scope == required_scope => Ok(()),
-        Some(scope) => Err(format!(
-            "scope mismatch: principal scope '{scope}' does not match \
-             connection scope_owner '{required_scope}'"
-        )),
-        None => Err(format!(
-            "scope_owner '{required_scope}' is set on connection '{}' but \
-             the principal has no scope claim",
-            provider_name.as_str()
-        )),
+
+    let (result, err_msg) = match principal_scope {
+        Some(scope) if scope == required_scope => (keyrack_core::audit::AuditResult::Success, None),
+        Some(scope) => (
+            keyrack_core::audit::AuditResult::Denied,
+            Some(format!(
+                "scope mismatch: principal scope '{scope}' does not match \
+                 connection scope_owner '{required_scope}'"
+            )),
+        ),
+        None => (
+            keyrack_core::audit::AuditResult::Denied,
+            Some(format!(
+                "scope_owner '{required_scope}' is set on connection '{}' but \
+                 the principal has no scope claim",
+                provider_name.as_str()
+            )),
+        ),
+    };
+
+    // Emit the scope_owner_check audit event.
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "scope".into(),
+        serde_json::Value::String(principal_scope.unwrap_or("").to_string()),
+    );
+    metadata.insert(
+        "connection_scope_owner".into(),
+        serde_json::Value::String(required_scope.clone()),
+    );
+
+    let event = keyrack_core::audit::AuditEvent {
+        schema_version: keyrack_core::audit::SCHEMA_VERSION,
+        event_id: uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string(),
+        timestamp: chrono::Utc::now(),
+        event_type: keyrack_core::audit::EventType::ScopeOwnerCheck,
+        action: action.clone(),
+        principal: keyrack_core::audit::AuditPrincipal {
+            id: principal_id.to_string(),
+            principal_type: "authenticated".into(),
+        },
+        resource: keyrack_core::audit::AuditResource {
+            id: provider_name.as_str().to_string(),
+            resource_type: "HsmConnection".into(),
+        },
+        result,
+        encryption_context_hash: None,
+        tenant: None,
+        project: None,
+        srn: None,
+        request_id: None,
+        metadata,
+        signature: None,
+        previous_hash: None,
+    };
+    if let Err(e) = audit.emit(&event).await {
+        tracing::warn!(error = %e, "failed to emit scope_owner_check audit event");
     }
+
+    match err_msg {
+        None => Ok(()),
+        Some(msg) => Err(DomainError::PermissionDenied(msg)),
+    }
+}
+
+/// Enforce `scope_owner` for a crypto operation on an existing key.
+///
+/// Checks the EFFECTIVE per-version binding (`key_version.provider_ref`, falling
+/// back to `record.provider_ref`) so migrated keys that straddle backends are
+/// checked against the correct connection.
+///
+/// For encrypt/sign/mac-generate: checks the primary version binding.
+/// For decrypt/verify/mac-verify: checks the specific version binding.
+pub async fn enforce_scope_for_key_op(
+    state: &crate::state::ServiceState,
+    record: &KeyRecord,
+    version_number: Option<u64>,
+    principal_scope: Option<&str>,
+    principal_id: &str,
+    action: &keyrack_core::audit::AuditAction,
+) -> Result<(), DomainError> {
+    let effective_pref = match version_number {
+        Some(ver) => record
+            .key_versions
+            .iter()
+            .find(|v| v.version_number == ver)
+            .and_then(|v| v.provider_ref.as_ref())
+            .or(record.provider_ref.as_ref()),
+        None => {
+            // Primary version.
+            record
+                .key_versions
+                .iter()
+                .find(|v| v.is_primary)
+                .and_then(|v| v.provider_ref.as_ref())
+                .or(record.provider_ref.as_ref())
+        }
+    };
+
+    let Some(pref) = effective_pref else {
+        return Ok(());
+    };
+
+    check_scope_owner(
+        &state.storage,
+        &state.audit,
+        pref,
+        principal_scope,
+        principal_id,
+        action,
+    )
+    .await
 }
 
 pub async fn create_key(
@@ -428,8 +544,7 @@ pub async fn create_key(
         requested_provider.as_deref(),
         input.hsm_connection_id.as_deref(),
         input.backend_id.as_deref(),
-    )
-    .map_err(DomainError::FailedPrecondition)?;
+    )?;
     let entry = state
         .providers
         .resolve(&provider_name)
@@ -1948,6 +2063,10 @@ mod resolve_tests {
         )
     }
 
+    fn no_rules_router() -> ProviderRouter {
+        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+    }
+
     fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
         let attrs: BTreeMap<String, String> = pairs
             .iter()
@@ -2004,17 +2123,44 @@ mod resolve_tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("route pin selected 'tenant-acme'"),
+            err.to_string().contains("route pin selected 'tenant-acme'"),
             "{err}"
         );
     }
 
     #[test]
-    fn hsm_connection_id_selects_directly_overriding_router_default() {
-        let r =
-            resolve_create_provider(&router(), &registry(), &tags(&[]), None, Some("conn-1"), None)
-                .unwrap();
+    fn hsm_connection_id_selects_directly_no_policy() {
+        // When no routing rules configured (backward compat), hsm_connection_id
+        // selects any registered provider (≈ delegate *).
+        let r = resolve_create_provider(
+            &no_rules_router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            Some("conn-1"),
+            None,
+        )
+        .unwrap();
         assert_eq!(r.as_str(), "conn-1");
+    }
+
+    #[test]
+    fn hsm_connection_id_denied_when_policy_configured() {
+        // When routing rules ARE configured and no delegate matches,
+        // caller backend_id that differs from default is rejected.
+        let err = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            Some("conn-1"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not authorized"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2028,13 +2174,13 @@ mod resolve_tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("not a registered provider"), "{err}");
+        assert!(err.to_string().contains("not a registered provider"), "{err}");
     }
 
     #[test]
     fn hsm_connection_id_with_matching_assertion() {
         let r = resolve_create_provider(
-            &router(),
+            &no_rules_router(),
             &registry(),
             &tags(&[]),
             Some("conn-1"),
@@ -2048,7 +2194,7 @@ mod resolve_tests {
     #[test]
     fn hsm_connection_id_with_conflicting_assertion() {
         let err = resolve_create_provider(
-            &router(),
+            &no_rules_router(),
             &registry(),
             &tags(&[]),
             Some("shared"),
@@ -2056,7 +2202,7 @@ mod resolve_tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("backend_id selected 'conn-1'"), "{err}");
+        assert!(err.to_string().contains("backend_id selected 'conn-1'"), "{err}");
     }
 
     #[test]
@@ -2072,7 +2218,7 @@ mod resolve_tests {
     #[test]
     fn backend_id_selects_directly() {
         let r = resolve_create_provider(
-            &router(),
+            &no_rules_router(),
             &registry(),
             &tags(&[]),
             None,
@@ -2086,7 +2232,7 @@ mod resolve_tests {
     #[test]
     fn backend_id_and_hsm_connection_id_agree() {
         let r = resolve_create_provider(
-            &router(),
+            &no_rules_router(),
             &registry(),
             &tags(&[]),
             None,
@@ -2108,7 +2254,7 @@ mod resolve_tests {
             Some("shared"),
         )
         .unwrap_err();
-        assert!(err.contains("disagree"), "{err}");
+        assert!(err.to_string().contains("disagree"), "{err}");
     }
 
     #[test]
@@ -2122,6 +2268,6 @@ mod resolve_tests {
             Some("nonexistent"),
         )
         .unwrap_err();
-        assert!(err.contains("not a registered provider"), "{err}");
+        assert!(err.to_string().contains("not a registered provider"), "{err}");
     }
 }

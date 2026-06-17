@@ -106,6 +106,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let ec_hash = if req.encryption_context.is_empty() {
                 None
@@ -133,16 +134,16 @@ impl KeyService for KeyServiceImpl {
                     )));
                 }
 
-                // Enforce scope_owner on the key's bound provider (ADR-0001 A1.4).
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Encrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let ec = build_encryption_context(&req.encryption_context);
 
@@ -217,6 +218,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let ec_hash = if req.encryption_context.is_empty() {
                 None
@@ -244,20 +246,21 @@ impl KeyService for KeyServiceImpl {
                     )));
                 }
 
-                // Enforce scope_owner on the key's bound provider (ADR-0001 A1.4).
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
-
                 let (header, ciphertext) =
                     keyrack_core::header::CiphertextHeader::unwrap_payload(&req.ciphertext_blob)
                         .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+                // Enforce scope_owner against the per-version binding.
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    Some(header.key_version),
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Decrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let ec = build_encryption_context(&req.encryption_context);
 
@@ -661,6 +664,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
             op_ctx.request_id = request_id;
@@ -691,15 +695,16 @@ impl KeyService for KeyServiceImpl {
                     ));
                 }
 
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Sign,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
                     .key_versions
@@ -757,6 +762,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
             op_ctx.request_id = request_id;
@@ -787,15 +793,16 @@ impl KeyService for KeyServiceImpl {
                     ));
                 }
 
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Verify,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
                     .key_versions
@@ -863,6 +870,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
             op_ctx.request_id = request_id;
@@ -883,15 +891,16 @@ impl KeyService for KeyServiceImpl {
                     ));
                 }
 
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::GenerateMac,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
                     .key_versions
@@ -941,6 +950,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                     _ => None,
                 });
+            let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
             op_ctx.request_id = request_id;
@@ -961,15 +971,16 @@ impl KeyService for KeyServiceImpl {
                     ));
                 }
 
-                if let Some(ref pref) = record.provider_ref {
-                    crate::domain::check_scope_owner(
-                        &state.storage,
-                        pref,
-                        principal_scope.as_deref(),
-                    )
-                    .await
-                    .map_err(Status::permission_denied)?;
-                }
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::VerifyMac,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
                     .key_versions
@@ -1012,6 +1023,7 @@ impl KeyService for KeyServiceImpl {
                 keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
                 _ => None,
             });
+        let principal_id = principal.id.clone();
         let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
         op_ctx.request_id = request_id;
         ops::execute(
@@ -1049,16 +1061,19 @@ impl KeyService for KeyServiceImpl {
                     req.hsm_connection_id.as_deref(),
                     req.backend_id.as_deref(),
                 )
-                .map_err(Status::failed_precondition)?;
+                .map_err(|e| e.to_grpc_status())?;
 
                 // Enforce scope_owner if the resolved backend has one (ADR-0001 A1.4).
                 crate::domain::check_scope_owner(
                     &state.storage,
+                    &state.audit,
                     &provider_name,
                     principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::CreateKey,
                 )
                 .await
-                .map_err(Status::permission_denied)?;
+                .map_err(|e| e.to_grpc_status())?;
 
                 let entry = state.providers.resolve(&provider_name).map_err(convert::error_to_status)?;
 

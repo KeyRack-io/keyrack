@@ -122,16 +122,43 @@ pub struct NamedProvider {
 
 /// A single provider-routing rule.
 ///
-/// If ALL tags in `match_tags` are present with the specified values on a
-/// new key's identity tags, the key is assigned to `provider`. Rules are
-/// evaluated in order; the first match wins.
+/// Rules are evaluated in order; the first rule whose `match_tags` are all
+/// present on a new key's identity tags wins.
+///
+/// ## Actions
+///
+/// - **route** (default): pin to a specific provider; caller cannot override.
+/// - **delegate**: caller may select from a bounded set of providers.
+/// - **`delegate_any`**: caller may select any registered provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRoutingRule {
     /// Identity-tag predicate. All entries must match (AND logic).
     #[serde(rename = "match", default)]
     pub match_tags: std::collections::BTreeMap<String, String>,
-    /// Name of the provider to use when this rule matches.
-    pub provider: String,
+    /// For `route` rules: name of the provider to pin to.
+    /// For `delegate` and `delegate_any` rules: unused (ignored if present).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The rule action. Defaults to "route" for backward compatibility.
+    #[serde(default = "default_rule_action")]
+    pub action: RuleActionConfig,
+    /// For `delegate` action: the set of allowed providers.
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+}
+
+fn default_rule_action() -> RuleActionConfig {
+    RuleActionConfig::Route
+}
+
+/// The action a routing rule takes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleActionConfig {
+    #[default]
+    Route,
+    Delegate,
+    DelegateAny,
 }
 
 impl Default for ServiceConfig {
@@ -526,7 +553,7 @@ provider_routing:
             config.provider_routing[0].match_tags.get("tenant"),
             Some(&"acme".to_string())
         );
-        assert_eq!(config.provider_routing[0].provider, "tenant-b");
+        assert_eq!(config.provider_routing[0].provider.as_deref(), Some("tenant-b"));
     }
 
     #[test]

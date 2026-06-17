@@ -247,6 +247,14 @@ async fn create_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal
+        .attributes
+        .get("scope")
+        .and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
     op_ctx.request_id = request_id;
     ops::execute_rest(
@@ -313,7 +321,20 @@ async fn create_key(
                 hsm_connection_id,
                 backend_id,
             )
-            .map_err(|m| ops::rest_error(StatusCode::CONFLICT, "ProviderMismatch", &m))?;
+            .map_err(|e| e.to_rest_error())?;
+
+            // Enforce scope_owner (ADR-0001 A1.4).
+            crate::domain::check_scope_owner(
+                &state.storage,
+                &state.audit,
+                &provider_name,
+                principal_scope.as_deref(),
+                &principal_id,
+                &keyrack_core::audit::AuditAction::CreateKey,
+            )
+            .await
+            .map_err(|e| e.to_rest_error())?;
+
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
 
             let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
@@ -678,6 +699,14 @@ async fn encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal
+        .attributes
+        .get("scope")
+        .and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -697,6 +726,16 @@ async fn encrypt(
                 "key not in Enabled state",
             ));
         }
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Encrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let plaintext_b64 = body.get("plaintext").and_then(|v| v.as_str()).unwrap_or("");
         let plaintext = base64_decode(plaintext_b64)?;
         let ec = body
@@ -755,6 +794,14 @@ async fn decrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal
+        .attributes
+        .get("scope")
+        .and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+    let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -783,6 +830,19 @@ async fn decrypt(
             .map_err(|e| {
                 ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
             })?;
+
+        // Enforce scope_owner against the per-version binding.
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            Some(header.key_version),
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Decrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
+
         let ec = body
             .get("encryption_context")
             .and_then(|v| v.as_object())

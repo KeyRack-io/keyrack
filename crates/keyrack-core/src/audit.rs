@@ -180,6 +180,10 @@ pub enum AuditAction {
     // provider secret reference (e.g. a PKCS#11 `pin_ref`) is resolved.
     #[serde(rename = "kms:AccessSecret")]
     AccessSecret,
+
+    // Scope ownership check on a backend connection (ADR-0001 A1.4).
+    #[serde(rename = "kms:ScopeOwnerCheck")]
+    ScopeOwnerCheck,
 }
 
 impl std::fmt::Display for AuditAction {
@@ -209,6 +213,7 @@ pub enum EventType {
     CascadeDisable,
     AuthorizationDenied,
     SecretAccess,
+    ScopeOwnerCheck,
 }
 
 /// Outcome of the audited operation.
