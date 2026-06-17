@@ -4,9 +4,37 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
-Toward `0.2.0` (stable). Pending: extend fail-closed authentication to the REST
-surface, and add an in-process mTLS integration test alongside the
-`10-mtls-identity` demo.
+## [0.3.0] — 2026-06-17
+
+Provider-resolution hardening and HSM connection governance for the first
+design-partner integration. All changes are wire-additive (no proto breaks).
+
+### Added
+
+- **Unified `backend_id` selector** — `CreateKeyRequest`, `KeyMetadata`, and
+  read paths now accept `backend_id` as the canonical crypto-backend selector.
+  The former `hsm_connection_id` field is retained as a deprecated wire alias
+  for one release (both accepted; if both set they must agree).
+- **Route/delegate routing model** — the provider router supports `route` (pin,
+  authoritative), `delegate {set}` (caller selects within an allowed set), and
+  `delegate *` (any registered backend). Default-deny: caller-supplied
+  `backend_id` is rejected unless a `delegate` rule opens it. Backward-compat:
+  with no routing-policy block configured, behavior is unchanged.
+- **`scope_owner` on HSM connections** — `CreateHsmConnectionRequest` accepts
+  an optional `scope_owner`; when set, all crypto operations (CreateKey,
+  Encrypt, Decrypt, Sign, Verify, GenerateMac, VerifyMac) referencing that
+  connection enforce exact scope match on the principal. Mismatch or absent
+  scope → `PermissionDenied`.
+- **`ListHsmConnections` scope filter** — optional `scope_owner` filter on the
+  list path (additive proto field).
+- **Metadata echo** — `KeyMetadata` now surfaces the bound `backend_id`
+  uniformly (gRPC + REST).
+
+### Fixed
+
+- **`DeleteHsmConnection` deregistration** — deleting a connection now also
+  removes it from the live provider registry, preventing stale backends from
+  serving new key creation after deletion.
 
 ## [0.2.0-beta.2] — 2026-06-15
 

@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-postgres"
-version = "0.1.0"
+version = "0.3.0"
 description = "KeyRack PostgreSQL storage backend with optimistic concurrency"
 edition.workspace = true
 rust-version.workspace = true
