@@ -61,6 +61,9 @@ struct KeyResponse {
     /// Name of the configured provider this key is bound to (routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_ref: Option<String>,
+    /// The crypto backend bound to this key (canonical name; same as `provider_ref`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
     description: String,
     user_tags: keyrack_core::tags::UserTags,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -83,6 +86,7 @@ impl From<&KeyRecord> for KeyResponse {
             origin: r.origin,
             provider_class: r.provider_class,
             provider_ref: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
+            backend_id: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
             description: r.description.clone(),
             user_tags: r.user_tags.clone(),
             created_at: r.created_at,
@@ -297,12 +301,17 @@ async fn create_key(
                 .get("hsm_connection_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
+            let backend_id = body
+                .get("backend_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             let provider_name = crate::domain::resolve_create_provider(
                 &state.provider_router,
                 &state.providers,
                 &identity_tags,
                 requested_provider.as_deref(),
                 hsm_connection_id,
+                backend_id,
             )
             .map_err(|m| ops::rest_error(StatusCode::CONFLICT, "ProviderMismatch", &m))?;
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;

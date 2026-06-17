@@ -181,6 +181,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
                 tags: std::collections::HashMap::default(),
                 parent_key_id: None,
                 hsm_connection_id: None,
+                backend_id: None,
                 attributes: attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 namespace: Some(args.namespace.clone()),
             }))

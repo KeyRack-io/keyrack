@@ -88,6 +88,13 @@ pub struct HsmConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_ref: Option<String>,
 
+    /// Scope owner for tenant isolation (ADR-0001 A1.4). Values: "platform",
+    /// "tenant:<id>". When set, operations referencing this connection must
+    /// carry a principal whose scope attribute matches (exact string equality);
+    /// mismatch → `PermissionDenied`. When unset → platform-scoped (no check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_owner: Option<String>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_health_check_at: Option<DateTime<Utc>>,
@@ -111,6 +118,7 @@ impl HsmConnection {
             description: description.into(),
             token_label: None,
             pin_ref: None,
+            scope_owner: None,
             created_at: now,
             updated_at: now,
             last_health_check_at: None,
@@ -129,6 +137,13 @@ impl HsmConnection {
     ) -> Self {
         self.token_label = Some(token_label.into());
         self.pin_ref = Some(pin_ref.into());
+        self
+    }
+
+    /// Set the scope owner for tenant isolation (ADR-0001 A1.4).
+    #[must_use]
+    pub fn with_scope_owner(mut self, scope_owner: impl Into<String>) -> Self {
+        self.scope_owner = Some(scope_owner.into());
         self
     }
 

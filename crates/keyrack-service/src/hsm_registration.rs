@@ -179,13 +179,18 @@ pub async fn register_pkcs11_connection(
     token_label_raw: &str,
     pin_ref_raw: &str,
     description: &str,
+    scope_owner: Option<&str>,
 ) -> Result<HsmConnection, RegisterError> {
     validate_connection_id(connection_id).map_err(RegisterError::Invalid)?;
     let token_label = normalize_token_label(token_label_raw).map_err(RegisterError::Invalid)?;
     let pin_ref = normalize_pin_ref(pin_ref_raw);
 
-    let candidate = HsmConnection::new(connection_id, HsmProviderType::Hsm, lib_path, description)
-        .with_pkcs11(token_label, pin_ref);
+    let mut candidate =
+        HsmConnection::new(connection_id, HsmProviderType::Hsm, lib_path, description)
+            .with_pkcs11(token_label, pin_ref);
+    if let Some(owner) = scope_owner.filter(|s| !s.is_empty()) {
+        candidate = candidate.with_scope_owner(owner);
+    }
 
     // No dedicated NotFound variant exists for HSM connections; the storage
     // backends signal a missing row via `Other("hsm connection not found: …")`.
@@ -539,6 +544,7 @@ mod tests {
             "tenant",
             "file:a.pin",
             "",
+            None,
         )
         .await
         .unwrap_err();
@@ -560,6 +566,7 @@ mod tests {
             &huge,
             "file:a.pin",
             "",
+            None,
         )
         .await
         .unwrap_err();
@@ -586,6 +593,7 @@ mod tests {
             "tenant   ",
             "file:a.pin",
             "ignored-description",
+            None,
         )
         .await
         .unwrap();
@@ -613,6 +621,7 @@ mod tests {
             "tenant",
             "file:b.pin",
             "",
+            None,
         )
         .await
         .unwrap_err();
@@ -633,6 +642,7 @@ mod tests {
             "tenant",
             "file:definitely-missing-pin-file.pin",
             "",
+            None,
         )
         .await
         .unwrap_err();

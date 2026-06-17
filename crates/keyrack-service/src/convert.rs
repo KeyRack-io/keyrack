@@ -225,12 +225,13 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
         current_key_version: record.current_key_version as u32,
         user_tags,
         parent_key_id: record.parent_lid.map(|l| l.to_string()),
-        hsm_connection_id: None,
+        hsm_connection_id: record.provider_ref.as_ref().map(|r| r.as_str().to_owned()),
         occ_version: record.occ_version,
         scheduled_deletion_at: record
             .scheduled_deletion_at
             .as_ref()
             .map(datetime_to_timestamp),
+        backend_id: record.provider_ref.as_ref().map(|r| r.as_str().to_owned()),
     }
 }
 
