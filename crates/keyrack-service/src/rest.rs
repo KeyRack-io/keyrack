@@ -292,20 +292,19 @@ async fn create_key(
             let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
             let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
 
-            // Route new key to the appropriate provider.
-            let provider_name = state.provider_router.select(&identity_tags);
-            if let Some(req_provider) = &requested_provider {
-                if req_provider != provider_name.as_str() {
-                    return Err(ops::rest_error(
-                        StatusCode::CONFLICT,
-                        "ProviderMismatch",
-                        &format!(
-                            "requested provider '{req_provider}' but routing policy selected '{}'",
-                            provider_name.as_str()
-                        ),
-                    ));
-                }
-            }
+            // Resolve the binding (tag routing + explicit selectors) once.
+            let hsm_connection_id = body
+                .get("hsm_connection_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let provider_name = crate::domain::resolve_create_provider(
+                &state.provider_router,
+                &state.providers,
+                &identity_tags,
+                requested_provider.as_deref(),
+                hsm_connection_id,
+            )
+            .map_err(|m| ops::rest_error(StatusCode::CONFLICT, "ProviderMismatch", &m))?;
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
 
             let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;

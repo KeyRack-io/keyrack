@@ -919,16 +919,15 @@ impl KeyService for KeyServiceImpl {
                 let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
                 let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
 
-                // Route new key to the appropriate provider.
-                let provider_name = state.provider_router.select(&identity_tags);
-                if let Some(req_provider) = &requested_provider {
-                    if req_provider != provider_name.as_str() {
-                        return Err(Status::failed_precondition(format!(
-                            "requested provider '{req_provider}' but routing policy selected '{}'",
-                            provider_name.as_str()
-                        )));
-                    }
-                }
+                // Resolve the binding (tag routing + explicit selectors) once.
+                let provider_name = crate::domain::resolve_create_provider(
+                    &state.provider_router,
+                    &state.providers,
+                    &identity_tags,
+                    requested_provider.as_deref(),
+                    req.hsm_connection_id.as_deref(),
+                )
+                .map_err(Status::failed_precondition)?;
                 let entry = state.providers.resolve(&provider_name).map_err(convert::error_to_status)?;
 
                 let handle = entry.provider.generate_key(&spec).await.map_err(convert::error_to_status)?;

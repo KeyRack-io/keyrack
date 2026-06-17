@@ -206,6 +206,64 @@ pub struct CreateKeyInput {
     pub parent_key_id: Option<String>,
     pub attributes: std::collections::BTreeMap<String, String>,
     pub namespace: String,
+    /// Explicit dynamic HSM connection to bind the key to (Stage 2). When set,
+    /// it must be a registered connection; see [`resolve_create_provider`].
+    pub hsm_connection_id: Option<String>,
+}
+
+/// Resolve the provider a new key binds to — the single source of truth shared
+/// by the gRPC, REST, and library (`create_key`) paths.
+///
+/// Precedence:
+/// 1. `hsm_connection_id` (when non-empty) selects that connection directly and
+///    is **fail-closed**: it must be a currently registered provider, otherwise
+///    resolution fails (the dynamic HSM connections created via
+///    `CreateHsmConnection` are not expressible in the static `provider_routing`
+///    rules, so this explicit selector is how a key targets one).
+/// 2. otherwise the tag-based [`ProviderRouter`] selects by identity tags.
+///
+/// `keyrack.provider` (when non-empty) is an **assertion over the final resolved
+/// binding**, whatever produced it (router or `hsm_connection_id`): a mismatch is
+/// rejected rather than silently overridden. This keeps one consistent guardrail
+/// semantic across both explicit inputs.
+///
+/// Every `Err` here is a fail-closed resolution failure (caller maps it to
+/// gRPC `FailedPrecondition` / REST `409`); no key material is produced.
+pub fn resolve_create_provider(
+    router: &keyrack_core::routing::ProviderRouter,
+    providers: &Arc<dyn keyrack_core::registry::ProviderRegistry>,
+    identity_tags: &keyrack_core::tags::IdentityTags,
+    requested_provider: Option<&str>,
+    hsm_connection_id: Option<&str>,
+) -> Result<keyrack_core::key::ProviderRef, String> {
+    let via_hsm_id = hsm_connection_id.filter(|s| !s.is_empty());
+    let resolved = match via_hsm_id {
+        Some(id) => {
+            let pref = keyrack_core::key::ProviderRef::new(id);
+            if !providers.contains(&pref) {
+                return Err(format!(
+                    "hsm_connection_id '{id}' is not a registered HSM connection"
+                ));
+            }
+            pref
+        }
+        None => router.select(identity_tags),
+    };
+
+    if let Some(req) = requested_provider.filter(|s| !s.is_empty()) {
+        if req != resolved.as_str() {
+            let via = if via_hsm_id.is_some() {
+                "hsm_connection_id"
+            } else {
+                "routing policy"
+            };
+            return Err(format!(
+                "requested provider '{req}' but {via} selected '{}'",
+                resolved.as_str()
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 pub async fn create_key(
@@ -231,16 +289,15 @@ pub async fn create_key(
     let (lid, attrs) = generate_key_lid_from_attrs(caller_attrs);
     let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
 
-    // Route new key to the appropriate provider based on identity tags.
-    let provider_name = state.provider_router.select(&identity_tags);
-    if let Some(req_provider) = &requested_provider {
-        if req_provider != provider_name.as_str() {
-            return Err(DomainError::FailedPrecondition(format!(
-                "requested provider '{req_provider}' but routing policy selected '{}'",
-                provider_name.as_str()
-            )));
-        }
-    }
+    // Resolve the binding (tag routing + explicit selectors) in one place.
+    let provider_name = resolve_create_provider(
+        &state.provider_router,
+        &state.providers,
+        &identity_tags,
+        requested_provider.as_deref(),
+        input.hsm_connection_id.as_deref(),
+    )
+    .map_err(DomainError::FailedPrecondition)?;
     let entry = state
         .providers
         .resolve(&provider_name)
@@ -1704,4 +1761,160 @@ pub async fn fail_rotation_job(
         .await
         .map_err(DomainError::from)?;
     Ok(job)
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::provider::inmem::InMemoryProvider;
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
+    use keyrack_core::routing::ProviderRouter;
+    use keyrack_core::tags::IdentityTags;
+    use std::collections::BTreeMap;
+
+    fn entry() -> ProviderEntry {
+        ProviderEntry {
+            provider: Arc::new(InMemoryProvider::new()),
+            class: ProviderClass::InMemory,
+        }
+    }
+
+    /// Registry with a static default + a static tenant provider + one
+    /// "dynamic" HSM connection (`conn-1`). `conn-unknown` is deliberately absent.
+    fn registry() -> Arc<dyn ProviderRegistry> {
+        Arc::new(
+            DynamicProviderRegistry::new(
+                [
+                    (ProviderRef::new("shared"), entry()),
+                    (ProviderRef::new("tenant-acme"), entry()),
+                    (ProviderRef::new("conn-1"), entry()),
+                ],
+                ProviderRef::new("shared"),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// One rule: `tenant=acme -> tenant-acme`, default `shared`.
+    fn router() -> ProviderRouter {
+        ProviderRouter::new(
+            vec![(
+                BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
+                ProviderRef::new("tenant-acme"),
+            )],
+            ProviderRef::new("shared"),
+        )
+    }
+
+    fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
+        let attrs: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let (_, attr_set) = generate_key_lid_from_attrs(attrs);
+        IdentityTags::from_attribute_set(&attr_set)
+    }
+
+    #[test]
+    fn no_explicit_no_match_uses_default() {
+        let r = resolve_create_provider(&router(), &registry(), &tags(&[]), None, None).unwrap();
+        assert_eq!(r.as_str(), "shared");
+    }
+
+    #[test]
+    fn no_explicit_tag_match_routes() {
+        let r = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[("tenant", "acme")]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.as_str(), "tenant-acme");
+    }
+
+    #[test]
+    fn requested_provider_agrees_with_routing() {
+        let r = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[("tenant", "acme")]),
+            Some("tenant-acme"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.as_str(), "tenant-acme");
+    }
+
+    #[test]
+    fn requested_provider_disagrees_with_routing() {
+        let err = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[("tenant", "acme")]),
+            Some("shared"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("routing policy selected 'tenant-acme'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hsm_connection_id_selects_directly_overriding_router_default() {
+        // No tag match -> router would pick "shared"; explicit id wins.
+        let r = resolve_create_provider(&router(), &registry(), &tags(&[]), None, Some("conn-1"))
+            .unwrap();
+        assert_eq!(r.as_str(), "conn-1");
+    }
+
+    #[test]
+    fn hsm_connection_id_unregistered_fails_closed() {
+        let err = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            Some("conn-unknown"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a registered HSM connection"), "{err}");
+    }
+
+    #[test]
+    fn hsm_connection_id_with_matching_assertion() {
+        let r = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            Some("conn-1"),
+            Some("conn-1"),
+        )
+        .unwrap();
+        assert_eq!(r.as_str(), "conn-1");
+    }
+
+    #[test]
+    fn hsm_connection_id_with_conflicting_assertion() {
+        let err = resolve_create_provider(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            Some("shared"),
+            Some("conn-1"),
+        )
+        .unwrap_err();
+        assert!(err.contains("hsm_connection_id selected 'conn-1'"), "{err}");
+    }
+
+    #[test]
+    fn empty_explicit_strings_treated_as_absent() {
+        let r = resolve_create_provider(&router(), &registry(), &tags(&[]), Some(""), Some(""))
+            .unwrap();
+        assert_eq!(r.as_str(), "shared");
+    }
 }
