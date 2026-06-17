@@ -1046,6 +1046,7 @@ impl KeyService for KeyServiceImpl {
                     req.attributes.clone().into_iter().collect();
                 let namespace = req.namespace.clone().unwrap_or_default();
                 let requested_provider = caller_attrs.remove("keyrack.provider");
+                caller_attrs.remove("backend_id");
                 if !namespace.is_empty() {
                     caller_attrs.insert("namespace".to_string(), namespace);
                 }
@@ -2255,6 +2256,11 @@ impl KeyService for KeyServiceImpl {
                         "",
                     );
                     if let Some(owner) = req.scope_owner.as_deref().filter(|s| !s.is_empty()) {
+                        if !crate::hsm_registration::is_valid_scope_owner(owner) {
+                            return Err(Status::invalid_argument(format!(
+                                "scope_owner must be 'platform' or 'tenant:<id>'; got '{owner}'"
+                            )));
+                        }
                         conn = conn.with_scope_owner(owner);
                     }
                     state

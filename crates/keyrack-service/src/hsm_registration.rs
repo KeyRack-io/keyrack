@@ -121,7 +121,7 @@ pub fn normalize_pin_ref(raw: &str) -> String {
 /// Validate that a `scope_owner` value is in the accepted set for 0.3.0:
 /// `"platform"` or `"tenant:<id>"`. Other formats (e.g. `"org:<id>"`) are
 /// deferred; accepting them now without enforcement is worse than rejecting.
-fn is_valid_scope_owner(value: &str) -> bool {
+pub(crate) fn is_valid_scope_owner(value: &str) -> bool {
     if value == "platform" {
         return true;
     }

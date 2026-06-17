@@ -405,9 +405,30 @@ pub async fn check_scope_owner(
     principal_id: &str,
     action: &keyrack_core::audit::AuditAction,
 ) -> Result<(), DomainError> {
-    let Ok(conn) = storage.get_hsm_connection(provider_name.as_str()).await else {
-        // Not an HSM connection (static provider or legacy) → no scope check.
-        return Ok(());
+    let conn = match storage.get_hsm_connection(provider_name.as_str()).await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                // Not an HSM connection (static provider or legacy) → no scope check.
+                return Ok(());
+            }
+            // Genuine storage error → emit result=error and propagate.
+            emit_scope_audit(
+                audit,
+                provider_name,
+                principal_scope,
+                principal_id,
+                action,
+                keyrack_core::audit::AuditResult::Error,
+                "",
+            )
+            .await;
+            return Err(DomainError::FailedPrecondition(format!(
+                "scope_owner check failed: storage error for connection '{}'",
+                provider_name.as_str()
+            )));
+        }
     };
     let Some(ref required_scope) = conn.scope_owner else {
         // No scope_owner set → platform-scoped, no check.
@@ -433,7 +454,32 @@ pub async fn check_scope_owner(
         ),
     };
 
-    // Emit the scope_owner_check audit event.
+    emit_scope_audit(
+        audit,
+        provider_name,
+        principal_scope,
+        principal_id,
+        action,
+        result,
+        required_scope,
+    )
+    .await;
+
+    match err_msg {
+        None => Ok(()),
+        Some(msg) => Err(DomainError::PermissionDenied(msg)),
+    }
+}
+
+async fn emit_scope_audit(
+    audit: &Arc<dyn keyrack_core::audit::AuditSink>,
+    provider_name: &keyrack_core::key::ProviderRef,
+    principal_scope: Option<&str>,
+    principal_id: &str,
+    action: &keyrack_core::audit::AuditAction,
+    result: keyrack_core::audit::AuditResult,
+    connection_scope_owner: &str,
+) {
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "scope".into(),
@@ -441,7 +487,7 @@ pub async fn check_scope_owner(
     );
     metadata.insert(
         "connection_scope_owner".into(),
-        serde_json::Value::String(required_scope.clone()),
+        serde_json::Value::String(connection_scope_owner.to_string()),
     );
 
     let event = keyrack_core::audit::AuditEvent {
@@ -470,11 +516,6 @@ pub async fn check_scope_owner(
     };
     if let Err(e) = audit.emit(&event).await {
         tracing::warn!(error = %e, "failed to emit scope_owner_check audit event");
-    }
-
-    match err_msg {
-        None => Ok(()),
-        Some(msg) => Err(DomainError::PermissionDenied(msg)),
     }
 }
 

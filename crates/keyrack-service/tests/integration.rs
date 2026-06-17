@@ -31,11 +31,14 @@ use keyrack_core::pdp::{
     AlwaysAllow, AlwaysDeny, AuthzRequest, AuthzResponse, PolicyDecisionPoint,
 };
 use keyrack_core::provider::inmem::InMemoryProvider;
+use keyrack_core::provider::CryptoProvider as _;
 use keyrack_service::proto;
 use keyrack_service::proto::key_service_server::KeyService;
 use keyrack_service::state::ServiceState;
 use std::sync::{Arc, Mutex};
 use tonic::Request;
+
+use base64::Engine as _;
 
 /// Audit sink that captures events for test assertions.
 struct CapturingSink {
@@ -1817,5 +1820,603 @@ async fn get_key_echoes_backend_id() {
         meta.hsm_connection_id.as_deref(),
         Some("tenant-hsm"),
         "hsm_connection_id alias should echo"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SURFACE × OP SCOPE ENFORCEMENT MATRIX
+// ═══════════════════════════════════════════════════════════════════
+
+/// Helper: create a scoped connection + key bound to it for scope enforcement tests.
+async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "scoped-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "scoped",
+    )
+    .with_scope_owner("tenant:acme");
+    state
+        .storage
+        .create_hsm_connection(&conn)
+        .await
+        .expect("save conn");
+
+    let default_entry = state.providers.default_entry();
+    let handle = default_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "scope matrix test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+    lid
+}
+
+/// Helper: create the same setup but for a signing key.
+async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
+    let conn_id = "scoped-sign-conn";
+    if state
+        .storage
+        .get_hsm_connection(conn_id)
+        .await
+        .is_err()
+    {
+        let conn = keyrack_core::hsm::HsmConnection::new(
+            conn_id,
+            keyrack_core::hsm::HsmProviderType::Hsm,
+            "/lib.so",
+            "scoped signing",
+        )
+        .with_scope_owner("tenant:acme");
+        state.storage.create_hsm_connection(&conn).await.unwrap();
+    }
+
+    let default_entry = state.providers.default_entry();
+    let handle = default_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Ed25519)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::SignVerify,
+        key_spec: keyrack_core::key::KeySpec::Ed25519,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "scope sign test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+    lid
+}
+
+// ── gRPC surface: all scoped ops deny on missing scope claim ──────
+
+#[tokio::test]
+async fn grpc_scope_deny_encrypt() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"x".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_decrypt() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Build a valid ciphertext header so the scope check fires before decryption.
+    let header = keyrack_core::header::CiphertextHeader::new(lid, 1, [0u8; 32]);
+    let ciphertext_blob = header.wrap_payload(&[0u8; 32]);
+
+    let err = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: lid.to_string(),
+            ciphertext_blob,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_sign() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_signing_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .sign(Request::new(proto::SignRequest {
+            key_id: lid.to_string(),
+            message: b"msg".to_vec(),
+            signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_verify() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_signing_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .verify(Request::new(proto::VerifyRequest {
+            key_id: lid.to_string(),
+            message: b"msg".to_vec(),
+            signature: vec![0u8; 64],
+            signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_generate_mac() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .generate_mac(Request::new(proto::GenerateMacRequest {
+            key_id: lid.to_string(),
+            message: b"x".to_vec(),
+            mac_algorithm: proto::MacAlgorithm::HmacSha256.into(),
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_verify_mac() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .verify_mac(Request::new(proto::VerifyMacRequest {
+            key_id: lid.to_string(),
+            message: b"x".to_vec(),
+            mac: vec![0u8; 32],
+            mac_algorithm: proto::MacAlgorithm::HmacSha256.into(),
+        }))
+        .await
+        .expect_err("scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_create_key_with_scoped_backend() {
+    let (state, _) = build_routed_state();
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "create-scoped",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("create-scoped"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "scope create test".into(),
+            backend_id: Some("create-scoped".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny create");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+// ── REST surface: scope enforcement via tower ─────────────────────
+
+#[tokio::test]
+async fn rest_scope_deny_encrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "plaintext": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-encrypt"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_decrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    // Build a valid ciphertext header so the scope check fires.
+    let header = keyrack_core::header::CiphertextHeader::new(lid, 1, [0u8; 32]);
+    let ciphertext_blob = header.wrap_payload(&[0u8; 32]);
+
+    let body = serde_json::json!({
+        "ciphertext_blob": base64::engine::general_purpose::STANDARD.encode(&ciphertext_blob),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-decrypt"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_sign() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_signing_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-sign"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_verify() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_signing_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signature": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-verify"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_generate_mac() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "mac_algorithm": "HMAC_SHA_256",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-generate-mac"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_verify_mac() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "mac": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        "mac_algorithm": "HMAC_SHA_256",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-verify-mac"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+// ── Registration rejects invalid scope_owner ──────────────────────
+
+#[tokio::test]
+async fn create_hsm_connection_rejects_org_scope_owner() {
+    let (state, _) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            endpoint: "kmip://host:5696".into(),
+            provider_type: proto::HsmProviderType::Hyok.into(),
+            scope_owner: Some("org:globex".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("org scope must be rejected for 0.3.0");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("scope_owner"));
+}
+
+#[tokio::test]
+async fn create_hsm_connection_rejects_empty_tenant() {
+    let (state, _) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            endpoint: "kmip://host:5696".into(),
+            provider_type: proto::HsmProviderType::Hyok.into(),
+            scope_owner: Some("tenant:".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("empty tenant: must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn create_hsm_connection_rejects_arbitrary_scope() {
+    let (state, _) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            endpoint: "kmip://host:5696".into(),
+            provider_type: proto::HsmProviderType::Hyok.into(),
+            scope_owner: Some("foobar".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("arbitrary scope must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn create_hsm_connection_accepts_valid_scope_owners() {
+    let (state, _) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let resp = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            connection_id: "valid-platform".into(),
+            endpoint: "kmip://host:5696".into(),
+            provider_type: proto::HsmProviderType::Hyok.into(),
+            scope_owner: Some("platform".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(resp.is_ok(), "platform scope_owner must be accepted");
+
+    let resp = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            connection_id: "valid-tenant".into(),
+            endpoint: "kmip://host:5696".into(),
+            provider_type: proto::HsmProviderType::Hyok.into(),
+            scope_owner: Some("tenant:globex".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(resp.is_ok(), "tenant:<id> scope_owner must be accepted");
+}
+
+// ── scope_owner_check audit envelope on success ───────────────────
+
+#[tokio::test]
+async fn scope_audit_success_on_unscoped_connection() {
+    let (state, audit) = build_routed_state();
+
+    // Register connection in storage AND in provider registry.
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "scoped-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "scoped",
+    );
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("scoped-conn"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov.clone(),
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    // Create a key bound to this connection.
+    let handle = prov
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "audit unscoped test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let result = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"data".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "unscoped connection must pass: {result:?}");
+
+    let events = audit.events();
+    let scope_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck)
+        .collect();
+    assert!(
+        scope_events.is_empty(),
+        "no scope_owner_check event when scope_owner is unset"
     );
 }
