@@ -172,6 +172,7 @@ impl HsmConnection {
             && self.endpoint == other.endpoint
             && self.token_label == other.token_label
             && self.pin_ref == other.pin_ref
+            && self.scope_owner == other.scope_owner
     }
 
     /// Update connection status from a health check probe.

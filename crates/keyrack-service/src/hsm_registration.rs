@@ -118,6 +118,19 @@ pub fn normalize_pin_ref(raw: &str) -> String {
 
 /// Validate a caller-supplied `connection_id` (ADR-0001 §1.2, Q8): non-empty,
 /// no surrounding/only whitespace, `<= 128` bytes, no control characters.
+/// Validate that a `scope_owner` value is in the accepted set for 0.3.0:
+/// `"platform"` or `"tenant:<id>"`. Other formats (e.g. `"org:<id>"`) are
+/// deferred; accepting them now without enforcement is worse than rejecting.
+fn is_valid_scope_owner(value: &str) -> bool {
+    if value == "platform" {
+        return true;
+    }
+    if let Some(tenant_id) = value.strip_prefix("tenant:") {
+        return !tenant_id.is_empty();
+    }
+    false
+}
+
 pub fn validate_connection_id(id: &str) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("connection_id must not be empty".to_string());
@@ -189,6 +202,11 @@ pub async fn register_pkcs11_connection(
         HsmConnection::new(connection_id, HsmProviderType::Hsm, lib_path, description)
             .with_pkcs11(token_label, pin_ref);
     if let Some(owner) = scope_owner.filter(|s| !s.is_empty()) {
+        if !is_valid_scope_owner(owner) {
+            return Err(RegisterError::Invalid(format!(
+                "scope_owner must be 'platform' or 'tenant:<id>'; got '{owner}'"
+            )));
+        }
         candidate = candidate.with_scope_owner(owner);
     }
 

@@ -24,6 +24,20 @@
 //! This eliminates behavioral divergence between the two API surfaces
 //! (Issue 3 / Option A from the project conclusion plan).
 //!
+//! ## Provider resolution precedence (ADR-0001 Amendment 1)
+//!
+//! 1. Evaluate routing rules against identity tags (first match wins).
+//! 2. Route pin — authoritative; caller `backend_id` must match or be absent.
+//! 3. Delegate — caller may select within bounded set (or any with `delegate *`).
+//! 4. Default (no rule matched): if routing rules configured → default-deny
+//!    caller selection; if no rules → backward-compat (caller selects freely).
+//!
+//! ## Scope-owner enforcement
+//!
+//! `check_scope_owner` / `enforce_scope_for_key_op` enforce tenant isolation
+//! on the shared path (both gRPC and REST). The check targets the effective
+//! per-version binding so migrated keys are checked against the correct backend.
+//!
 //! Functions here are called *inside* [`ops::execute`] /
 //! [`ops::execute_rest`] closures, so PDP authorization and audit
 //! emission remain structurally guaranteed by the ops layer.

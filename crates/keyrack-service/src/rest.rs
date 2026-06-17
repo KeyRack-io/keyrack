@@ -298,6 +298,7 @@ async fn create_key(
                 .unwrap_or("")
                 .to_string();
             let requested_provider = caller_attrs.remove("keyrack.provider");
+            caller_attrs.remove("backend_id");
             if !namespace.is_empty() {
                 caller_attrs.insert("namespace".to_string(), namespace);
             }
