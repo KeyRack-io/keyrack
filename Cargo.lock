@@ -2761,8 +2761,6 @@ dependencies = [
  "chrono",
  "criterion",
  "ed25519-dalek",
- "http-body-util",
- "hyper",
  "keyrack-core",
  "keyrack-kmip",
  "keyrack-nats",

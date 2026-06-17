@@ -53,8 +53,6 @@ keyrack-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-hyper = "1"
 
 [[bench]]
 name = "service_ops"

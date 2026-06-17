@@ -2420,3 +2420,205 @@ async fn scope_audit_success_on_unscoped_connection() {
         "no scope_owner_check event when scope_owner is unset"
     );
 }
+
+// ── Idempotency conflict on scope_owner change ────────────────────
+
+#[tokio::test]
+async fn scope_owner_change_is_conflict_not_idempotent() {
+    use keyrack_service::hsm_registration::{classify_registration, RegistrationOutcome};
+
+    let a = keyrack_core::hsm::HsmConnection::new(
+        "conn-x",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:alpha");
+
+    let b = keyrack_core::hsm::HsmConnection::new(
+        "conn-x",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:beta");
+
+    let outcome = classify_registration(Some(&a), &b);
+    assert!(
+        matches!(outcome, RegistrationOutcome::Conflict),
+        "changing scope_owner must be a conflict, not idempotent: got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn same_scope_owner_re_register_is_idempotent() {
+    use keyrack_service::hsm_registration::{classify_registration, RegistrationOutcome};
+
+    let a = keyrack_core::hsm::HsmConnection::new(
+        "conn-y",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+
+    let b = keyrack_core::hsm::HsmConnection::new(
+        "conn-y",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+
+    let outcome = classify_registration(Some(&a), &b);
+    assert!(
+        matches!(outcome, RegistrationOutcome::Idempotent),
+        "same scope_owner re-register must be idempotent: got {outcome:?}"
+    );
+}
+
+// ── No-policy backward-compat ─────────────────────────────────────
+
+fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_custom = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("custom-hsm"),
+            ProviderEntry {
+                provider: prov_custom,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
+            .expect("valid registry"),
+    );
+
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+#[tokio::test]
+async fn no_policy_backend_id_free_select() {
+    let (state, _) = build_no_policy_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "no-policy select".into(),
+            backend_id: Some("custom-hsm".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        resp.is_ok(),
+        "no-policy mode must allow backend_id free-select: {resp:?}"
+    );
+    let meta = resp.unwrap().into_inner().metadata.unwrap();
+    assert_eq!(
+        meta.backend_id.as_deref(),
+        Some("custom-hsm"),
+        "selected backend must be custom-hsm"
+    );
+}
+
+#[tokio::test]
+async fn no_policy_default_provider_used_without_backend_id() {
+    let (state, _) = build_no_policy_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "no-policy default".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(resp.is_ok(), "no-policy default must work: {resp:?}");
+    let meta = resp.unwrap().into_inner().metadata.unwrap();
+    assert_eq!(
+        meta.backend_id.as_deref(),
+        Some("default"),
+        "should route to default provider"
+    );
+}
+
+// ── REST CreateKey scope deny ─────────────────────────────────────
+
+#[tokio::test]
+async fn rest_scope_deny_create_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "rest-create-scoped",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("rest-create-scoped"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "description": "scope test",
+        "backend_id": "rest-create-scoped",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
