@@ -1234,3 +1234,588 @@ async fn create_aes_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
         .expect("metadata")
         .key_id
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 0.3.0 DENY-PATH TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Build a state with routing rules configured (`has_rules` = true) and two providers.
+fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::{ProviderRouter, RoutingRule, RuleAction};
+    use std::collections::BTreeMap;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_tenant = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("tenant-hsm"),
+            ProviderEntry {
+                provider: prov_tenant,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
+            .expect("valid registry"),
+    );
+
+    let mut match_tags = BTreeMap::new();
+    match_tags.insert("tenant".to_string(), "acme".to_string());
+    let rules = vec![RoutingRule {
+        match_tags,
+        action: RuleAction::Route(ProviderRef::new("tenant-hsm")),
+    }];
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+/// Build a state with delegate rules for deny-path testing.
+fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::{ProviderRouter, RoutingRule, RuleAction};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_a = Arc::new(InMemoryProvider::new());
+    let prov_b = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("prov-a"),
+            ProviderEntry {
+                provider: prov_a,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("prov-b"),
+            ProviderEntry {
+                provider: prov_b,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
+            .expect("valid registry"),
+    );
+
+    let mut match_tags = BTreeMap::new();
+    match_tags.insert("tier".to_string(), "premium".to_string());
+    let allowed: BTreeSet<ProviderRef> =
+        [ProviderRef::new("prov-a"), ProviderRef::new("prov-b")]
+            .into_iter()
+            .collect();
+    let rules = vec![RoutingRule {
+        match_tags,
+        action: RuleAction::Delegate(allowed),
+    }];
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+// ── backend_id deny paths ──────────────────────────────────────────
+
+#[tokio::test]
+async fn backend_id_unregistered_fails_with_failed_precondition() {
+    let (state, _audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "test".into(),
+            backend_id: Some("nonexistent-provider".into()),
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("unregistered backend_id must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("not a registered provider"));
+}
+
+#[tokio::test]
+async fn backend_id_default_deny_when_policy_configured() {
+    let (state, _audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Request backend_id "tenant-hsm" without matching any routing rule
+    // (no tags match the rule). With routing rules configured, this is
+    // denied because no delegate authorizes it.
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "test".into(),
+            backend_id: Some("tenant-hsm".into()),
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("default-deny must reject unauthorized backend_id");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("not authorized"));
+}
+
+#[tokio::test]
+async fn backend_id_alias_disagree_fails() {
+    let (state, _audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "test".into(),
+            backend_id: Some("default".into()),
+            hsm_connection_id: Some("tenant-hsm".into()),
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("disagree must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("disagree"));
+}
+
+// ── delegate deny paths ────────────────────────────────────────────
+
+#[tokio::test]
+async fn delegate_bounded_select_honored() {
+    let (state, _audit) = build_delegate_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("tier".to_string(), "premium".to_string());
+
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "delegated".into(),
+            backend_id: Some("prov-a".into()),
+            attributes,
+            ..Default::default()
+        }))
+        .await;
+
+    assert!(result.is_ok(), "delegate allows prov-a: {result:?}");
+    let lid: keyrack_core::lid::Lid = result
+        .unwrap()
+        .into_inner()
+        .metadata
+        .unwrap()
+        .key_id
+        .parse()
+        .unwrap();
+    let record = state.storage.get_key(&lid).await.unwrap();
+    assert_eq!(
+        record.provider_ref,
+        Some(keyrack_core::key::ProviderRef::new("prov-a"))
+    );
+}
+
+#[tokio::test]
+async fn delegate_outside_set_rejected_permission_denied() {
+    let (state, _audit) = build_delegate_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("tier".to_string(), "premium".to_string());
+
+    // "default" is registered but not in the delegate's allowed set.
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "blocked".into(),
+            backend_id: Some("default".into()),
+            attributes,
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("outside delegate set must be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("not permitted by the delegate rule"));
+}
+
+#[tokio::test]
+async fn route_pin_conflict_fails_precondition_names_both() {
+    let (state, _audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("tenant".to_string(), "acme".to_string());
+
+    // Route pins to "tenant-hsm" but caller requests "default".
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "conflict".into(),
+            backend_id: Some("default".into()),
+            attributes,
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("pin conflict must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("tenant-hsm"));
+    assert!(err.message().contains("default"));
+}
+
+// ── scope_owner deny paths ─────────────────────────────────────────
+
+#[tokio::test]
+async fn scope_owner_mismatch_denied_on_encrypt() {
+    let (state, audit) = build_routed_state();
+
+    // Register a dynamic HSM connection with scope_owner.
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "scoped-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "scoped connection",
+    )
+    .with_scope_owner("tenant:acme");
+    state
+        .storage
+        .create_hsm_connection(&conn)
+        .await
+        .expect("save conn");
+
+    // Create a key bound to this connection by inserting directly.
+    let default_entry = state.providers.default_entry();
+    let handle = default_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "scope test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+
+    // The InsecureAuthenticator principal has no scope claim → must be denied.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let result = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"test".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+
+    let err = result.expect_err("missing scope claim must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // Verify audit event was emitted with the correct envelope.
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check event must be emitted");
+    let ev = scope_event.unwrap();
+    assert_eq!(ev.result, keyrack_core::audit::AuditResult::Denied);
+    assert_eq!(ev.resource.resource_type, "HsmConnection");
+    assert_eq!(ev.resource.id, "scoped-conn");
+    assert!(ev.metadata.contains_key("scope"));
+    assert!(ev.metadata.contains_key("connection_scope_owner"));
+    assert_eq!(
+        ev.metadata["connection_scope_owner"],
+        serde_json::Value::String("tenant:acme".into())
+    );
+}
+
+#[tokio::test]
+async fn scope_owner_unset_passes_without_check() {
+    // When scope_owner is not set on the connection, no check is performed
+    // and the operation succeeds.
+    let (state, audit) = build_routed_state();
+
+    // Register a connection WITHOUT scope_owner and add it as a provider.
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "unscoped-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "no scope",
+    );
+    state
+        .storage
+        .create_hsm_connection(&conn)
+        .await
+        .expect("save conn");
+    let prov = Arc::new(InMemoryProvider::new());
+    let entry = keyrack_core::registry::ProviderEntry {
+        provider: prov,
+        class: keyrack_core::key::ProviderClass::InMemory,
+    };
+    let _ = state
+        .providers
+        .register(keyrack_core::key::ProviderRef::new("unscoped-conn"), entry);
+
+    // Create a key bound to it.
+    let unscoped_entry = state
+        .providers
+        .resolve(&keyrack_core::key::ProviderRef::new("unscoped-conn"))
+        .unwrap();
+    let handle = unscoped_entry
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "unscoped test".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+
+    // Should succeed — no scope check because connection has no scope_owner.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let result = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"test".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+
+    assert!(result.is_ok(), "unscoped connection should allow: {result:?}");
+
+    // No scope_owner_check events should be emitted.
+    let scope_events: Vec<_> = audit
+        .events()
+        .iter()
+        .filter(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck)
+        .cloned()
+        .collect();
+    assert!(
+        scope_events.is_empty(),
+        "no scope_owner_check event when scope_owner is unset"
+    );
+}
+
+// ── DeleteHsmConnection deregisters ────────────────────────────────
+
+#[tokio::test]
+async fn delete_hsm_connection_deregisters_from_registry() {
+    let (state, _audit) = build_routed_state();
+
+    // Register a connection directly in storage (bypassing the PKCS#11
+    // provider initialization which requires a real library + secret root).
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "temp-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "temporary",
+    );
+    state
+        .storage
+        .create_hsm_connection(&conn)
+        .await
+        .expect("save conn");
+    // Add it to the live registry as well.
+    let prov = Arc::new(InMemoryProvider::new());
+    let entry = keyrack_core::registry::ProviderEntry {
+        provider: prov,
+        class: keyrack_core::key::ProviderClass::InMemory,
+    };
+    let _ = state
+        .providers
+        .register(keyrack_core::key::ProviderRef::new("temp-conn"), entry);
+
+    assert!(state
+        .providers
+        .contains(&keyrack_core::key::ProviderRef::new("temp-conn")));
+
+    // Delete it via the gRPC handler.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let _ = svc
+        .delete_hsm_connection(Request::new(proto::DeleteHsmConnectionRequest {
+            connection_id: "temp-conn".into(),
+        }))
+        .await
+        .expect("delete");
+
+    // A subsequent contains check must be false.
+    assert!(
+        !state
+            .providers
+            .contains(&keyrack_core::key::ProviderRef::new("temp-conn")),
+        "provider must be removed from live registry after delete"
+    );
+}
+
+// ── read echo of backend_id ────────────────────────────────────────
+
+#[tokio::test]
+async fn get_key_echoes_backend_id() {
+    let (state, _audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Create a key that routes to tenant-hsm via matching attributes.
+    let mut attributes = std::collections::HashMap::new();
+    attributes.insert("tenant".to_string(), "acme".to_string());
+
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "echo test".into(),
+            attributes,
+            ..Default::default()
+        }))
+        .await
+        .expect("create");
+    let key_id = resp.into_inner().metadata.unwrap().key_id;
+
+    let get_resp = svc
+        .get_key(Request::new(proto::GetKeyRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .expect("get_key");
+    let meta = get_resp.into_inner().metadata.unwrap();
+    assert_eq!(
+        meta.backend_id.as_deref(),
+        Some("tenant-hsm"),
+        "backend_id should echo the bound provider"
+    );
+    // Deprecated hsm_connection_id should also echo.
+    assert_eq!(
+        meta.hsm_connection_id.as_deref(),
+        Some("tenant-hsm"),
+        "hsm_connection_id alias should echo"
+    );
+}
