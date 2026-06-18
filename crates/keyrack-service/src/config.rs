@@ -553,7 +553,10 @@ provider_routing:
             config.provider_routing[0].match_tags.get("tenant"),
             Some(&"acme".to_string())
         );
-        assert_eq!(config.provider_routing[0].provider.as_deref(), Some("tenant-b"));
+        assert_eq!(
+            config.provider_routing[0].provider.as_deref(),
+            Some("tenant-b")
+        );
     }
 
     #[test]

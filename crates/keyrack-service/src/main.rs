@@ -467,25 +467,39 @@ async fn build_state(
         use keyrack_service::config::RuleActionConfig;
         let action = match &rule.action {
             RuleActionConfig::Route => {
-                let provider = rule.provider.as_deref().ok_or_else(|| -> Box<dyn std::error::Error> {
-                    "provider_routing: route rule requires `provider` field".into()
-                })?;
+                let provider =
+                    rule.provider
+                        .as_deref()
+                        .ok_or_else(|| -> Box<dyn std::error::Error> {
+                            "provider_routing: route rule requires `provider` field".into()
+                        })?;
                 let pref = ProviderRef::new(provider);
-                providers.resolve(&pref).map_err(|_| -> Box<dyn std::error::Error> {
-                    format!("provider_routing rule references unknown provider '{provider}'").into()
-                })?;
+                providers
+                    .resolve(&pref)
+                    .map_err(|_| -> Box<dyn std::error::Error> {
+                        format!("provider_routing rule references unknown provider '{provider}'")
+                            .into()
+                    })?;
                 keyrack_core::routing::RuleAction::Route(pref)
             }
             RuleActionConfig::Delegate => {
                 if rule.allowed_providers.is_empty() {
-                    return Err("provider_routing: delegate rule requires non-empty `allowed_providers`".into());
+                    return Err(
+                        "provider_routing: delegate rule requires non-empty `allowed_providers`"
+                            .into(),
+                    );
                 }
                 let mut set = std::collections::BTreeSet::new();
                 for p in &rule.allowed_providers {
                     let pref = ProviderRef::new(p.as_str());
-                    providers.resolve(&pref).map_err(|_| -> Box<dyn std::error::Error> {
-                        format!("provider_routing delegate rule references unknown provider '{p}'").into()
-                    })?;
+                    providers
+                        .resolve(&pref)
+                        .map_err(|_| -> Box<dyn std::error::Error> {
+                            format!(
+                                "provider_routing delegate rule references unknown provider '{p}'"
+                            )
+                            .into()
+                        })?;
                     set.insert(pref);
                 }
                 keyrack_core::routing::RuleAction::Delegate(set)

@@ -99,13 +99,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let ec_hash = if req.encryption_context.is_empty() {
@@ -211,13 +208,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let ec_hash = if req.encryption_context.is_empty() {
@@ -657,13 +651,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
@@ -755,13 +746,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
@@ -863,13 +851,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
@@ -943,13 +928,10 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
-            let principal_scope = principal
-                .attributes
-                .get("scope")
-                .and_then(|v| match v {
-                    keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let principal_id = principal.id.clone();
 
             let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
@@ -1016,13 +998,10 @@ impl KeyService for KeyServiceImpl {
         let principal = self.principal(&request).await?;
         let req = request.into_inner();
 
-        let principal_scope = principal
-            .attributes
-            .get("scope")
-            .and_then(|v| match v {
-                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-                _ => None,
-            });
+        let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
         let principal_id = principal.id.clone();
         let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
         op_ctx.request_id = request_id;

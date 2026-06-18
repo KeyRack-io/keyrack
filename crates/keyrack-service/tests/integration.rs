@@ -1270,8 +1270,7 @@ fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         ),
     ];
     let registry = Arc::new(
-        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
-            .expect("valid registry"),
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
     let mut match_tags = BTreeMap::new();
@@ -1340,16 +1339,14 @@ fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         ),
     ];
     let registry = Arc::new(
-        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
-            .expect("valid registry"),
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
     let mut match_tags = BTreeMap::new();
     match_tags.insert("tier".to_string(), "premium".to_string());
-    let allowed: BTreeSet<ProviderRef> =
-        [ProviderRef::new("prov-a"), ProviderRef::new("prov-b")]
-            .into_iter()
-            .collect();
+    let allowed: BTreeSet<ProviderRef> = [ProviderRef::new("prov-a"), ProviderRef::new("prov-b")]
+        .into_iter()
+        .collect();
     let rules = vec![RoutingRule {
         match_tags,
         action: RuleAction::Delegate(allowed),
@@ -1559,10 +1556,8 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -1613,7 +1608,10 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
     let scope_event = events
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
-    assert!(scope_event.is_some(), "scope_owner_check event must be emitted");
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check event must be emitted"
+    );
     let ev = scope_event.unwrap();
     assert_eq!(ev.result, keyrack_core::audit::AuditResult::Denied);
     assert_eq!(ev.resource.resource_type, "HsmConnection");
@@ -1669,10 +1667,8 @@ async fn scope_owner_unset_passes_without_check() {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -1715,7 +1711,10 @@ async fn scope_owner_unset_passes_without_check() {
         }))
         .await;
 
-    assert!(result.is_ok(), "unscoped connection should allow: {result:?}");
+    assert!(
+        result.is_ok(),
+        "unscoped connection should allow: {result:?}"
+    );
 
     // No scope_owner_check events should be emitted.
     let scope_events: Vec<_> = audit
@@ -1854,10 +1853,8 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -1895,12 +1892,7 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
 /// Helper: create the same setup but for a signing key.
 async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
     let conn_id = "scoped-sign-conn";
-    if state
-        .storage
-        .get_hsm_connection(conn_id)
-        .await
-        .is_err()
-    {
+    if state.storage.get_hsm_connection(conn_id).await.is_err() {
         let conn = keyrack_core::hsm::HsmConnection::new(
             conn_id,
             keyrack_core::hsm::HsmProviderType::Hsm,
@@ -1923,10 +1915,8 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -2364,10 +2354,8 @@ async fn scope_audit_success_on_unscoped_connection() {
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -2505,8 +2493,7 @@ fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         ),
     ];
     let registry = Arc::new(
-        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
-            .expect("valid registry"),
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
     let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
@@ -2692,8 +2679,7 @@ fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
         ),
     ];
     let registry = Arc::new(
-        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
-            .expect("valid registry"),
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
     let mut match_tags = BTreeMap::new();
@@ -2743,8 +2729,7 @@ fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<Capturing
         },
     )];
     let registry = Arc::new(
-        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
-            .expect("valid registry"),
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
     let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
@@ -2804,10 +2789,8 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         "_keyrack_key_id",
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
-    let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
-        &attrs,
-    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
     let lid = keyrack_core::lid::Lid::derive(
         keyrack_core::canon::CanonicalizationVersion::V1,
         &canonical,
@@ -2863,7 +2846,10 @@ async fn grpc_scope_match_allows_encrypt() {
     let scope_event = events
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
-    assert!(scope_event.is_some(), "scope_owner_check must be emitted on success");
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check must be emitted on success"
+    );
     let ev = scope_event.unwrap();
     assert_eq!(ev.result, keyrack_core::audit::AuditResult::Success);
     assert_eq!(ev.resource.id, "scoped-enc");
@@ -2918,7 +2904,10 @@ async fn grpc_scope_match_allows_create_key() {
             ..Default::default()
         }))
         .await;
-    assert!(result.is_ok(), "create without scoped backend must work: {result:?}");
+    assert!(
+        result.is_ok(),
+        "create without scoped backend must work: {result:?}"
+    );
 
     // Now test CreateKey with a scoped backend in no-policy mode:
     drop(svc);
@@ -2953,14 +2942,23 @@ async fn grpc_scope_match_allows_create_key() {
             ..Default::default()
         }))
         .await;
-    assert!(result.is_ok(), "matching scope must allow create: {result:?}");
+    assert!(
+        result.is_ok(),
+        "matching scope must allow create: {result:?}"
+    );
 
     let events = audit2.events();
     let scope_event = events
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
-    assert!(scope_event.is_some(), "scope_owner_check event on create success");
-    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Success);
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check event on create success"
+    );
+    assert_eq!(
+        scope_event.unwrap().result,
+        keyrack_core::audit::AuditResult::Success
+    );
 }
 
 // ── gRPC: MISMATCH → DENY ────────────────────────────────────────
@@ -2985,7 +2983,10 @@ async fn grpc_scope_mismatch_denies_encrypt() {
     let scope_event = events
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
-    assert!(scope_event.is_some(), "scope_owner_check must be emitted on mismatch");
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check must be emitted on mismatch"
+    );
     let ev = scope_event.unwrap();
     assert_eq!(ev.result, keyrack_core::audit::AuditResult::Denied);
     assert_eq!(
@@ -3056,18 +3057,31 @@ async fn rest_scope_match_allows_encrypt() {
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK, "REST encrypt must succeed with matching scope");
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "REST encrypt must succeed with matching scope"
+    );
 
     let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
     let parsed: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    assert!(parsed.get("ciphertext_blob").is_some(), "response must contain ciphertext_blob");
+    assert!(
+        parsed.get("ciphertext_blob").is_some(),
+        "response must contain ciphertext_blob"
+    );
 
     let events = audit.events();
     let scope_event = events
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
-    assert!(scope_event.is_some(), "scope_owner_check emitted on REST success");
-    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Success);
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check emitted on REST success"
+    );
+    assert_eq!(
+        scope_event.unwrap().result,
+        keyrack_core::audit::AuditResult::Success
+    );
 }
 
 #[tokio::test]
@@ -3144,7 +3158,10 @@ async fn rest_scope_mismatch_denies_encrypt() {
         .iter()
         .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
     assert!(scope_event.is_some(), "scope_owner_check on REST mismatch");
-    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Denied);
+    assert_eq!(
+        scope_event.unwrap().result,
+        keyrack_core::audit::AuditResult::Denied
+    );
 }
 
 #[tokio::test]

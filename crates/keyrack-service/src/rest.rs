@@ -247,13 +247,10 @@ async fn create_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
     op_ctx.request_id = request_id;
@@ -700,13 +697,10 @@ async fn encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
@@ -795,13 +789,10 @@ async fn decrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
@@ -901,13 +892,10 @@ async fn sign(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
     op_ctx.request_id = request_id;
@@ -987,13 +975,10 @@ async fn verify(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
     op_ctx.request_id = request_id;
@@ -1133,13 +1118,10 @@ async fn generate_mac(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
     op_ctx.request_id = request_id;
@@ -1200,13 +1182,10 @@ async fn verify_mac(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
-    let principal_scope = principal
-        .attributes
-        .get("scope")
-        .and_then(|v| match v {
-            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
-            _ => None,
-        });
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
     let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
     op_ctx.request_id = request_id;

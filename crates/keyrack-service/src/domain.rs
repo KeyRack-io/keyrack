@@ -302,41 +302,40 @@ pub fn resolve_create_provider(
             }
             pinned.clone()
         }
-        RouteOutcome::Delegated(ref allowed_set) => {
-            match effective_backend {
-                Some(caller_id) => {
-                    let pref = keyrack_core::key::ProviderRef::new(caller_id);
-                    if !providers.contains(&pref) {
-                        return Err(DomainError::FailedPrecondition(format!(
-                            "backend_id '{caller_id}' is not a registered provider"
-                        )));
-                    }
-                    if !allowed_set.contains(&pref) {
-                        return Err(DomainError::PermissionDenied(format!(
-                            "backend_id '{caller_id}' is not permitted by the delegate rule \
+        RouteOutcome::Delegated(ref allowed_set) => match effective_backend {
+            Some(caller_id) => {
+                let pref = keyrack_core::key::ProviderRef::new(caller_id);
+                if !providers.contains(&pref) {
+                    return Err(DomainError::FailedPrecondition(format!(
+                        "backend_id '{caller_id}' is not a registered provider"
+                    )));
+                }
+                if !allowed_set.contains(&pref) {
+                    return Err(DomainError::PermissionDenied(format!(
+                        "backend_id '{caller_id}' is not permitted by the delegate rule \
                              (allowed: {:?})",
-                            allowed_set.iter().map(keyrack_core::key::ProviderRef::as_str).collect::<Vec<_>>()
-                        )));
-                    }
-                    pref
+                        allowed_set
+                            .iter()
+                            .map(keyrack_core::key::ProviderRef::as_str)
+                            .collect::<Vec<_>>()
+                    )));
                 }
-                None => router.default_ref().clone(),
+                pref
             }
-        }
-        RouteOutcome::DelegatedAny => {
-            match effective_backend {
-                Some(caller_id) => {
-                    let pref = keyrack_core::key::ProviderRef::new(caller_id);
-                    if !providers.contains(&pref) {
-                        return Err(DomainError::FailedPrecondition(format!(
-                            "backend_id '{caller_id}' is not a registered provider"
-                        )));
-                    }
-                    pref
+            None => router.default_ref().clone(),
+        },
+        RouteOutcome::DelegatedAny => match effective_backend {
+            Some(caller_id) => {
+                let pref = keyrack_core::key::ProviderRef::new(caller_id);
+                if !providers.contains(&pref) {
+                    return Err(DomainError::FailedPrecondition(format!(
+                        "backend_id '{caller_id}' is not a registered provider"
+                    )));
                 }
-                None => router.default_ref().clone(),
+                pref
             }
-        }
+            None => router.default_ref().clone(),
+        },
         RouteOutcome::Default(ref default_provider) => {
             match effective_backend {
                 Some(caller_id) => {
@@ -2212,10 +2211,7 @@ mod resolve_tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("not authorized"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("not authorized"), "{err}");
     }
 
     #[test]
@@ -2229,7 +2225,10 @@ mod resolve_tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("not a registered provider"), "{err}");
+        assert!(
+            err.to_string().contains("not a registered provider"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2257,7 +2256,10 @@ mod resolve_tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("backend_id selected 'conn-1'"), "{err}");
+        assert!(
+            err.to_string().contains("backend_id selected 'conn-1'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2323,6 +2325,9 @@ mod resolve_tests {
             Some("nonexistent"),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("not a registered provider"), "{err}");
+        assert!(
+            err.to_string().contains("not a registered provider"),
+            "{err}"
+        );
     }
 }
