@@ -4,11 +4,12 @@ Showcases KeyRack 0.3.0 differentiators in a two-tenant HYOK deployment:
 
 | Feature | What the demo proves |
 |---------|---------------------|
-| **`scope_owner` tenant isolation** | A tenant's principal can only use HSM connections scoped to its own tenant — cross-tenant access returns `PermissionDenied`. |
+| **`scope_owner` tenant isolation** | A tenant's principal can only use HSM connections scoped to its own tenant — cross-tenant access returns `PermissionDenied` on both REST and gRPC. |
 | **`backend_id` selector** | Callers name their crypto backend explicitly on `CreateKey`. The response echoes the resolved `backend_id`. |
-| **Route / delegate routing** | Operator `route` pins a namespace to a backend (authoritative). `delegate_any` lets callers choose via `backend_id`. |
+| **`route` pin** | Operator pins `regulated=true` keys to the default software backend — caller `backend_id` conflicting with the pin is rejected. |
+| **`delegate_any`** | Untagged keys use `delegate_any` — callers select any registered backend via `backend_id`. |
 | **Absent-scope denial** | A principal with no scope claim is denied access to any scoped connection. |
-| **Audit** | Every `scope_owner` evaluation emits a `scope_owner_check` audit event to NATS. |
+| **Audit (NATS)** | Subscribes to the NATS audit subject and asserts that `scope_owner_check` events with `result=success` (allowed op) and `result=denied` (cross-tenant block) are present. Fails the demo if either is missing. |
 
 ## Architecture
 
@@ -42,9 +43,14 @@ docker compose up --build
 
 ## Assertions (CI-gated, fail-on-error)
 
-The demo exits non-zero if any check fails. Key deny-path assertions:
+The demo exits non-zero if any check fails. Key assertions:
 
-- `CreateKey` with `backend_id=conn-tenant-b` by a `scope=tenant:a` principal → HTTP 403
-- `Encrypt` on a key bound to `conn-tenant-b` by a `scope=tenant:a` principal → HTTP 403
-- `Decrypt` on a cross-tenant key → HTTP 403
-- `CreateKey` with no scope claim on a scoped connection → HTTP 403
+- gRPC `CreateHsmConnection` succeeds for both tenants (exits if not)
+- REST `CreateKey` with `backend_id=conn-tenant-b` by `scope=tenant:a` → HTTP 403
+- REST `Encrypt`/`Decrypt` on cross-tenant keys → HTTP 403
+- gRPC `Encrypt` on cross-tenant key → `PermissionDenied`
+- `CreateKey` with no scope claim on scoped connection → HTTP 403
+- `regulated=true` route pin → `backend_id=default`; conflicting `backend_id` rejected
+- `delegate_any` → caller-selected `backend_id` echoed
+- NATS audit: `scope_owner_check` event with `result=success` present
+- NATS audit: `scope_owner_check` event with `result=denied` present

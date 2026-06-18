@@ -5,13 +5,12 @@
 # Showcases KeyRack 0.3.0 differentiators:
 #   (a) scope_owner tenant isolation — PermissionDenied on cross-tenant access
 #   (b) backend_id selector — callers name their crypto backend
-#   (c) route / delegate routing actions
-#   (d) NATS audit events for scope_owner_check
+#   (c) route pin (operator-authoritative) and delegate_any (caller selects)
+#   (d) NATS audit: scope_owner_check events with result=success AND denied
 #
-# Two tenants (tenant-a, tenant-b) each get a dynamically registered HSM
-# connection with scope_owner. The scope claim arrives via a namespaced
-# JWT claim (keyrack:scope → principal attribute "scope"). The demo ASSERTS
-# every positive AND deny path — a single unexpected result fails the demo.
+# Every positive AND deny path is ASSERTED — a single unexpected result
+# fails the demo. The audit assertions subscribe to NATS and verify
+# specific scope_owner_check event payloads (not just message counts).
 # ═══════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -19,6 +18,7 @@ KEYRACK_REST="http://keyrack:8080"
 KEYRACK_GRPC="keyrack:50051"
 JWT_ISSUER="http://jwt-issuer:9000"
 PROTO_DIR="/proto"
+AUDIT_LOG="/tmp/audit-events.log"
 
 PASS=0
 FAIL=0
@@ -76,7 +76,7 @@ grpc_call() {
 }
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 0 — Wait for KeyRack
+#  PART 0 — Wait for KeyRack + start NATS audit subscription
 # ══════════════════════════════════════════════════════════════════════
 
 banner "Demo 11: Multi-Tenant HYOK (scope_owner + backend_id)"
@@ -96,11 +96,22 @@ if [ $attempts -ge 30 ]; then
   exit 1
 fi
 
+step "Starting NATS audit subscription (captures events for later assertion)..."
+: > "$AUDIT_LOG"
+nats sub "kms.audit.>" -s nats://nats:4222 > "$AUDIT_LOG" 2>&1 &
+NATS_SUB_PID=$!
+sleep 2
+if kill -0 "$NATS_SUB_PID" 2>/dev/null; then
+  ok "NATS subscriber active (PID $NATS_SUB_PID)"
+else
+  bad "NATS subscriber failed to start — check nats CLI installation"
+fi
+
 # ══════════════════════════════════════════════════════════════════════
 #  PART 1 — Register two HSM connections with scope_owner via gRPC
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 1: Register tenant HSM connections (scope_owner isolation)"
+banner "Part 1: Register tenant HSM connections (gRPC, scope_owner isolation)"
 
 step "Getting admin token for HSM connection registration..."
 ADMIN_TOKEN=$(get_token "platform-admin" "admin")
@@ -111,7 +122,7 @@ else
   exit 1
 fi
 
-step "Registering conn-tenant-a (scope_owner=tenant:a)..."
+step "Registering conn-tenant-a (scope_owner=tenant:a) via gRPC..."
 REG_A=$(grpc_call CreateHsmConnection \
   -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{
@@ -123,15 +134,17 @@ REG_A=$(grpc_call CreateHsmConnection \
       "pinRef": "file:/etc/keyrack/secrets/pin-tenant-a"
     },
     "scopeOwner": "tenant:a"
-  }' 2>&1) || true
+  }' 2>&1)
 echo "  Response: $REG_A"
 if echo "$REG_A" | grep -q '"connectionId"'; then
   ok "conn-tenant-a registered with scope_owner=tenant:a"
 else
-  bad "Failed to register conn-tenant-a"
+  bad "gRPC CreateHsmConnection failed for conn-tenant-a"
+  echo "  ↑ registration must succeed — cannot continue"
+  exit 1
 fi
 
-step "Registering conn-tenant-b (scope_owner=tenant:b)..."
+step "Registering conn-tenant-b (scope_owner=tenant:b) via gRPC..."
 REG_B=$(grpc_call CreateHsmConnection \
   -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{
@@ -143,19 +156,20 @@ REG_B=$(grpc_call CreateHsmConnection \
       "pinRef": "file:/etc/keyrack/secrets/pin-tenant-b"
     },
     "scopeOwner": "tenant:b"
-  }' 2>&1) || true
+  }' 2>&1)
 echo "  Response: $REG_B"
 if echo "$REG_B" | grep -q '"connectionId"'; then
   ok "conn-tenant-b registered with scope_owner=tenant:b"
 else
-  bad "Failed to register conn-tenant-b"
+  bad "gRPC CreateHsmConnection failed for conn-tenant-b"
+  echo "  ↑ registration must succeed — cannot continue"
+  exit 1
 fi
 
-step "Listing HSM connections..."
+step "Listing HSM connections via gRPC..."
 LIST_ALL=$(grpc_call ListHsmConnections \
   -H "authorization: Bearer $ADMIN_TOKEN" \
-  -d '{}' 2>&1) || true
-echo "  $LIST_ALL" | head -20
+  -d '{}' 2>&1)
 CONN_COUNT=$(echo "$LIST_ALL" | grep -c '"connectionId"' || true)
 if [ "$CONN_COUNT" -ge 2 ]; then
   ok "Both connections visible ($CONN_COUNT connections)"
@@ -166,7 +180,7 @@ fi
 step "Listing connections filtered by scope_owner=tenant:a..."
 LIST_A=$(grpc_call ListHsmConnections \
   -H "authorization: Bearer $ADMIN_TOKEN" \
-  -d '{"scopeOwner":"tenant:a"}' 2>&1) || true
+  -d '{"scopeOwner":"tenant:a"}' 2>&1)
 FILTERED_COUNT=$(echo "$LIST_A" | grep -c '"connectionId"' || true)
 assert_eq "$FILTERED_COUNT" "1" "scope_owner filter returns exactly tenant-a's connection"
 
@@ -224,18 +238,18 @@ DECODED=$(echo "$DEC_PT" | base64 -d 2>/dev/null || true)
 assert_eq "$DECODED" "$PLAINTEXT" "Decrypted plaintext matches original exactly"
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 3 — DENY PATH: tenant-a CANNOT use tenant-b's connection
+#  PART 3 — DENY PATH: tenant-a CANNOT use tenant-b's connection (REST)
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 3: DENY PATH — cross-tenant scope_owner isolation"
+banner "Part 3: DENY PATH — cross-tenant scope_owner isolation (REST)"
 
-step "tenant-a attempts to create a key on conn-tenant-b..."
+step "tenant-a attempts to create a key on conn-tenant-b (REST)..."
 echo "  → scope_owner=tenant:b but principal scope=tenant:a → must be DENIED"
 DENY_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$KEYRACK_REST/v1/keys" \
   -H "Authorization: Bearer $TOKEN_A" \
   -H "Content-Type: application/json" \
   -d '{"key_spec": "AES_256", "description": "should fail", "backend_id": "conn-tenant-b"}')
-assert_http "$DENY_CODE" "403" "CreateKey on cross-tenant connection → PermissionDenied"
+assert_http "$DENY_CODE" "403" "REST CreateKey on cross-tenant connection → PermissionDenied"
 
 step "tenant-b creates a key on conn-tenant-b (for cross-tenant encrypt test)..."
 TOKEN_B=$(get_token "tenant-b-admin" "tenant:b")
@@ -259,18 +273,16 @@ else
 fi
 assert_eq "$BACKEND_B" "conn-tenant-b" "tenant-b key bound to conn-tenant-b"
 
-step "tenant-a attempts to encrypt using tenant-b's key..."
+step "tenant-a attempts to encrypt using tenant-b's key (REST)..."
 echo "  → key is on conn-tenant-b (scope_owner=tenant:b), principal scope=tenant:a → DENIED"
 CROSS_ENC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   "$KEYRACK_REST/v1/keys/$KEY_B/actions-encrypt" \
   -H "Authorization: Bearer $TOKEN_A" \
   -H "Content-Type: application/json" \
   -d "{\"plaintext\": \"$PLAINTEXT_B64\"}")
-assert_http "$CROSS_ENC_CODE" "403" "Encrypt on cross-tenant key → PermissionDenied"
+assert_http "$CROSS_ENC_CODE" "403" "REST Encrypt on cross-tenant key → PermissionDenied"
 
-step "tenant-a attempts to decrypt using tenant-b's key..."
-echo "  → must also be denied for the decrypt path"
-# Use tenant-b's own ciphertext (first get one)
+step "tenant-a attempts to decrypt using tenant-b's key (REST)..."
 ENC_B_RESP=$(curl -sf -X POST "$KEYRACK_REST/v1/keys/$KEY_B/actions-encrypt" \
   -H "Authorization: Bearer $TOKEN_B" \
   -H "Content-Type: application/json" \
@@ -285,7 +297,24 @@ CROSS_DEC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   -H "Authorization: Bearer $TOKEN_A" \
   -H "Content-Type: application/json" \
   -d "{\"ciphertext_blob\": \"$CT_B\"}")
-assert_http "$CROSS_DEC_CODE" "403" "Decrypt on cross-tenant key → PermissionDenied"
+assert_http "$CROSS_DEC_CODE" "403" "REST Decrypt on cross-tenant key → PermissionDenied"
+
+# ══════════════════════════════════════════════════════════════════════
+#  PART 3b — DENY PATH: gRPC cross-tenant Encrypt → PermissionDenied
+# ══════════════════════════════════════════════════════════════════════
+
+banner "Part 3b: DENY PATH — gRPC cross-tenant Encrypt"
+
+step "tenant-a attempts to encrypt using tenant-b's key via gRPC..."
+echo "  → same scope_owner check, gRPC surface"
+GRPC_DENY_OUT=$(grpc_call Encrypt \
+  -H "authorization: Bearer $TOKEN_A" \
+  -d "{\"keyId\": \"$KEY_B\", \"plaintext\": \"$PLAINTEXT_B64\"}" 2>&1) || true
+if echo "$GRPC_DENY_OUT" | grep -qi "PermissionDenied"; then
+  ok "gRPC Encrypt on cross-tenant key → PermissionDenied"
+else
+  bad "gRPC Encrypt should have returned PermissionDenied (got: $GRPC_DENY_OUT)"
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 4 — DENY PATH: no-scope principal cannot use scoped connections
@@ -309,29 +338,42 @@ NO_SCOPE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$KEYRACK_REST/v1
 assert_http "$NO_SCOPE_CODE" "403" "CreateKey with no scope on scoped connection → PermissionDenied"
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 5 — Route / Delegate routing actions
+#  PART 5 — Route (operator pin) + delegate_any (caller selects)
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 5: Delegate routing — caller selects backend via backend_id"
+banner "Part 5: Route pin + delegate_any routing"
 
-step "Creating key WITHOUT backend_id → falls to default software provider..."
-echo "  → delegate_any catch-all allows caller selection; no backend_id → default"
-DEFAULT_RESP=$(curl -sf -X POST "$KEYRACK_REST/v1/keys" \
+step "Creating key with regulated=true tag → route pins to default (software)..."
+echo "  → config: regulated=true → route to 'default'; operator-authoritative pin"
+ROUTE_RESP=$(curl -sf -X POST "$KEYRACK_REST/v1/keys" \
   -H "Authorization: Bearer $TOKEN_A" \
   -H "Content-Type: application/json" \
-  -d '{"key_spec": "AES_256", "description": "default-backend key"}')
-DEFAULT_KEY=$(json_field "$DEFAULT_RESP" lid)
-DEFAULT_BACKEND=$(json_field "$DEFAULT_RESP" backend_id)
-if [ -n "$DEFAULT_KEY" ]; then
-  ok "Created key on default backend: $DEFAULT_KEY"
+  -d '{"key_spec": "AES_256", "description": "regulated key", "attributes": {"regulated": "true"}}')
+ROUTE_KEY=$(json_field "$ROUTE_RESP" lid)
+ROUTE_BACKEND=$(json_field "$ROUTE_RESP" backend_id)
+if [ -n "$ROUTE_KEY" ]; then
+  ok "Created regulated key: $ROUTE_KEY"
 else
-  bad "Failed to create key on default backend"
-  echo "  Response: $DEFAULT_RESP"
+  bad "Failed to create regulated key"
+  echo "  Response: $ROUTE_RESP"
 fi
-assert_eq "$DEFAULT_BACKEND" "default" "Key without backend_id → default software provider"
+assert_eq "$ROUTE_BACKEND" "default" "Route pin: regulated=true → default software provider"
 
-step "Creating key WITH backend_id → delegate_any lets caller select..."
-echo "  → tenant-b selects conn-tenant-b via backend_id (authorized by scope_owner)"
+step "Attempting regulated key with conflicting backend_id..."
+echo "  → route pins to 'default', but caller asks for conn-tenant-a → route overrides"
+CONFLICT_RESP=$(curl -s -X POST "$KEYRACK_REST/v1/keys" \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"key_spec": "AES_256", "description": "conflict test", "attributes": {"regulated": "true"}, "backend_id": "conn-tenant-a"}')
+if echo "$CONFLICT_RESP" | grep -q '"lid"'; then
+  CONFLICT_BACKEND=$(json_field "$CONFLICT_RESP" backend_id)
+  assert_eq "$CONFLICT_BACKEND" "default" "Route pin overrides caller backend_id (operator-authoritative)"
+else
+  ok "Route-pin conflict rejected — operator pin is authoritative"
+fi
+
+step "Creating key WITHOUT tags + backend_id → delegate_any lets caller select..."
+echo "  → no tag match → delegate_any catch-all → tenant-b picks conn-tenant-b"
 DELEG_RESP=$(curl -sf -X POST "$KEYRACK_REST/v1/keys" \
   -H "Authorization: Bearer $TOKEN_B" \
   -H "Content-Type: application/json" \
@@ -344,32 +386,55 @@ else
   bad "Failed to create delegated key"
   echo "  Response: $DELEG_RESP"
 fi
-assert_eq "$DELEG_BACKEND" "conn-tenant-b" "Delegate allowed caller to select conn-tenant-b"
+assert_eq "$DELEG_BACKEND" "conn-tenant-b" "delegate_any: caller selected conn-tenant-b"
+
+step "Creating key WITHOUT backend_id → falls to default software provider..."
+DEFAULT_RESP=$(curl -sf -X POST "$KEYRACK_REST/v1/keys" \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"key_spec": "AES_256", "description": "default-backend key"}')
+DEFAULT_BACKEND=$(json_field "$DEFAULT_RESP" backend_id)
+assert_eq "$DEFAULT_BACKEND" "default" "No backend_id → default software provider"
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 6 — Verify NATS audit events contain scope_owner_check
+#  PART 6 — Audit: assert scope_owner_check events in NATS (REAL)
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 6: Audit — scope_owner_check events in NATS"
+banner "Part 6: Audit — scope_owner_check events from NATS (content assertion)"
 
-step "Subscribing to NATS audit subject to check for scope_owner_check events..."
-# Use the NATS HTTP monitoring API to verify the audit stream is active,
-# then verify scope_owner_check events exist in the audit log.
-NATS_VARZ=$(curl -sf "http://nats:8222/varz" 2>/dev/null || true)
-if echo "$NATS_VARZ" | grep -q '"server_id"'; then
-  ok "NATS server is reachable"
+step "Stopping NATS subscription and analysing captured events..."
+sleep 2
+kill "$NATS_SUB_PID" 2>/dev/null || true
+wait "$NATS_SUB_PID" 2>/dev/null || true
+
+CAPTURED=$(wc -l < "$AUDIT_LOG" | tr -d ' ')
+step "Captured $CAPTURED lines of NATS output"
+
+SCOPE_EVENTS=$(grep -c "scope_owner_check" "$AUDIT_LOG" || true)
+if [ "$SCOPE_EVENTS" -gt 0 ]; then
+  ok "Found $SCOPE_EVENTS scope_owner_check audit events in NATS stream"
 else
-  bad "NATS server not reachable for audit verification"
+  bad "NO scope_owner_check events found in NATS — audit pipeline broken"
 fi
 
-# The audit log is signed and written to NATS. Verify the audit subject
-# has received messages (non-zero msg count on the connection stats).
-NATS_VARZ_FULL=$(curl -sf "http://nats:8222/varz" 2>/dev/null || true)
-TOTAL_MSGS=$(echo "$NATS_VARZ_FULL" | grep -o '"in_msgs"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*' || echo "0")
-if [ "$TOTAL_MSGS" -gt 0 ]; then
-  ok "NATS received $TOTAL_MSGS messages (audit events flowing)"
+step "Asserting scope_owner_check with result=success (allowed operation)..."
+SUCCESS_COUNT=$(grep "scope_owner_check" "$AUDIT_LOG" | grep -c '"success"' || true)
+if [ "$SUCCESS_COUNT" -gt 0 ]; then
+  ok "scope_owner_check result=success events present ($SUCCESS_COUNT hits)"
 else
-  bad "No messages received by NATS (audit pipeline may not be active)"
+  bad "scope_owner_check result=success event MISSING — allowed ops must emit success"
+  echo "  Dumping scope_owner_check lines for debugging:"
+  grep "scope_owner_check" "$AUDIT_LOG" | head -3
+fi
+
+step "Asserting scope_owner_check with result=denied (cross-tenant block)..."
+DENIED_COUNT=$(grep "scope_owner_check" "$AUDIT_LOG" | grep -c '"denied"' || true)
+if [ "$DENIED_COUNT" -gt 0 ]; then
+  ok "scope_owner_check result=denied events present ($DENIED_COUNT hits)"
+else
+  bad "scope_owner_check result=denied event MISSING — deny path must emit denied"
+  echo "  Dumping scope_owner_check lines for debugging:"
+  grep "scope_owner_check" "$AUDIT_LOG" | head -3
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -384,11 +449,11 @@ echo ""
 echo "  Demonstrated:"
 echo "    • scope_owner tenant isolation (conn-level, fail-closed)"
 echo "    • backend_id selector (callers name their crypto backend)"
-echo "    • delegate_any routing: default fallback vs caller backend_id"
-echo "    • Cross-tenant deny: CreateKey, Encrypt, Decrypt all blocked"
+echo "    • Route pin (regulated → default) + delegate_any (caller picks)"
+echo "    • Cross-tenant deny: REST CreateKey/Encrypt/Decrypt + gRPC Encrypt"
 echo "    • Absent-scope deny: no scope claim → PermissionDenied"
-echo "    • ListHsmConnections scope_owner filter"
-echo "    • NATS audit pipeline with scope_owner_check events"
+echo "    • gRPC CreateHsmConnection + ListHsmConnections scope_owner filter"
+echo "    • NATS audit: scope_owner_check events (success + denied) verified"
 echo ""
 
 if [ "$FAIL" -gt 0 ]; then

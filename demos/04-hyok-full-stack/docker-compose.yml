@@ -84,16 +84,15 @@ services:
       retries: 15
 
   demo:
-    image: curlimages/curl:8.10.1
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
     user: "0:0"
     depends_on:
       keyrack:
         condition: service_healthy
     volumes:
-      - ./scripts:/scripts:ro
       - hsm-tokens:/hsm-tokens
-    entrypoint: /bin/sh
-    command: ["/scripts/run-demo.sh"]
 
 volumes:
   hsm-tokens:

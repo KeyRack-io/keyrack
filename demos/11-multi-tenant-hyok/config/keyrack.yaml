@@ -10,10 +10,14 @@ storage:
 provider:
   type: software
 
-# Routing policy: delegate_any lets callers select any registered
-# backend via backend_id. Tenant HSM connections are registered
-# dynamically with scope_owner enforcement.
+# Routing: regulated keys are pinned to the default (software) backend by
+# operator policy; everything else uses delegate_any (caller picks via
+# backend_id). This shows both route (authoritative pin) and delegate_any.
 provider_routing:
+  - match:
+      regulated: "true"
+    action: route
+    provider: default
   - match: {}
     action: delegate_any
 

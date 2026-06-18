@@ -6,13 +6,14 @@ set -e
 # Demonstrates: JWT AuthN → Cedar AuthZ → PKCS#11 Encrypt → NATS Audit
 #
 # HARDENED: all capabilities are ASSERTED (exit non-zero on failure).
-# Cross-tenant denial, NATS audit, HYOK disconnect, and decrypt
-# round-trip are CI-gated — not just logged or documented.
+# Cross-tenant denial, NATS audit event content, HYOK disconnect, and
+# decrypt round-trip are CI-gated — not just logged or documented.
 # ═══════════════════════════════════════════════════════════════════════
 
 KEYRACK="http://keyrack:8080"
 JWT_ISSUER="http://jwt-issuer:9000"
 CACHE_TTL=10
+AUDIT_LOG="/tmp/audit-events.log"
 
 PASS=0
 FAIL=0
@@ -42,6 +43,20 @@ json_field() {
     | grep "\"$2\"" | head -1 \
     | sed 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}//; s/"\{0,1\}[[:space:]]*$//'
 }
+
+# ──────────────────────────────────────────────────────────────────────
+banner "Step 0: Start NATS audit subscription"
+
+step "Subscribing to NATS audit subject before operations..."
+: > "$AUDIT_LOG"
+nats sub "kms.audit.>" -s nats://nats:4222 > "$AUDIT_LOG" 2>&1 &
+NATS_SUB_PID=$!
+sleep 2
+if kill -0 "$NATS_SUB_PID" 2>/dev/null; then
+  ok "NATS subscriber active (PID $NATS_SUB_PID)"
+else
+  bad "NATS subscriber failed to start — check nats CLI installation"
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 banner "Step 1: Obtain JWT for tenant-a-admin"
@@ -112,23 +127,35 @@ DECODED=$(echo "$PLAINTEXT_BACK" | base64 -d 2>/dev/null || true)
 assert_eq "$DECODED" "$PLAINTEXT" "Decrypted plaintext matches original exactly"
 
 # ──────────────────────────────────────────────────────────────────────
-banner "Step 5: Verify NATS audit events are flowing"
+banner "Step 5: Verify NATS audit events (content assertion)"
 
-step "Checking NATS server via HTTP monitoring API..."
-NATS_VARZ=$(curl -sf "http://nats:8222/varz" 2>/dev/null || true)
-if echo "$NATS_VARZ" | grep -q '"server_id"'; then
-  ok "NATS server is reachable"
+step "Stopping NATS subscription and analysing captured events..."
+sleep 2
+kill "$NATS_SUB_PID" 2>/dev/null || true
+wait "$NATS_SUB_PID" 2>/dev/null || true
+
+CAPTURED=$(wc -l < "$AUDIT_LOG" | tr -d ' ')
+step "Captured $CAPTURED lines of NATS output"
+
+step "Asserting CreateKey audit event present..."
+if grep -qi "CreateKey" "$AUDIT_LOG"; then
+  ok "CreateKey audit event found in NATS stream"
 else
-  bad "NATS server not reachable"
+  bad "CreateKey audit event MISSING from NATS — audit pipeline broken"
 fi
 
-step "Checking NATS has received audit messages..."
-NATS_VARZ_FULL=$(curl -sf "http://nats:8222/varz" 2>/dev/null || true)
-TOTAL_MSGS=$(echo "$NATS_VARZ_FULL" | grep -o '"in_msgs"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*' || echo "0")
-if [ "$TOTAL_MSGS" -gt 0 ]; then
-  ok "NATS received $TOTAL_MSGS messages (audit events flowing)"
+step "Asserting Encrypt audit event present..."
+if grep -qi "Encrypt" "$AUDIT_LOG"; then
+  ok "Encrypt audit event found in NATS stream"
 else
-  bad "No messages received by NATS (audit pipeline not active)"
+  bad "Encrypt audit event MISSING from NATS — audit pipeline broken"
+fi
+
+step "Asserting Decrypt audit event present..."
+if grep -qi "Decrypt" "$AUDIT_LOG"; then
+  ok "Decrypt audit event found in NATS stream"
+else
+  bad "Decrypt audit event MISSING from NATS — audit pipeline broken"
 fi
 
 # ──────────────────────────────────────────────────────────────────────
