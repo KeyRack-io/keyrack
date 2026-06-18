@@ -448,6 +448,7 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         AuditAction::CascadeDisable => EventType::CascadeDisable,
         AuditAction::KeyDestroyed => EventType::KeyDeleted,
         AuditAction::AccessSecret => EventType::SecretAccess,
+        AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-core"
-version = "0.1.0"
+version = "0.3.0"
 description = "KeyRack core library: types, traits, canonicalization, LID, rule engine, resolver"
 edition.workspace = true
 rust-version.workspace = true

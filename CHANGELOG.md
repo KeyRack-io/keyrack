@@ -4,9 +4,65 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
-Toward `0.2.0` (stable). Pending: extend fail-closed authentication to the REST
-surface, and add an in-process mTLS integration test alongside the
-`10-mtls-identity` demo.
+## [0.3.0] — 2026-06-17
+
+Provider-resolution hardening and HSM connection governance for multi-tenant
+HYOK deployments. All wire changes are **additive** (no proto breaks); existing
+single-provider and `hsm_connection_id` callers are unaffected.
+
+### Added
+
+- **`backend_id` backend selector** — `CreateKey` accepts `backend_id`, an
+  opaque id naming the crypto backend on which a key's material is created
+  (software provider, static HSM, or dynamically-registered HSM connection —
+  one shared id space). Read responses (`KeyMetadata`, gRPC + REST) echo the
+  resolved `backend_id`.
+- **Routing-policy actions `route` / `delegate` / `delegate *`** — in the
+  `provider_routing` config block, operators can `route` a match to a pinned
+  backend (authoritative), `delegate {set}` to let callers choose within a
+  bounded set, or `delegate *` to allow any registered backend.
+- **`scope_owner` on HSM connections** — `CreateHsmConnection` accepts an
+  optional `scope_owner` (`platform` or `tenant:<id>`). When set, KeyRack
+  enforces that the calling principal's scope matches before any operation
+  (`CreateKey`, `Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateMac`,
+  `VerifyMac`) that resolves to that connection. Each evaluation emits a
+  `scope_owner_check` audit event.
+- **`ListHsmConnections` `scope_owner` filter** (additive proto field).
+
+### Changed
+
+- **Caller backend selection is default-deny when a routing policy is
+  configured.** With a `provider_routing` block present, a caller-supplied
+  `backend_id` is honored only where a `delegate` rule authorizes it; otherwise
+  the request binds the default backend, and naming a non-default backend is
+  rejected. **Backward-compatible:** with no `provider_routing` block, a
+  caller-supplied `backend_id` selects any registered backend, exactly as before.
+- **Selection error codes** — an unknown backend id returns `FailedPrecondition`;
+  a backend the policy does not permit the caller to select returns
+  `PermissionDenied`; a caller selection conflicting with an operator `route`
+  pin returns `FailedPrecondition` (the error names both the pinned and the
+  requested id, never secret material).
+
+### Deprecated
+
+- **`hsm_connection_id`** (request + metadata) is superseded by `backend_id` and
+  retained as an alias for one release — both are accepted, and if both are set
+  they must agree. The `keyrack.provider` assertion attribute likewise folds
+  into `backend_id`.
+
+### Security
+
+- **Connection-scoped tenant isolation (`scope_owner`) is fail-closed** — a
+  mismatched or absent principal scope yields `PermissionDenied`, never an
+  authenticated downgrade. This is the primary KeyRack-side tenant-isolation
+  control in deployments where an external gateway is the authoritative
+  authorization layer and KeyRack's PDP is configured `always_allow`.
+
+### Fixed
+
+- **`DeleteHsmConnection` deregistration** — deleting a connection now also
+  removes it from the live provider registry, so a deleted connection can no
+  longer back new key creation until the next restart.
 
 ## [0.2.0-beta.2] — 2026-06-15
 

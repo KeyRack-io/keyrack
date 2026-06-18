@@ -462,32 +462,57 @@ async fn build_state(
     }
 
     // Build the provider router from routing rules.
-    let router_rules: Vec<(std::collections::BTreeMap<String, String>, ProviderRef)> = config
-        .provider_routing
-        .iter()
-        .map(|rule| {
-            (
-                rule.match_tags.clone(),
-                ProviderRef::new(rule.provider.clone()),
-            )
-        })
-        .collect();
-
-    // Validate that every rule's provider exists in the registry.
+    let mut routing_rules: Vec<keyrack_core::routing::RoutingRule> = Vec::new();
     for rule in &config.provider_routing {
-        let pref = ProviderRef::new(rule.provider.clone());
-        providers
-            .resolve(&pref)
-            .map_err(|_| -> Box<dyn std::error::Error> {
-                format!(
-                    "provider_routing rule references unknown provider '{}'",
+        use keyrack_service::config::RuleActionConfig;
+        let action = match &rule.action {
+            RuleActionConfig::Route => {
+                let provider =
                     rule.provider
-                )
-                .into()
-            })?;
+                        .as_deref()
+                        .ok_or_else(|| -> Box<dyn std::error::Error> {
+                            "provider_routing: route rule requires `provider` field".into()
+                        })?;
+                let pref = ProviderRef::new(provider);
+                providers
+                    .resolve(&pref)
+                    .map_err(|_| -> Box<dyn std::error::Error> {
+                        format!("provider_routing rule references unknown provider '{provider}'")
+                            .into()
+                    })?;
+                keyrack_core::routing::RuleAction::Route(pref)
+            }
+            RuleActionConfig::Delegate => {
+                if rule.allowed_providers.is_empty() {
+                    return Err(
+                        "provider_routing: delegate rule requires non-empty `allowed_providers`"
+                            .into(),
+                    );
+                }
+                let mut set = std::collections::BTreeSet::new();
+                for p in &rule.allowed_providers {
+                    let pref = ProviderRef::new(p.as_str());
+                    providers
+                        .resolve(&pref)
+                        .map_err(|_| -> Box<dyn std::error::Error> {
+                            format!(
+                                "provider_routing delegate rule references unknown provider '{p}'"
+                            )
+                            .into()
+                        })?;
+                    set.insert(pref);
+                }
+                keyrack_core::routing::RuleAction::Delegate(set)
+            }
+            RuleActionConfig::DelegateAny => keyrack_core::routing::RuleAction::DelegateAny,
+        };
+        routing_rules.push(keyrack_core::routing::RoutingRule {
+            match_tags: rule.match_tags.clone(),
+            action,
+        });
     }
 
-    let provider_router = ProviderRouter::new(router_rules, default_ref);
+    let provider_router = ProviderRouter::with_rules(routing_rules, default_ref);
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = match &config.pdp {
         PdpConfig::AlwaysAllow => Arc::new(keyrack_core::pdp::AlwaysAllow),

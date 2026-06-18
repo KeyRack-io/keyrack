@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-wasm"
-version = "0.1.0"
+version = "0.3.0"
 description = "KeyRack WASM target + JS/TS bindings (Workstream 4)"
 edition.workspace = true
 rust-version.workspace = true

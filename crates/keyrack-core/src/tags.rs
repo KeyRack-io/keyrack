@@ -67,6 +67,12 @@ impl IdentityTags {
         Self(map)
     }
 
+    /// Construct directly from a string map (useful for tests and routing).
+    #[must_use]
+    pub fn from_map(map: BTreeMap<String, String>) -> Self {
+        Self(map)
+    }
+
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(String::as_str)

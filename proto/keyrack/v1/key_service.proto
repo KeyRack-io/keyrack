@@ -184,9 +184,12 @@ message KeyMetadata {
   uint32 current_key_version = 8;
   map<string, string> user_tags = 9;
   optional string parent_key_id = 10;
+  // Deprecated: use backend_id (field 14) instead.
   optional string hsm_connection_id = 11;
   uint64 occ_version = 12;
   optional google.protobuf.Timestamp scheduled_deletion_at = 13;
+  // The crypto backend bound to this key's primary version.
+  optional string backend_id = 14;
 }
 
 message KeyVersionMetadata {
@@ -351,10 +354,16 @@ message CreateKeyRequest {
   string description = 3;
   map<string, string> tags = 4;
   optional string parent_key_id = 5;
+  // Deprecated: use backend_id instead. Retained as a one-release alias; if
+  // both backend_id and hsm_connection_id are set, they must agree.
   optional string hsm_connection_id = 6;
   map<string, string> attributes = 7;
   // Optional: empty means no namespace.
   optional string namespace = 8;
+  // The crypto backend that holds the key's material (software, static HSM, or
+  // dynamic HSM connection). Supersedes hsm_connection_id; the reserved
+  // attribute keyrack.provider also folds into this and deprecates.
+  optional string backend_id = 9;
 }
 
 message CreateKeyResponse {
@@ -647,6 +656,9 @@ message HsmConnectionMetadata {
   // form (idempotency is post-normalization equality). Absent for HYOK/legacy.
   optional string token_label = 7;  // normalized (trimmed, <= 32 bytes)
   optional string pin_ref = 8;      // scheme-normalized "file:<path>" reference
+  // Scope owner for tenant isolation. When set, operations referencing this
+  // connection require a matching principal scope claim.
+  optional string scope_owner = 9;
 }
 
 // PKCS#11 connection config (HSM provider type). Additive oneof variant on
@@ -682,6 +694,13 @@ message CreateHsmConnectionRequest {
   // id with an identical normalized binding is idempotent; with a different
   // binding it is ALREADY_EXISTS.
   string connection_id = 7;
+
+  // Optional scope owner for tenant isolation. Values: "platform",
+  // "tenant:<id>". When set, operations referencing this connection must carry
+  // a principal whose scope attribute matches (exact string equality);
+  // mismatch -> PermissionDenied. When unset, the connection is
+  // platform-scoped (no check).
+  optional string scope_owner = 8;
 }
 
 message CreateHsmConnectionResponse {
@@ -699,6 +718,8 @@ message GetHsmConnectionResponse {
 message ListHsmConnectionsRequest {
   uint32 max_results = 1;
   string cursor = 2;
+  // Optional filter: return only connections with this scope_owner value.
+  optional string scope_owner = 3;
 }
 
 message ListHsmConnectionsResponse {

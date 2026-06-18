@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-cli"
-version = "0.1.0"
+version = "0.3.0"
 description = "KeyRack CLI tools: lint, provision, migrate, admin (Workstream 3)"
 edition.workspace = true
 rust-version.workspace = true

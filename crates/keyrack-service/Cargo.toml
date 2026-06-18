@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-service"
-version = "0.1.0"
+version = "0.3.0"
 description = "KeyRack gRPC + REST service binary (Workstream 2)"
 edition.workspace = true
 rust-version.workspace = true
@@ -52,6 +52,8 @@ rand = "0.8"
 keyrack-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[bench]]
 name = "service_ops"

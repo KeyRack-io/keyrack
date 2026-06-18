@@ -99,6 +99,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let ec_hash = if req.encryption_context.is_empty() {
                 None
             } else {
@@ -124,6 +130,17 @@ impl KeyService for KeyServiceImpl {
                         record.state
                     )));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Encrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let ec = build_encryption_context(&req.encryption_context);
 
@@ -191,6 +208,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let ec_hash = if req.encryption_context.is_empty() {
                 None
             } else {
@@ -220,6 +243,18 @@ impl KeyService for KeyServiceImpl {
                 let (header, ciphertext) =
                     keyrack_core::header::CiphertextHeader::unwrap_payload(&req.ciphertext_blob)
                         .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+                // Enforce scope_owner against the per-version binding.
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    Some(header.key_version),
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Decrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let ec = build_encryption_context(&req.encryption_context);
 
@@ -616,6 +651,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
@@ -644,6 +685,18 @@ impl KeyService for KeyServiceImpl {
                         "sign not permitted in current state",
                     ));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Sign,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+
                 let primary_version = record
                     .key_versions
                     .iter()
@@ -693,6 +746,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
@@ -721,6 +780,18 @@ impl KeyService for KeyServiceImpl {
                         "verify not permitted in current state",
                     ));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::Verify,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+
                 let primary_version = record
                     .key_versions
                     .iter()
@@ -780,6 +851,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
@@ -798,6 +875,18 @@ impl KeyService for KeyServiceImpl {
                         "generate_mac not permitted in current state",
                     ));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::GenerateMac,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+
                 let primary_version = record
                     .key_versions
                     .iter()
@@ -839,6 +928,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
@@ -857,6 +952,18 @@ impl KeyService for KeyServiceImpl {
                         "verify_mac not permitted in current state",
                     ));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::VerifyMac,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+
                 let primary_version = record
                     .key_versions
                     .iter()
@@ -891,6 +998,11 @@ impl KeyService for KeyServiceImpl {
         let principal = self.principal(&request).await?;
         let req = request.into_inner();
 
+        let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        let principal_id = principal.id.clone();
         let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
         op_ctx.request_id = request_id;
         ops::execute(
@@ -913,6 +1025,7 @@ impl KeyService for KeyServiceImpl {
                     req.attributes.clone().into_iter().collect();
                 let namespace = req.namespace.clone().unwrap_or_default();
                 let requested_provider = caller_attrs.remove("keyrack.provider");
+                caller_attrs.remove("backend_id");
                 if !namespace.is_empty() {
                     caller_attrs.insert("namespace".to_string(), namespace);
                 }
@@ -926,8 +1039,22 @@ impl KeyService for KeyServiceImpl {
                     &identity_tags,
                     requested_provider.as_deref(),
                     req.hsm_connection_id.as_deref(),
+                    req.backend_id.as_deref(),
                 )
-                .map_err(Status::failed_precondition)?;
+                .map_err(|e| e.to_grpc_status())?;
+
+                // Enforce scope_owner if the resolved backend has one (ADR-0001 A1.4).
+                crate::domain::check_scope_owner(
+                    &state.storage,
+                    &state.audit,
+                    &provider_name,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::CreateKey,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+
                 let entry = state.providers.resolve(&provider_name).map_err(convert::error_to_status)?;
 
                 let handle = entry.provider.generate_key(&spec).await.map_err(convert::error_to_status)?;
@@ -2079,6 +2206,7 @@ impl KeyService for KeyServiceImpl {
                         &cfg.token_label,
                         &cfg.pin_ref,
                         "",
+                        req.scope_owner.as_deref(),
                     )
                     .await
                     .map_err(|e| match e {
@@ -2100,12 +2228,20 @@ impl KeyService for KeyServiceImpl {
                             .map_err(Status::invalid_argument)?;
                         req.connection_id.clone()
                     };
-                    let conn = keyrack_core::hsm::HsmConnection::new(
+                    let mut conn = keyrack_core::hsm::HsmConnection::new(
                         connection_id,
                         hsm_provider_from_proto(provider_type),
                         &req.endpoint,
                         "",
                     );
+                    if let Some(owner) = req.scope_owner.as_deref().filter(|s| !s.is_empty()) {
+                        if !crate::hsm_registration::is_valid_scope_owner(owner) {
+                            return Err(Status::invalid_argument(format!(
+                                "scope_owner must be 'platform' or 'tenant:<id>'; got '{owner}'"
+                            )));
+                        }
+                        conn = conn.with_scope_owner(owner);
+                    }
                     state
                         .storage
                         .create_hsm_connection(&conn)
@@ -2153,7 +2289,7 @@ impl KeyService for KeyServiceImpl {
     ) -> Result<Response<proto::ListHsmConnectionsResponse>, Status> {
         let request_id = Self::request_id(&request);
         let principal = self.principal(&request).await?;
-        let _req = request.into_inner();
+        let req = request.into_inner();
         let mut op_ctx = OpContext::resource(
             AuditAction::ListHsmConnections,
             principal,
@@ -2162,11 +2298,16 @@ impl KeyService for KeyServiceImpl {
         );
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
-            let conns = state
+            let mut conns = state
                 .storage
                 .list_hsm_connections()
                 .await
                 .map_err(convert::error_to_status)?;
+            if let Some(ref filter_scope) = req.scope_owner {
+                if !filter_scope.is_empty() {
+                    conns.retain(|c| c.scope_owner.as_deref() == Some(filter_scope.as_str()));
+                }
+            }
             let connections = conns.iter().map(hsm_connection_to_proto).collect();
             Ok(Response::new(proto::ListHsmConnectionsResponse {
                 connections,
@@ -2196,6 +2337,16 @@ impl KeyService for KeyServiceImpl {
                 .delete_hsm_connection(&conn_id)
                 .await
                 .map_err(convert::error_to_status)?;
+            // De-register the live provider so the deleted connection stops
+            // serving new key creation immediately (not only after reboot).
+            let pref = keyrack_core::key::ProviderRef::new(&conn_id);
+            if let Err(e) = state.providers.remove(&pref) {
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    error = %e,
+                    "provider not in live registry (static or already removed)"
+                );
+            }
             Ok(Response::new(proto::DeleteHsmConnectionResponse {}))
         })
         .await
@@ -2497,10 +2648,9 @@ fn hsm_connection_to_proto(
         last_health_check: conn
             .last_health_check_at
             .map(|dt| convert::datetime_to_timestamp(&dt)),
-        // Canonical PKCS#11 binding echoed back so callers persist the
-        // normalized form (ADR-0001 §8.1, Q11). Absent for HYOK/legacy.
         token_label: conn.token_label.clone(),
         pin_ref: conn.pin_ref.clone(),
+        scope_owner: conn.scope_owner.clone(),
     }
 }
 

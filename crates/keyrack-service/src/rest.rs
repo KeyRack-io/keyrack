@@ -61,6 +61,9 @@ struct KeyResponse {
     /// Name of the configured provider this key is bound to (routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_ref: Option<String>,
+    /// The crypto backend bound to this key (canonical name; same as `provider_ref`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
     description: String,
     user_tags: keyrack_core::tags::UserTags,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -83,6 +86,7 @@ impl From<&KeyRecord> for KeyResponse {
             origin: r.origin,
             provider_class: r.provider_class,
             provider_ref: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
+            backend_id: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
             description: r.description.clone(),
             user_tags: r.user_tags.clone(),
             created_at: r.created_at,
@@ -243,6 +247,11 @@ async fn create_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
     op_ctx.request_id = request_id;
     ops::execute_rest(
@@ -286,6 +295,7 @@ async fn create_key(
                 .unwrap_or("")
                 .to_string();
             let requested_provider = caller_attrs.remove("keyrack.provider");
+            caller_attrs.remove("backend_id");
             if !namespace.is_empty() {
                 caller_attrs.insert("namespace".to_string(), namespace);
             }
@@ -297,14 +307,32 @@ async fn create_key(
                 .get("hsm_connection_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
+            let backend_id = body
+                .get("backend_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             let provider_name = crate::domain::resolve_create_provider(
                 &state.provider_router,
                 &state.providers,
                 &identity_tags,
                 requested_provider.as_deref(),
                 hsm_connection_id,
+                backend_id,
             )
-            .map_err(|m| ops::rest_error(StatusCode::CONFLICT, "ProviderMismatch", &m))?;
+            .map_err(|e| e.to_rest_error())?;
+
+            // Enforce scope_owner (ADR-0001 A1.4).
+            crate::domain::check_scope_owner(
+                &state.storage,
+                &state.audit,
+                &provider_name,
+                principal_scope.as_deref(),
+                &principal_id,
+                &keyrack_core::audit::AuditAction::CreateKey,
+            )
+            .await
+            .map_err(|e| e.to_rest_error())?;
+
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
 
             let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
@@ -669,6 +697,11 @@ async fn encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -688,6 +721,16 @@ async fn encrypt(
                 "key not in Enabled state",
             ));
         }
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Encrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let plaintext_b64 = body.get("plaintext").and_then(|v| v.as_str()).unwrap_or("");
         let plaintext = base64_decode(plaintext_b64)?;
         let ec = body
@@ -746,6 +789,11 @@ async fn decrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -774,6 +822,19 @@ async fn decrypt(
             .map_err(|e| {
                 ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
             })?;
+
+        // Enforce scope_owner against the per-version binding.
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            Some(header.key_version),
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Decrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
+
         let ec = body
             .get("encryption_context")
             .and_then(|v| v.as_object())
@@ -831,11 +892,26 @@ async fn sign(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::Sign, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Sign,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let alg_str = body
             .get("signing_algorithm")
             .and_then(|v| v.as_str())
@@ -899,11 +975,26 @@ async fn verify(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::Verify, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::Verify,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let alg_str = body
             .get("signing_algorithm")
             .and_then(|v| v.as_str())
@@ -1027,11 +1118,26 @@ async fn generate_mac(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::GenerateMac, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::GenerateMac,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let alg_str = body
             .get("mac_algorithm")
             .and_then(|v| v.as_str())
@@ -1076,11 +1182,26 @@ async fn verify_mac(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::VerifyMac, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::VerifyMac,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let alg_str = body
             .get("mac_algorithm")
             .and_then(|v| v.as_str())
