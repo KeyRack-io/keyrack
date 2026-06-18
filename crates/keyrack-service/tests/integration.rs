@@ -2622,3 +2622,569 @@ async fn rest_scope_deny_create_key() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SCOPED PRINCIPAL: MATCH → ALLOW + MISMATCH → DENY
+// ═══════════════════════════════════════════════════════════════════
+
+/// Test authenticator that returns a principal carrying a configurable `scope`
+/// attribute. Mirrors what the JWT authenticator does in production (lifts the
+/// namespaced claim into `principal.attributes["scope"]`).
+struct ScopedAuthenticator {
+    scope: String,
+}
+
+impl ScopedAuthenticator {
+    fn new(scope: &str) -> Self {
+        Self {
+            scope: scope.to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl keyrack_core::authn::Authenticator for ScopedAuthenticator {
+    async fn authenticate(
+        &self,
+        _metadata: &keyrack_core::authn::RequestMetadata,
+    ) -> Result<Option<keyrack_core::authn::AuthnResult>, keyrack_core::authn::AuthnError> {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert(
+            "scope".to_string(),
+            keyrack_core::pdp::AttributeValue::String(self.scope.clone()),
+        );
+        Ok(Some(keyrack_core::authn::AuthnResult {
+            principal: keyrack_core::pdp::Principal {
+                id: "test:scoped-user".into(),
+                principal_type: "Service".into(),
+                attributes: attrs,
+            },
+            method: "test-scoped".into(),
+        }))
+    }
+}
+
+/// Build a state using a `ScopedAuthenticator` with the given scope value.
+fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::{ProviderRouter, RoutingRule, RuleAction};
+    use std::collections::BTreeMap;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_tenant = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("tenant-hsm"),
+            ProviderEntry {
+                provider: prov_tenant,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
+            .expect("valid registry"),
+    );
+
+    let mut match_tags = BTreeMap::new();
+    match_tags.insert("tenant".to_string(), "acme".to_string());
+    let rules = vec![RoutingRule {
+        match_tags,
+        action: RuleAction::Route(ProviderRef::new("tenant-hsm")),
+    }];
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(ScopedAuthenticator::new(scope)),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+/// Build a state with `ScopedAuthenticator` but NO routing rules (no-policy mode).
+fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![(
+        ProviderRef::new("default"),
+        ProviderEntry {
+            provider: prov_default,
+            class: ProviderClass::InMemory,
+        },
+    )];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default"))
+            .expect("valid registry"),
+    );
+
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(ScopedAuthenticator::new(scope)),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+/// Helper: register a scoped connection + provider, create a key bound to it.
+async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrack_core::lid::Lid {
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        conn_id,
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "scoped",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new(conn_id),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov.clone(),
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let handle = prov
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical = keyrack_core::canon::canonicalize(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &attrs,
+    );
+    let lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "scoped key".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: handle,
+            provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    state.storage.create_key(&record).await.unwrap();
+    lid
+}
+
+// ── gRPC: MATCH → ALLOW (positive control) ───────────────────────
+
+#[tokio::test]
+async fn grpc_scope_match_allows_encrypt() {
+    let (state, audit) = build_scoped_state("tenant:acme");
+    let lid = setup_scoped_key_in(&state, "scoped-enc").await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let result = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"hello".to_vec(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "matching scope must allow: {result:?}");
+
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check must be emitted on success");
+    let ev = scope_event.unwrap();
+    assert_eq!(ev.result, keyrack_core::audit::AuditResult::Success);
+    assert_eq!(ev.resource.id, "scoped-enc");
+    assert_eq!(ev.resource.resource_type, "HsmConnection");
+    assert_eq!(
+        ev.metadata["scope"],
+        serde_json::Value::String("tenant:acme".into())
+    );
+    assert_eq!(
+        ev.metadata["connection_scope_owner"],
+        serde_json::Value::String("tenant:acme".into())
+    );
+}
+
+#[tokio::test]
+async fn grpc_scope_match_allows_create_key() {
+    let (state, _audit) = build_scoped_state("tenant:acme");
+
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "create-match",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("create-match"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    // Use attributes that match the routing rule → routes to tenant-hsm (no scope_owner).
+    // Instead, test scope on Encrypt with a key already bound to the scoped conn.
+    // For CreateKey, we need a delegate rule. Use the no-policy trick: create with
+    // attributes matching the rule so routing selects tenant-hsm, then override is not needed.
+    // Actually just test CreateKey using the already-delegated setup: select backend_id
+    // matching a DelegateAny rule. We'll use a fresh state without routing rules.
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "scope match create".into(),
+            // Don't select the scoped backend directly; let routing pick tenant-hsm
+            // (which has no scope_owner) and test scope enforcement on a directly-bound key.
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "create without scoped backend must work: {result:?}");
+
+    // Now test CreateKey with a scoped backend in no-policy mode:
+    drop(svc);
+    drop(state);
+    let (state2, audit2) = build_scoped_state_no_rules("tenant:acme");
+    let conn2 = keyrack_core::hsm::HsmConnection::new(
+        "create-match2",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state2.storage.create_hsm_connection(&conn2).await.unwrap();
+    let prov2 = Arc::new(InMemoryProvider::new());
+    state2
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("create-match2"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov2,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let svc2 = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state2));
+    let result = svc2
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "scope match create".into(),
+            backend_id: Some("create-match2".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "matching scope must allow create: {result:?}");
+
+    let events = audit2.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check event on create success");
+    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Success);
+}
+
+// ── gRPC: MISMATCH → DENY ────────────────────────────────────────
+
+#[tokio::test]
+async fn grpc_scope_mismatch_denies_encrypt() {
+    let (state, audit) = build_scoped_state("tenant:other");
+    let lid = setup_scoped_key_in(&state, "scoped-mm-enc").await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let err = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: lid.to_string(),
+            plaintext: b"hello".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("mismatched scope must deny");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check must be emitted on mismatch");
+    let ev = scope_event.unwrap();
+    assert_eq!(ev.result, keyrack_core::audit::AuditResult::Denied);
+    assert_eq!(
+        ev.metadata["scope"],
+        serde_json::Value::String("tenant:other".into())
+    );
+    assert_eq!(
+        ev.metadata["connection_scope_owner"],
+        serde_json::Value::String("tenant:acme".into())
+    );
+}
+
+#[tokio::test]
+async fn grpc_scope_mismatch_denies_create_key() {
+    let (state, _) = build_scoped_state_no_rules("tenant:other");
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "create-mismatch",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("create-mismatch"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let err = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "scope mismatch create".into(),
+            backend_id: Some("create-mismatch".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("mismatched scope must deny create");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+// ── REST: MATCH → ALLOW ──────────────────────────────────────────
+
+#[tokio::test]
+async fn rest_scope_match_allows_encrypt() {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, audit) = build_scoped_state("tenant:acme");
+    let lid = setup_scoped_key_in(&state, "rest-match-enc").await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "plaintext": base64::engine::general_purpose::STANDARD.encode(b"data"),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-encrypt"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK, "REST encrypt must succeed with matching scope");
+
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(parsed.get("ciphertext_blob").is_some(), "response must contain ciphertext_blob");
+
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check emitted on REST success");
+    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Success);
+}
+
+#[tokio::test]
+async fn rest_scope_match_allows_create_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_scoped_state_no_rules("tenant:acme");
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "rest-create-match",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("rest-create-match"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "description": "rest scope match create",
+        "backend_id": "rest-create-match",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CREATED,
+        "REST create with matching scope must succeed"
+    );
+}
+
+// ── REST: MISMATCH → DENY ────────────────────────────────────────
+
+#[tokio::test]
+async fn rest_scope_mismatch_denies_encrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, audit) = build_scoped_state("tenant:other");
+    let lid = setup_scoped_key_in(&state, "rest-mm-enc").await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "plaintext": base64::engine::general_purpose::STANDARD.encode(b"data"),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-encrypt"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(scope_event.is_some(), "scope_owner_check on REST mismatch");
+    assert_eq!(scope_event.unwrap().result, keyrack_core::audit::AuditResult::Denied);
+}
+
+#[tokio::test]
+async fn rest_scope_mismatch_denies_create_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_scoped_state_no_rules("tenant:other");
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "rest-create-mm",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "test",
+    )
+    .with_scope_owner("tenant:acme");
+    state.storage.create_hsm_connection(&conn).await.unwrap();
+    let prov = Arc::new(InMemoryProvider::new());
+    state
+        .providers
+        .register(
+            keyrack_core::key::ProviderRef::new("rest-create-mm"),
+            keyrack_core::registry::ProviderEntry {
+                provider: prov,
+                class: keyrack_core::key::ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "description": "rest scope mismatch create",
+        "backend_id": "rest-create-mm",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
