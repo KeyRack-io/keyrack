@@ -1,0 +1,135 @@
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package keyrack.v1;
+
+option java_package = "io.keyrack.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+
+// Policy Decision Point service.
+//
+// Wire format follows the PDP Service Contract v1.0
+// (docs/PDP_SERVICE_CONTRACT.md).
+service PdpService {
+  rpc Authorize(PdpAuthorizeRequest) returns (PdpAuthorizeResponse);
+  rpc BatchAuthorize(PdpBatchAuthorizeRequest) returns (PdpBatchAuthorizeResponse);
+  rpc ExplainAuthorization(PdpExplainRequest) returns (PdpExplainResponse);
+}
+
+// --- Attribute value types (§3.5) ---
+
+message PdpAttributeValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    bool bool_value = 3;
+    PdpStringList string_list = 4;
+    PdpAttributeRecord record = 5;
+    google.protobuf.Timestamp timestamp = 6;
+    PdpRecordList record_list = 7;
+  }
+}
+
+message PdpStringList {
+  repeated string values = 1;
+}
+
+message PdpAttributeRecord {
+  map<string, PdpAttributeValue> fields = 1;
+}
+
+message PdpRecordList {
+  repeated PdpAttributeRecord records = 1;
+}
+
+// --- Request types (§3) ---
+
+message PdpPrincipal {
+  string id = 1;
+  string type = 2;
+  map<string, PdpAttributeValue> attributes = 3;
+}
+
+message PdpResource {
+  string id = 1;
+  string type = 2;
+  map<string, PdpAttributeValue> attributes = 3;
+}
+
+message PdpRequestContext {
+  map<string, PdpAttributeValue> entries = 1;
+}
+
+message PdpAuthorizeRequest {
+  string pdp_api_version = 1;
+  string request_id = 2;
+  string action = 3;
+  PdpPrincipal principal = 4;
+  PdpResource resource = 5;
+  PdpRequestContext context = 6;
+}
+
+message PdpBatchAuthorizeRequest {
+  repeated PdpAuthorizeRequest checks = 1;
+}
+
+message PdpExplainRequest {
+  string request_id = 1;
+}
+
+// --- Response types (§4) ---
+
+enum PdpDecision {
+  PDP_DECISION_UNSPECIFIED = 0;
+  PDP_DECISION_PERMIT = 1;
+  PDP_DECISION_FORBID = 2;
+  PDP_DECISION_INDETERMINATE = 3;
+}
+
+message PdpPolicyReason {
+  string policy_id = 1;
+  string reason_code = 2;
+  string human_message = 3;
+}
+
+message PdpObligation {
+  string obligation_id = 1;
+  map<string, PdpAttributeValue> parameters = 2;
+}
+
+message PdpAuthorizeResponse {
+  string request_id = 1;
+  PdpDecision decision = 2;
+  repeated PdpPolicyReason reasons = 3;
+  repeated PdpObligation obligations = 4;
+  string policy_version = 5;
+}
+
+message PdpBatchAuthorizeResponse {
+  repeated PdpAuthorizeResponse results = 1;
+}
+
+message PdpExplainResponse {
+  string request_id = 1;
+  PdpDecision decision = 2;
+  repeated PdpPolicyReason reasons = 3;
+  repeated PdpObligation obligations = 4;
+  string policy_version = 5;
+  string explanation = 6;
+}
+
+// --- Validation errors (§4.7) ---
+
+message PdpValidationError {
+  string field_path = 1;
+  string error_code = 2;
+  string message = 3;
+}
+
+message PdpValidationErrorResponse {
+  repeated PdpValidationError errors = 1;
+}

@@ -37,35 +37,16 @@ services:
       timeout: 3s
       retries: 10
 
-  cedar-pdp:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.service
-    entrypoint: ["keyrack-cedar-pdp"]
-    environment:
-      CEDAR_POLICY_PATH: /config/policies.cedar
-      CEDAR_PDP_ADDR: "[::]:8181"
-      RUST_LOG: info
-    volumes:
-      - ./config/cedar-policy.cedar:/config/policies.cedar:ro
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8181/healthz"]
-      interval: 2s
-      timeout: 3s
-      retries: 10
-
   keyrack:
     build:
       context: ../..
-      dockerfile: demos/04-hyok-full-stack/Dockerfile.keyrack
+      dockerfile: demos/11-multi-tenant-hyok/Dockerfile.keyrack
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
       jwt-issuer:
-        condition: service_healthy
-      cedar-pdp:
         condition: service_healthy
     environment:
       KEYRACK_CONFIG: /config/keyrack.yaml
@@ -84,16 +65,15 @@ services:
       retries: 15
 
   demo:
-    image: curlimages/curl:8.10.1
-    user: "0:0"
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
     depends_on:
       keyrack:
         condition: service_healthy
     volumes:
       - ./scripts:/scripts:ro
-      - hsm-tokens:/hsm-tokens
-    entrypoint: /bin/sh
-    command: ["/scripts/run-demo.sh"]
+      - ./proto:/proto:ro
 
 volumes:
   hsm-tokens:

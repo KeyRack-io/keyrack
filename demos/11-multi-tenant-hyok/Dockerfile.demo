@@ -1,0 +1,15 @@
+# Demo runner with curl (REST) + grpcurl (gRPC, for HSM connection registration).
+FROM alpine:3.20
+
+RUN apk add --no-cache curl bash jq
+
+# grpcurl for CreateHsmConnection (gRPC-only API)
+ARG GRPCURL_VERSION=1.9.1
+RUN ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/arm64/') && \
+    curl -sSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin grpcurl
+
+COPY proto/ /proto/
+COPY scripts/ /scripts/
+
+ENTRYPOINT ["bash", "/scripts/run-demo.sh"]
