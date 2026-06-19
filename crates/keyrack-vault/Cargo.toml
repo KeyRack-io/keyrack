@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-vault"
-version = "0.3.0"
+version = "0.3.1"
 description = "KeyRack crypto provider for HashiCorp Vault Transit secrets engine"
 edition.workspace = true
 rust-version.workspace = true

@@ -507,10 +507,15 @@ pub async fn extract_principal_grpc<T>(
 }
 
 /// Extract the authenticated principal from an axum REST request.
+///
+/// **Fails closed:** if the configured authenticators recognise no valid
+/// credential, the request is rejected with `401 Unauthenticated` rather
+/// than downgraded to an anonymous principal. The insecure authenticator
+/// never errors, so dev/test deployments (no real authn) are unaffected.
 pub async fn extract_principal_rest(
     state: &Arc<ServiceState>,
     headers: &axum::http::HeaderMap,
-) -> Principal {
+) -> Result<Principal, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     use keyrack_core::authn::RequestMetadata;
 
     let mut meta = RequestMetadata::default();
@@ -521,10 +526,14 @@ pub async fn extract_principal_rest(
     }
 
     match state.authn.authenticate(&meta).await {
-        Ok(result) => result.principal,
+        Ok(result) => Ok(result.principal),
         Err(e) => {
-            tracing::warn!(error = %e, "authentication failed, using default principal");
-            default_principal()
+            tracing::warn!(error = %e, "REST authentication failed; rejecting request");
+            Err(rest_error(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthenticated",
+                &format!("authentication failed: {e}"),
+            ))
         }
     }
 }

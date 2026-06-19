@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-kmip"
-version = "0.3.0"
+version = "0.3.1"
 description = "KeyRack KMIP client provider for HYOK and external HSMs"
 edition.workspace = true
 rust-version.workspace = true
