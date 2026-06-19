@@ -3592,3 +3592,290 @@ async fn grpc_authn_reject_no_credential() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// IN-PROCESS mTLS IDENTITY TESTS (docker-free, deterministic)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Mirrors demo 10 (10-mtls-identity) as an in-process CI gate:
+//   1. Valid client cert  → principal extracted, reaches PDP/audit
+//   2. No client cert     → rejected (Unauthenticated)
+//   3. Untrusted CA cert  → TLS-layer rejection
+
+/// Bundle of a generated certificate + its key pair.
+struct TestCertBundle {
+    params: rcgen::CertificateParams,
+    cert: rcgen::Certificate,
+    key_pair: rcgen::KeyPair,
+}
+
+/// Generate a self-signed CA certificate + key pair using `rcgen`.
+fn generate_ca(cn: &str) -> TestCertBundle {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    TestCertBundle {
+        params,
+        cert,
+        key_pair,
+    }
+}
+
+/// Generate a leaf certificate signed by the given CA.
+fn generate_leaf(cn: &str, san_dns: &[&str], ca: &TestCertBundle) -> TestCertBundle {
+    let sans: Vec<String> = san_dns.iter().map(|s| (*s).to_string()).collect();
+    let mut params = rcgen::CertificateParams::new(sans).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.is_ca = rcgen::IsCa::NoCa;
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+    let cert = params.signed_by(&key_pair, &issuer).unwrap();
+    TestCertBundle {
+        params,
+        cert,
+        key_pair,
+    }
+}
+
+/// mTLS case 1: valid client cert → principal extracted, reaches PDP/audit.
+///
+/// Uses extension injection (no real TLS): injects the DER-encoded client
+/// cert as `PeerCertificates`, wired through `MtlsAuthenticator`.
+#[tokio::test]
+async fn mtls_valid_cert_principal_reaches_pdp_audit() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::ops::PeerCertificates;
+    use keyrack_service::routing::ProviderRouter;
+
+    let ca = generate_ca("Test CA");
+    let client = generate_leaf("alice", &[], &ca);
+    let client_der = client.cert.der().to_vec();
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::MtlsAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let mut req = Request::new(proto::CreateKeyRequest {
+        key_spec: proto::KeySpec::Aes256 as i32,
+        ..Default::default()
+    });
+    req.extensions_mut()
+        .insert(PeerCertificates(vec![client_der]));
+
+    let result = svc.create_key(req).await;
+    assert!(result.is_ok(), "valid mTLS cert should be accepted");
+
+    let events = audit.events();
+    assert!(!events.is_empty(), "audit events emitted");
+    assert_eq!(
+        events[0].principal.id, "alice",
+        "principal extracted from cert CN"
+    );
+}
+
+/// mTLS case 2: no client cert → rejected (Unauthenticated).
+///
+/// With `MtlsAuthenticator` as the sole authenticator and no peer certs,
+/// the chain returns `NoCredential` → gRPC `Unauthenticated`.
+#[tokio::test]
+async fn mtls_no_cert_rejected() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::MtlsAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn AuditSink> = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let req = Request::new(proto::CreateKeyRequest {
+        key_spec: proto::KeySpec::Aes256 as i32,
+        ..Default::default()
+    });
+
+    let result = svc.create_key(req).await;
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().code(),
+        tonic::Code::Unauthenticated,
+        "no client cert → Unauthenticated"
+    );
+}
+
+/// mTLS case 3: untrusted CA → TLS-layer rejection.
+///
+/// Starts a real gRPC server with TLS + client CA verification on a
+/// localhost port, then connects with a client cert signed by a different
+/// (rogue) CA. The TLS handshake itself fails — no application-level
+/// response is produced.
+#[tokio::test]
+async fn mtls_untrusted_ca_tls_rejected() {
+    use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    let trusted_ca = generate_ca("Trusted CA");
+    let rogue_ca = generate_ca("Rogue CA");
+    let server_leaf = generate_leaf("localhost", &["localhost"], &trusted_ca);
+    let rogue_client = generate_leaf("rogue-alice", &[], &rogue_ca);
+
+    let server_cert_pem = server_leaf.cert.pem();
+    let server_key_pem = server_leaf.key_pair.serialize_pem();
+    let trusted_ca_pem = trusted_ca.cert.pem();
+
+    let identity = Identity::from_pem(server_cert_pem, server_key_pem);
+    let tls = ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(Certificate::from_pem(trusted_ca_pem));
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers: Arc<dyn keyrack_core::registry::ProviderRegistry> =
+        Arc::new(keyrack_core::registry::StaticProviderRegistry::single(
+            provider,
+            keyrack_core::key::ProviderClass::InMemory,
+        ));
+    let provider_router = keyrack_service::routing::ProviderRouter::new(
+        vec![],
+        keyrack_core::key::ProviderRef::new("default"),
+    );
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::MtlsAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn AuditSink> = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .tls_config(tls)
+            .expect("TLS config")
+            .add_service(keyrack_service::proto::key_service_server::KeyServiceServer::new(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let rogue_client_cert_pem = rogue_client.cert.pem();
+    let rogue_client_key_pem = rogue_client.key_pair.serialize_pem();
+
+    let client_identity = Identity::from_pem(rogue_client_cert_pem, rogue_client_key_pem);
+    let ca_cert = Certificate::from_pem(trusted_ca.cert.pem());
+
+    let channel =
+        tonic::transport::Channel::from_shared(format!("https://localhost:{}", addr.port()))
+            .unwrap()
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .domain_name("localhost")
+                    .ca_certificate(ca_cert)
+                    .identity(client_identity),
+            )
+            .unwrap()
+            .connect()
+            .await;
+
+    match channel {
+        Err(_) => {
+            // TLS handshake failed — expected (rogue CA not trusted by server).
+        }
+        Ok(channel) => {
+            let mut client =
+                keyrack_service::proto::key_service_client::KeyServiceClient::new(channel);
+            let result = client
+                .create_key(proto::CreateKeyRequest {
+                    key_spec: proto::KeySpec::Aes256 as i32,
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                result.is_err(),
+                "rogue-CA client should be rejected at TLS layer"
+            );
+        }
+    }
+
+    server_handle.abort();
+}
