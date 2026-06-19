@@ -15,7 +15,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEMOS_DIR="$REPO_ROOT/demos"
 
-ALL_DEMOS=(01-foss-vault 02-foss-softhsm 04-hyok-full-stack 06-provider-routing 08-cascade-rotation 09-audit-tamper-evidence 10-mtls-identity)
+ALL_DEMOS=(01-foss-vault 02-foss-softhsm 04-hyok-full-stack 06-provider-routing 08-cascade-rotation 09-audit-tamper-evidence 10-mtls-identity 11-multi-tenant-hyok)
 DEMOS=("$@")
 if [ "${#DEMOS[@]}" -eq 0 ]; then
   DEMOS=("${ALL_DEMOS[@]}")

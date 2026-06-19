@@ -1,0 +1,65 @@
+name: Demo PR checks
+
+# Near-zero-cost demo signal on every PR:
+#   1. Meta-lint: every demo run-demo.sh must contain real assertion scaffolding
+#      (exit 1, assert, PASS/FAIL counters). Catches assertion-rot without running
+#      the full compose stacks.
+#   2. Canary: run the single software-only demo (01-foss-vault) — no Postgres, no
+#      HSM, fastest. A smoke check that the core compose demo path still works.
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  meta-lint:
+    name: Demo assertion lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check all demo scripts contain real assertions
+        run: |
+          set -euo pipefail
+          failed=0
+
+          # Find all run-demo.sh scripts in demos/
+          for script in demos/*/run-demo.sh demos/*/scripts/run-demo.sh; do
+            [ -f "$script" ] || continue
+            demo_dir=$(echo "$script" | sed 's|/scripts/run-demo.sh||;s|/run-demo.sh||')
+            demo_name=$(basename "$demo_dir")
+
+            # Must contain at least one of: exit 1, PASS/FAIL counter, assert pattern
+            if grep -qE 'exit 1|FAIL=|PASS=|assert_eq|assert_http|bad\s|fail\s' "$script"; then
+              echo "✓ $demo_name ($script): has assertions"
+            else
+              echo "✗ $demo_name ($script): NO assertion scaffolding found"
+              echo "  Demo scripts MUST contain hard assertions (exit 1, PASS/FAIL counters, or assert helpers)."
+              echo "  A demo that cannot fail is not a test."
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo ""
+            echo "FAILED: one or more demo scripts lack assertion scaffolding."
+            echo "Fix: add PASS/FAIL counters and 'exit 1' on failure (see demos/01-foss-vault as a model)."
+            exit 1
+          fi
+          echo ""
+          echo "All demo scripts contain assertion scaffolding."
+
+  canary:
+    name: Demo canary (01-foss-vault)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run software-only canary demo
+        run: ./scripts/run-demos-ci.sh 01-foss-vault

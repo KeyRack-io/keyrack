@@ -1,0 +1,17 @@
+# Demo runner with curl (REST) + nats CLI (audit subscription).
+FROM alpine:3.20
+
+RUN apk add --no-cache curl bash jq unzip
+
+ARG NATS_VERSION=0.1.6
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    curl -sSL "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-${ARCH}.zip" \
+    -o /tmp/nats.zip && \
+    unzip -j /tmp/nats.zip -d /usr/local/bin && \
+    rm /tmp/nats.zip && \
+    chmod +x /usr/local/bin/nats
+
+COPY scripts/ /scripts/
+
+ENTRYPOINT ["/bin/sh"]
+CMD ["/scripts/run-demo.sh"]

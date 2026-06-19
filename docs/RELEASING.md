@@ -31,6 +31,27 @@ PRs and on the release tag.
    the multi-arch image to `ghcr.io/keyrack-io/keyrack-service:X.Y.Z` (+ `:X.Y`).
    A failed E2E **blocks** the publish.
 
+## Demo coverage model
+
+The docker-compose demo stacks (`scripts/run-demos-ci.sh`) are the automated E2E
+gate. Every demo in that driver runs on release PRs and `v*` tags.
+
+**Demo 07 (k8s-sidecar) is release-gate-only, validated manually.** It requires a
+Kubernetes cluster (`kind`); adding a kind-based CI lane for one demo is
+disproportionate cost (~5-10 min kind bootstrap + image load, requires
+docker-in-docker or a privileged runner). The demo's core crypto paths (create,
+encrypt, decrypt, Cedar authz) are already covered by the compose-based demos. The
+sidecar-specific assertions (Pod lifecycle, native sidecar startup probe, localhost
+networking) are topology concerns validated manually per release. Run it with:
+
+```bash
+cd demos/07-k8s-sidecar && ./run-demo.sh
+```
+
+On PRs, a lightweight meta-lint (`demo-pr.yml`) verifies all demo `run-demo.sh`
+scripts contain real assertions, and runs a single software-only canary
+(`01-foss-vault`) as a fast smoke check.
+
 ## Notes
 
 - **Prereleases** (e.g. `vX.Y.Z-beta.N`) never move `:latest` (`latest=auto`).

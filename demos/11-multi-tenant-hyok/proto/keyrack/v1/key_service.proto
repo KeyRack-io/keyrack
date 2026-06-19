@@ -1,0 +1,839 @@
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package keyrack.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The full V1 gRPC RPC set per KEYRACK_SPEC.md §3.1.
+service KeyService {
+  // ── Cryptographic operations ──────────────────────────────────────
+
+  rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+  rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+  rpc ReEncrypt(ReEncryptRequest) returns (ReEncryptResponse);
+  rpc GenerateDataKey(GenerateDataKeyRequest) returns (GenerateDataKeyResponse);
+  rpc GenerateDataKeyWithoutPlaintext(GenerateDataKeyWithoutPlaintextRequest)
+      returns (GenerateDataKeyWithoutPlaintextResponse);
+  rpc GenerateRandom(GenerateRandomRequest) returns (GenerateRandomResponse);
+  rpc Sign(SignRequest) returns (SignResponse);
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  rpc GenerateMac(GenerateMacRequest) returns (GenerateMacResponse);
+  rpc VerifyMac(VerifyMacRequest) returns (VerifyMacResponse);
+
+  // ── Key lifecycle ─────────────────────────────────────────────────
+
+  rpc CreateKey(CreateKeyRequest) returns (CreateKeyResponse);
+  rpc GetKey(GetKeyRequest) returns (GetKeyResponse);
+  rpc DescribeKey(DescribeKeyRequest) returns (DescribeKeyResponse);
+  rpc UpdateKey(UpdateKeyRequest) returns (UpdateKeyResponse);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+  rpc EnableKey(EnableKeyRequest) returns (EnableKeyResponse);
+  rpc DisableKey(DisableKeyRequest) returns (DisableKeyResponse);
+  rpc ScheduleKeyDeletion(ScheduleKeyDeletionRequest) returns (ScheduleKeyDeletionResponse);
+  rpc CancelKeyDeletion(CancelKeyDeletionRequest) returns (CancelKeyDeletionResponse);
+  rpc ReportKeyCompromise(ReportKeyCompromiseRequest) returns (ReportKeyCompromiseResponse);
+  rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
+
+  // ── Key versions ──────────────────────────────────────────────────
+
+  rpc ListKeyVersions(ListKeyVersionsRequest) returns (ListKeyVersionsResponse);
+  rpc GetKeyVersion(GetKeyVersionRequest) returns (GetKeyVersionResponse);
+
+  // ── Rotation control ──────────────────────────────────────────────
+
+  rpc EnableKeyRotation(EnableKeyRotationRequest) returns (EnableKeyRotationResponse);
+  rpc DisableKeyRotation(DisableKeyRotationRequest) returns (DisableKeyRotationResponse);
+  rpc GetKeyRotationStatus(GetKeyRotationStatusRequest) returns (GetKeyRotationStatusResponse);
+  rpc GetKeyRotationHistory(GetKeyRotationHistoryRequest) returns (GetKeyRotationHistoryResponse);
+  rpc GetKeyRotationPolicy(GetKeyRotationPolicyRequest) returns (GetKeyRotationPolicyResponse);
+  rpc SetKeyRotationPolicy(SetKeyRotationPolicyRequest) returns (SetKeyRotationPolicyResponse);
+
+  // ── Hierarchy queries ─────────────────────────────────────────────
+
+  rpc GetKeyDependents(GetKeyDependentsRequest) returns (GetKeyDependentsResponse);
+  rpc GetKeyAncestors(GetKeyAncestorsRequest) returns (GetKeyAncestorsResponse);
+
+  // ── Aliases ───────────────────────────────────────────────────────
+
+  rpc CreateAlias(CreateAliasRequest) returns (CreateAliasResponse);
+  rpc DeleteAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
+  rpc ListAliases(ListAliasesRequest) returns (ListAliasesResponse);
+
+  // ── Tags ──────────────────────────────────────────────────────────
+
+  rpc TagResource(TagResourceRequest) returns (TagResourceResponse);
+  rpc UntagResource(UntagResourceRequest) returns (UntagResourceResponse);
+  rpc ListResourceTags(ListResourceTagsRequest) returns (ListResourceTagsResponse);
+
+  // ── HSM connections ───────────────────────────────────────────────
+
+  rpc CreateHsmConnection(CreateHsmConnectionRequest) returns (CreateHsmConnectionResponse);
+  rpc GetHsmConnection(GetHsmConnectionRequest) returns (GetHsmConnectionResponse);
+  rpc ListHsmConnections(ListHsmConnectionsRequest) returns (ListHsmConnectionsResponse);
+  rpc DeleteHsmConnection(DeleteHsmConnectionRequest) returns (DeleteHsmConnectionResponse);
+  rpc GetHsmConnectionStatus(GetHsmConnectionStatusRequest) returns (GetHsmConnectionStatusResponse);
+
+  // ── Namespaces ────────────────────────────────────────────────────
+
+  rpc RegisterNamespace(RegisterNamespaceRequest) returns (RegisterNamespaceResponse);
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
+  rpc DescribeNamespace(DescribeNamespaceRequest) returns (DescribeNamespaceResponse);
+
+  // ── Cooperative rotation jobs ─────────────────────────────────────
+
+  rpc ListRotationJobs(ListRotationJobsRequest) returns (ListRotationJobsResponse);
+  rpc AcknowledgeRotationJob(AcknowledgeRotationJobRequest) returns (AcknowledgeRotationJobResponse);
+  rpc CompleteRotationJob(CompleteRotationJobRequest) returns (CompleteRotationJobResponse);
+  rpc FailRotationJob(FailRotationJobRequest) returns (FailRotationJobResponse);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Common types
+// ═══════════════════════════════════════════════════════════════════
+
+enum KeySpec {
+  KEY_SPEC_UNSPECIFIED = 0;
+  AES_256 = 1;
+  ED25519 = 2;
+  RSA_2048 = 3;
+  RSA_3072 = 4;
+  RSA_4096 = 5;
+  ECDSA_P256 = 6;
+  RSA_PSS_2048 = 7;
+  RSA_PSS_3072 = 8;
+  RSA_PSS_4096 = 9;
+  // Added 2026-06 (design-partner proto alignment). Appended to preserve wire values.
+  ECC_NIST_P384 = 10;
+  HMAC_256 = 11;
+  AES_128 = 12;
+}
+
+enum KeyUsage {
+  KEY_USAGE_UNSPECIFIED = 0;
+  ENCRYPT_DECRYPT = 1;
+  SIGN_VERIFY = 2;
+  // For symmetric MAC keys (HMAC). Used with GenerateMac / VerifyMac.
+  GENERATE_VERIFY_MAC = 3;
+}
+
+// NOTE: renumbered 2026-06 to the conventional ordering (most common steady
+// state at 1). This is a WIRE-BREAKING change for gRPC clients compiled against
+// the prior numbering (CREATING=1, ENABLED=2, ...). Recompile all clients,
+// including the commercial AWS KMS / Barbican shims, against this proto.
+enum KeyState {
+  KEY_STATE_UNSPECIFIED = 0;
+  ENABLED = 1;
+  DISABLED = 2;
+  PENDING_DELETION = 3;
+  DESTROYED = 4;
+  CREATING = 5;
+  COMPROMISED = 6;
+}
+
+enum KeyOrigin {
+  KEY_ORIGIN_UNSPECIFIED = 0;
+  KEYRACK = 1;
+  EXTERNAL = 2;
+}
+
+enum SigningAlgorithm {
+  SIGNING_ALGORITHM_UNSPECIFIED = 0;
+  ED25519_PURE = 1;
+  RSA_PKCS1_V15_SHA256 = 2;
+  ECDSA_P256_SHA256 = 3;
+  RSA_PSS_SHA256 = 4;
+  // Added 2026-06 (design-partner proto alignment). Additive; existing values fixed.
+  RSA_PKCS1_V15_SHA384 = 5;
+  RSA_PKCS1_V15_SHA512 = 6;
+  RSA_PSS_SHA384 = 7;
+  RSA_PSS_SHA512 = 8;
+  ECDSA_P256_SHA384 = 9;
+  ECDSA_P384_SHA384 = 10;
+}
+
+// Whether the bytes supplied to Sign/Verify are the raw message (which the
+// server hashes) or a pre-computed digest (signed/verified as-is). Mirrors AWS
+// KMS MessageType. UNSPECIFIED is treated as RAW for backward compatibility.
+// DIGEST is invalid for ED25519_PURE (Ed25519 signs the full message).
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  RAW = 1;
+  DIGEST = 2;
+}
+
+// Symmetric MAC algorithms for GenerateMac / VerifyMac (HMAC keys).
+enum MacAlgorithm {
+  MAC_ALGORITHM_UNSPECIFIED = 0;
+  HMAC_SHA_256 = 1;
+  HMAC_SHA_384 = 2;
+  HMAC_SHA_512 = 3;
+}
+
+// Key metadata visible to callers (identity tags excluded per §5.14).
+message KeyMetadata {
+  string key_id = 1;
+  KeySpec key_spec = 2;
+  KeyUsage key_usage = 3;
+  KeyState state = 4;
+  KeyOrigin origin = 5;
+  string description = 6;
+  google.protobuf.Timestamp created_at = 7;
+  uint32 current_key_version = 8;
+  map<string, string> user_tags = 9;
+  optional string parent_key_id = 10;
+  // Deprecated: use backend_id (field 14) instead.
+  optional string hsm_connection_id = 11;
+  uint64 occ_version = 12;
+  optional google.protobuf.Timestamp scheduled_deletion_at = 13;
+  // The crypto backend bound to this key's primary version.
+  optional string backend_id = 14;
+}
+
+message KeyVersionMetadata {
+  uint32 version = 1;
+  google.protobuf.Timestamp created_at = 2;
+  KeyState state = 3;
+}
+
+// Lineage entry for hierarchy queries (§5.5).
+message LineageEntry {
+  string id = 1;
+  string resource_type = 2;
+  uint32 depth = 3;
+  optional string parent_id = 4;
+}
+
+message Tag {
+  string key = 1;
+  string value = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Cryptographic operations
+// ═══════════════════════════════════════════════════════════════════
+
+message EncryptRequest {
+  string key_id = 1;
+  bytes plaintext = 2;
+  map<string, string> encryption_context = 3;
+}
+
+message EncryptResponse {
+  bytes ciphertext_blob = 1;
+  string key_id = 2;
+  uint32 key_version = 3;
+}
+
+message DecryptRequest {
+  string key_id = 1;
+  bytes ciphertext_blob = 2;
+  map<string, string> encryption_context = 3;
+}
+
+message DecryptResponse {
+  bytes plaintext = 1;
+  string key_id = 2;
+}
+
+message ReEncryptRequest {
+  string source_key_id = 1;
+  bytes ciphertext_blob = 2;
+  string destination_key_id = 3;
+  map<string, string> source_encryption_context = 4;
+  map<string, string> destination_encryption_context = 5;
+}
+
+message ReEncryptResponse {
+  bytes ciphertext_blob = 1;
+  string source_key_id = 2;
+  string destination_key_id = 3;
+}
+
+message GenerateDataKeyRequest {
+  string key_id = 1;
+  KeySpec key_spec = 2;
+  map<string, string> encryption_context = 3;
+}
+
+message GenerateDataKeyResponse {
+  bytes plaintext_data_key = 1;
+  bytes encrypted_data_key = 2;
+  string key_id = 3;
+}
+
+message GenerateDataKeyWithoutPlaintextRequest {
+  string key_id = 1;
+  KeySpec key_spec = 2;
+  map<string, string> encryption_context = 3;
+}
+
+message GenerateDataKeyWithoutPlaintextResponse {
+  bytes encrypted_data_key = 1;
+  string key_id = 2;
+}
+
+message GenerateRandomRequest {
+  uint32 number_of_bytes = 1;
+}
+
+message GenerateRandomResponse {
+  bytes random_bytes = 1;
+}
+
+message SignRequest {
+  string key_id = 1;
+  // Raw message or a pre-computed digest, per message_type.
+  bytes message = 2;
+  SigningAlgorithm signing_algorithm = 3;
+  // Added 2026-06. UNSPECIFIED => RAW (server hashes). DIGEST => sign the
+  // supplied bytes directly (the digest must match the algorithm's hash).
+  MessageType message_type = 4;
+}
+
+message SignResponse {
+  bytes signature = 1;
+  string key_id = 2;
+  SigningAlgorithm signing_algorithm = 3;
+}
+
+message VerifyRequest {
+  string key_id = 1;
+  // Raw message or a pre-computed digest, per message_type.
+  bytes message = 2;
+  bytes signature = 3;
+  SigningAlgorithm signing_algorithm = 4;
+  // Added 2026-06. UNSPECIFIED => RAW (server hashes). DIGEST => verify the
+  // supplied bytes directly.
+  MessageType message_type = 5;
+}
+
+message VerifyResponse {
+  bool signature_valid = 1;
+  string key_id = 2;
+  SigningAlgorithm signing_algorithm = 3;
+}
+
+message GenerateMacRequest {
+  string key_id = 1;
+  bytes message = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
+message GenerateMacResponse {
+  bytes mac = 1;
+  string key_id = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
+message VerifyMacRequest {
+  string key_id = 1;
+  bytes message = 2;
+  bytes mac = 3;
+  MacAlgorithm mac_algorithm = 4;
+}
+
+message VerifyMacResponse {
+  bool mac_valid = 1;
+  string key_id = 2;
+  MacAlgorithm mac_algorithm = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Key lifecycle
+// ═══════════════════════════════════════════════════════════════════
+
+message CreateKeyRequest {
+  KeySpec key_spec = 1;
+  // Optional: the server derives usage from key_spec when unset
+  // (AES/HMAC => symmetric usage; asymmetric => SIGN_VERIFY). Provided values
+  // that conflict with the spec are rejected.
+  optional KeyUsage key_usage = 2;
+  string description = 3;
+  map<string, string> tags = 4;
+  optional string parent_key_id = 5;
+  // Deprecated: use backend_id instead. Retained as a one-release alias; if
+  // both backend_id and hsm_connection_id are set, they must agree.
+  optional string hsm_connection_id = 6;
+  map<string, string> attributes = 7;
+  // Optional: empty means no namespace.
+  optional string namespace = 8;
+  // The crypto backend that holds the key's material (software, static HSM, or
+  // dynamic HSM connection). Supersedes hsm_connection_id; the reserved
+  // attribute keyrack.provider also folds into this and deprecates.
+  optional string backend_id = 9;
+}
+
+message CreateKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message GetKeyRequest {
+  string key_id = 1;
+}
+
+message GetKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message DescribeKeyRequest {
+  string key_id = 1;
+}
+
+message DescribeKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message UpdateKeyRequest {
+  string key_id = 1;
+  optional string description = 2;
+}
+
+message UpdateKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message ListKeysRequest {
+  uint32 max_results = 1;
+  string cursor = 2;
+  optional KeyState state_filter = 3;
+}
+
+message ListKeysResponse {
+  repeated KeyMetadata keys = 1;
+  string next_cursor = 2;
+}
+
+message EnableKeyRequest {
+  string key_id = 1;
+}
+
+message EnableKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message DisableKeyRequest {
+  string key_id = 1;
+}
+
+message DisableKeyResponse {
+  KeyMetadata metadata = 1;
+}
+
+message ScheduleKeyDeletionRequest {
+  string key_id = 1;
+  uint32 grace_period_days = 2;
+}
+
+message ScheduleKeyDeletionResponse {
+  KeyMetadata metadata = 1;
+  google.protobuf.Timestamp deletion_date = 2;
+}
+
+message CancelKeyDeletionRequest {
+  string key_id = 1;
+}
+
+message CancelKeyDeletionResponse {
+  KeyMetadata metadata = 1;
+}
+
+message ReportKeyCompromiseRequest {
+  string key_id = 1;
+}
+
+message ReportKeyCompromiseResponse {
+  KeyMetadata metadata = 1;
+}
+
+message RotateKeyRequest {
+  string key_id = 1;
+}
+
+message RotateKeyResponse {
+  KeyMetadata metadata = 1;
+  uint32 new_version = 2;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Key versions
+// ═══════════════════════════════════════════════════════════════════
+
+message ListKeyVersionsRequest {
+  string key_id = 1;
+  uint32 max_results = 2;
+  string cursor = 3;
+}
+
+message ListKeyVersionsResponse {
+  repeated KeyVersionMetadata versions = 1;
+  string next_cursor = 2;
+}
+
+message GetKeyVersionRequest {
+  string key_id = 1;
+  uint32 version = 2;
+}
+
+message GetKeyVersionResponse {
+  KeyVersionMetadata version = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Rotation control
+// ═══════════════════════════════════════════════════════════════════
+
+message RotationPolicy {
+  bool enabled = 1;
+  uint32 rotation_interval_days = 2;
+}
+
+message EnableKeyRotationRequest {
+  string key_id = 1;
+}
+
+message EnableKeyRotationResponse {}
+
+message DisableKeyRotationRequest {
+  string key_id = 1;
+}
+
+message DisableKeyRotationResponse {}
+
+message GetKeyRotationStatusRequest {
+  string key_id = 1;
+}
+
+message GetKeyRotationStatusResponse {
+  bool rotation_enabled = 1;
+  optional google.protobuf.Timestamp next_rotation_date = 2;
+  optional google.protobuf.Timestamp last_rotated_at = 3;
+}
+
+message GetKeyRotationHistoryRequest {
+  string key_id = 1;
+  uint32 max_results = 2;
+  string cursor = 3;
+}
+
+message RotationHistoryEntry {
+  uint32 from_version = 1;
+  uint32 to_version = 2;
+  google.protobuf.Timestamp rotated_at = 3;
+}
+
+message GetKeyRotationHistoryResponse {
+  repeated RotationHistoryEntry entries = 1;
+  string next_cursor = 2;
+}
+
+message GetKeyRotationPolicyRequest {
+  string key_id = 1;
+}
+
+message GetKeyRotationPolicyResponse {
+  RotationPolicy policy = 1;
+}
+
+message SetKeyRotationPolicyRequest {
+  string key_id = 1;
+  RotationPolicy policy = 2;
+}
+
+message SetKeyRotationPolicyResponse {}
+
+// ═══════════════════════════════════════════════════════════════════
+// Hierarchy queries
+// ═══════════════════════════════════════════════════════════════════
+
+message GetKeyDependentsRequest {
+  string key_id = 1;
+  bool recursive = 2;
+}
+
+message GetKeyDependentsResponse {
+  repeated LineageEntry dependents = 1;
+}
+
+message GetKeyAncestorsRequest {
+  string key_id = 1;
+}
+
+message GetKeyAncestorsResponse {
+  repeated LineageEntry ancestors = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Aliases
+// ═══════════════════════════════════════════════════════════════════
+
+message CreateAliasRequest {
+  string alias_name = 1;
+  string target_key_id = 2;
+}
+
+message CreateAliasResponse {
+  string alias_name = 1;
+  string target_key_id = 2;
+}
+
+message DeleteAliasRequest {
+  string alias_name = 1;
+}
+
+message DeleteAliasResponse {}
+
+message ListAliasesRequest {
+  uint32 max_results = 1;
+  string cursor = 2;
+  optional string key_id = 3;
+}
+
+message ListAliasesResponse {
+  repeated AliasEntry aliases = 1;
+  string next_cursor = 2;
+}
+
+message AliasEntry {
+  string alias_name = 1;
+  string target_key_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Tags
+// ═══════════════════════════════════════════════════════════════════
+
+message TagResourceRequest {
+  string key_id = 1;
+  repeated Tag tags = 2;
+}
+
+message TagResourceResponse {}
+
+message UntagResourceRequest {
+  string key_id = 1;
+  repeated string tag_keys = 2;
+}
+
+message UntagResourceResponse {}
+
+message ListResourceTagsRequest {
+  string key_id = 1;
+}
+
+message ListResourceTagsResponse {
+  repeated Tag tags = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HSM connections
+// ═══════════════════════════════════════════════════════════════════
+
+enum HsmProviderType {
+  HSM_PROVIDER_TYPE_UNSPECIFIED = 0;
+  HSM = 1;
+  HYOK = 2;
+}
+
+enum HsmConnectionStatus {
+  HSM_CONNECTION_STATUS_UNSPECIFIED = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  DOWN = 3;
+}
+
+message HsmConnectionMetadata {
+  string connection_id = 1;
+  HsmProviderType provider_type = 2;
+  string endpoint = 3;
+  HsmConnectionStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  optional google.protobuf.Timestamp last_health_check = 6;
+  // Canonical PKCS#11 binding echoed back so callers persist the normalized
+  // form (idempotency is post-normalization equality). Absent for HYOK/legacy.
+  optional string token_label = 7;  // normalized (trimmed, <= 32 bytes)
+  optional string pin_ref = 8;      // scheme-normalized "file:<path>" reference
+  // Scope owner for tenant isolation. When set, operations referencing this
+  // connection require a matching principal scope claim.
+  optional string scope_owner = 9;
+}
+
+// PKCS#11 connection config (HSM provider type). Additive oneof variant on
+// CreateHsmConnectionRequest; HYOK/KMIP keeps using endpoint + tls_* instead.
+message Pkcs11ConnectionConfig {
+  string lib_path = 1;
+  // Operator-provided UTF-8 token label. KeyRack normalizes it (trailing
+  // whitespace trimmed, <= 32 bytes UTF-8, non-empty) and echoes the canonical
+  // value in HsmConnectionMetadata.token_label.
+  string token_label = 2;
+  // Reference ONLY: "file:<path>" resolved KeyRack-side under the allowlist
+  // root (KEYRACK_SECRET_ROOT, default /etc/keyrack/secrets/). NEVER PIN bytes.
+  string pin_ref = 3;
+}
+
+message CreateHsmConnectionRequest {
+  HsmProviderType provider_type = 1;
+  string endpoint = 2;             // HYOK/KMIP only
+  string tls_cert_pem = 3;         // HYOK/KMIP only
+  string tls_key_pem = 4;          // HYOK/KMIP only
+  optional string tls_ca_pem = 5;  // HYOK/KMIP only
+
+  // Consistency rule (handler-enforced, INVALID_ARGUMENT on violation): when
+  // the pkcs11 variant is set, provider_type MUST be HSM and endpoint/tls_*
+  // MUST be empty. AWS/Barbican shims send no connection_config -> unaffected.
+  oneof connection_config {
+    Pkcs11ConnectionConfig pkcs11 = 6;
+  }
+
+  // Caller-supplied idempotency key + routing reference (general to HSM and
+  // HYOK). For PKCS#11 registration it is required and validated (non-empty,
+  // <= 128 bytes, no control/whitespace-only chars). Re-registering the same
+  // id with an identical normalized binding is idempotent; with a different
+  // binding it is ALREADY_EXISTS.
+  string connection_id = 7;
+
+  // Optional scope owner for tenant isolation. Values: "platform",
+  // "tenant:<id>". When set, operations referencing this connection must carry
+  // a principal whose scope attribute matches (exact string equality);
+  // mismatch -> PermissionDenied. When unset, the connection is
+  // platform-scoped (no check).
+  optional string scope_owner = 8;
+}
+
+message CreateHsmConnectionResponse {
+  HsmConnectionMetadata metadata = 1;
+}
+
+message GetHsmConnectionRequest {
+  string connection_id = 1;
+}
+
+message GetHsmConnectionResponse {
+  HsmConnectionMetadata metadata = 1;
+}
+
+message ListHsmConnectionsRequest {
+  uint32 max_results = 1;
+  string cursor = 2;
+  // Optional filter: return only connections with this scope_owner value.
+  optional string scope_owner = 3;
+}
+
+message ListHsmConnectionsResponse {
+  repeated HsmConnectionMetadata connections = 1;
+  string next_cursor = 2;
+}
+
+message DeleteHsmConnectionRequest {
+  string connection_id = 1;
+}
+
+message DeleteHsmConnectionResponse {}
+
+message GetHsmConnectionStatusRequest {
+  string connection_id = 1;
+}
+
+message GetHsmConnectionStatusResponse {
+  string connection_id = 1;
+  HsmConnectionStatus status = 2;
+  optional google.protobuf.Timestamp last_check = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Namespaces
+// ═══════════════════════════════════════════════════════════════════
+
+message RegisterNamespaceRequest {
+  string name = 1;
+  string yaml_config = 2;
+}
+
+message RegisterNamespaceResponse {
+  string name = 1;
+}
+
+message ListNamespacesRequest {}
+
+message ListNamespacesResponse {
+  repeated string names = 1;
+}
+
+message DescribeNamespaceRequest {
+  string name = 1;
+}
+
+message DescribeNamespaceResponse {
+  string name = 1;
+  string yaml_config = 2;
+  uint32 max_depth = 3;
+  uint32 rule_count = 4;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Cooperative rotation jobs
+// ═══════════════════════════════════════════════════════════════════
+
+enum RotationJobState {
+  ROTATION_JOB_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  ACKNOWLEDGED = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+  EXPIRED = 5;
+}
+
+message RotationJobMetadata {
+  string job_id = 1;
+  // LID of the parent key whose rotation triggered this job.
+  string key_id = 2;
+  uint32 from_version = 3;
+  uint32 to_version = 4;
+  RotationJobState state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  optional string failure_reason = 8;
+  // LID of the dependent key that must re-wrap in response to the parent
+  // rotation. This is the key a cooperating consumer acts on.
+  string dependent_key_id = 9;
+}
+
+message ListRotationJobsRequest {
+  optional RotationJobState state_filter = 1;
+  optional string key_id = 2;
+  uint32 max_results = 3;
+  string cursor = 4;
+}
+
+message ListRotationJobsResponse {
+  repeated RotationJobMetadata jobs = 1;
+  string next_cursor = 2;
+}
+
+message AcknowledgeRotationJobRequest {
+  string job_id = 1;
+}
+
+message AcknowledgeRotationJobResponse {
+  RotationJobMetadata job = 1;
+}
+
+message CompleteRotationJobRequest {
+  string job_id = 1;
+}
+
+message CompleteRotationJobResponse {
+  RotationJobMetadata job = 1;
+}
+
+message FailRotationJobRequest {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message FailRotationJobResponse {
+  RotationJobMetadata job = 1;
+}
