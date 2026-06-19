@@ -4,6 +4,21 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-19
+
+Security patch: the REST API now fails closed on authentication errors.
+
+### Security
+
+- **REST authentication fails closed.** On an authn error (missing / invalid /
+  expired bootstrap token or JWT) the REST surface previously downgraded the
+  caller to the `keyrack:anonymous` principal (fail-**open**); it now rejects with
+  `401 Unauthorized` and a structured `{"error":"Unauthenticated", ...}` body,
+  matching the gRPC surface (which already failed closed). Deployments with no
+  authentication configured (insecure mode) are unaffected. Added in-process,
+  docker-free mTLS identity integration tests (valid client cert → principal
+  reaches PDP/audit; no cert → reject; untrusted CA → TLS-layer reject).
+
 ## [0.3.0] — 2026-06-17
 
 Provider-resolution hardening and HSM connection governance for multi-tenant

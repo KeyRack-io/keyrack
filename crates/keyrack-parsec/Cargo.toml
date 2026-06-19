@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-parsec"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Parsec-backed CryptoProvider for KeyRack — hardware security via TPM, PKCS#11, PSA Crypto"

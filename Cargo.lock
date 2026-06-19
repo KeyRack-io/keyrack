@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2596,7 +2596,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-aws-common"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2605,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-aws-proxy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-cedar-pdp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum 0.7.9",
  "cedar-policy",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-e2e"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-kmip"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-nats"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-parsec"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "keyrack-core",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-pii"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "proptest",
@@ -2785,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-pkcs11"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "cryptoki",
@@ -2800,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-postgres"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-service"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-sqlite"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-test-support"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "keyrack-core",
@@ -2888,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-vault"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "keyrack-wasm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "getrandom 0.2.17",
  "js-sys",
