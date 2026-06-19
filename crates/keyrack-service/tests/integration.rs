@@ -3205,3 +3205,390 @@ async fn rest_scope_mismatch_denies_create_key() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// REST AUTHN FAIL-CLOSED TESTS
+// ═══════════════════════════════════════════════════════════════════
+//
+// These tests prove that REST handlers reject (401) when authn is
+// configured and the caller presents missing/invalid credentials,
+// rather than silently downgrading to `keyrack:anonymous`.
+
+/// Authenticator that always rejects — simulates a configured authn
+/// (JWT/bootstrap-token) that finds no valid credential.
+struct RejectingAuthenticator;
+
+#[async_trait::async_trait]
+impl keyrack_core::authn::Authenticator for RejectingAuthenticator {
+    async fn authenticate(
+        &self,
+        _metadata: &keyrack_core::authn::RequestMetadata,
+    ) -> Result<Option<keyrack_core::authn::AuthnResult>, keyrack_core::authn::AuthnError> {
+        Err(keyrack_core::authn::AuthnError::NoCredential)
+    }
+}
+
+/// Authenticator that rejects with `InvalidCredential` — simulates a
+/// bad/expired token.
+struct InvalidCredentialAuthenticator;
+
+#[async_trait::async_trait]
+impl keyrack_core::authn::Authenticator for InvalidCredentialAuthenticator {
+    async fn authenticate(
+        &self,
+        _metadata: &keyrack_core::authn::RequestMetadata,
+    ) -> Result<Option<keyrack_core::authn::AuthnResult>, keyrack_core::authn::AuthnError> {
+        Err(keyrack_core::authn::AuthnError::InvalidCredential(
+            "expired token".into(),
+        ))
+    }
+}
+
+/// Build a `ServiceState` wired to a `RejectingAuthenticator`.
+fn build_rejecting_authn_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(RejectingAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    (state, audit)
+}
+
+/// Build a `ServiceState` wired to an `InvalidCredentialAuthenticator`.
+fn build_invalid_cred_authn_state() -> Arc<ServiceState> {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(InvalidCredentialAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn AuditSink> = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    })
+}
+
+/// REST: missing credential → 401 on `CreateKey`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_create_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, audit) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({ "key_spec": "AES_256" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(audit.event_count(), 0, "no audit event on authn rejection");
+}
+
+/// REST: invalid credential → 401 on `CreateKey`.
+#[tokio::test]
+async fn rest_authn_reject_invalid_credential_create_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let state = build_invalid_cred_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({ "key_spec": "AES_256" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `ListKeys`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_list_keys() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/keys")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `GetKey`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_get_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/keys/some-key-id")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `Encrypt`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_encrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "plaintext": base64::engine::general_purpose::STANDARD.encode(b"secret"),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/some-key/actions-encrypt")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `Decrypt`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_decrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "ciphertext_blob": base64::engine::general_purpose::STANDARD.encode(b"fake"),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/some-key/actions-decrypt")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `RotateKey`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_rotate_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/some-key/actions-rotate")
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on `Sign`.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_sign() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/some-key/actions-sign")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: missing credential → 401 on aliases.
+#[tokio::test]
+async fn rest_authn_reject_no_credential_create_alias() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "alias_name": "test-alias",
+        "target_key_id": "some-key",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/aliases")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// REST: valid credential (`InsecureAuthenticator`) → principal reaches
+/// PDP + audit with correct identity (not anonymous-fallback).
+#[tokio::test]
+async fn rest_authn_valid_credential_reaches_pdp_and_audit() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, pdp, audit) = build_test_state();
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({ "key_spec": "AES_256", "description": "authn test" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+
+    assert!(pdp.count() >= 1, "PDP was consulted");
+    let events = audit.events();
+    assert!(!events.is_empty(), "audit events emitted");
+    assert_eq!(
+        events[0].principal.id, "keyrack:anonymous",
+        "InsecureAuthenticator principal reaches audit"
+    );
+}
+
+/// REST: 401 response body includes structured error JSON.
+#[tokio::test]
+async fn rest_authn_reject_response_body_is_json() {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({ "key_spec": "AES_256" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json["error"], "Unauthenticated");
+    assert!(body_json["message"]
+        .as_str()
+        .unwrap()
+        .contains("authentication failed"),);
+}
+
+/// gRPC: missing credential → Unauthenticated (confirms gRPC was
+/// already fail-closed, for parity).
+#[tokio::test]
+async fn grpc_authn_reject_no_credential() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(RejectingAuthenticator),
+    ]));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn AuditSink> = Arc::new(CapturingSink::new());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let result = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256 as i32,
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+}

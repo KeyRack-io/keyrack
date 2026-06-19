@@ -246,7 +246,7 @@ async fn create_key(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -392,7 +392,7 @@ async fn get_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::GetKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -409,7 +409,7 @@ async fn describe_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::DescribeKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -427,7 +427,7 @@ async fn update_key(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::UpdateKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -453,7 +453,7 @@ async fn list_keys(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
     op_ctx.resource_type = "Key".into();
     op_ctx.request_id = request_id;
@@ -484,7 +484,7 @@ async fn enable_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::EnableKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -509,7 +509,7 @@ async fn disable_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::DisableKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -535,7 +535,7 @@ async fn schedule_key_deletion(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -569,7 +569,7 @@ async fn cancel_key_deletion(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -602,7 +602,7 @@ async fn report_key_compromise(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::ReportKeyCompromise, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -636,7 +636,7 @@ async fn rotate_key(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -696,7 +696,7 @@ async fn encrypt(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -788,7 +788,7 @@ async fn decrypt(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -891,7 +891,7 @@ async fn sign(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -974,7 +974,7 @@ async fn verify(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -1117,7 +1117,7 @@ async fn generate_mac(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -1181,7 +1181,7 @@ async fn verify_mac(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
         keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -1246,7 +1246,7 @@ async fn generate_data_key(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -1326,7 +1326,7 @@ async fn re_encrypt(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let dst_key_id = body
         .get("destination_key_id")
         .and_then(|v| v.as_str())
@@ -1460,7 +1460,7 @@ async fn generate_random(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::resource(AuditAction::GenerateRandom, principal, "", "System");
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -1491,7 +1491,7 @@ async fn list_resource_tags(
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::ListResourceTags, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -1514,7 +1514,7 @@ async fn tag_resource(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::TagResource, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -1549,7 +1549,7 @@ async fn untag_resource(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::UntagResource, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
@@ -1582,7 +1582,7 @@ async fn create_alias(
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let alias_name = body
         .get("alias_name")
         .and_then(|v| v.as_str())
@@ -1619,7 +1619,7 @@ async fn list_aliases(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::alias(AuditAction::ListAliases, principal, "");
     op_ctx.request_id = request_id;
     ops::execute_rest(
@@ -1639,7 +1639,7 @@ async fn delete_alias(
     Path(alias_name): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
-    let principal = ops::extract_principal_rest(&state, &headers).await;
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::alias(AuditAction::DeleteAlias, principal, &alias_name);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
