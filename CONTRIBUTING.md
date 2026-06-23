@@ -43,6 +43,15 @@ For large changes, open an issue first to discuss the approach.
 - Docker (for E2E tests)
 - Optional: SoftHSM2 (for PKCS#11 tests)
 
+### Git hooks
+
+Install the project's pre-commit hook (blocks commits that introduce forbidden
+partner references into the FOSS tree):
+
+```bash
+./scripts/install-hooks.sh
+```
+
 ### Building
 
 ```bash

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# FOSS partner-name pre-commit guard.
+#
+# Fails the commit if any ADDED line in the staged diff contains the
+# forbidden partner name (case-insensitive). Removals are allowed.
+#
+# The pattern is constructed from fragments so this file itself does not
+# contain the literal string and will not self-match.
+
+FORBIDDEN="$(printf '%s' 'Sov' 'erita')"
+
+ADDED_MATCHES=$(git diff --cached | grep '^+' | grep -i "$FORBIDDEN" || true)
+
+if [ -n "$ADDED_MATCHES" ]; then
+  echo "BLOCKED: staged changes introduce the forbidden partner name."
+  echo ""
+  echo "FOSS repos must not reference the partner — use neutral wording"
+  echo "(e.g. 'design partner', 'an integrator')."
+  echo ""
+  echo "Offending added lines:"
+  echo "$ADDED_MATCHES"
+  exit 1
+fi

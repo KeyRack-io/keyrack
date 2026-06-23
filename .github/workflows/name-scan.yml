@@ -1,0 +1,37 @@
+name: FOSS name scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  name-scan:
+    name: Partner-name scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan working tree for forbidden partner name
+        run: |
+          # Construct the pattern from fragments so this workflow file
+          # does not contain the literal string and will not self-match.
+          FORBIDDEN="$(printf '%s' 'Sov' 'erita')"
+
+          MATCHES=$(grep -rni "$FORBIDDEN" --exclude-dir=.git --exclude-dir=target . 2>/dev/null || true)
+          if [ -n "$MATCHES" ]; then
+            echo "ERROR: forbidden partner name found in the working tree."
+            echo ""
+            echo "FOSS repos must not reference the partner — use neutral"
+            echo "wording (e.g. 'design partner', 'an integrator')."
+            echo ""
+            echo "Matches:"
+            echo "$MATCHES"
+            exit 1
+          fi
+
+          echo "Clean — no forbidden partner name found."
