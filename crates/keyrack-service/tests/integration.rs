@@ -3879,3 +3879,170 @@ async fn mtls_untrusted_ca_tls_rejected() {
 
     server_handle.abort();
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// ROUTING EXPLAIN (read-only dry-run)
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn explain_routing_returns_routed_for_matching_attributes() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_service::routing::ProviderRouter;
+    use std::collections::BTreeMap;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_acme = Arc::new(InMemoryProvider::new());
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("acme-hsm"),
+            ProviderEntry {
+                provider: prov_acme,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry =
+        Arc::new(DynamicProviderRegistry::new(entries, ProviderRef::new("default")).unwrap());
+    let provider_router = ProviderRouter::new(
+        vec![(
+            BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
+            ProviderRef::new("acme-hsm"),
+        )],
+        ProviderRef::new("default"),
+    );
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn keyrack_core::audit::AuditSink> = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+    let state = Arc::new(ServiceState {
+        storage: storage.clone(),
+        providers: registry,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Call ExplainRouting with matching tenant=acme.
+    let resp = svc
+        .explain_routing(Request::new(proto::ExplainRoutingRequest {
+            attributes: [("tenant".to_string(), "acme".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: None,
+            backend_id: None,
+            hsm_connection_id: None,
+        }))
+        .await
+        .expect("ExplainRouting should succeed");
+
+    let inner = resp.into_inner();
+    assert_eq!(inner.outcome, proto::RoutingOutcome::Routed as i32);
+    assert_eq!(inner.selected_backend_id, "acme-hsm");
+    assert_eq!(inner.matched_rule_index, 0);
+    assert!(inner.deny_reason.is_empty());
+    assert!(inner.policy_configured);
+
+    // CRITICAL: verify that NO key was created (the store is empty).
+    use keyrack_core::storage::StorageBackend;
+    let page = storage
+        .list_keys(&keyrack_core::storage::KeyFilter::default())
+        .await
+        .expect("list_keys");
+    assert!(
+        page.items.is_empty(),
+        "ExplainRouting must not create any keys; found {} key(s)",
+        page.items.len()
+    );
+}
+
+#[tokio::test]
+async fn explain_routing_returns_deny_and_creates_no_key() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_service::routing::ProviderRouter;
+    use std::collections::BTreeMap;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let entries = vec![(
+        ProviderRef::new("default"),
+        ProviderEntry {
+            provider: prov_default,
+            class: ProviderClass::InMemory,
+        },
+    )];
+    let registry =
+        Arc::new(DynamicProviderRegistry::new(entries, ProviderRef::new("default")).unwrap());
+    let provider_router = ProviderRouter::new(
+        vec![(
+            BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
+            ProviderRef::new("default"),
+        )],
+        ProviderRef::new("default"),
+    );
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit: Arc<dyn keyrack_core::audit::AuditSink> = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+    let state = Arc::new(ServiceState {
+        storage: storage.clone(),
+        providers: registry,
+        provider_router,
+        pdp,
+        audit,
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Call ExplainRouting requesting a non-existent backend (default-deny).
+    let resp = svc
+        .explain_routing(Request::new(proto::ExplainRoutingRequest {
+            attributes: std::collections::HashMap::new(),
+            namespace: None,
+            backend_id: Some("nonexistent".to_string()),
+            hsm_connection_id: None,
+        }))
+        .await
+        .expect("ExplainRouting should succeed even for denials");
+
+    let inner = resp.into_inner();
+    assert_eq!(inner.outcome, proto::RoutingOutcome::Denied as i32);
+    assert!(inner.selected_backend_id.is_empty());
+    assert!(!inner.deny_reason.is_empty());
+
+    // CRITICAL: no key created.
+    use keyrack_core::storage::StorageBackend;
+    let page = storage
+        .list_keys(&keyrack_core::storage::KeyFilter::default())
+        .await
+        .expect("list_keys");
+    assert!(
+        page.items.is_empty(),
+        "ExplainRouting DENY must not create any keys"
+    );
+}

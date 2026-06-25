@@ -168,6 +168,8 @@ pub fn router(state: AppState) -> Router {
         // ── Aliases ─────────────────────────────────────────
         .route("/v1/aliases", get(list_aliases).post(create_alias))
         .route("/v1/aliases/:alias_name", delete(delete_alias))
+        // ── Routing explain (read-only dry-run) ───────────────
+        .route("/v1/routing/explain", post(explain_routing))
         // ── Health / ops ────────────────────────────────────
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -1701,6 +1703,72 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.metrics_handle.render()
+}
+
+// ── Routing explain (read-only dry-run) ─────────────────────────────
+
+async fn explain_routing(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    let _principal = ops::extract_principal_rest(&state, &headers).await?;
+
+    let mut caller_attrs: std::collections::BTreeMap<String, String> = body
+        .get("attributes")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let requested_provider = caller_attrs.remove("keyrack.provider");
+    caller_attrs.remove("backend_id");
+    let namespace = body
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !namespace.is_empty() {
+        caller_attrs.insert("namespace".to_string(), namespace);
+    }
+
+    let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs);
+
+    let hsm_connection_id = body
+        .get("hsm_connection_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let backend_id = body
+        .get("backend_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    let result = crate::domain::explain_routing(
+        &state.provider_router,
+        &state.providers,
+        &identity_tags,
+        requested_provider.as_deref(),
+        hsm_connection_id,
+        backend_id,
+    );
+
+    let outcome_str = match result.outcome {
+        crate::domain::ExplainOutcome::Routed => "ROUTED",
+        crate::domain::ExplainOutcome::Delegated => "DELEGATED",
+        crate::domain::ExplainOutcome::Default => "DEFAULT",
+        crate::domain::ExplainOutcome::Denied => "DENIED",
+        crate::domain::ExplainOutcome::Clash => "CLASH",
+    };
+
+    Ok(Json(serde_json::json!({
+        "outcome": outcome_str,
+        "selected_backend_id": result.selected_backend_id,
+        "matched_rule_index": result.matched_rule_index,
+        "deny_reason": result.deny_reason,
+        "policy_configured": result.policy_configured,
+    })))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

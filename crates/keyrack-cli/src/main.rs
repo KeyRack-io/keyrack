@@ -28,6 +28,7 @@ mod audit;
 mod lint;
 mod migrate;
 mod provision;
+mod routing;
 
 use clap::{Parser, Subcommand};
 
@@ -58,6 +59,9 @@ enum Commands {
 
     /// Audit log verification and analysis.
     Audit(audit::AuditArgs),
+
+    /// Provider routing inspection and dry-run.
+    Routing(routing::RoutingArgs),
 }
 
 #[tokio::main]
@@ -78,5 +82,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Admin(args) => admin::run(args).await,
         Commands::Migrate(args) => migrate::run(args).await,
         Commands::Audit(args) => audit::run(args),
+        Commands::Routing(args) => routing::run(args).await,
     }
 }

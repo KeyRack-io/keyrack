@@ -151,6 +151,26 @@ impl ProviderRouter {
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }
+
+    /// Like [`Self::evaluate`] but also returns the 0-based index of the
+    /// matched rule (or `None` when no rule matched → Default).
+    pub fn evaluate_with_index(&self, tags: &IdentityTags) -> (RouteOutcome, Option<usize>) {
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule
+                .match_tags
+                .iter()
+                .all(|(k, v)| tags.get(k) == Some(v.as_str()))
+            {
+                let outcome = match &rule.action {
+                    RuleAction::Route(provider) => RouteOutcome::Pinned(provider.clone()),
+                    RuleAction::Delegate(set) => RouteOutcome::Delegated(set.clone()),
+                    RuleAction::DelegateAny => RouteOutcome::DelegatedAny,
+                };
+                return (outcome, Some(idx));
+            }
+        }
+        (RouteOutcome::Default(self.default.clone()), None)
+    }
 }
 
 #[cfg(test)]

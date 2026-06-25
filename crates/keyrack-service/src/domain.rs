@@ -384,6 +384,111 @@ pub fn resolve_create_provider(
     Ok(resolved)
 }
 
+// ── Routing explain (read-only dry-run) ─────────────────────────────
+
+/// The outcome of a routing explain (dry-run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplainOutcome {
+    /// A route rule pinned the provider.
+    Routed,
+    /// A delegate rule authorized caller selection.
+    Delegated,
+    /// No rule matched; the default provider was used.
+    Default,
+    /// Resolution would be denied (fail-closed).
+    Denied,
+    /// The inputs conflict (`backend_id` vs `hsm_connection_id`, or assertion mismatch).
+    Clash,
+}
+
+/// Full result of a routing dry-run / explain.
+#[derive(Debug, Clone)]
+pub struct ExplainResult {
+    pub outcome: ExplainOutcome,
+    /// The selected `backend_id` (empty when denied or clash).
+    pub selected_backend_id: String,
+    /// 0-based index of the matched routing rule, or -1 when no rule matched.
+    pub matched_rule_index: i32,
+    /// Human-readable deny/clash reason (empty on success).
+    pub deny_reason: String,
+    /// Whether routing rules are configured.
+    pub policy_configured: bool,
+}
+
+/// Read-only dry-run of provider resolution. Uses the SAME logic as
+/// [`resolve_create_provider`] so the explanation cannot drift from reality.
+/// Denials and clashes are reported as successful results (not errors).
+pub fn explain_routing(
+    router: &keyrack_core::routing::ProviderRouter,
+    providers: &Arc<dyn keyrack_core::registry::ProviderRegistry>,
+    identity_tags: &keyrack_core::tags::IdentityTags,
+    requested_provider: Option<&str>,
+    hsm_connection_id: Option<&str>,
+    backend_id: Option<&str>,
+) -> ExplainResult {
+    let policy_configured = router.has_rules();
+
+    // Try the real resolution. On success we know the outcome; on error
+    // we inspect the error to classify as DENIED or CLASH.
+    match resolve_create_provider(
+        router,
+        providers,
+        identity_tags,
+        requested_provider,
+        hsm_connection_id,
+        backend_id,
+    ) {
+        Ok(resolved) => {
+            let (_, rule_index) = router.evaluate_with_index(identity_tags);
+            let outcome = match rule_index {
+                Some(_) => {
+                    use keyrack_core::routing::RouteOutcome;
+                    let (raw_outcome, _) = router.evaluate_with_index(identity_tags);
+                    match raw_outcome {
+                        RouteOutcome::Pinned(_) => ExplainOutcome::Routed,
+                        RouteOutcome::Delegated(_) | RouteOutcome::DelegatedAny => {
+                            ExplainOutcome::Delegated
+                        }
+                        RouteOutcome::Default(_) => ExplainOutcome::Default,
+                    }
+                }
+                None => ExplainOutcome::Default,
+            };
+            ExplainResult {
+                outcome,
+                selected_backend_id: resolved.as_str().to_string(),
+                matched_rule_index: rule_index.map_or(-1, |i| i as i32),
+                deny_reason: String::new(),
+                policy_configured,
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let (_, rule_index) = router.evaluate_with_index(identity_tags);
+
+            // Classify: clash vs deny.
+            let is_clash = msg.contains("disagree")
+                || msg.contains("but backend_id")
+                || msg.contains("but route pin")
+                || (msg.contains("requested provider") && msg.contains("selected"));
+
+            let outcome = if is_clash {
+                ExplainOutcome::Clash
+            } else {
+                ExplainOutcome::Denied
+            };
+
+            ExplainResult {
+                outcome,
+                selected_backend_id: String::new(),
+                matched_rule_index: rule_index.map_or(-1, |i| i as i32),
+                deny_reason: msg,
+                policy_configured,
+            }
+        }
+    }
+}
+
 /// Enforce `scope_owner` on a resolved backend (ADR-0001 A1.4).
 ///
 /// If the resolved `provider_name` corresponds to a persisted HSM connection
@@ -2329,5 +2434,187 @@ mod resolve_tests {
             err.to_string().contains("not a registered provider"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::provider::inmem::InMemoryProvider;
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
+    use keyrack_core::routing::ProviderRouter;
+    use keyrack_core::tags::IdentityTags;
+    use std::collections::BTreeMap;
+
+    fn entry() -> ProviderEntry {
+        ProviderEntry {
+            provider: Arc::new(InMemoryProvider::new()),
+            class: ProviderClass::InMemory,
+        }
+    }
+
+    fn registry() -> Arc<dyn ProviderRegistry> {
+        Arc::new(
+            DynamicProviderRegistry::new(
+                [
+                    (ProviderRef::new("shared"), entry()),
+                    (ProviderRef::new("tenant-acme"), entry()),
+                    (ProviderRef::new("conn-1"), entry()),
+                ],
+                ProviderRef::new("shared"),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn router() -> ProviderRouter {
+        ProviderRouter::new(
+            vec![(
+                BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
+                ProviderRef::new("tenant-acme"),
+            )],
+            ProviderRef::new("shared"),
+        )
+    }
+
+    fn no_rules_router() -> ProviderRouter {
+        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+    }
+
+    fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        IdentityTags::from_map(map)
+    }
+
+    #[test]
+    fn explain_returns_routed_for_matching_rule() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[("tenant", "acme")]),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Routed);
+        assert_eq!(result.selected_backend_id, "tenant-acme");
+        assert_eq!(result.matched_rule_index, 0);
+        assert!(result.deny_reason.is_empty());
+        assert!(result.policy_configured);
+    }
+
+    #[test]
+    fn explain_returns_default_when_no_rule_matches() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[("env", "staging")]),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Default);
+        assert_eq!(result.selected_backend_id, "shared");
+        assert_eq!(result.matched_rule_index, -1);
+        assert!(result.deny_reason.is_empty());
+        assert!(result.policy_configured);
+    }
+
+    #[test]
+    fn explain_returns_clash_when_backend_id_conflicts_with_hsm_connection_id() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            Some("conn-1"),
+            Some("shared"),
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Clash);
+        assert!(result.selected_backend_id.is_empty());
+        assert!(result.deny_reason.contains("disagree"));
+    }
+
+    #[test]
+    fn explain_returns_deny_under_default_deny() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            Some("conn-1"),
+            None,
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Denied);
+        assert!(result.selected_backend_id.is_empty());
+        assert!(result.deny_reason.contains("not authorized"));
+        assert!(result.policy_configured);
+    }
+
+    #[test]
+    fn explain_returns_deny_for_unregistered_backend() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            None,
+            Some("nonexistent"),
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Denied);
+        assert!(result.selected_backend_id.is_empty());
+        assert!(result.deny_reason.contains("not a registered provider"));
+    }
+
+    #[test]
+    fn explain_returns_clash_when_assertion_disagrees_with_routing() {
+        let result = explain_routing(
+            &router(),
+            &registry(),
+            &tags(&[("tenant", "acme")]),
+            Some("shared"),
+            None,
+            None,
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Clash);
+        assert!(result.selected_backend_id.is_empty());
+        assert!(result
+            .deny_reason
+            .contains("route pin selected 'tenant-acme'"));
+    }
+
+    #[test]
+    fn explain_no_policy_returns_default_without_deny() {
+        let result = explain_routing(
+            &no_rules_router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Default);
+        assert_eq!(result.selected_backend_id, "shared");
+        assert_eq!(result.matched_rule_index, -1);
+        assert!(!result.policy_configured);
+    }
+
+    #[test]
+    fn explain_no_policy_backend_id_selects_freely() {
+        let result = explain_routing(
+            &no_rules_router(),
+            &registry(),
+            &tags(&[]),
+            None,
+            None,
+            Some("conn-1"),
+        );
+        assert_eq!(result.outcome, ExplainOutcome::Default);
+        assert_eq!(result.selected_backend_id, "conn-1");
+        assert!(!result.policy_configured);
     }
 }

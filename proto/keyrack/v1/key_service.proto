@@ -88,6 +88,10 @@ service KeyService {
   rpc AcknowledgeRotationJob(AcknowledgeRotationJobRequest) returns (AcknowledgeRotationJobResponse);
   rpc CompleteRotationJob(CompleteRotationJobRequest) returns (CompleteRotationJobResponse);
   rpc FailRotationJob(FailRotationJobRequest) returns (FailRotationJobResponse);
+
+  // ── Routing explain (read-only dry-run) ─────────────────────────────
+
+  rpc ExplainRouting(ExplainRoutingRequest) returns (ExplainRoutingResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -837,3 +841,53 @@ message FailRotationJobRequest {
 message FailRotationJobResponse {
   RotationJobMetadata job = 1;
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Routing explain (read-only dry-run)
+// ═══════════════════════════════════════════════════════════════════
+
+// Previews how a set of routing-relevant inputs resolves to a backend
+// WITHOUT creating a key or any other side effect. Uses the same
+// resolve_create_provider path as CreateKey so the explanation cannot
+// drift from reality.
+message ExplainRoutingRequest {
+  // Key attributes (identity tags for routing rule matching).
+  map<string, string> attributes = 1;
+  // Optional namespace (folded into identity tags as "namespace" tag).
+  optional string namespace = 2;
+  // Explicit backend selector (the unified backend_id field).
+  optional string backend_id = 3;
+  // Deprecated alias for backend_id; if both set they must agree.
+  optional string hsm_connection_id = 4;
+}
+
+// The resolution outcome — always returned (denials are reported here,
+// not as RPC errors).
+enum RoutingOutcome {
+  ROUTING_OUTCOME_UNSPECIFIED = 0;
+  // A routing rule pinned the provider (route action).
+  ROUTED = 1;
+  // A delegate rule authorized caller selection.
+  DELEGATED = 2;
+  // No rule matched; the default provider was used.
+  DEFAULT = 3;
+  // Resolution would be DENIED (fail-closed).
+  DENIED = 4;
+  // The backend_id / hsm_connection_id / keyrack.provider inputs conflict.
+  CLASH = 5;
+}
+
+message ExplainRoutingResponse {
+  // The outcome category of the resolution.
+  RoutingOutcome outcome = 1;
+  // The selected backend_id (empty when outcome is DENIED or CLASH).
+  string selected_backend_id = 2;
+  // Which rule matched: 0-based index into the operator routing table,
+  // or -1 when no rule matched (DEFAULT / DENIED / CLASH).
+  int32 matched_rule_index = 3;
+  // Human-readable deny reason (non-empty only for DENIED / CLASH).
+  string deny_reason = 4;
+  // Whether routing rules are configured (affects default-deny behavior).
+  bool policy_configured = 5;
+}
+

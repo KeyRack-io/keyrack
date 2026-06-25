@@ -2590,6 +2590,52 @@ impl KeyService for KeyServiceImpl {
         })
         .await
     }
+
+    // ── Routing explain (read-only dry-run) ──────────────────────────
+
+    async fn explain_routing(
+        &self,
+        request: Request<proto::ExplainRoutingRequest>,
+    ) -> Result<Response<proto::ExplainRoutingResponse>, Status> {
+        let _principal = self.principal(&request).await?;
+        let req = request.into_inner();
+
+        let mut caller_attrs: std::collections::BTreeMap<String, String> =
+            req.attributes.into_iter().collect();
+        let requested_provider = caller_attrs.remove("keyrack.provider");
+        caller_attrs.remove("backend_id");
+        let namespace = req.namespace.unwrap_or_default();
+        if !namespace.is_empty() {
+            caller_attrs.insert("namespace".to_string(), namespace);
+        }
+
+        let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs);
+
+        let result = crate::domain::explain_routing(
+            &self.state.provider_router,
+            &self.state.providers,
+            &identity_tags,
+            requested_provider.as_deref(),
+            req.hsm_connection_id.as_deref(),
+            req.backend_id.as_deref(),
+        );
+
+        let outcome = match result.outcome {
+            crate::domain::ExplainOutcome::Routed => proto::RoutingOutcome::Routed,
+            crate::domain::ExplainOutcome::Delegated => proto::RoutingOutcome::Delegated,
+            crate::domain::ExplainOutcome::Default => proto::RoutingOutcome::Default,
+            crate::domain::ExplainOutcome::Denied => proto::RoutingOutcome::Denied,
+            crate::domain::ExplainOutcome::Clash => proto::RoutingOutcome::Clash,
+        };
+
+        Ok(Response::new(proto::ExplainRoutingResponse {
+            outcome: outcome.into(),
+            selected_backend_id: result.selected_backend_id,
+            matched_rule_index: result.matched_rule_index,
+            deny_reason: result.deny_reason,
+            policy_configured: result.policy_configured,
+        }))
+    }
 }
 
 #[cfg(feature = "crypto-endpoints")]
