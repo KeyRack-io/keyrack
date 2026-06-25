@@ -3888,6 +3888,7 @@ async fn mtls_untrusted_ca_tls_rejected() {
 async fn explain_routing_returns_routed_for_matching_attributes() {
     use keyrack_core::key::{ProviderClass, ProviderRef};
     use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::storage::StorageBackend;
     use keyrack_service::routing::ProviderRouter;
     use std::collections::BTreeMap;
 
@@ -3961,7 +3962,6 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
     assert!(inner.policy_configured);
 
     // CRITICAL: verify that NO key was created (the store is empty).
-    use keyrack_core::storage::StorageBackend;
     let page = storage
         .list_keys(&keyrack_core::storage::KeyFilter::default())
         .await
@@ -3977,6 +3977,7 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
 async fn explain_routing_returns_deny_and_creates_no_key() {
     use keyrack_core::key::{ProviderClass, ProviderRef};
     use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::storage::StorageBackend;
     use keyrack_service::routing::ProviderRouter;
     use std::collections::BTreeMap;
 
@@ -4036,7 +4037,6 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
     assert!(!inner.deny_reason.is_empty());
 
     // CRITICAL: no key created.
-    use keyrack_core::storage::StorageBackend;
     let page = storage
         .list_keys(&keyrack_core::storage::KeyFilter::default())
         .await
