@@ -4046,3 +4046,347 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
         "ExplainRouting DENY must not create any keys"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// RESIDUAL 0.3.x TEST-DEBT — THREE MISSING TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Test #1: scope_owner_check audit event result=error ───────────
+//
+// The 3-outcome model (ADR-0001 §5.1 / Amendment 1 A1.4): success,
+// denied, ERROR. The error path fires when storage.get_hsm_connection
+// returns a genuine failure (not "not found"). Existing tests cover
+// success + denied; this covers the error path.
+
+/// Storage wrapper that delegates to a real backend but injects a
+/// non-"not found" error for `get_hsm_connection` on a specific id.
+struct FailingHsmLookupStorage {
+    inner: Arc<dyn keyrack_core::storage::StorageBackend>,
+    fail_on: String,
+}
+
+#[async_trait::async_trait]
+impl keyrack_core::storage::StorageBackend for FailingHsmLookupStorage {
+    async fn create_key(
+        &self,
+        r: &keyrack_core::key::KeyRecord,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.create_key(r).await
+    }
+    async fn get_key(
+        &self,
+        lid: &keyrack_core::lid::Lid,
+    ) -> keyrack_core::error::Result<keyrack_core::key::KeyRecord> {
+        self.inner.get_key(lid).await
+    }
+    async fn update_key(
+        &self,
+        r: &keyrack_core::key::KeyRecord,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.update_key(r).await
+    }
+    async fn list_keys(
+        &self,
+        f: &keyrack_core::storage::KeyFilter,
+    ) -> keyrack_core::error::Result<keyrack_core::storage::Page<keyrack_core::key::KeyRecord>>
+    {
+        self.inner.list_keys(f).await
+    }
+    async fn list_children(
+        &self,
+        parent: &keyrack_core::lid::Lid,
+    ) -> keyrack_core::error::Result<Vec<keyrack_core::key::KeyRecord>> {
+        self.inner.list_children(parent).await
+    }
+    async fn create_alias(
+        &self,
+        alias: &keyrack_core::storage::AliasRecord,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.create_alias(alias).await
+    }
+    async fn resolve_alias(
+        &self,
+        name: &str,
+    ) -> keyrack_core::error::Result<keyrack_core::lid::Lid> {
+        self.inner.resolve_alias(name).await
+    }
+    async fn delete_alias(&self, name: &str) -> keyrack_core::error::Result<()> {
+        self.inner.delete_alias(name).await
+    }
+    async fn list_aliases(
+        &self,
+    ) -> keyrack_core::error::Result<Vec<keyrack_core::storage::AliasRecord>> {
+        self.inner.list_aliases().await
+    }
+    async fn create_hsm_connection(
+        &self,
+        conn: &keyrack_core::hsm::HsmConnection,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.create_hsm_connection(conn).await
+    }
+    async fn get_hsm_connection(
+        &self,
+        connection_id: &str,
+    ) -> keyrack_core::error::Result<keyrack_core::hsm::HsmConnection> {
+        if connection_id == self.fail_on {
+            return Err(keyrack_core::error::KeyRackError::Storage(
+                "simulated storage I/O failure".into(),
+            ));
+        }
+        self.inner.get_hsm_connection(connection_id).await
+    }
+    async fn update_hsm_connection(
+        &self,
+        conn: &keyrack_core::hsm::HsmConnection,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.update_hsm_connection(conn).await
+    }
+    async fn list_hsm_connections(
+        &self,
+    ) -> keyrack_core::error::Result<Vec<keyrack_core::hsm::HsmConnection>> {
+        self.inner.list_hsm_connections().await
+    }
+    async fn delete_hsm_connection(&self, connection_id: &str) -> keyrack_core::error::Result<()> {
+        self.inner.delete_hsm_connection(connection_id).await
+    }
+    async fn create_rotation_job(
+        &self,
+        job: &keyrack_core::rotation::RotationJob,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.create_rotation_job(job).await
+    }
+    async fn get_rotation_job(
+        &self,
+        job_id: &str,
+    ) -> keyrack_core::error::Result<keyrack_core::rotation::RotationJob> {
+        self.inner.get_rotation_job(job_id).await
+    }
+    async fn update_rotation_job(
+        &self,
+        job: &keyrack_core::rotation::RotationJob,
+    ) -> keyrack_core::error::Result<()> {
+        self.inner.update_rotation_job(job).await
+    }
+    async fn list_rotation_jobs(
+        &self,
+        state_filter: Option<keyrack_core::rotation::RotationJobState>,
+    ) -> keyrack_core::error::Result<Vec<keyrack_core::rotation::RotationJob>> {
+        self.inner.list_rotation_jobs(state_filter).await
+    }
+    async fn ping(&self) -> keyrack_core::error::Result<()> {
+        self.inner.ping().await
+    }
+}
+
+#[tokio::test]
+async fn scope_owner_check_emits_result_error_on_storage_failure() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::routing::ProviderRouter;
+    use keyrack_core::storage::StorageBackend as _;
+
+    let real_storage =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+
+    let failing_conn_id = "fail-storage-conn";
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(FailingHsmLookupStorage {
+            inner: real_storage.clone(),
+            fail_on: failing_conn_id.to_string(),
+        });
+
+    let prov_default = Arc::new(InMemoryProvider::new());
+    let prov_failing = Arc::new(InMemoryProvider::new());
+
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: prov_default,
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new(failing_conn_id),
+            ProviderEntry {
+                provider: prov_failing,
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
+    );
+
+    // No routing rules → backward-compat mode: backend_id free select.
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let audit = Arc::new(CapturingSink::new());
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(keyrack_core::authn::InsecureAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage: storage.clone(),
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    // Insert a key record directly in storage, bound to the failing
+    // connection — mirrors the pattern used in the existing scope tests.
+    let prov_failing_ref = ProviderRef::new(failing_conn_id);
+    let key_handle = state
+        .providers
+        .resolve(&prov_failing_ref)
+        .unwrap()
+        .provider
+        .generate_key(&keyrack_core::key::KeySpec::Aes256)
+        .await
+        .unwrap();
+    let (lid, attrs) = keyrack_service::domain::generate_key_lid();
+    let record = keyrack_core::key::KeyRecord {
+        lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 0,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: ProviderClass::InMemory,
+        provider_ref: Some(prov_failing_ref.clone()),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        scheduled_deletion_at: None,
+        description: String::new(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle,
+            provider_ref: Some(prov_failing_ref),
+            created_at: chrono::Utc::now(),
+            is_primary: true,
+        }],
+    };
+    real_storage.create_key(&record).await.unwrap();
+    let key_id = lid.to_string();
+
+    // Encrypt with this key: the scope_owner check will call
+    // get_hsm_connection("fail-storage-conn") → Storage error (not "not found")
+    // → error branch → emit audit result=error → FailedPrecondition.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+    let encrypt_err = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: b"test".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("encrypt must fail: scope_owner check hits a storage error");
+
+    // The operation must fail (fail-closed on storage error).
+    assert_eq!(
+        encrypt_err.code(),
+        tonic::Code::FailedPrecondition,
+        "storage error in scope check → FailedPrecondition, not a silent pass"
+    );
+    assert!(
+        encrypt_err
+            .message()
+            .contains("scope_owner check failed: storage error"),
+        "error message must identify the scope_owner check as the source: {}",
+        encrypt_err.message()
+    );
+
+    // The audit event must carry result=error (the 3rd outcome per ADR §5.1).
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check audit event must be emitted even on error"
+    );
+    let ev = scope_event.unwrap();
+    assert_eq!(
+        ev.result,
+        keyrack_core::audit::AuditResult::Error,
+        "audit result must be Error (3rd outcome), not Success or Denied"
+    );
+    assert_eq!(ev.resource.resource_type, "HsmConnection");
+    assert_eq!(ev.resource.id, failing_conn_id);
+}
+
+// ── Test #2: PKCS#11 registration-reject (fail-closed, not persisted) ──
+
+#[tokio::test]
+async fn pkcs11_registration_reject_fail_closed_not_persisted() {
+    let (state, audit) = build_routed_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    let err = svc
+        .create_hsm_connection(Request::new(proto::CreateHsmConnectionRequest {
+            provider_type: proto::HsmProviderType::Hsm.into(),
+            connection_id: "reject-test-conn".into(),
+            connection_config: Some(
+                proto::create_hsm_connection_request::ConnectionConfig::Pkcs11(
+                    proto::Pkcs11ConnectionConfig {
+                        lib_path: "/nonexistent/libsofthsm2.so".into(),
+                        token_label: "test-token".into(),
+                        pin_ref: "file:nonexistent-pin.pin".into(),
+                    },
+                ),
+            ),
+            ..Default::default()
+        }))
+        .await
+        .expect_err(
+            "CreateHsmConnection with unresolvable pin_ref must fail (ADR-0001 §3: fail-closed)",
+        );
+
+    // Must be FailedPrecondition — not Internal, not Ok (ADR-0001 §8.2).
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "invalid PKCS#11 config → FailedPrecondition (fail-closed construct): {}",
+        err.message()
+    );
+
+    // No connection record must be persisted (construct BEFORE persist; ADR-0001 §3).
+    let lookup = state.storage.get_hsm_connection("reject-test-conn").await;
+    assert!(
+        lookup.is_err(),
+        "rejected connection must NOT be persisted in storage"
+    );
+
+    // No provider must be registered in the live registry.
+    assert!(
+        !state
+            .providers
+            .contains(&keyrack_core::key::ProviderRef::new("reject-test-conn")),
+        "rejected connection must NOT be registered as a provider"
+    );
+
+    // Verify the audit trail captured the attempt. The ops::execute wrapper
+    // emits an HsmConnectionMutation event for the handler, even on failure.
+    let events = audit.events();
+    let has_connection_audit = events.iter().any(|e| {
+        e.event_type == keyrack_core::audit::EventType::SecretAccess
+            || e.event_type == keyrack_core::audit::EventType::HsmConnectionMutation
+    });
+    assert!(
+        has_connection_audit,
+        "failed registration attempt must still emit audit events"
+    );
+}

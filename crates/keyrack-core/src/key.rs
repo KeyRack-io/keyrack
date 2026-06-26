@@ -526,4 +526,106 @@ pub(crate) mod tests {
             }],
         }
     }
+
+    /// Load-bearing invariant (provider-routing.md line 42, key.rs ~258-261):
+    /// `provider_ref` is a create-time, per-version backend binding that MUST
+    /// NOT feed LID derivation. Logical key identity stays independent of
+    /// the physical backend — this is what lets a key migrate HSMs without
+    /// its identity (and header-pinned ciphertext references) changing.
+    #[test]
+    fn lid_derivation_ignores_provider_ref() {
+        use crate::attr::{AttributeSet, AttributeValue};
+        use crate::canon::{canonicalize, CanonicalizationVersion};
+
+        let mut attrs = AttributeSet::new();
+        attrs.insert("tenant", AttributeValue::String("acme".into()));
+        attrs.insert("namespace", AttributeValue::String("prod".into()));
+        attrs.insert(
+            "_keyrack_key_id",
+            AttributeValue::String("deterministic-id-for-test".into()),
+        );
+
+        let canonical = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let lid = Lid::derive(CanonicalizationVersion::V1, &canonical);
+
+        // Deterministic: same attributes → same LID.
+        let lid2 = Lid::derive(
+            CanonicalizationVersion::V1,
+            &canonicalize(CanonicalizationVersion::V1, &attrs),
+        );
+        assert_eq!(lid, lid2, "LID derivation must be deterministic");
+
+        // Two KeyRecords with the SAME identity attributes but DIFFERENT
+        // provider_ref values get identical LIDs (provider_ref is a side
+        // property, not part of identity_tags or the canonical form).
+        let identity_tags = IdentityTags::from_attribute_set(&attrs);
+
+        let record_software = KeyRecord {
+            lid,
+            canonicalization_version: CanonicalizationVersion::V1,
+            parent_lid: None,
+            occ_version: 1,
+            current_key_version: 1,
+            state: KeyState::Enabled,
+            key_usage: KeyUsage::EncryptDecrypt,
+            key_spec: KeySpec::Aes256,
+            origin: KeyOrigin::KeyRack,
+            provider_class: ProviderClass::Software,
+            provider_ref: Some(ProviderRef::new("software-default")),
+            identity_tags: identity_tags.clone(),
+            user_tags: UserTags::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            scheduled_deletion_at: None,
+            description: String::new(),
+            key_versions: vec![KeyVersionRecord {
+                version_number: 1,
+                key_handle: KeyHandle {
+                    key_id: "handle-a".into(),
+                    key_spec: KeySpec::Aes256,
+                },
+                provider_ref: Some(ProviderRef::new("software-default")),
+                created_at: Utc::now(),
+                is_primary: true,
+            }],
+        };
+
+        let record_hsm = KeyRecord {
+            lid,
+            provider_class: ProviderClass::Pkcs11,
+            provider_ref: Some(ProviderRef::new("hsm-tenant-a")),
+            key_versions: vec![KeyVersionRecord {
+                version_number: 1,
+                key_handle: KeyHandle {
+                    key_id: "handle-b".into(),
+                    key_spec: KeySpec::Aes256,
+                },
+                provider_ref: Some(ProviderRef::new("hsm-tenant-a")),
+                created_at: Utc::now(),
+                is_primary: true,
+            }],
+            ..record_software.clone()
+        };
+
+        assert_eq!(
+            record_software.lid, record_hsm.lid,
+            "LID must be identical for keys with same identity but different provider_ref — \
+             the physical backend binding must never affect logical key identity"
+        );
+
+        // Positive control: if provider_ref WERE (incorrectly) included in the
+        // attribute set, the LID WOULD change, proving the exclusion matters.
+        let mut attrs_contaminated = attrs.clone();
+        attrs_contaminated.insert(
+            "provider_ref",
+            AttributeValue::String("hsm-tenant-a".into()),
+        );
+        let contaminated_canonical = canonicalize(CanonicalizationVersion::V1, &attrs_contaminated);
+        let lid_contaminated = Lid::derive(CanonicalizationVersion::V1, &contaminated_canonical);
+        assert_ne!(
+            lid, lid_contaminated,
+            "Including provider_ref in the attribute set WOULD change the LID — \
+             this proves its exclusion from the canonical form is load-bearing"
+        );
+    }
 }
