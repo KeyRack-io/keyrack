@@ -37,7 +37,8 @@
 
 use crate::pdp::{AttributeValue, Principal};
 use async_trait::async_trait;
-use der::Decode;
+use base64::Engine as _;
+use der::{Decode, Encode};
 use jsonwebtoken::jwk::JwkSet;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -47,6 +48,10 @@ use tokio::sync::RwLock;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::Certificate;
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::STANDARD.decode(input)
+}
 
 /// Metadata carried on an incoming request.
 ///
@@ -218,7 +223,7 @@ pub struct MtlsAuthenticator;
 
 impl MtlsAuthenticator {
     /// Extract the Common Name from the certificate's Subject field.
-    fn extract_cn(cert: &Certificate) -> Option<String> {
+    pub(crate) fn extract_cn(cert: &Certificate) -> Option<String> {
         use der::oid::db::rfc4519::CN;
         cert.tbs_certificate
             .subject
@@ -412,6 +417,265 @@ impl Authenticator for ForwardedIdentityAuthenticator {
                 attributes,
             },
             method: "forwarded_identity".into(),
+        }))
+    }
+}
+
+/// Trusted mTLS peer authenticator for platform-internal fast-path.
+///
+/// Authenticates a peer whose client certificate was issued by a specific
+/// trusted CA (identified by Subject DN match against the configured CA cert).
+/// On match, derives a platform-scoped principal (`scope=platform`) from the
+/// certificate, allowing the caller to skip JWT verification on internal
+/// hot paths.
+///
+/// **This is authn-METHOD SUBSTITUTION, not skip-authn.** The peer IS
+/// authenticated (via its verified mTLS certificate); only the JWT
+/// revalidation step is avoided.
+///
+/// **Security properties:**
+/// - The TLS layer already verified the certificate chain (signature,
+///   expiry, revocation). This authenticator performs an additional
+///   application-level trust check: the leaf cert must have been issued
+///   by the specifically configured trusted CA.
+/// - Returns `Ok(None)` (not an error) if the peer cert is absent or
+///   not from the trusted CA, allowing downstream authenticators (JWT)
+///   to handle it — preserving fail-closed for untrusted peers.
+/// - The derived `scope=platform` integrates with `scope_owner`
+///   enforcement: a platform-scoped peer satisfies platform connections
+///   but NOT tenant-scoped connections.
+///
+/// **OPT-IN:** this authenticator is only instantiated when explicitly
+/// configured (`authn.type = trusted_mtls_peer`); existing deployments
+/// are unchanged.
+pub struct TrustedMtlsPeerAuthenticator {
+    /// DER-encoded Subject DN of the trusted CA. The leaf cert's Issuer
+    /// must match this exactly (byte equality).
+    trusted_ca_subject_der: Vec<u8>,
+    /// Optional: require the leaf cert to contain a SAN matching this value
+    /// (exact match on DNS name or URI).
+    required_san: Option<String>,
+    /// Optional: require the leaf cert's Subject to contain this OU.
+    required_ou: Option<String>,
+}
+
+impl TrustedMtlsPeerAuthenticator {
+    /// Create from a PEM-encoded trusted CA certificate.
+    ///
+    /// The CA's Subject DN is extracted and used as the trust anchor.
+    pub fn from_ca_pem(pem_bytes: &[u8]) -> Result<Self, AuthnError> {
+        let ca_cert = Self::parse_first_pem_cert(pem_bytes)?;
+        let trusted_ca_subject_der = ca_cert
+            .tbs_certificate
+            .subject
+            .to_der()
+            .map_err(|e| AuthnError::Internal(format!("failed to encode CA subject: {e}")))?;
+        Ok(Self {
+            trusted_ca_subject_der,
+            required_san: None,
+            required_ou: None,
+        })
+    }
+
+    /// Require the peer certificate to have a SAN matching this value.
+    #[must_use]
+    pub fn with_required_san(mut self, san: String) -> Self {
+        self.required_san = Some(san);
+        self
+    }
+
+    /// Require the peer certificate's Subject to contain this OU.
+    #[must_use]
+    pub fn with_required_ou(mut self, ou: String) -> Self {
+        self.required_ou = Some(ou);
+        self
+    }
+
+    fn parse_first_pem_cert(pem_bytes: &[u8]) -> Result<Certificate, AuthnError> {
+        let pem_str = std::str::from_utf8(pem_bytes)
+            .map_err(|e| AuthnError::Internal(format!("trusted CA PEM is not valid UTF-8: {e}")))?;
+
+        let begin_marker = "-----BEGIN CERTIFICATE-----";
+        let end_marker = "-----END CERTIFICATE-----";
+        let start = pem_str.find(begin_marker).ok_or_else(|| {
+            AuthnError::Internal("trusted CA PEM missing BEGIN CERTIFICATE marker".into())
+        })? + begin_marker.len();
+        let end = pem_str[start..].find(end_marker).ok_or_else(|| {
+            AuthnError::Internal("trusted CA PEM missing END CERTIFICATE marker".into())
+        })? + start;
+
+        let b64: String = pem_str[start..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let der_bytes = base64_decode(&b64).map_err(|e| {
+            AuthnError::Internal(format!("trusted CA PEM base64 decode failed: {e}"))
+        })?;
+        Certificate::from_der(&der_bytes)
+            .map_err(|e| AuthnError::Internal(format!("failed to parse trusted CA cert: {e}")))
+    }
+
+    fn check_issuer_matches(&self, leaf: &Certificate) -> bool {
+        match leaf.tbs_certificate.issuer.to_der() {
+            Ok(issuer_der) => issuer_der == self.trusted_ca_subject_der,
+            Err(_) => false,
+        }
+    }
+
+    fn check_san_requirement(&self, leaf: &Certificate) -> bool {
+        const SAN_OID: der::oid::ObjectIdentifier =
+            der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
+        let Some(ref required) = self.required_san else {
+            return true;
+        };
+        let Some(extensions) = &leaf.tbs_certificate.extensions else {
+            return false;
+        };
+        for ext in extensions {
+            if ext.extn_id != SAN_OID {
+                continue;
+            }
+            let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) else {
+                continue;
+            };
+            for name in &san.0 {
+                match name {
+                    GeneralName::UniformResourceIdentifier(uri) if uri.as_str() == required => {
+                        return true;
+                    }
+                    GeneralName::DnsName(dns) if dns.as_str() == required => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    fn check_ou_requirement(&self, leaf: &Certificate) -> bool {
+        use der::oid::db::rfc4519::OU;
+        let Some(ref required_ou) = self.required_ou else {
+            return true;
+        };
+        leaf.tbs_certificate
+            .subject
+            .0
+            .iter()
+            .flat_map(|rdn| rdn.0.iter())
+            .any(|atav| {
+                if atav.oid != OU {
+                    return false;
+                }
+                let val = &atav.value;
+                der::asn1::Utf8StringRef::try_from(val)
+                    .map(|s| s.as_str() == required_ou)
+                    .or_else(|_| {
+                        der::asn1::PrintableStringRef::try_from(val)
+                            .map(|s| s.as_str() == required_ou)
+                    })
+                    .unwrap_or(false)
+            })
+    }
+}
+
+#[async_trait]
+impl Authenticator for TrustedMtlsPeerAuthenticator {
+    async fn authenticate(
+        &self,
+        metadata: &RequestMetadata,
+    ) -> Result<Option<AuthnResult>, AuthnError> {
+        if metadata.peer_certificates.is_empty() {
+            return Ok(None);
+        }
+
+        let leaf_der = &metadata.peer_certificates[0];
+        let Ok(leaf) = Certificate::from_der(leaf_der) else {
+            return Ok(None);
+        };
+
+        if !self.check_issuer_matches(&leaf) {
+            return Ok(None);
+        }
+
+        if !self.check_san_requirement(&leaf) {
+            return Ok(None);
+        }
+
+        if !self.check_ou_requirement(&leaf) {
+            return Ok(None);
+        }
+
+        // Trusted peer confirmed. Derive principal from the certificate.
+        let mut attributes = BTreeMap::<String, AttributeValue>::new();
+
+        // Inject platform scope for scope_owner enforcement integration.
+        attributes.insert("scope".into(), AttributeValue::String("platform".into()));
+
+        let serial = leaf.tbs_certificate.serial_number.as_bytes().iter().fold(
+            String::new(),
+            |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            },
+        );
+        attributes.insert("serial_number".into(), AttributeValue::String(serial));
+
+        let cn = MtlsAuthenticator::extract_cn(&leaf);
+        if let Some(ref cn_val) = cn {
+            attributes.insert("cn".into(), AttributeValue::String(cn_val.clone()));
+        }
+
+        // Extract SPIFFE ID if present.
+        let mut spiffe_id: Option<String> = None;
+        if let Some(extensions) = &leaf.tbs_certificate.extensions {
+            const SAN_OID: der::oid::ObjectIdentifier =
+                der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
+            for ext in extensions {
+                if ext.extn_id != SAN_OID {
+                    continue;
+                }
+                if let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) {
+                    for name in &san.0 {
+                        if let GeneralName::UniformResourceIdentifier(uri) = name {
+                            let uri_str = uri.as_str();
+                            if uri_str.starts_with("spiffe://") {
+                                attributes.insert(
+                                    "spiffe_id".into(),
+                                    AttributeValue::String(uri_str.to_owned()),
+                                );
+                                spiffe_id = Some(uri_str.to_owned());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let principal_id = match (&spiffe_id, &cn) {
+            (Some(sid), _) => sid.clone(),
+            (None, Some(cn_val)) => cn_val.clone(),
+            (None, None) => {
+                return Err(AuthnError::InvalidCredential(
+                    "trusted peer certificate has neither a CN nor a SPIFFE SAN".into(),
+                ));
+            }
+        };
+
+        tracing::info!(
+            principal = %principal_id,
+            method = "trusted_mtls_peer",
+            "platform peer authenticated via trusted mTLS fast-path"
+        );
+
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: principal_id,
+                principal_type: "TrustedPlatformPeer".into(),
+                attributes,
+            },
+            method: "trusted_mtls_peer".into(),
         }))
     }
 }
@@ -704,6 +968,7 @@ impl Authenticator for JwtAuthenticator {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -805,5 +1070,252 @@ mod tests {
         let metadata = RequestMetadata::default();
         let result = authn.authenticate(&metadata).await.unwrap();
         assert!(result.is_none());
+    }
+
+    // ── TrustedMtlsPeerAuthenticator tests ────────────────────────────
+
+    struct TestCaBundle {
+        params: rcgen::CertificateParams,
+        cert: rcgen::Certificate,
+        key_pair: rcgen::KeyPair,
+    }
+
+    fn test_ca_named(cn: &str) -> TestCaBundle {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        TestCaBundle {
+            params,
+            cert,
+            key_pair,
+        }
+    }
+
+    fn test_ca() -> TestCaBundle {
+        test_ca_named("Platform CA")
+    }
+
+    fn test_leaf(cn: &str, ca: &TestCaBundle) -> rcgen::Certificate {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::NoCa;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+        params.signed_by(&key_pair, &issuer).unwrap()
+    }
+
+    fn test_leaf_with_ou(cn: &str, ou: &str, ca: &TestCaBundle) -> rcgen::Certificate {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationalUnitName, ou);
+        params.is_ca = rcgen::IsCa::NoCa;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+        params.signed_by(&key_pair, &issuer).unwrap()
+    }
+
+    fn test_leaf_with_san(cn: &str, san_dns: &str, ca: &TestCaBundle) -> rcgen::Certificate {
+        let mut params = rcgen::CertificateParams::new(vec![san_dns.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::NoCa;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+        params.signed_by(&key_pair, &issuer).unwrap()
+    }
+
+    fn build_trusted_authn(ca: &TestCaBundle) -> TrustedMtlsPeerAuthenticator {
+        let pem = ca.cert.pem();
+        TrustedMtlsPeerAuthenticator::from_ca_pem(pem.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_authenticates_with_scope_platform() {
+        let ca = test_ca();
+        let leaf = test_leaf("gateway.internal", &ca);
+        let authn = build_trusted_authn(&ca);
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap().unwrap();
+        assert_eq!(result.method, "trusted_mtls_peer");
+        assert_eq!(result.principal.id, "gateway.internal");
+        assert_eq!(result.principal.principal_type, "TrustedPlatformPeer");
+        assert_eq!(
+            result.principal.attributes.get("scope"),
+            Some(&AttributeValue::String("platform".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_no_certs_skips() {
+        let ca = test_ca();
+        let authn = build_trusted_authn(&ca);
+        let metadata = RequestMetadata::default();
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none(), "no peer certs should skip (Ok(None))");
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_wrong_ca_skips() {
+        let trusted_ca = test_ca();
+        let other_ca = test_ca_named("Other CA");
+        let leaf = test_leaf("intruder", &other_ca);
+        let authn = build_trusted_authn(&trusted_ca);
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none(), "wrong CA should skip (Ok(None))");
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_ou_required_and_present() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_ou("svc", "platform-services", &ca);
+        let authn = build_trusted_authn(&ca).with_required_ou("platform-services".into());
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap().unwrap();
+        assert_eq!(result.principal.id, "svc");
+        assert_eq!(
+            result.principal.attributes.get("scope"),
+            Some(&AttributeValue::String("platform".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_ou_required_but_missing() {
+        let ca = test_ca();
+        let leaf = test_leaf("svc", &ca);
+        let authn = build_trusted_authn(&ca).with_required_ou("platform-services".into());
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none(), "missing required OU should skip");
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_san_required_and_present() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_san("svc", "gateway.platform.internal", &ca);
+        let authn = build_trusted_authn(&ca).with_required_san("gateway.platform.internal".into());
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap().unwrap();
+        assert_eq!(
+            result.principal.attributes.get("scope"),
+            Some(&AttributeValue::String("platform".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_san_required_but_wrong() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_san("svc", "other.host.internal", &ca);
+        let authn = build_trusted_authn(&ca).with_required_san("gateway.platform.internal".into());
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none(), "wrong SAN should skip");
+    }
+
+    #[tokio::test]
+    async fn chain_trusted_peer_first_skips_jwt_for_trusted() {
+        let ca = test_ca();
+        let leaf = test_leaf("platform-gateway", &ca);
+        let authn = build_trusted_authn(&ca);
+
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(authn),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer wrong-token".into());
+
+        let result = chain.authenticate(&metadata).await.unwrap();
+        assert_eq!(
+            result.method, "trusted_mtls_peer",
+            "trusted peer should win, JWT/bootstrap not tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_untrusted_peer_falls_through_to_next() {
+        let trusted_ca = test_ca();
+        let other_ca = test_ca_named("Untrusted CA");
+        let leaf = test_leaf("untrusted", &other_ca);
+        let authn = build_trusted_authn(&trusted_ca);
+
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(authn),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "my-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer my-token".into());
+
+        let result = chain.authenticate(&metadata).await.unwrap();
+        assert_eq!(
+            result.method, "bootstrap_token",
+            "untrusted peer should fall through to bootstrap token"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_no_cert_no_token_rejected() {
+        let ca = test_ca();
+        let authn = build_trusted_authn(&ca);
+
+        let chain = AuthenticatorChain::new(vec![Box::new(authn), Box::new(MtlsAuthenticator)]);
+
+        let metadata = RequestMetadata::default();
+        let result = chain.authenticate(&metadata).await;
+        assert!(
+            matches!(result, Err(AuthnError::NoCredential)),
+            "no cert + no token must be rejected (fail-closed)"
+        );
     }
 }

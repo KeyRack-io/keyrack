@@ -179,7 +179,7 @@ async fn build_authenticators(
 ) -> Result<Vec<Box<dyn keyrack_core::authn::Authenticator>>, Box<dyn std::error::Error>> {
     use keyrack_core::authn::{
         BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator, InsecureAuthenticator,
-        JwtAuthenticator, MtlsAuthenticator,
+        JwtAuthenticator, MtlsAuthenticator, TrustedMtlsPeerAuthenticator,
     };
     use keyrack_service::config::AuthnConfig;
 
@@ -223,6 +223,33 @@ async fn build_authenticators(
             ))])
         }
         AuthnConfig::ForwardedIdentity => Ok(vec![Box::new(ForwardedIdentityAuthenticator)]),
+        AuthnConfig::TrustedMtlsPeer {
+            trusted_ca_cert_path,
+            required_san,
+            required_ou,
+        } => {
+            let pem_bytes =
+                std::fs::read(trusted_ca_cert_path).map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("failed to read trusted CA cert at '{trusted_ca_cert_path}': {e}")
+                        .into()
+                })?;
+            let mut authn = TrustedMtlsPeerAuthenticator::from_ca_pem(&pem_bytes).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!("trusted mTLS peer authenticator init failed: {e}").into()
+                },
+            )?;
+            if let Some(san) = required_san {
+                authn = authn.with_required_san(san.clone());
+            }
+            if let Some(ou) = required_ou {
+                authn = authn.with_required_ou(ou.clone());
+            }
+            tracing::info!(
+                ca_path = %trusted_ca_cert_path,
+                "trusted mTLS peer authenticator configured (platform fast-path)"
+            );
+            Ok(vec![Box::new(authn)])
+        }
         AuthnConfig::Chain { authenticators } => {
             let mut all: Vec<Box<dyn keyrack_core::authn::Authenticator>> = Vec::new();
             for sub in authenticators {

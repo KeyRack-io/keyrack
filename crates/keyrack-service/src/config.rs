@@ -385,6 +385,25 @@ pub enum AuthnConfig {
     /// Trust `x-keyrack-principal-id` header from an already-authenticated
     /// upstream service (e.g. the Barbican shim). Only safe behind mTLS.
     ForwardedIdentity,
+    /// Trusted mTLS peer: platform-internal fast-path authentication.
+    ///
+    /// A peer whose client cert was issued by the configured trusted CA
+    /// authenticates as a platform-scoped principal (`scope=platform`),
+    /// skipping JWT verification. OPT-IN: only active when explicitly
+    /// configured. Place first in a Chain to get the fast-path benefit.
+    TrustedMtlsPeer {
+        /// Path to the PEM-encoded CA certificate that signs trusted
+        /// platform peers. The leaf cert's Issuer must match this CA's
+        /// Subject DN.
+        trusted_ca_cert_path: String,
+        /// Optional: require the peer cert to have a SAN matching this
+        /// value (DNS name or URI, exact match).
+        #[serde(default)]
+        required_san: Option<String>,
+        /// Optional: require the peer cert's Subject to contain this OU.
+        #[serde(default)]
+        required_ou: Option<String>,
+    },
     /// Skip authentication entirely (dev/test only).
     Insecure,
     /// Chain of authenticators tried in order (first match wins).

@@ -2672,6 +2672,7 @@ version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "base64",
  "blake3",
  "bytes",
  "chrono",
@@ -2684,6 +2685,7 @@ dependencies = [
  "p384",
  "proptest",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
  "rsa",
  "serde",

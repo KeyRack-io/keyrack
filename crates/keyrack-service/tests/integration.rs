@@ -4390,3 +4390,197 @@ async fn pkcs11_registration_reject_fail_closed_not_persisted() {
         "failed registration attempt must still emit audit events"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// TRUSTED mTLS PEER FAST-PATH — SCOPE ISOLATION (authn-mtls-fastpath)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Proves that a platform-scoped mTLS peer (scope=platform, derived from
+// a trusted peer certificate) does NOT satisfy a tenant-scoped
+// scope_owner connection. This is the mandatory deny-case for the
+// authn-mtls-fastpath feature.
+
+#[tokio::test]
+async fn trusted_mtls_peer_denied_on_tenant_scoped_connection() {
+    use keyrack_core::authn::{AuthenticatorChain, TrustedMtlsPeerAuthenticator};
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_core::storage::StorageBackend as _;
+    use keyrack_service::ops::PeerCertificates;
+    use keyrack_service::routing::ProviderRouter;
+
+    let ca = generate_ca("Trusted Platform CA");
+    let client = generate_leaf("platform-gateway", &[], &ca);
+    let client_der = client.cert.der().to_vec();
+
+    let ca_pem = ca.cert.pem();
+    let authn = TrustedMtlsPeerAuthenticator::from_ca_pem(ca_pem.as_bytes()).unwrap();
+    let authn_chain = Arc::new(AuthenticatorChain::new(vec![Box::new(authn)]));
+
+    let audit = Arc::new(CapturingSink::new());
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+
+    // Store a tenant-scoped HSM connection record.
+    let conn = keyrack_core::hsm::HsmConnection::new(
+        "tenant-conn",
+        keyrack_core::hsm::HsmProviderType::Hsm,
+        "/lib.so",
+        "tenant-a",
+    )
+    .with_scope_owner("tenant:abc123");
+    storage.create_hsm_connection(&conn).await.unwrap();
+
+    let software = Arc::new(InMemoryProvider::new());
+    let entries = vec![
+        (
+            ProviderRef::new("default"),
+            ProviderEntry {
+                provider: software.clone(),
+                class: ProviderClass::InMemory,
+            },
+        ),
+        (
+            ProviderRef::new("tenant-conn"),
+            ProviderEntry {
+                provider: software.clone(),
+                class: ProviderClass::InMemory,
+            },
+        ),
+    ];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
+    );
+
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage: storage.clone(),
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn: authn_chain,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Attempt to create a key on the tenant-scoped connection as a platform peer.
+    let mut req = Request::new(proto::CreateKeyRequest {
+        key_spec: proto::KeySpec::Aes256 as i32,
+        hsm_connection_id: Some("tenant-conn".into()),
+        ..Default::default()
+    });
+    req.extensions_mut()
+        .insert(PeerCertificates(vec![client_der.clone()]));
+
+    let result = svc.create_key(req).await;
+    assert!(
+        result.is_err(),
+        "platform-scoped mTLS peer must NOT satisfy tenant-scoped connection"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::PermissionDenied,
+        "scope mismatch must be PermissionDenied, not a permissive pass"
+    );
+    assert!(
+        status.message().contains("scope"),
+        "error message should mention scope: {:?}",
+        status.message()
+    );
+
+    // Verify the scope_owner_check audit event reports the denial.
+    let events = audit.events();
+    let scope_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::ScopeOwnerCheck);
+    assert!(
+        scope_event.is_some(),
+        "scope_owner_check audit event must be emitted on denial"
+    );
+    let ev = scope_event.unwrap();
+    assert_eq!(ev.result, keyrack_core::audit::AuditResult::Denied);
+    assert_eq!(ev.metadata["scope"], "platform");
+    assert_eq!(ev.metadata["connection_scope_owner"], "tenant:abc123");
+}
+
+#[tokio::test]
+async fn trusted_mtls_peer_passes_platform_scoped_connection() {
+    use keyrack_core::authn::{AuthenticatorChain, TrustedMtlsPeerAuthenticator};
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry};
+    use keyrack_service::ops::PeerCertificates;
+    use keyrack_service::routing::ProviderRouter;
+
+    let ca = generate_ca("Trusted Platform CA");
+    let client = generate_leaf("platform-gateway", &[], &ca);
+    let client_der = client.cert.der().to_vec();
+
+    let ca_pem = ca.cert.pem();
+    let authn = TrustedMtlsPeerAuthenticator::from_ca_pem(ca_pem.as_bytes()).unwrap();
+    let authn_chain = Arc::new(AuthenticatorChain::new(vec![Box::new(authn)]));
+
+    let audit = Arc::new(CapturingSink::new());
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let software = Arc::new(InMemoryProvider::new());
+    let entries = vec![(
+        ProviderRef::new("default"),
+        ProviderEntry {
+            provider: software.clone(),
+            class: ProviderClass::InMemory,
+        },
+    )];
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
+    );
+
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+
+    let state = Arc::new(ServiceState {
+        storage: storage.clone(),
+        providers: registry,
+        provider_router,
+        pdp,
+        audit: audit.clone(),
+        authn: authn_chain,
+        metrics_handle,
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
+
+    // Create a key on the default provider (no scope_owner set → platform-scoped).
+    let mut req = Request::new(proto::CreateKeyRequest {
+        key_spec: proto::KeySpec::Aes256 as i32,
+        ..Default::default()
+    });
+    req.extensions_mut()
+        .insert(PeerCertificates(vec![client_der]));
+
+    let result = svc.create_key(req).await;
+    assert!(
+        result.is_ok(),
+        "platform peer on platform-scoped (unscoped) connection should succeed: {:?}",
+        result.err()
+    );
+
+    // Verify the principal was authenticated via the trusted mTLS fast-path.
+    let events = audit.events();
+    let create_event = events
+        .iter()
+        .find(|e| e.event_type == keyrack_core::audit::EventType::KeyCreated);
+    assert!(create_event.is_some(), "key creation audit event expected");
+    let ev = create_event.unwrap();
+    assert_eq!(ev.principal.id, "platform-gateway");
+}
