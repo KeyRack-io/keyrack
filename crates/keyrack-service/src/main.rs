@@ -244,6 +244,16 @@ async fn build_authenticators(
             if let Some(ou) = required_ou {
                 authn = authn.with_required_ou(ou.clone());
             }
+            if required_san.is_none() && required_ou.is_none() {
+                tracing::warn!(
+                    ca_path = %trusted_ca_cert_path,
+                    "TrustedMtlsPeer has neither required_san nor required_ou set: EVERY client \
+                     certificate issued by this CA will be granted scope=platform. This is only \
+                     safe if the trusted CA is DEDICATED to the platform gateway. For a shared \
+                     CA, set required_san or required_ou to pin the specific peer. Also ensure \
+                     the gRPC server's TLS client_ca_root verifies certs against this CA."
+                );
+            }
             tracing::info!(
                 ca_path = %trusted_ca_cert_path,
                 "trusted mTLS peer authenticator configured (platform fast-path)"

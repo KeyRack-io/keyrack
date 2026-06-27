@@ -391,6 +391,20 @@ pub enum AuthnConfig {
     /// authenticates as a platform-scoped principal (`scope=platform`),
     /// skipping JWT verification. OPT-IN: only active when explicitly
     /// configured. Place first in a Chain to get the fast-path benefit.
+    ///
+    /// SECURITY — the trust decision is `leaf cert Issuer DN == trusted CA
+    /// Subject DN`, so it grants `scope=platform` to **every** certificate
+    /// issued by `trusted_ca_cert_path`. Two operator requirements:
+    /// 1. Use a CA **dedicated** to the platform gateway, OR set
+    ///    `required_san`/`required_ou` to pin the specific peer. A shared
+    ///    corporate CA without SAN/OU would grant platform scope to ALL its
+    ///    clients (the server logs a warning at startup in that case).
+    /// 2. The gRPC server's TLS `client_ca_root` MUST be configured to
+    ///    cryptographically verify peer certs against this CA (or a bundle
+    ///    including it) — this authenticator trusts the TLS-verified chain
+    ///    and only matches the Issuer DN; it does not re-verify signatures.
+    ///    If TLS does not verify the platform CA, peer certs simply never
+    ///    reach the fast-path (fail-safe no-op), and it will not work.
     TrustedMtlsPeer {
         /// Path to the PEM-encoded CA certificate that signs trusted
         /// platform peers. The leaf cert's Issuer must match this CA's
