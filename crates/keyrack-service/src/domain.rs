@@ -1366,7 +1366,10 @@ pub mod crypto {
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
 
-        // Same-provider path: use atomic re_encrypt (no plaintext leaves provider).
+        // Same-provider path: calls `re_encrypt` on the shared provider.
+        // NOTE: no in-tree provider currently overrides `re_encrypt`, so the
+        // trait default fires and plaintext surfaces in coordinator memory
+        // regardless of the Arc::ptr_eq check.
         // Cross-provider path: decrypt on source, re-encrypt on destination
         // (plaintext transits service memory).
         let output = if Arc::ptr_eq(&src_entry.provider, &dst_entry.provider) {

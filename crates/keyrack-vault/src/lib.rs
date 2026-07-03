@@ -514,3 +514,34 @@ impl CryptoProvider for VaultTransitProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // If you flip either flag to true you MUST have overridden the
+    // corresponding method to keep plaintext in-boundary AND added a
+    // test proving it. This guard converts a silent capability lie
+    // into a conscious, reviewed change.
+    //
+    // VaultTransitProvider::new() requires a live Vault server, so we
+    // construct the struct directly to bypass the health-check.
+    #[test]
+    fn capability_flags_are_honest() {
+        let provider = VaultTransitProvider {
+            client: Client::new(),
+            vault_addr: String::new(),
+            token: String::new(),
+            mount: String::new(),
+        };
+        let caps = provider.capabilities();
+        assert!(
+            !caps.supports_atomic_data_key,
+            "supports_atomic_data_key must be false without a generate_data_key override"
+        );
+        assert!(
+            !caps.supports_atomic_re_encrypt,
+            "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
+    }
+}

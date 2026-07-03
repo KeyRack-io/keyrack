@@ -375,8 +375,8 @@ impl CryptoProvider for KmipProvider {
                 },
             ],
             supports_generate_random: true,
-            supports_atomic_data_key: true,
-            supports_atomic_re_encrypt: true,
+            supports_atomic_data_key: false,
+            supports_atomic_re_encrypt: false,
         }
     }
 }
@@ -418,8 +418,25 @@ mod tests {
         let caps = provider.capabilities();
         assert_eq!(caps.provider_name, "kmip");
         assert!(caps.supports_generate_random);
-        assert!(caps.supports_atomic_data_key);
         assert_eq!(caps.key_specs.len(), 4);
+    }
+
+    // If you flip either flag to true you MUST have overridden the
+    // corresponding method to keep plaintext in-boundary AND added a
+    // test proving it. This guard converts a silent capability lie
+    // into a conscious, reviewed change.
+    #[test]
+    fn capability_flags_are_honest() {
+        let provider = KmipProvider::new(test_config());
+        let caps = provider.capabilities();
+        assert!(
+            !caps.supports_atomic_data_key,
+            "supports_atomic_data_key must be false without a generate_data_key override"
+        );
+        assert!(
+            !caps.supports_atomic_re_encrypt,
+            "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
     }
 
     #[test]

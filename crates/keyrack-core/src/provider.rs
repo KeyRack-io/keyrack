@@ -141,7 +141,15 @@ pub struct ProviderCapabilities {
     pub provider_name: String,
     pub key_specs: Vec<KeySpecCapability>,
     pub supports_generate_random: bool,
+    /// MUST be `true` ONLY if the provider overrides
+    /// [`CryptoProvider::generate_data_key`] such that plaintext key
+    /// material never leaves the provider boundary. Declaring `true`
+    /// while relying on the trait default is a false security assertion.
     pub supports_atomic_data_key: bool,
+    /// MUST be `true` ONLY if the provider overrides
+    /// [`CryptoProvider::re_encrypt`] such that plaintext key material
+    /// never leaves the provider boundary. Declaring `true` while
+    /// relying on the trait default is a false security assertion.
     pub supports_atomic_re_encrypt: bool,
 }
 
@@ -276,8 +284,14 @@ pub trait CryptoProvider: Send + Sync {
     /// identified by `wrapping_handle`, and return both the plaintext
     /// DEK and its encrypted form (§5.1 envelope encryption pattern).
     ///
-    /// Default implementation composes `generate_random` + `encrypt`.
-    /// HSM providers should override for atomicity.
+    /// # Default implementation
+    ///
+    /// Composes `generate_random` + `encrypt`. The plaintext DEK
+    /// materializes in the caller (coordinator) process memory before
+    /// being passed to `encrypt`. A provider that keeps plaintext
+    /// entirely within its own boundary (e.g. an HSM with on-device
+    /// key-wrap) MUST override this method AND set
+    /// `supports_atomic_data_key: true` in its capabilities.
     async fn generate_data_key(
         &self,
         wrapping_handle: &KeyHandle,
@@ -294,12 +308,17 @@ pub trait CryptoProvider: Send + Sync {
         })
     }
 
-    /// Atomic decrypt + re-encrypt: decrypt `ciphertext` with
-    /// `source_handle` and re-encrypt with `dest_handle`. Plaintext
-    /// never leaves the provider boundary (§5.3).
+    /// Decrypt `ciphertext` with `source_handle` and re-encrypt with
+    /// `dest_handle`.
     ///
-    /// Default implementation composes `decrypt` + `encrypt`.
-    /// HSM providers should override to keep plaintext inside the HSM.
+    /// # Default implementation
+    ///
+    /// Composes `decrypt` + `encrypt`. The plaintext transits through
+    /// the caller (coordinator) process memory — it is NOT kept inside
+    /// the provider boundary. A provider that keeps plaintext inside
+    /// its own boundary (e.g. an HSM with on-device re-wrap) MUST
+    /// override this method AND set `supports_atomic_re_encrypt: true`
+    /// in its capabilities.
     async fn re_encrypt(
         &self,
         source_handle: &KeyHandle,

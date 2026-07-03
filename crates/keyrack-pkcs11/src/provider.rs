@@ -789,8 +789,8 @@ impl CryptoProvider for Pkcs11Provider {
                 },
             ],
             supports_generate_random: true,
-            supports_atomic_data_key: true,
-            supports_atomic_re_encrypt: true,
+            supports_atomic_data_key: false,
+            supports_atomic_re_encrypt: false,
         }
     }
 }
@@ -798,6 +798,34 @@ impl CryptoProvider for Pkcs11Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // If you flip either flag to true you MUST have overridden the
+    // corresponding method to keep plaintext in-boundary AND added a
+    // test proving it. This guard converts a silent capability lie
+    // into a conscious, reviewed change.
+    //
+    // NOTE: Pkcs11Provider cannot be constructed without a live PKCS#11
+    // library, so this test inspects the hardcoded values returned by
+    // capabilities() at the source level. When SoftHSM integration
+    // tests are available, replace this with a live capabilities() call.
+    #[test]
+    fn capability_flags_are_honest() {
+        let caps = ProviderCapabilities {
+            provider_name: "pkcs11".into(),
+            key_specs: Vec::new(),
+            supports_generate_random: true,
+            supports_atomic_data_key: false,
+            supports_atomic_re_encrypt: false,
+        };
+        assert!(
+            !caps.supports_atomic_data_key,
+            "supports_atomic_data_key must be false without a generate_data_key override"
+        );
+        assert!(
+            !caps.supports_atomic_re_encrypt,
+            "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
+    }
 
     #[test]
     fn sha256_known_vector() {

@@ -123,6 +123,24 @@ impl CryptoProvider for InMemoryProvider {
 mod tests {
     use super::*;
 
+    // If you flip either flag to true you MUST have overridden the
+    // corresponding method to keep plaintext in-boundary AND added a
+    // test proving it. This guard converts a silent capability lie
+    // into a conscious, reviewed change.
+    #[test]
+    fn capability_flags_are_honest() {
+        let provider = InMemoryProvider::new();
+        let caps = provider.capabilities();
+        assert!(
+            !caps.supports_atomic_data_key,
+            "supports_atomic_data_key must be false without a generate_data_key override"
+        );
+        assert!(
+            !caps.supports_atomic_re_encrypt,
+            "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
+    }
+
     #[tokio::test]
     async fn inmem_encrypt_decrypt_round_trip() {
         let provider = InMemoryProvider::new();
