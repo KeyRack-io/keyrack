@@ -4,6 +4,25 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-03
+
+Security patch: corrected false atomic re-wrap / data-key capability declarations
+(no API or behavioral change).
+
+### Security
+
+- **Corrected false `supports_atomic_re_encrypt` / `supports_atomic_data_key`
+  capability declarations.** The PKCS#11 and KMIP providers declared these
+  capabilities `true` while relying on the trait-default `re_encrypt` /
+  `generate_data_key` implementations, which compose `decrypt`+`encrypt`
+  (respectively `generate_random`+`encrypt`) so that plaintext key material
+  transits the coordinator process. No in-tree provider currently keeps plaintext
+  inside the backend for these operations, so every provider now honestly declares
+  `false`. Also corrected the misleading "plaintext never leaves the provider
+  boundary" doc comments, added a contract on the capability fields, and added
+  per-provider regression-guard tests that fail if a flag is set `true` without a
+  custody-preserving override. No wire, API, or behavioral change.
+
 ## [0.3.1] — 2026-06-19
 
 Security patch: the REST API now fails closed on authentication errors.

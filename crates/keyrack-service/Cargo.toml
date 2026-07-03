@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-service"
-version = "0.3.1"
+version = "0.3.2"
 description = "KeyRack gRPC + REST service binary (Workstream 2)"
 edition.workspace = true
 rust-version.workspace = true
