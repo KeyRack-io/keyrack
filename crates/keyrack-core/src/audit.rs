@@ -184,6 +184,14 @@ pub enum AuditAction {
     // Scope ownership check on a backend connection (ADR-0001 A1.4).
     #[serde(rename = "kms:ScopeOwnerCheck")]
     ScopeOwnerCheck,
+
+    // Exportable key operations (Phase 1: db-cmk-exportable-keys).
+    #[serde(rename = "kms:GetKeyMaterial")]
+    GetKeyMaterial,
+    #[serde(rename = "kms:MakeKeyExportable")]
+    MakeKeyExportable,
+    #[serde(rename = "kms:RevokeKeyExportability")]
+    RevokeKeyExportability,
 }
 
 impl std::fmt::Display for AuditAction {
@@ -910,6 +918,9 @@ mod tests {
             AuditAction::FailRotationJob,
             AuditAction::CascadeDisable,
             AuditAction::AccessSecret,
+            AuditAction::GetKeyMaterial,
+            AuditAction::MakeKeyExportable,
+            AuditAction::RevokeKeyExportability,
         ];
 
         for action in &actions {

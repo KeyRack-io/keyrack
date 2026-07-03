@@ -56,6 +56,8 @@ pub fn test_key_record(state: KeyState) -> KeyRecord {
         origin: KeyOrigin::KeyRack,
         provider_class: ProviderClass::Software,
         provider_ref: None,
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: IdentityTags::from_attribute_set(&attrs),
         user_tags: UserTags::new(),
         created_at: chrono::Utc::now(),

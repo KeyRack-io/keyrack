@@ -232,6 +232,8 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
             .as_ref()
             .map(datetime_to_timestamp),
         backend_id: record.provider_ref.as_ref().map(|r| r.as_str().to_owned()),
+        exportable: record.exportability == keyrack_core::key::Exportability::Exportable,
+        first_exported_at: record.first_exported_at.as_ref().map(datetime_to_timestamp),
     }
 }
 

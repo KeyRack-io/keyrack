@@ -117,6 +117,10 @@ impl CryptoProvider for InMemoryProvider {
         caps.provider_name = "in_memory".into();
         caps
     }
+
+    async fn export_key_material(&self, handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
+        self.inner.export_key_material(handle).await
+    }
 }
 
 #[cfg(test)]

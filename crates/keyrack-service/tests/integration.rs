@@ -890,6 +890,8 @@ async fn routing_matching_rule_selects_tenant_b() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: entry.class,
         provider_ref: Some(selected.clone()),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: identity_tags.clone(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1080,6 +1082,8 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: None,
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1574,6 +1578,8 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1685,6 +1691,8 @@ async fn scope_owner_unset_passes_without_check() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1871,6 +1879,8 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1933,6 +1943,8 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -2372,6 +2384,8 @@ async fn scope_audit_success_on_unscoped_connection() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -2807,6 +2821,8 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: keyrack_core::key::ProviderClass::InMemory,
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -4265,6 +4281,8 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: ProviderClass::InMemory,
         provider_ref: Some(prov_failing_ref.clone()),
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: chrono::Utc::now(),
@@ -4583,4 +4601,356 @@ async fn trusted_mtls_peer_passes_platform_scoped_connection() {
     assert!(create_event.is_some(), "key creation audit event expected");
     let ev = create_event.unwrap();
     assert_eq!(ev.principal.id, "platform-gateway");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EXPORTABLE KEY TESTS (Phase 1)
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn get_key_material_on_non_exportable_refused() {
+    let (state, _pdp, audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key_id = create_aes_key(&svc).await;
+
+    let resp = svc
+        .get_key_material(Request::new(proto::GetKeyMaterialRequest {
+            key_id: key_id.clone(),
+            key_version: 0,
+            wrapping_key: None,
+        }))
+        .await;
+
+    assert!(
+        resp.is_err(),
+        "GetKeyMaterial must fail for non-exportable key"
+    );
+    let status = resp.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("not exportable"),
+        "error message should indicate non-exportable: {}",
+        status.message()
+    );
+
+    // Audit should NOT have a SecretAccess success event (the check is pre-PDP)
+    let secret_events: Vec<_> = audit
+        .events()
+        .into_iter()
+        .filter(|e| e.action == keyrack_core::audit::AuditAction::GetKeyMaterial)
+        .collect();
+    assert!(
+        secret_events.is_empty(),
+        "no GetKeyMaterial audit event should be emitted for pre-PDP rejection"
+    );
+}
+
+#[tokio::test]
+async fn get_key_material_on_exportable_succeeds() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Create an exportable key (born-exportable)
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "exportable test".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable key");
+    let key_id = resp.into_inner().metadata.unwrap().key_id;
+
+    let resp = svc
+        .get_key_material(Request::new(proto::GetKeyMaterialRequest {
+            key_id: key_id.clone(),
+            key_version: 0,
+            wrapping_key: None,
+        }))
+        .await;
+
+    assert!(
+        resp.is_ok(),
+        "GetKeyMaterial should succeed for exportable key"
+    );
+    let material = resp.unwrap().into_inner();
+    assert!(
+        !material.key_material.is_empty(),
+        "key material must not be empty"
+    );
+    assert_eq!(material.key_version, 1);
+    assert!(!material.wrapped);
+}
+
+#[tokio::test]
+async fn make_key_exportable_then_revoke_pre_export() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let key_id = create_aes_key(&svc).await;
+
+    // Make exportable
+    let resp = svc
+        .make_key_exportable(Request::new(proto::MakeKeyExportableRequest {
+            key_id: key_id.clone(),
+        }))
+        .await;
+    assert!(resp.is_ok(), "MakeKeyExportable should succeed");
+    let meta = resp.unwrap().into_inner().metadata.unwrap();
+    assert!(meta.exportable, "key should now be exportable");
+
+    // Revoke before any export — should succeed
+    let resp = svc
+        .revoke_key_exportability(Request::new(proto::RevokeKeyExportabilityRequest {
+            key_id: key_id.clone(),
+        }))
+        .await;
+    assert!(
+        resp.is_ok(),
+        "RevokeKeyExportability should succeed pre-export"
+    );
+    let meta = resp.unwrap().into_inner().metadata.unwrap();
+    assert!(
+        !meta.exportable,
+        "key should be non-exportable after revocation"
+    );
+}
+
+#[tokio::test]
+async fn revoke_exportability_post_export_refused() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Create exportable key
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "will be exported".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable key");
+    let key_id = resp.into_inner().metadata.unwrap().key_id;
+
+    // Export it (sets the latch)
+    svc.get_key_material(Request::new(proto::GetKeyMaterialRequest {
+        key_id: key_id.clone(),
+        key_version: 0,
+        wrapping_key: None,
+    }))
+    .await
+    .expect("export should succeed");
+
+    // Attempt to revoke — must fail
+    let resp = svc
+        .revoke_key_exportability(Request::new(proto::RevokeKeyExportabilityRequest {
+            key_id: key_id.clone(),
+        }))
+        .await;
+    assert!(resp.is_err(), "revoke after export must be refused");
+    let status = resp.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn make_key_exportable_leaf_only_rejects_parent() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Create a parent key
+    let parent_id = create_aes_key(&svc).await;
+
+    // Create a child key under that parent
+    let _child_resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "child".into(),
+            parent_key_id: Some(parent_id.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect("create child key");
+
+    // Attempt to make parent exportable — should fail (has dependents)
+    let resp = svc
+        .make_key_exportable(Request::new(proto::MakeKeyExportableRequest {
+            key_id: parent_id.clone(),
+        }))
+        .await;
+    assert!(
+        resp.is_err(),
+        "MakeKeyExportable on parent with children must fail"
+    );
+    let status = resp.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("dependents"),
+        "error should mention dependents: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn create_child_under_exportable_parent_refused() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Create an exportable parent
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "exportable parent".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable parent");
+    let parent_id = resp.into_inner().metadata.unwrap().key_id;
+
+    // Attempt to create a child under the exportable parent — must be refused
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "child of exportable".into(),
+            parent_key_id: Some(parent_id.clone()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        resp.is_err(),
+        "creating child under exportable parent must fail"
+    );
+    let status = resp.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("exportable parent"),
+        "error should mention exportable parent: {}",
+        status.message()
+    );
+}
+
+/// PDP that allows everything EXCEPT `MakeKeyExportable`.
+struct DenyMakeExportablePdp;
+
+#[async_trait::async_trait]
+impl PolicyDecisionPoint for DenyMakeExportablePdp {
+    async fn evaluate(&self, request: &AuthzRequest) -> keyrack_core::error::Result<AuthzResponse> {
+        use keyrack_core::pdp::{Decision, PolicyReason};
+        let decision = if request.action == keyrack_core::audit::AuditAction::MakeKeyExportable {
+            Decision::Forbid
+        } else {
+            Decision::Permit
+        };
+        Ok(AuthzResponse {
+            request_id: request.request_id.clone(),
+            decision,
+            reasons: if decision == Decision::Forbid {
+                vec![PolicyReason {
+                    policy_id: "test:deny_make_exportable".into(),
+                    reason_code: Some("denied".into()),
+                    human_message: Some("MakeKeyExportable denied by test policy".into()),
+                }]
+            } else {
+                vec![]
+            },
+            obligations: vec![],
+            policy_version: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn born_exportable_double_gate_denies_without_make_exportable_privilege() {
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(DenyMakeExportablePdp);
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with(pdp, audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    // Attempt to create a born-exportable key — should fail because the
+    // double-gate requires MakeKeyExportable authorization, which our PDP denies.
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "born-exportable denied".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        resp.is_err(),
+        "born-exportable create must fail when MakeKeyExportable is denied"
+    );
+    let status = resp.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    // Verify that an audit event for MakeKeyExportable denial was emitted
+    let events = audit.events();
+    let export_denied = events.iter().any(|e| {
+        e.action == keyrack_core::audit::AuditAction::MakeKeyExportable
+            && e.result == keyrack_core::audit::AuditResult::Denied
+    });
+    assert!(
+        export_denied,
+        "audit must include a MakeKeyExportable denied event for double-gate"
+    );
+}
+
+#[tokio::test]
+async fn born_exportable_double_gate_succeeds_with_full_privilege() {
+    let (state, pdp, audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "born-exportable allowed".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        resp.is_ok(),
+        "born-exportable create should succeed with AlwaysAllow PDP"
+    );
+    let meta = resp.unwrap().into_inner().metadata.unwrap();
+    assert!(meta.exportable, "key metadata should show exportable=true");
+
+    // PDP should be called at least twice (once for CreateKey, once for MakeKeyExportable)
+    assert!(
+        pdp.count() >= 2,
+        "PDP must be called at least twice for born-exportable (CreateKey + MakeKeyExportable), got {}",
+        pdp.count()
+    );
+
+    // Verify audit events include both actions
+    let events = audit.events();
+    let create_event = events
+        .iter()
+        .any(|e| e.action == keyrack_core::audit::AuditAction::CreateKey);
+    assert!(create_event, "audit must include CreateKey event");
+}
+
+#[tokio::test]
+async fn default_key_is_non_exportable() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "default key".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("create key");
+
+    let meta = resp.into_inner().metadata.unwrap();
+    assert!(!meta.exportable, "default key must be non-exportable");
+    assert!(
+        meta.first_exported_at.is_none(),
+        "never-exported key has no export timestamp"
+    );
 }

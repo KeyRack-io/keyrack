@@ -203,6 +203,17 @@ pub enum KeyOrigin {
     External,
 }
 
+/// Whether this key's raw material may cross the trust boundary via an
+/// explicit, audited export / KMIP Get. Default = `NonExportable`. Mutable
+/// only via the two guarded transitions (never a public field setter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Exportability {
+    #[default]
+    NonExportable,
+    Exportable,
+}
+
 /// Per-rotation key version record.
 ///
 /// Each rotation creates a new `KeyVersionRecord` with fresh material.
@@ -261,6 +272,14 @@ pub struct KeyRecord {
     /// via [`KeyVersionRecord::provider_ref`] (e.g. mid-migration).
     #[serde(default)]
     pub provider_ref: Option<ProviderRef>,
+    /// Whether this key's material may be exported. Side property — never
+    /// part of the LID. Legacy records deserialize as `NonExportable`.
+    #[serde(default)]
+    pub exportability: Exportability,
+    /// Monotonic latch: set on the first successful `GetKeyMaterial` and
+    /// never reset. Gates `RevokeKeyExportability` (tighten only pre-export).
+    #[serde(default)]
+    pub first_exported_at: Option<DateTime<Utc>>,
     pub identity_tags: IdentityTags,
     pub user_tags: UserTags,
     pub created_at: DateTime<Utc>,
@@ -316,6 +335,45 @@ impl KeyRecord {
         self.get_version(version_number)
             .and_then(|v| v.provider_ref.as_ref())
             .or(self.provider_ref.as_ref())
+    }
+
+    /// Attempt an exportability transition. Returns `Err` if the transition
+    /// is invalid (e.g. tightening after material was exported).
+    pub fn transition_exportability(
+        &mut self,
+        target: Exportability,
+    ) -> std::result::Result<Exportability, &'static str> {
+        match (self.exportability, target) {
+            (from, to) if from == to => Ok(to),
+            (Exportability::NonExportable, Exportability::Exportable) => {
+                self.exportability = target;
+                self.occ_version += 1;
+                self.updated_at = Utc::now();
+                Ok(target)
+            }
+            (Exportability::Exportable, Exportability::NonExportable) => {
+                if self.first_exported_at.is_some() {
+                    return Err(
+                        "cannot revoke exportability: key material has already been exported",
+                    );
+                }
+                self.exportability = target;
+                self.occ_version += 1;
+                self.updated_at = Utc::now();
+                Ok(target)
+            }
+            _ => Err("invalid exportability transition"),
+        }
+    }
+
+    /// Set the `first_exported_at` latch on the first successful export.
+    /// No-op if already set. OCC-bumps.
+    pub fn mark_exported(&mut self) {
+        if self.first_exported_at.is_none() {
+            self.first_exported_at = Some(Utc::now());
+            self.occ_version += 1;
+            self.updated_at = Utc::now();
+        }
     }
 }
 
@@ -508,6 +566,8 @@ pub(crate) mod tests {
             origin: KeyOrigin::KeyRack,
             provider_class: ProviderClass::Software,
             provider_ref: None,
+            exportability: Exportability::default(),
+            first_exported_at: None,
             identity_tags: IdentityTags::from_attribute_set(&attrs),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
@@ -572,6 +632,8 @@ pub(crate) mod tests {
             origin: KeyOrigin::KeyRack,
             provider_class: ProviderClass::Software,
             provider_ref: Some(ProviderRef::new("software-default")),
+            exportability: Exportability::default(),
+            first_exported_at: None,
             identity_tags: identity_tags.clone(),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
@@ -627,5 +689,135 @@ pub(crate) mod tests {
             "Including provider_ref in the attribute set WOULD change the LID — \
              this proves its exclusion from the canonical form is load-bearing"
         );
+    }
+
+    #[test]
+    fn exportability_defaults_to_non_exportable_for_legacy_records() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.exportability = Exportability::NonExportable;
+        let json = serde_json::to_string(&record).unwrap();
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("exportability");
+        obj.remove("first_exported_at");
+        let legacy = serde_json::to_string(&value).unwrap();
+
+        let parsed: KeyRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(parsed.exportability, Exportability::NonExportable);
+        assert_eq!(parsed.first_exported_at, None);
+    }
+
+    #[test]
+    fn lid_derivation_ignores_exportability() {
+        use crate::attr::{AttributeSet, AttributeValue};
+        use crate::canon::{canonicalize, CanonicalizationVersion};
+
+        let mut attrs = AttributeSet::new();
+        attrs.insert("tenant", AttributeValue::String("acme".into()));
+        attrs.insert(
+            "_keyrack_key_id",
+            AttributeValue::String("export-lid-test".into()),
+        );
+
+        let canonical = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let lid = Lid::derive(CanonicalizationVersion::V1, &canonical);
+        let identity_tags = IdentityTags::from_attribute_set(&attrs);
+
+        let record_non_exportable = KeyRecord {
+            lid,
+            canonicalization_version: CanonicalizationVersion::V1,
+            parent_lid: None,
+            occ_version: 1,
+            current_key_version: 1,
+            state: KeyState::Enabled,
+            key_usage: KeyUsage::EncryptDecrypt,
+            key_spec: KeySpec::Aes256,
+            origin: KeyOrigin::KeyRack,
+            provider_class: ProviderClass::Software,
+            provider_ref: None,
+            exportability: Exportability::NonExportable,
+            first_exported_at: None,
+            identity_tags: identity_tags.clone(),
+            user_tags: UserTags::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            scheduled_deletion_at: None,
+            description: String::new(),
+            key_versions: vec![KeyVersionRecord {
+                version_number: 1,
+                key_handle: KeyHandle {
+                    key_id: "handle-1".into(),
+                    key_spec: KeySpec::Aes256,
+                },
+                provider_ref: None,
+                created_at: Utc::now(),
+                is_primary: true,
+            }],
+        };
+
+        let record_exportable = KeyRecord {
+            exportability: Exportability::Exportable,
+            first_exported_at: Some(Utc::now()),
+            ..record_non_exportable.clone()
+        };
+
+        assert_eq!(
+            record_non_exportable.lid, record_exportable.lid,
+            "LID must be identical regardless of exportability — \
+             exportability is a side property, not part of identity"
+        );
+    }
+
+    #[test]
+    fn transition_exportability_loosen() {
+        let mut record = make_test_record(KeyState::Enabled);
+        let v = record.occ_version;
+        assert_eq!(record.exportability, Exportability::NonExportable);
+
+        let result = record.transition_exportability(Exportability::Exportable);
+        assert!(result.is_ok());
+        assert_eq!(record.exportability, Exportability::Exportable);
+        assert_eq!(record.occ_version, v + 1);
+    }
+
+    #[test]
+    fn transition_exportability_tighten_pre_export() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.exportability = Exportability::Exportable;
+        record.first_exported_at = None;
+
+        let result = record.transition_exportability(Exportability::NonExportable);
+        assert!(result.is_ok());
+        assert_eq!(record.exportability, Exportability::NonExportable);
+    }
+
+    #[test]
+    fn transition_exportability_tighten_post_export_refused() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.exportability = Exportability::Exportable;
+        record.first_exported_at = Some(Utc::now());
+
+        let result = record.transition_exportability(Exportability::NonExportable);
+        assert!(result.is_err());
+        assert_eq!(record.exportability, Exportability::Exportable);
+    }
+
+    #[test]
+    fn mark_exported_sets_latch_once() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.exportability = Exportability::Exportable;
+        assert!(record.first_exported_at.is_none());
+
+        let v = record.occ_version;
+        record.mark_exported();
+        assert!(record.first_exported_at.is_some());
+        assert_eq!(record.occ_version, v + 1);
+
+        let ts = record.first_exported_at;
+        let v2 = record.occ_version;
+        record.mark_exported();
+        assert_eq!(record.first_exported_at, ts);
+        assert_eq!(record.occ_version, v2);
     }
 }

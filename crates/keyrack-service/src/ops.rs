@@ -447,8 +447,11 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
         AuditAction::KeyDestroyed => EventType::KeyDeleted,
-        AuditAction::AccessSecret => EventType::SecretAccess,
+        AuditAction::AccessSecret | AuditAction::GetKeyMaterial => EventType::SecretAccess,
         AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
+        AuditAction::MakeKeyExportable | AuditAction::RevokeKeyExportability => {
+            EventType::KeyStateChanged
+        }
     }
 }
 
@@ -460,6 +463,112 @@ pub fn default_principal() -> Principal {
         principal_type: "Service".into(),
         attributes: BTreeMap::new(),
     }
+}
+
+/// Authorize with explicit resource attributes (for exportable-key operations
+/// that populate `exportable`/`exported` on the PDP resource). Returns
+/// `Err(tonic::Status)` on deny/indeterminate.
+pub async fn authorize_with_resource_attrs(
+    state: &Arc<ServiceState>,
+    ctx: &OpContext,
+    resource_attrs: BTreeMap<String, keyrack_core::pdp::AttributeValue>,
+) -> Result<(), tonic::Status> {
+    let pdp_start = Instant::now();
+
+    let request = AuthzRequest {
+        pdp_api_version: PDP_API_VERSION.into(),
+        request_id: ctx.request_id.clone(),
+        action: ctx.action.clone(),
+        principal: ctx.principal.clone(),
+        resource: Resource {
+            id: ctx.resource_id.clone(),
+            resource_type: ctx.resource_type.clone(),
+            attributes: resource_attrs,
+        },
+        context: RequestContext::default(),
+    };
+
+    let response = state.pdp.evaluate(&request).await.map_err(|e| {
+        tracing::error!(error = %e, "PDP evaluation failed");
+        crate::metrics::record_pdp(pdp_start.elapsed(), false);
+        tonic::Status::internal("authorization service unavailable")
+    })?;
+
+    match response.decision {
+        Decision::Permit => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
+            Ok(())
+        }
+        Decision::Forbid | Decision::Indeterminate => {
+            crate::metrics::record_pdp(pdp_start.elapsed(), true);
+            let reasons: String = response
+                .reasons
+                .iter()
+                .map(|r| {
+                    r.human_message
+                        .as_deref()
+                        .or(r.reason_code.as_deref())
+                        .unwrap_or(&r.policy_id)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(tonic::Status::permission_denied(format!(
+                "authorization denied: {reasons}"
+            )))
+        }
+    }
+}
+
+/// Emit an authorization-denied audit event (used by double-gate flows where
+/// a secondary authorization check happens inside an already-authorized operation).
+pub async fn emit_audit_denied(state: &Arc<ServiceState>, ctx: &OpContext) {
+    emit_audit(
+        state,
+        ctx,
+        AuditResult::Denied,
+        Some(keyrack_core::audit::EventType::AuthorizationDenied),
+    )
+    .await;
+}
+
+/// PDP + audit envelope with resource-attribute enrichment. Used by
+/// exportable-key operations that must populate `Resource.attributes`.
+pub async fn execute_with_resource_attrs<F, Fut, T>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    resource_attrs: BTreeMap<String, keyrack_core::pdp::AttributeValue>,
+    op: F,
+) -> Result<T, tonic::Status>
+where
+    F: FnOnce(Arc<ServiceState>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
+
+    if let Err(denied) = authorize_with_resource_attrs(state, &ctx, resource_attrs).await {
+        emit_audit(
+            state,
+            &ctx,
+            AuditResult::Denied,
+            Some(keyrack_core::audit::EventType::AuthorizationDenied),
+        )
+        .await;
+        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
+        return Err(denied);
+    }
+
+    let result = op(Arc::clone(state)).await;
+
+    let (audit_result, result_str) = if result.is_ok() {
+        (AuditResult::Success, "success")
+    } else {
+        (AuditResult::Error, "error")
+    };
+    emit_audit(state, &ctx, audit_result, None).await;
+    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
+
+    result
 }
 
 /// Extract the authenticated principal from a tonic gRPC request.
