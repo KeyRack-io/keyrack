@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-e2e"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license.workspace = true
 description = "E2E test + demo binary for KeyRack — exercises gRPC and REST from the outside"

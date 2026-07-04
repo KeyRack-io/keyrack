@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-pii"
-version = "0.3.1"
+version = "0.3.2"
 description = "KeyRack PII tokenization helper (Workstream 5)"
 edition.workspace = true
 rust-version.workspace = true
