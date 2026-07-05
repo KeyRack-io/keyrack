@@ -85,7 +85,7 @@ curl -X POST http://localhost:8080/v1/keys \
 
 ### 4. HYOK Disconnect (Bounded Lockout)
 
-The most important property of HYOK: when a tenant revokes HSM access, KeyRack's ability to perform crypto operations is bounded by the cache TTL.
+The most important property of HYOK: when a tenant revokes HSM access, KeyRack's ability to perform crypto operations becomes limited. With a network HSM (KMIP), disconnect fails the provider call immediately at the transport layer. This demo uses in-process SoftHSM, where the session artifact remains valid until the metadata cache TTL expires — demonstrating the upper-bound lockout window visible in HA/multi-node deployments.
 
 **Automated test** (run from host after `docker compose up -d`):
 

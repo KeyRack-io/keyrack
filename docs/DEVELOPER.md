@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-keyrack-core = "0.1"
+keyrack-core = "0.3"
 ```
 
 ### Resolving a key hierarchy
@@ -166,10 +166,10 @@ impl AuditSink for MyAuditSink {
 
 ---
 
-## PII tokenization (coming soon)
+## PII tokenization
 
-The `keyrack-pii` crate will provide helpers for tokenizing PII before
-passing it as a key attribute. This is planned for a future release.
+The `keyrack-pii` crate provides helpers for tokenizing PII before
+passing it as a key attribute, using a BLAKE3-based tokenizer.
 
 ---
 
@@ -209,7 +209,7 @@ keyrack-core/        # Library: types, traits, canonicalization, LID, providers
 keyrack-service/     # gRPC + REST server binary
 keyrack-cedar-pdp/   # Optional Cedar PDP companion
 keyrack-cli/         # CLI tools: lint, provision, admin, migrate
-keyrack-pii/         # PII tokenization helper (coming soon)
+keyrack-pii/         # PII tokenization helper (BLAKE3 tokenizer)
 keyrack-wasm/        # WASM target + JS/TS bindings
 keyrack-sqlite/      # SQLite storage backend
 keyrack-postgres/    # PostgreSQL storage backend

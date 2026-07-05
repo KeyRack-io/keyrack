@@ -42,7 +42,7 @@ rotation, audit events, and HSM integration. You just call encrypt/decrypt.
 
 ```toml
 [dependencies]
-keyrack-core = "0.1"
+keyrack-core = "0.3"
 ```
 
 ```rust

@@ -439,8 +439,9 @@ sign_audit_events: true
 
 On startup the service generates an ephemeral Ed25519 keypair and logs
 the hex-encoded verifying key. Each audit event is signed and includes a
-hash-chain reference to the previous event, ensuring tampering or
-deletion is detectable.
+hash-chain reference to the previous event, ensuring interior tampering
+or deletion is detectable. Tail-truncation (dropping the latest N events)
+is not detectable without an external anchor.
 
 To persist the signing key across restarts (so verifiers can use a stable
 public key), provide a path to a 32-byte Ed25519 seed file:

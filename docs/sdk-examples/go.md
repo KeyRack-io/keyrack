@@ -181,7 +181,7 @@ func readPaymentToken(ctx context.Context, db *sql.DB, tenantID, userID string) 
 | Concern | Before | After |
 |---------|--------|-------|
 | Key storage | Env var | KeyRack manages keys in HSM or encrypted store |
-| Key rotation | Redeploy + maintenance window | `RotateKey()` + cooperative re-wrap |
+| Key rotation | Redeploy + maintenance window | `RotateKey()` + re-encryption |
 | Per-tenant isolation | None | Key hierarchy with tenant KEKs |
 | Audit trail | None | Every operation logged with principal, action, result |
 | Encryption context | None | AAD-bound, prevents cross-tenant misuse |

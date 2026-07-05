@@ -42,7 +42,7 @@ docker compose up --build
 # the `demo` container runs automatically and asserts each routing outcome
 ```
 
-Or via the repo-root wrapper: `./run-foss-demos.sh 06`
+Or via the CI runner: `./scripts/run-demos-ci.sh 06-provider-routing`
 
 ## What it demonstrates
 

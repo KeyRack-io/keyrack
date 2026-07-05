@@ -34,7 +34,7 @@ cryptographic authority for all connected sensors and actuators.
 |-------------|---------|
 | Hardware | Raspberry Pi 4 or 5 (ARM64) |
 | OS | Raspberry Pi OS 64-bit, or Ubuntu Server 24.04+ |
-| Runtime | Docker (recommended) **or** Rust 1.78+ toolchain |
+| Runtime | Docker (recommended) **or** Rust 1.80+ toolchain |
 | Network | IP connectivity between Pi and IoT devices |
 
 Ensure the Pi is reachable from your sensor network (e.g. static IP or mDNS).
@@ -43,7 +43,7 @@ Ensure the Pi is reachable from your sensor network (e.g. static IP or mDNS).
 
 ```bash
 # Pull the multi-arch image (includes ARM64)
-docker pull ghcr.io/keyrack/keyrack-service:latest
+docker pull ghcr.io/keyrack-io/keyrack-service:latest
 
 # Create directories
 mkdir -p ~/keyrack/{config,data}
@@ -76,7 +76,7 @@ docker run -d \
   -v ~/keyrack/config:/etc/keyrack:ro \
   -v ~/keyrack/data:/data \
   -e KMS_BOOTSTRAP_TOKEN=my-secret-token \
-  ghcr.io/keyrack/keyrack-service:latest
+  ghcr.io/keyrack-io/keyrack-service:latest
 ```
 
 Verify it started:
@@ -95,7 +95,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
 # Clone and build
-git clone https://github.com/nicosResworworking/keyrack.git
+git clone https://github.com/KeyRack-io/keyrack.git
 cd keyrack
 cargo build --release -p keyrack-service
 
@@ -190,7 +190,7 @@ them locally, then decrypts on demand for display. See the file for full usage.
 | Storage | Mount the SQLite database on LUKS-encrypted storage or use dm-crypt. |
 | Audit | Enable file-based audit logging; forward logs to a central SIEM via syslog or NATS. |
 | Network | Segment the sensor VLAN from the KMS management interface. Only expose port 8080/50051 to the sensor subnet. |
-| Key material | The `software` provider keeps keys in the DB. For hardware-backed keys, use Parsec with the Pi's TPM (when supported). |
+| Key material | The `software` provider holds key bytes in process memory (not in the DB). For hardware-backed keys, use a PKCS#11 or KMIP provider, or Parsec with the Pi's TPM (when supported). |
 | Updates | Pin the Docker image tag to a specific version; subscribe to KeyRack security advisories. |
 
 ## Next steps

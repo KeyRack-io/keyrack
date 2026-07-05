@@ -230,10 +230,12 @@ cache:
   ttl_secs: 300
 ```
 
-The cache TTL is a **security property** in HYOK deployments: after you disconnect
-an external HSM, cached key records remain usable for at most one TTL window.
-Set the TTL based on your lockout SLA — shorter TTL means faster revocation at
-the cost of more backend lookups.
+The cache TTL is a **security property** in HA/multi-node HYOK deployments: after
+you disconnect an external HSM, cross-node cache-invalidation staleness means
+other replicas may not learn of the disconnect for up to one TTL window. On the
+local node, the crypto provider call fails immediately at the transport layer
+(no grace period). Set the TTL based on your cross-replica lockout SLA — shorter
+TTL means faster convergence at the cost of more backend lookups.
 
 ---
 

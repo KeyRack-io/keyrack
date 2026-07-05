@@ -83,7 +83,7 @@ BLAKE3 is **not** a FIPS-approved hash algorithm. FIPS-approved hash functions a
 
 **Two-tier FIPS story:**
 
-1. **PKCS#11 provider path (production):** Key material lives in an HSM. If the HSM holds a FIPS 140-3 certificate (e.g., Thales Luna, AWS CloudHSM), then the cryptographic boundary for key generation, encryption, signing, and decryption is FIPS-validated. KeyRack acts as an orchestrator — it never touches raw key material. This path is the strongest FIPS story.
+1. **PKCS#11 provider path (production):** Key material lives in an HSM. If the HSM holds a FIPS 140-3 certificate (e.g., Thales Luna, AWS CloudHSM), then the cryptographic boundary for key generation, encryption, signing, and decryption is FIPS-validated. KeyRack acts as an orchestrator — raw key material stays in the HSM. This path is the strongest FIPS story.
 
 2. **Software provider path (dev/test):** Uses RustCrypto crates. No RustCrypto crate has undergone CMVP validation as of May 2026. The `aes-gcm` crate has received a security audit by NCC Group, but a security audit is not FIPS validation. This path is explicitly **not FIPS-compliant**.
 
@@ -154,18 +154,18 @@ For a KMS, the Security and Confidentiality criteria are primary. Auditors expec
 | Gap | Severity | Notes |
 |---|---|---|
 | No built-in key management policy documentation generator | Low | SOC 2 requires documented policies; KeyRack provides the technical controls but policy documents are an organizational concern |
-| Audit log tamper-evidence | Medium | NATS provides durable delivery, but the audit trail itself is not cryptographically signed by KeyRack (the commercial audit service adds receipt signing). FOSS deployments lack this. |
+| Audit log tamper-evidence | Low | FOSS ships Ed25519+BLAKE3 signed/chained audit events (opt-in; ephemeral key by default). Interior tamper-evidence is strong; tail-truncation detection requires an external anchor. |
 | Continuous monitoring / alerting | Low | KeyRack emits metrics and events, but SOC 2 Type II requires evidence of monitoring over time. This is an operational concern. |
 
 #### What would be needed to close them?
 
-1. **FOSS audit integrity** — add an optional audit log signing feature (e.g., hash chain or Ed25519 signature on audit events) for FOSS deployments without the commercial audit pipeline.
+1. **FOSS audit integrity** — Ed25519+BLAKE3 signing is shipped (opt-in). To strengthen: add monotonic sequence numbers, periodic signed checkpoints, and optional external witness integration for tail-truncation detection.
 2. **Policy template generation** — ship a template key management policy document with the FOSS distribution.
 3. **Operational runbooks** — document key rotation procedures, incident response for compromised keys, and destruction verification.
 
 #### FOSS or commercial concern?
 
-**Both, but primarily commercial.** SOC 2 Type II is relevant for commercial SaaS offerings. FOSS users self-hosting don't typically undergo SOC 2 audits, but the technical controls KeyRack provides are the foundation. The audit trail completeness is strong for commercial deployments with the full commercial stack; FOSS deployments may need the signed audit log feature.
+**Both, but primarily commercial.** SOC 2 Type II is relevant for commercial SaaS offerings. FOSS users self-hosting don't typically undergo SOC 2 audits, but the technical controls KeyRack provides are the foundation. The FOSS core ships Ed25519+BLAKE3 audit signing; the commercial stack adds HA cache-invalidation and shim-level audit.
 
 ---
 
@@ -262,7 +262,7 @@ As of 2026, HIPAA encryption requirements have shifted from "addressable" to **m
 
 #### What would be needed to close them?
 
-1. **Signed audit events for FOSS** — same recommendation as SOC 2 §2.2.
+1. **Audit strengthening** — Ed25519+BLAKE3 signing is shipped. Add monotonic sequence numbers and external-anchor options for tail-truncation detection.
 2. **HIPAA deployment guide** — document which deployment mode (HSM-backed, PDP-enabled, audit pipeline) meets HIPAA requirements.
 
 #### FOSS or commercial concern?

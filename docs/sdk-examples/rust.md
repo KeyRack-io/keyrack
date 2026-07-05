@@ -160,5 +160,5 @@ async fn main() -> Result<(), keyrack::KeyRackError> {
 | Key versioning | None | Self-describing ciphertext header |
 | Encryption context | None | AAD-bound, cross-tenant swap prevented |
 | Provider swap | Rewrite crypto layer | Change one constructor |
-| Rotation | Re-encrypt everything offline | `rotate_key()` + cooperative re-wrap |
+| Rotation | Re-encrypt everything offline | `rotate_key()` + re-encryption |
 | Audit | None | Every operation emitted as structured event |
