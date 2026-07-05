@@ -187,8 +187,7 @@ Plus a Kubernetes demo (needs `kind` + `kubectl`, not docker compose):
 |------|--------------|----------|
 | [07-k8s-sidecar](demos/07-k8s-sidecar/) | App + KeyRack sidecar in one pod (localhost), Postgres + Cedar | kind |
 
-The AWS KMS shim demos (`03-aws-kms-shim`, `05-hyok-aws-shim`) ship with the
-commercial extensions under `keyrack-commercial/demos/`.
+AWS KMS-compatible access (including HYOK) is available via the commercial extensions.
 
 ## License
 
