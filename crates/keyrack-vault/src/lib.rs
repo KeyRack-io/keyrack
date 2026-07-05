@@ -169,6 +169,33 @@ impl VaultTransitProvider {
         }
         Ok(())
     }
+
+    async fn vault_get<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R> {
+        let url = self.url(path);
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .map_err(|e| KeyRackError::Provider(format!("vault GET failed: {e}")))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| KeyRackError::Provider(format!("failed to read vault response: {e}")))?;
+
+        if !status.is_success() {
+            let msg = parse_vault_errors(&text).unwrap_or(text);
+            return Err(KeyRackError::Provider(format!(
+                "vault GET {path} returned {status}: {msg}"
+            )));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|e| KeyRackError::Provider(format!("failed to parse vault response: {e}")))
+    }
 }
 
 fn parse_vault_errors(body: &str) -> Option<String> {
@@ -229,6 +256,8 @@ fn vault_signature_algorithm(alg: SigningAlgorithm) -> Option<&'static str> {
 struct CreateKeyRequest {
     #[serde(rename = "type")]
     key_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exportable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -325,6 +354,22 @@ struct KeyConfigRequest {
     deletion_allowed: bool,
 }
 
+#[derive(Serialize)]
+struct ExportableConfigRequest {
+    exportable: bool,
+}
+
+/// GET /transit/export/encryption-key/{name}/{version}
+#[derive(Deserialize)]
+struct ExportKeyResponse {
+    data: ExportKeyData,
+}
+
+#[derive(Deserialize)]
+struct ExportKeyData {
+    keys: std::collections::HashMap<String, String>,
+}
+
 // ── CryptoProvider impl ────────────────────────────────────────────────
 
 #[async_trait]
@@ -332,7 +377,10 @@ impl CryptoProvider for VaultTransitProvider {
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
         let key_name = uuid::Uuid::new_v4().to_string();
         let key_type = vault_key_type(spec)?;
-        let body = CreateKeyRequest { key_type };
+        let body = CreateKeyRequest {
+            key_type,
+            exportable: None,
+        };
 
         self.vault_post_no_body(&format!("keys/{key_name}"), &body)
             .await?;
@@ -513,6 +561,71 @@ impl CryptoProvider for VaultTransitProvider {
             supports_atomic_re_encrypt: false,
         }
     }
+
+    async fn export_key_material(&self, handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
+        let resp: ExportKeyResponse = self
+            .vault_get(&format!("export/encryption-key/{}", handle.key_id))
+            .await?;
+
+        // The export response `keys` map is version_number→base64(material).
+        // When no version suffix is given, Vault returns the latest version.
+        let b64_material = resp.data.keys.values().next().ok_or_else(|| {
+            KeyRackError::Provider("vault export returned no key versions".into())
+        })?;
+
+        let material = B64.decode(b64_material).map_err(|e| {
+            KeyRackError::Provider(format!("base64 decode of exported key failed: {e}"))
+        })?;
+
+        Ok(Sensitive::new(material))
+    }
+
+    async fn make_key_exportable(&self, handle: &KeyHandle) -> Result<()> {
+        let config = ExportableConfigRequest { exportable: true };
+        self.vault_post_no_body(&format!("keys/{}/config", handle.key_id), &config)
+            .await?;
+
+        tracing::info!(
+            key_id = %handle.key_id,
+            "vault transit key marked exportable"
+        );
+        Ok(())
+    }
+
+    async fn revoke_key_exportability(&self, handle: &KeyHandle) -> Result<Option<KeyHandle>> {
+        // Vault Transit cannot turn `exportable` off. The honest path is:
+        //   1. Read the current key to learn the latest version.
+        //   2. Rotate to a new version (still exportable at the Vault level).
+        //   3. Bump min_decryption_version past all exportable versions so
+        //      Vault crypto-shreds (purges) them.
+        //   4. The new primary version's material is inaccessible via /export
+        //      because min_decryption_version > all previously exported
+        //      versions, and the key-level `exportable` flag is moot once
+        //      there are no versions below `latest_version` to export.
+        //
+        // However, `exportable` on the Vault key remains `true` (immutable),
+        // so the NEW version is technically exportable at the Vault level
+        // even though KeyRack marks the record NonExportable. Defense-in-depth:
+        // the KeyRack service layer will refuse GetKeyMaterial on a
+        // NonExportable record regardless.
+        //
+        // Alternative: create an entirely new Vault Transit key (non-exportable
+        // from birth) and destroy the old one. This is cleaner but loses the
+        // ability to decrypt ciphertext produced with the old key. Since
+        // RevokeKeyExportability is gated on first_exported_at==None (material
+        // never left), we take the STRONGER path: new key + destroy old.
+
+        let new_handle = self.generate_key(&handle.key_spec).await?;
+        self.destroy_key(handle).await?;
+
+        tracing::info!(
+            old_key = %handle.key_id,
+            new_key = %new_handle.key_id,
+            "vault transit: re-keyed to non-exportable key, old key crypto-shredded"
+        );
+
+        Ok(Some(new_handle))
+    }
 }
 
 #[cfg(test)]
@@ -543,5 +656,118 @@ mod tests {
             !caps.supports_atomic_re_encrypt,
             "supports_atomic_re_encrypt must be false without a re_encrypt override"
         );
+    }
+
+    // ── Live Vault integration tests ───────────────────────────────────
+    //
+    // Require VAULT_ADDR + VAULT_TOKEN pointing at a running Vault with
+    // Transit enabled (`vault secrets enable transit`).
+    //
+    // Run: cargo test -p keyrack-vault -- --ignored
+
+    async fn live_provider() -> Option<VaultTransitProvider> {
+        let addr = std::env::var("VAULT_ADDR").ok()?;
+        let token = std::env::var("VAULT_TOKEN").ok()?;
+        VaultTransitProvider::new(&addr, &token, None).await.ok()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
+    async fn exportable_round_trip() {
+        let provider = live_provider().await.expect("live Vault required");
+
+        // Create a key, then make it exportable.
+        let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+        provider.make_key_exportable(&handle).await.unwrap();
+
+        // Export the key material.
+        let material = provider.export_key_material(&handle).await.unwrap();
+        assert_eq!(material.expose().len(), 32, "AES-256 = 32 bytes");
+
+        // Encrypt with the key, then decrypt — the key still works.
+        let ct = provider.encrypt(&handle, b"hello", b"").await.unwrap();
+        let pt = provider
+            .decrypt(&handle, &ct.ciphertext, b"")
+            .await
+            .unwrap();
+        assert_eq!(pt.expose().as_slice(), b"hello");
+
+        provider.destroy_key(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
+    async fn loosen_then_export() {
+        let provider = live_provider().await.expect("live Vault required");
+
+        // Create a non-exportable key.
+        let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+        // Export should fail (non-exportable Vault key has no /export path).
+        let err = provider.export_key_material(&handle).await;
+        assert!(err.is_err(), "export on non-exportable key must fail");
+
+        // Loosen: make it exportable via config update.
+        provider.make_key_exportable(&handle).await.unwrap();
+
+        // Now export succeeds.
+        let material = provider.export_key_material(&handle).await.unwrap();
+        assert_eq!(material.expose().len(), 32);
+
+        provider.destroy_key(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
+    async fn tighten_pre_export_rekeys_and_old_gone() {
+        let provider = live_provider().await.expect("live Vault required");
+
+        // Create and make exportable.
+        let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+        provider.make_key_exportable(&handle).await.unwrap();
+
+        // Encrypt some data with the exportable key.
+        let ct = provider.encrypt(&handle, b"secret", b"").await.unwrap();
+
+        // Revoke: re-keys to a fresh non-exportable key.
+        let result = provider.revoke_key_exportability(&handle).await.unwrap();
+        assert!(result.is_some(), "Vault must re-key on revoke");
+        let new_handle = result.unwrap();
+        assert_ne!(
+            new_handle.key_id, handle.key_id,
+            "re-key must produce a new Vault key"
+        );
+
+        // Old key is gone — decrypt with old handle must fail.
+        let old_decrypt = provider.decrypt(&handle, &ct.ciphertext, b"").await;
+        assert!(old_decrypt.is_err(), "old key should be destroyed");
+
+        // New key works for new operations.
+        let ct2 = provider.encrypt(&new_handle, b"new", b"").await.unwrap();
+        let pt2 = provider
+            .decrypt(&new_handle, &ct2.ciphertext, b"")
+            .await
+            .unwrap();
+        assert_eq!(pt2.expose().as_slice(), b"new");
+
+        // New key is NOT exportable.
+        let export_err = provider.export_key_material(&new_handle).await;
+        assert!(export_err.is_err(), "re-keyed key must not be exportable");
+
+        provider.destroy_key(&new_handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
+    async fn non_exportable_has_no_export_path() {
+        let provider = live_provider().await.expect("live Vault required");
+
+        let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+
+        // Default key is non-exportable → export must fail.
+        let err = provider.export_key_material(&handle).await;
+        assert!(err.is_err(), "non-exportable key must refuse export");
+
+        provider.destroy_key(&handle).await.unwrap();
     }
 }

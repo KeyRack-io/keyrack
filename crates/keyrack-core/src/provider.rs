@@ -359,4 +359,29 @@ pub trait CryptoProvider: Send + Sync {
             "key export not supported by this provider".into(),
         ))
     }
+
+    /// Provider-level action when making a key exportable.
+    ///
+    /// Vault Transit: flips `exportable=true` via the key config endpoint.
+    /// Software/in-memory: no-op (no provider-level state to change).
+    ///
+    /// Called by the service layer after the posture-gate and PDP checks pass.
+    async fn make_key_exportable(&self, _handle: &KeyHandle) -> Result<()> {
+        Ok(())
+    }
+
+    /// Provider-level action when revoking key exportability.
+    ///
+    /// Vault Transit cannot turn `exportable` off, so it re-keys: creates a
+    /// fresh non-exportable key and destroys the old one. Returns
+    /// `Some(new_handle)` when a re-key occurred so the service layer can
+    /// update the key record. Returns `None` when no provider-level change
+    /// is needed (software/in-memory).
+    ///
+    /// Called by the service layer after the posture-gate checks pass.
+    /// The `first_exported_at is None` guard is enforced by the service layer;
+    /// providers must NOT duplicate that check.
+    async fn revoke_key_exportability(&self, _handle: &KeyHandle) -> Result<Option<KeyHandle>> {
+        Ok(None)
+    }
 }
