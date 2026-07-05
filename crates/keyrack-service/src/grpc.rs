@@ -1003,6 +1003,7 @@ impl KeyService for KeyServiceImpl {
             _ => None,
         });
         let principal_id = principal.id.clone();
+        let principal_for_export_gate = principal.clone();
         let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
         op_ctx.request_id = request_id;
         ops::execute(
@@ -1065,6 +1066,21 @@ impl KeyService for KeyServiceImpl {
                     .map(parse_lid)
                     .transpose()?;
 
+                // Leaf-only (Q3): reject creating a child whose parent is Exportable.
+                if let Some(parent) = &parent_lid {
+                    let parent_record = state
+                        .storage
+                        .get_key(parent)
+                        .await
+                        .map_err(convert::error_to_status)?;
+                    if parent_record.exportability == keyrack_core::key::Exportability::Exportable {
+                        return Err(Status::failed_precondition(
+                            "cannot create a child key under an exportable parent — \
+                             exportable keys must be leaf-only"
+                        ));
+                    }
+                }
+
                 let now = chrono::Utc::now();
                 let key_usage = match spec {
                     keyrack_core::key::KeySpec::Aes256 | keyrack_core::key::KeySpec::Aes128 => {
@@ -1104,6 +1120,12 @@ impl KeyService for KeyServiceImpl {
                     origin: keyrack_core::key::KeyOrigin::KeyRack,
                     provider_class: entry.class,
                     provider_ref: Some(provider_name.clone()),
+                    exportability: if req.exportable {
+                        keyrack_core::key::Exportability::Exportable
+                    } else {
+                        keyrack_core::key::Exportability::NonExportable
+                    },
+                    first_exported_at: None,
                     identity_tags,
                     user_tags: keyrack_core::tags::UserTags::new(),
                     created_at: now,
@@ -1118,6 +1140,34 @@ impl KeyService for KeyServiceImpl {
                         is_primary: true,
                     }],
                 };
+
+                // Born-exportable double-gate (Clarification #2): when exportable=true,
+                // the caller must ALSO be authorized for kms:MakeKeyExportable.
+                if req.exportable {
+                    // Leaf-only (Q3): reject born-exportable if parent set.
+                    if record.parent_lid.is_some() {
+                        return Err(Status::failed_precondition(
+                            "exportable keys must be leaf-only — cannot create with a parent"
+                        ));
+                    }
+
+                    let export_attrs = crate::domain::exportability_resource_attrs(&record);
+                    let export_ctx = OpContext::key(
+                        AuditAction::MakeKeyExportable,
+                        principal_for_export_gate,
+                        &lid.to_string(),
+                    );
+                    if let Err(denied) = ops::authorize_with_resource_attrs(
+                        &state,
+                        &export_ctx,
+                        export_attrs,
+                    )
+                    .await
+                    {
+                        ops::emit_audit_denied(&state, &export_ctx).await;
+                        return Err(denied);
+                    }
+                }
 
                 state.storage.create_key(&record).await.map_err(convert::error_to_status)?;
 
@@ -2635,6 +2685,171 @@ impl KeyService for KeyServiceImpl {
             deny_reason: result.deny_reason,
             policy_configured: result.policy_configured,
         }))
+    }
+
+    // ── Exportable key operations ────────────────────────────────────
+
+    async fn get_key_material(
+        &self,
+        request: Request<proto::GetKeyMaterialRequest>,
+    ) -> Result<Response<proto::GetKeyMaterialResponse>, Status> {
+        let request_id = Self::request_id(&request);
+        let principal = self.principal(&request).await?;
+        let req = request.into_inner();
+        let key_id = req.key_id.clone();
+
+        let lid = parse_lid(&key_id)?;
+        let record = self
+            .state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(convert::error_to_status)?;
+
+        if record.exportability != keyrack_core::key::Exportability::Exportable {
+            return Err(Status::failed_precondition(format!(
+                "key {key_id} is not exportable"
+            )));
+        }
+
+        let resource_attrs = crate::domain::exportability_resource_attrs(&record);
+        let mut op_ctx = OpContext::key(AuditAction::GetKeyMaterial, principal, &key_id);
+        op_ctx.request_id = request_id;
+
+        ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
+            let version_number = if req.key_version == 0 {
+                record.current_key_version
+            } else {
+                u64::from(req.key_version)
+            };
+            let version = record
+                .get_version(version_number)
+                .ok_or_else(|| Status::not_found(format!("version {version_number} not found")))?;
+
+            let entry = state
+                .providers
+                .resolve_for_version(&record, version_number)
+                .map_err(convert::error_to_status)?;
+            let material = entry
+                .provider
+                .export_key_material(&version.key_handle)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            tracing::warn!(
+                key_id = %key_id,
+                version = version_number,
+                "HARVEST-NOW CAVEAT: key material exported in plaintext — \
+                 captured bytes are usable forever"
+            );
+
+            let mut updated = record.clone();
+            updated.mark_exported();
+            state
+                .storage
+                .update_key(&updated)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            Ok(Response::new(proto::GetKeyMaterialResponse {
+                key_material: material.expose().clone(),
+                key_spec: convert::key_spec_to_proto(&record.key_spec).into(),
+                key_version: version_number as u32,
+                wrapped: false,
+            }))
+        })
+        .await
+    }
+
+    async fn make_key_exportable(
+        &self,
+        request: Request<proto::MakeKeyExportableRequest>,
+    ) -> Result<Response<proto::MakeKeyExportableResponse>, Status> {
+        let request_id = Self::request_id(&request);
+        let principal = self.principal(&request).await?;
+        let req = request.into_inner();
+        let key_id = req.key_id.clone();
+
+        let lid = parse_lid(&key_id)?;
+        let record = self
+            .state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(convert::error_to_status)?;
+
+        // Leaf-only enforcement (Q3): reject if key has dependents.
+        let dependents = self
+            .state
+            .storage
+            .list_children(&lid)
+            .await
+            .map_err(convert::error_to_status)?;
+        if !dependents.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "key {key_id} has dependents — exportable keys must be leaf-only"
+            )));
+        }
+
+        let resource_attrs = crate::domain::exportability_resource_attrs(&record);
+        let mut op_ctx = OpContext::key(AuditAction::MakeKeyExportable, principal, &key_id);
+        op_ctx.request_id = request_id;
+
+        ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
+            let mut updated = record.clone();
+            updated
+                .transition_exportability(keyrack_core::key::Exportability::Exportable)
+                .map_err(Status::failed_precondition)?;
+            state
+                .storage
+                .update_key(&updated)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            Ok(Response::new(proto::MakeKeyExportableResponse {
+                metadata: Some(convert::key_record_to_metadata(&updated)),
+            }))
+        })
+        .await
+    }
+
+    async fn revoke_key_exportability(
+        &self,
+        request: Request<proto::RevokeKeyExportabilityRequest>,
+    ) -> Result<Response<proto::RevokeKeyExportabilityResponse>, Status> {
+        let request_id = Self::request_id(&request);
+        let principal = self.principal(&request).await?;
+        let req = request.into_inner();
+        let key_id = req.key_id.clone();
+
+        let lid = parse_lid(&key_id)?;
+        let record = self
+            .state
+            .storage
+            .get_key(&lid)
+            .await
+            .map_err(convert::error_to_status)?;
+
+        let resource_attrs = crate::domain::exportability_resource_attrs(&record);
+        let mut op_ctx = OpContext::key(AuditAction::RevokeKeyExportability, principal, &key_id);
+        op_ctx.request_id = request_id;
+
+        ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
+            let mut updated = record.clone();
+            updated
+                .transition_exportability(keyrack_core::key::Exportability::NonExportable)
+                .map_err(Status::failed_precondition)?;
+            state
+                .storage
+                .update_key(&updated)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            Ok(Response::new(proto::RevokeKeyExportabilityResponse {
+                metadata: Some(convert::key_record_to_metadata(&updated)),
+            }))
+        })
+        .await
     }
 }
 

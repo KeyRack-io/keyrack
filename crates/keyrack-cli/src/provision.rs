@@ -184,6 +184,7 @@ pub async fn run(args: ProvisionArgs) -> anyhow::Result<()> {
                 backend_id: None,
                 attributes: attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 namespace: Some(args.namespace.clone()),
+                exportable: false,
             }))
             .await;
 

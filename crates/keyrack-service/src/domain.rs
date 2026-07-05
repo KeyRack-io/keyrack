@@ -229,6 +229,8 @@ pub struct CreateKeyInput {
     pub hsm_connection_id: Option<String>,
     /// The crypto backend to bind this key to. Supersedes `hsm_connection_id`.
     pub backend_id: Option<String>,
+    /// Whether the key is born exportable. Default `NonExportable`.
+    pub exportable: keyrack_core::key::Exportability,
 }
 
 /// Resolve the provider a new key binds to — the single source of truth shared
@@ -741,6 +743,8 @@ pub async fn create_key(
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: entry.class,
         provider_ref: Some(provider_name.clone()),
+        exportability: input.exportable,
+        first_exported_at: None,
         identity_tags,
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -2620,4 +2624,22 @@ mod explain_tests {
         assert_eq!(result.selected_backend_id, "conn-1");
         assert!(!result.policy_configured);
     }
+}
+
+/// Build PDP resource attributes for exportable-key operations.
+/// Populates `exportable` and `exported` so Cedar can gate on them.
+pub fn exportability_resource_attrs(
+    record: &KeyRecord,
+) -> std::collections::BTreeMap<String, keyrack_core::pdp::AttributeValue> {
+    use keyrack_core::pdp::AttributeValue;
+    let mut attrs = std::collections::BTreeMap::new();
+    attrs.insert(
+        "exportable".into(),
+        AttributeValue::Bool(record.exportability == keyrack_core::key::Exportability::Exportable),
+    );
+    attrs.insert(
+        "exported".into(),
+        AttributeValue::Bool(record.first_exported_at.is_some()),
+    );
+    attrs
 }

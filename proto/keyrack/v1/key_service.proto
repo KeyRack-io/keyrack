@@ -92,6 +92,12 @@ service KeyService {
   // ── Routing explain (read-only dry-run) ─────────────────────────────
 
   rpc ExplainRouting(ExplainRoutingRequest) returns (ExplainRoutingResponse);
+
+  // ── Exportable key operations ──────────────────────────────────────
+
+  rpc GetKeyMaterial(GetKeyMaterialRequest) returns (GetKeyMaterialResponse);
+  rpc MakeKeyExportable(MakeKeyExportableRequest) returns (MakeKeyExportableResponse);
+  rpc RevokeKeyExportability(RevokeKeyExportabilityRequest) returns (RevokeKeyExportabilityResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -194,6 +200,10 @@ message KeyMetadata {
   optional google.protobuf.Timestamp scheduled_deletion_at = 13;
   // The crypto backend bound to this key's primary version.
   optional string backend_id = 14;
+  // Whether this key's material may be exported via GetKeyMaterial.
+  bool exportable = 15;
+  // Timestamp of the first successful export (write-once latch).
+  optional google.protobuf.Timestamp first_exported_at = 16;
 }
 
 message KeyVersionMetadata {
@@ -368,6 +378,9 @@ message CreateKeyRequest {
   // dynamic HSM connection). Supersedes hsm_connection_id; the reserved
   // attribute keyrack.provider also folds into this and deprecates.
   optional string backend_id = 9;
+  // Create the key as exportable (material may be retrieved via GetKeyMaterial).
+  // Default false. Requires separate kms:MakeKeyExportable authorization.
+  bool exportable = 10;
 }
 
 message CreateKeyResponse {
@@ -889,5 +902,40 @@ message ExplainRoutingResponse {
   string deny_reason = 4;
   // Whether routing rules are configured (affects default-deny behavior).
   bool policy_configured = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Exportable key operations
+// ═══════════════════════════════════════════════════════════════════
+
+message GetKeyMaterialRequest {
+  string key_id = 1;
+  // Version to export. 0 => primary (current) version.
+  uint32 key_version = 2;
+  // Optional wrapping key for wrapped export (reserved for Phase 2+).
+  optional bytes wrapping_key = 3;
+}
+
+message GetKeyMaterialResponse {
+  bytes key_material = 1;
+  KeySpec key_spec = 2;
+  uint32 key_version = 3;
+  bool wrapped = 4;
+}
+
+message MakeKeyExportableRequest {
+  string key_id = 1;
+}
+
+message MakeKeyExportableResponse {
+  KeyMetadata metadata = 1;
+}
+
+message RevokeKeyExportabilityRequest {
+  string key_id = 1;
+}
+
+message RevokeKeyExportabilityResponse {
+  KeyMetadata metadata = 1;
 }
 

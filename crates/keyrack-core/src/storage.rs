@@ -161,6 +161,8 @@ mod tests {
             origin: KeyOrigin::KeyRack,
             provider_class: ProviderClass::Software,
             provider_ref: None,
+            exportability: crate::key::Exportability::default(),
+            first_exported_at: None,
             identity_tags: IdentityTags::from_attribute_set(&attrs),
             user_tags: UserTags::new(),
             created_at: chrono::Utc::now(),

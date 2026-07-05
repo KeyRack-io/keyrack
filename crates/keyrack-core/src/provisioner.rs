@@ -268,6 +268,8 @@ impl LazyProvisioner {
             origin: KeyOrigin::KeyRack,
             provider_class: entry.class,
             provider_ref: Some(provider_name.clone()),
+            exportability: crate::key::Exportability::default(),
+            first_exported_at: None,
             identity_tags,
             user_tags: UserTags::new(),
             created_at: now,

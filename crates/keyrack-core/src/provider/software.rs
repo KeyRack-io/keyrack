@@ -857,6 +857,22 @@ impl CryptoProvider for SoftwareProvider {
             supports_atomic_re_encrypt: false,
         }
     }
+
+    async fn export_key_material(&self, handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
+        let keys = self
+            .keys
+            .read()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+
+        let bytes = Self::get_material(&keys, handle, |m| match m {
+            KeyMaterial::Aes256(k) | KeyMaterial::Aes128(k) | KeyMaterial::Hmac256(k) => {
+                Some(k.clone())
+            }
+            _ => None,
+        })?;
+
+        Ok(Sensitive::new(bytes))
+    }
 }
 
 #[cfg(test)]

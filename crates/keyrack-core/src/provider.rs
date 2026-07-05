@@ -346,4 +346,17 @@ pub trait CryptoProvider: Send + Sync {
     /// exposes it via health/info endpoints. Providers should override
     /// to accurately reflect their HSM or backend capabilities.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Export raw key material for an exportable key.
+    ///
+    /// The caller (service layer) is responsible for enforcing that the key
+    /// is marked `Exportable` and for setting the `first_exported_at` latch;
+    /// this method simply returns the bytes.
+    ///
+    /// Default: unsupported. Providers that hold raw material override this.
+    async fn export_key_material(&self, _handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
+        Err(crate::error::KeyRackError::Provider(
+            "key export not supported by this provider".into(),
+        ))
+    }
 }

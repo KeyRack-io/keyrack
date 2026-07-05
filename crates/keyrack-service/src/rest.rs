@@ -356,6 +356,7 @@ async fn create_key(
                 _ => keyrack_core::key::KeyUsage::SignVerify,
             };
             let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let exportable = body.get("exportable").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let record = keyrack_core::key::KeyRecord {
                 lid,
                 canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
@@ -368,6 +369,12 @@ async fn create_key(
                 origin: keyrack_core::key::KeyOrigin::KeyRack,
                 provider_class: entry.class,
                 provider_ref: Some(provider_name.clone()),
+                exportability: if exportable {
+                    keyrack_core::key::Exportability::Exportable
+                } else {
+                    keyrack_core::key::Exportability::NonExportable
+                },
+                first_exported_at: None,
                 identity_tags,
                 user_tags: keyrack_core::tags::UserTags::new(),
                 created_at: now,
