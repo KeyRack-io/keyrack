@@ -50,3 +50,6 @@ pub mod secret;
 pub mod sensitive;
 pub mod storage;
 pub mod tags;
+
+#[cfg(kani)]
+mod kani_proofs;
