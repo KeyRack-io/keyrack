@@ -592,39 +592,32 @@ impl CryptoProvider for VaultTransitProvider {
         Ok(())
     }
 
-    async fn revoke_key_exportability(&self, handle: &KeyHandle) -> Result<Option<KeyHandle>> {
-        // Vault Transit cannot turn `exportable` off. The honest path is:
-        //   1. Read the current key to learn the latest version.
-        //   2. Rotate to a new version (still exportable at the Vault level).
-        //   3. Bump min_decryption_version past all exportable versions so
-        //      Vault crypto-shreds (purges) them.
-        //   4. The new primary version's material is inaccessible via /export
-        //      because min_decryption_version > all previously exported
-        //      versions, and the key-level `exportable` flag is moot once
-        //      there are no versions below `latest_version` to export.
+    async fn revoke_key_exportability(&self, _handle: &KeyHandle) -> Result<Option<KeyHandle>> {
+        // SOFT REVOKE — no-op at the Vault backend level.
         //
-        // However, `exportable` on the Vault key remains `true` (immutable),
-        // so the NEW version is technically exportable at the Vault level
-        // even though KeyRack marks the record NonExportable. Defense-in-depth:
-        // the KeyRack service layer will refuse GetKeyMaterial on a
-        // NonExportable record regardless.
+        // Vault Transit's `exportable` flag is one-way (cannot be turned off
+        // once set), so the backend key retains its exportable flag. However
+        // the KeyRack service layer marks the KeyRecord `NonExportable` and
+        // GetKeyMaterial refuses requests for non-exportable records, making
+        // this a KeyRack-POLICY revocation — not a cryptographic one.
         //
-        // Alternative: create an entirely new Vault Transit key (non-exportable
-        // from birth) and destroy the old one. This is cleaner but loses the
-        // ability to decrypt ciphertext produced with the old key. Since
-        // RevokeKeyExportability is gated on first_exported_at==None (material
-        // never left), we take the STRONGER path: new key + destroy old.
-
-        let new_handle = self.generate_key(&handle.key_spec).await?;
-        self.destroy_key(handle).await?;
+        // HONESTY: the backend key's material remains theoretically
+        // extractable by a Vault admin with direct Transit /export access.
+        // Full backend-level (cryptographic) revocation — destroying the key
+        // so the material is irrecoverable — requires a SEPARATE explicit
+        // destroy/crypto-shred operation (not part of RevokeKeyExportability).
+        //
+        // Rationale: RevokeKeyExportability must never destroy keys or cause
+        // silent data loss. Existing ciphertext encrypted with this key
+        // remains decryptable after a soft revoke.
 
         tracing::info!(
-            old_key = %handle.key_id,
-            new_key = %new_handle.key_id,
-            "vault transit: re-keyed to non-exportable key, old key crypto-shredded"
+            key_id = %_handle.key_id,
+            "vault transit: soft revoke — KeyRack policy marks key non-exportable; \
+             Vault-level exportable flag unchanged (one-way)"
         );
 
-        Ok(Some(new_handle))
+        Ok(None)
     }
 }
 
@@ -719,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
-    async fn tighten_pre_export_rekeys_and_old_gone() {
+    async fn tighten_soft_revoke_preserves_data() {
         let provider = live_provider().await.expect("live Vault required");
 
         // Create and make exportable.
@@ -729,32 +722,38 @@ mod tests {
         // Encrypt some data with the exportable key.
         let ct = provider.encrypt(&handle, b"secret", b"").await.unwrap();
 
-        // Revoke: re-keys to a fresh non-exportable key.
+        // Soft revoke: provider returns None (no re-key, no destroy).
         let result = provider.revoke_key_exportability(&handle).await.unwrap();
-        assert!(result.is_some(), "Vault must re-key on revoke");
-        let new_handle = result.unwrap();
-        assert_ne!(
-            new_handle.key_id, handle.key_id,
-            "re-key must produce a new Vault key"
+        assert!(
+            result.is_none(),
+            "soft revoke must NOT re-key — should return None"
         );
 
-        // Old key is gone — decrypt with old handle must fail.
-        let old_decrypt = provider.decrypt(&handle, &ct.ciphertext, b"").await;
-        assert!(old_decrypt.is_err(), "old key should be destroyed");
+        // POSITIVE CONTROL: old ciphertext still decrypts (data preserved).
+        let pt = provider
+            .decrypt(&handle, &ct.ciphertext, b"")
+            .await
+            .expect("old ciphertext must still decrypt after soft revoke");
+        assert_eq!(pt.expose().as_slice(), b"secret");
 
-        // New key works for new operations.
-        let ct2 = provider.encrypt(&new_handle, b"new", b"").await.unwrap();
+        // Key still works for new encrypt/decrypt operations.
+        let ct2 = provider.encrypt(&handle, b"new data", b"").await.unwrap();
         let pt2 = provider
-            .decrypt(&new_handle, &ct2.ciphertext, b"")
+            .decrypt(&handle, &ct2.ciphertext, b"")
             .await
             .unwrap();
-        assert_eq!(pt2.expose().as_slice(), b"new");
+        assert_eq!(pt2.expose().as_slice(), b"new data");
 
-        // New key is NOT exportable.
-        let export_err = provider.export_key_material(&new_handle).await;
-        assert!(export_err.is_err(), "re-keyed key must not be exportable");
+        // Vault-level exportable flag is still set (one-way, cannot be unset).
+        // The service layer's NonExportable posture is the actual gate.
+        let material = provider.export_key_material(&handle).await;
+        assert!(
+            material.is_ok(),
+            "Vault-level export still works (one-way flag); \
+             KeyRack service layer is the real gate"
+        );
 
-        provider.destroy_key(&new_handle).await.unwrap();
+        provider.destroy_key(&handle).await.unwrap();
     }
 
     #[tokio::test]

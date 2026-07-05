@@ -2861,9 +2861,9 @@ impl KeyService for KeyServiceImpl {
                 .transition_exportability(keyrack_core::key::Exportability::NonExportable)
                 .map_err(Status::failed_precondition)?;
 
-            // Provider-level: revoke exportability. Some providers (Vault)
-            // cannot turn exportable off, so they re-key to a fresh
-            // non-exportable key and destroy the old one.
+            // Provider-level: notify the backend of the soft revoke. No
+            // provider is expected to destroy or re-key here; this call
+            // exists so backends can perform bookkeeping if needed.
             let version_handles: Vec<_> = updated
                 .key_versions
                 .iter()
