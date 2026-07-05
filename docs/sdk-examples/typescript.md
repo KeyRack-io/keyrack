@@ -178,7 +178,7 @@ async function decryptDocument(ciphertext: Uint8Array): Promise<ArrayBuffer> {
 |---------|---------------|-------------------|-------|
 | Key management | Env var | Manual WebCrypto | KeyRack manages lifecycle |
 | Key storage | Process memory | ???  | HSM (server), IndexedDB (browser) |
-| Rotation | Redeploy | Not addressed | `rotateKey()` + cooperative re-wrap |
+| Rotation | Redeploy | Not addressed | `rotateKey()` + re-encryption |
 | Audit | None | None | Server-side audit log |
 | Multi-device sync | N/A | Build it yourself | KeyRack syncs wrapped DEKs |
 | Encryption context | None | None | AAD-bound |

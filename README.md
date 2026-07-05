@@ -4,22 +4,24 @@
 
 KeyRack is an open-source key lifecycle coordination layer. It tracks key
 hierarchies, drives rotation, and delegates all cryptographic material to
-HSM backends (PKCS#11, KMIP). It never stores raw key material.
+HSM backends (PKCS#11, KMIP, Vault Transit). When backed by an HSM or
+Vault provider, raw key material never leaves the backend; the software
+provider holds key bytes in process memory (dev/test only).
 
 - **Sovereign** — you control your keys. No cloud vendor lock-in.
 - **Pluggable HSMs** — PKCS#11 (Thales, Entrust, YubiHSM, CloudHSM), KMIP for tenant-managed HSMs, Vault Transit.
 - **API compatible** — AWS KMS and OpenStack Barbican shims let existing apps work without code changes.
 - **Policy-driven** — external authorization via any PDP (Cedar, OPA). Every operation is authorized and audited.
-- **Hierarchical keys** — deterministic key derivation trees with namespace-scoped rules and cascade disable.
-- **HYOK (Hold Your Own Key)** — tenants plug in their own HSM; disconnect guarantees bounded lockout via configurable cache TTL.
-- **Cryptographic audit** — Ed25519-signed events with BLAKE3 hash chain, delivered over NATS.
+- **Hierarchical keys** — KEK-wrapping hierarchy with namespace-scoped rules and cascade disable.
+- **HYOK (Hold Your Own Key)** — tenants plug in their own HSM; disconnect immediately fails crypto operations on that backend. Cross-node cache staleness in the commercial HA tier is bounded by a configurable TTL.
+- **Cryptographic audit** — Ed25519-signed events with BLAKE3 hash chain, delivered over NATS. Provides strong interior tamper-evidence; tail-truncation detection requires an external anchor; signing is opt-in and ephemeral by default.
 
 ## Quickstart
 
 Start the full stack (KeyRack service + Cedar PDP) with Docker Compose:
 
 ```bash
-git clone https://github.com/keyrack/keyrack.git
+git clone https://github.com/KeyRack-io/keyrack.git
 cd keyrack
 docker compose up -d keyrack-service
 ```
@@ -116,7 +118,7 @@ crates/
 ├── keyrack-cedar-pdp/      Standalone Cedar PDP binary
 ├── keyrack-cli/            CLI tools (lint, provision, migrate, admin)
 ├── keyrack-wasm/           WASM target + JS/TS bindings
-├── keyrack-pii/            PII tokenization helper (coming soon)
+├── keyrack-pii/            PII tokenization helper (BLAKE3 tokenizer)
 ├── keyrack-pkcs11/         PKCS#11 HSM provider
 ├── keyrack-kmip/           KMIP client provider (HYOK)
 ├── keyrack-postgres/       PostgreSQL storage backend
@@ -168,7 +170,7 @@ The same operations are available over gRPC on port 50051.
 
 ## Demos
 
-Six runnable FOSS demos (each a `docker compose up` away):
+Eight runnable FOSS demos (each a `docker compose up` away):
 
 | Demo | What it shows | Provider |
 |------|--------------|----------|
@@ -178,8 +180,10 @@ Six runnable FOSS demos (each a `docker compose up` away):
 | [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across HSM partitions | 2× SoftHSM tokens |
 | [08-cascade-rotation](demos/08-cascade-rotation/) | Hierarchical cascade rotation + cooperative ack/complete | Software |
 | [09-audit-tamper-evidence](demos/09-audit-tamper-evidence/) | Ed25519-signed + BLAKE3 hash-chained audit log verification | Software |
+| [10-mtls-identity](demos/10-mtls-identity/) | mTLS client-certificate identity | Software |
+| [11-multi-tenant-hyok](demos/11-multi-tenant-hyok/) | Multi-tenant HYOK with per-tenant HSMs | 2× SoftHSM tokens |
 
-Run them all with a pass/fail summary via [`run-foss-demos.sh`](../run-foss-demos.sh) at the repo root.
+Run them all with a pass/fail summary via [`scripts/run-demos-ci.sh`](scripts/run-demos-ci.sh).
 
 Plus a Kubernetes demo (needs `kind` + `kubectl`, not docker compose):
 

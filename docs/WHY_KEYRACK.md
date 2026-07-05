@@ -22,7 +22,7 @@ For regulated industries under DORA, NIS2, or national sovereignty requirements,
 
 ### 3. No audit verifiability
 
-Cloud KMS providers generate audit logs. You receive them. But you cannot independently verify their completeness or integrity. There is no cryptographic proof that the log you received is the same log the provider recorded, or that no entries were omitted. You trust the provider's logging pipeline end-to-end.
+Cloud KMS providers generate audit logs. You receive them. But you cannot independently verify their integrity. There is no cryptographic proof that the log you received is the same log the provider recorded. You trust the provider's logging pipeline end-to-end.
 
 ### 4. No instant revocation
 
@@ -54,34 +54,36 @@ Switch providers without changing application code. Your key hierarchy, policies
 
 ### Hold Your Own Key (HYOK)
 
-Tenants provision their own HSM or KMIP-compatible crypto backend. KeyRack manages the key hierarchy on top — tenant root key, KEKs, DEKs — but the root key never leaves the tenant's HSM. KeyRack holds only opaque handles.
+Tenants provision their own HSM or KMIP-compatible crypto backend. KeyRack manages the key hierarchy on top — tenant root key, KEKs, DEKs. The backend relationship operates in one of two modes:
 
-Disconnect the HSM and all derived keys become immediately unusable, bounded by a configurable cache TTL. This is a cryptographic kill switch, not an administrative one.
+- **Custody / managed mode** — the database or application uses server-side Encrypt/Decrypt via KMIP; key material never leaves the HSM or Vault (e.g. MongoDB KMIP default). KeyRack holds only opaque handles.
+- **Sovereign / keystore mode** — for appliances that pull raw keys (MySQL/Percona, vSphere), KeyRack serves an exportable key. Material intentionally leaves the backend, so the value proposition is governance (hierarchy, policy, audit, per-key exportability), not "keys never leave."
 
-Two deployment modes are first-class:
+Disconnect the HSM and crypto operations against that backend fail immediately. The FOSS cache stores lifecycle metadata, not key material — disable propagates on the node without delay. Cross-node cache staleness in the commercial HA tier is bounded by a configurable TTL.
+
+Three deployment patterns:
 
 - **Operator-managed HSM** — central hardware HSM under platform operator control
-- **Tenant-managed HYOK** — tenant controls the HSM and can revoke cloud access unilaterally by updating their KMIP policy
+- **Tenant-managed HYOK (custody)** — tenant controls the HSM; crypto stays server-side; disconnect is an immediate kill switch
+- **Tenant-managed HYOK (sovereign)** — tenant controls an exportable-key backend for appliances that require raw key access
 
 ### Cryptographic audit trail
 
 Every KeyRack operation emits an audit event containing:
 
-- Ed25519 signature over the event payload
+- Ed25519 signature over the event payload (opt-in; ephemeral key by default unless a persistent signing key path is configured)
 - BLAKE3 hash-chain linking each event to its predecessor
 - Full operation metadata (principal, action, key ID, timestamp)
 
-The audit trail is independently verifiable. Any party with the public key can validate the chain without trusting the KMS operator. Events are delivered via NATS for real-time consumption.
+The chain provides strong interior tamper-evidence: any modification or interior deletion of events is detectable by replaying the hash chain. Tail-truncation (dropping the latest N events) is not detectable without an external anchor such as a signed checkpoint or independent witness. Events are delivered via NATS for real-time consumption.
 
-### Bounded lockout guarantee
+### Lockout behavior
 
-KeyRack's cache TTL is a security property, not just a performance knob. When a tenant disconnects their HSM or an operator disables a root key:
+When a tenant disconnects their HSM or an operator disables a root key:
 
-1. The key state change propagates immediately.
-2. Any cached key material expires within the configured TTL window.
-3. After TTL expiry, no cryptographic operation can succeed against the affected key hierarchy.
-
-The TTL is configurable and documented. The upper bound on "time until lockout" is a contract, not a best-effort estimate.
+1. On the local node, the key state change propagates immediately — the FOSS cache stores lifecycle metadata, not key material, so disable is instant.
+2. HSM disconnect is immediately fatal: every crypto operation calls the provider unconditionally; a disconnected KMIP/PKCS#11 backend fails at the transport layer.
+3. In the commercial HA tier, cross-node cache-invalidation staleness is bounded by a configurable TTL — this is the upper bound on "time until lockout" across replicas.
 
 ### AWS KMS API compatibility (commercial)
 
@@ -184,8 +186,8 @@ FIPS 140-3 compliance is achieved through the HSM provider path. The HSM's certi
 |---------|-----------|---------|
 | Key sovereignty | Provider-controlled HSM | Customer-controlled (any PKCS#11/KMIP device) |
 | HSM choice | Provider's hardware only | Bring any certified HSM |
-| Audit verifiability | Provider-generated logs | Ed25519-signed hash chain, independently verifiable |
-| Instant revocation | No guarantee; provider-dependent | Bounded by configurable cache TTL |
+| Audit verifiability | Provider-generated logs | BLAKE3 hash chain (Ed25519 signing opt-in); strong interior integrity; truncation needs external anchor |
+| Instant revocation | No guarantee; provider-dependent | Immediate on the local node; cross-node staleness bounded by configurable TTL (commercial HA) |
 | Multi-cloud portable | No (proprietary APIs) | Yes (single KMS across all environments) |
 | HYOK | Limited (CloudHSM-only in AWS) | Full: tenant-managed HSM with unilateral revocation |
 | API compatibility | Proprietary per provider | Native gRPC/REST + AWS KMS shim + Barbican shim |
@@ -201,7 +203,7 @@ KeyRack's core is open source under AGPL-3.0-or-later (the Protocol Buffers
 definitions and the client SDK are Apache-2.0). Commercial licensing is
 available for embedding without AGPL reciprocity.
 
-- **Repository:** [keyrack-oss](https://github.com/Keyrack-io/keyrack)
+- **Repository:** [keyrack-oss](https://github.com/KeyRack-io/keyrack)
 - **Security model:** [`docs/compliance/CRYPTO_SECURITY_MODEL.md`](compliance/CRYPTO_SECURITY_MODEL.md)
 - **Compliance posture:** [`docs/compliance/COMPLIANCE_POSTURE.md`](compliance/COMPLIANCE_POSTURE.md)
 

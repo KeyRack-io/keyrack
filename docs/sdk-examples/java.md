@@ -16,7 +16,7 @@ public class TransactionEncryptionService {
 
     private final KmsClient kms;
     // Hardcoded key ARN. Rotation is configured in AWS Console.
-    // No hierarchy, no dependency tracking, no cooperative re-wrapping.
+    // No hierarchy, no dependency tracking, no coordinated re-encryption.
     private static final String KEY_ARN =
         "arn:aws:kms:us-east-1:123456789:key/abc-def-123";
 

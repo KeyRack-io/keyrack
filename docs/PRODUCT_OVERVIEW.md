@@ -46,8 +46,8 @@ rotation tooling. The capability gap is universal.
 ### FOSS Core
 
 **Key Lifecycle Coordination**
-- Hierarchical key management with parent-child dependency tracking
-- Deterministic key addressing via Logical IDs (LIDs)
+- Hierarchical key management (KEK-wrapping hierarchy) with parent-child dependency tracking
+- Content-addressed key identity via Logical IDs (LIDs)
 - Full key state machine: Creating → Enabled ⇄ Disabled →
   PendingDeletion → Destroyed
 - Cascade disable: disable one key, all descendants instantly
@@ -67,8 +67,8 @@ rotation tooling. The capability gap is universal.
 - Software (RustCrypto): development, non-regulated workloads
 - PKCS#11: production HSMs (SoftHSM, Thales, Entrust, Utimaco)
 - KMIP: remote HSM via standardized network protocol
-- Parsec: IoT/embedded via PSA Crypto API (planned)
-- Vault Transit: brownfield adoption path (planned)
+- Vault Transit: HashiCorp Vault-backed crypto operations
+- Parsec: IoT/embedded via PSA Crypto API (stub — integration pending)
 
 **Self-Describing Ciphertext**
 - Every ciphertext embeds key ID, version, algorithm, and encryption

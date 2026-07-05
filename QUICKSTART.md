@@ -9,7 +9,7 @@ Get KeyRack running and perform your first encrypt/decrypt in under 5 minutes.
 This starts KeyRack with a Cedar PDP for authorization. Requires Docker.
 
 ```bash
-git clone https://github.com/keyrack/keyrack.git
+git clone https://github.com/KeyRack-io/keyrack.git
 cd keyrack
 docker compose up -d keyrack-service
 ```
@@ -62,7 +62,7 @@ Requires Rust 1.80+ and protobuf compiler.
 ### 1. Build
 
 ```bash
-git clone https://github.com/keyrack/keyrack.git
+git clone https://github.com/KeyRack-io/keyrack.git
 cd keyrack
 cargo build --release -p keyrack-service
 ```

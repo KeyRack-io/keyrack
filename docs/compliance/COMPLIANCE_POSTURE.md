@@ -41,7 +41,7 @@ KeyRack's compliance posture is fundamentally determined by which cryptographic 
 
 - Key material lives in an HSM (Thales Luna, AWS CloudHSM, SoftHSM, etc.)
 - Cryptographic boundary is the HSM's FIPS 140-3 certificate
-- KeyRack acts as an orchestrator — it never handles raw key material
+- KeyRack acts as an orchestrator — raw key material stays in the HSM
 - This is the path for FIPS, PCI-DSS, HIPAA, and SOC 2 deployments
 
 ### KMIP provider (HYOK / multi-cloud)

@@ -128,7 +128,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#features">Features</a></li>
       <li><a href="#quickstart">Quickstart</a></li>
-      <li><a href="https://github.com/keyrack/keyrack">GitHub</a></li>
+      <li><a href="https://github.com/KeyRack-io/keyrack">GitHub</a></li>
     </ul>
   </div>
 </nav>
@@ -136,10 +136,10 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
 <header class="hero">
   <div class="container">
     <h1>Sovereign key management.<br><span>Your hardware. Your rules.</span></h1>
-    <p>KeyRack is an open-source key lifecycle coordination layer. It tracks key hierarchies, drives rotation, and delegates all cryptographic material to HSM backends. It never stores raw key material.</p>
+    <p>KeyRack is an open-source key lifecycle coordination layer. It tracks key hierarchies, drives rotation, and delegates all cryptographic material to HSM backends. When backed by an HSM or Vault provider, raw key material never leaves the backend; the software provider holds key bytes in process memory (dev/test only).</p>
     <div class="hero-actions">
       <a href="#quickstart" class="btn btn-primary">Get Started</a>
-      <a href="https://github.com/keyrack/keyrack" class="btn btn-secondary">View on GitHub &#8599;</a>
+      <a href="https://github.com/KeyRack-io/keyrack" class="btn btn-secondary">View on GitHub &#8599;</a>
     </div>
     <div style="margin-top:24px">
       <span class="license-badge">AGPL-3.0-or-later</span>
@@ -153,7 +153,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
   <div class="container">
     <div class="section-label">Why KeyRack</div>
     <h2 class="section-title">Infrastructure you control, end to end</h2>
-    <p class="section-desc">No vendor lock-in. No key material leaving your HSMs. Policy-driven authorization with full audit trails.</p>
+    <p class="section-desc">No vendor lock-in. HSM/Vault-backed providers keep key material in the backend. Policy-driven authorization with audit trails.</p>
     <div class="values">
       <div class="value">
         <h3><span class="icon">&#9670;</span> Sovereign</h3>
@@ -173,7 +173,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
       </div>
       <div class="value">
         <h3><span class="icon">&#9670;</span> Hierarchical Keys</h3>
-        <p>Deterministic key derivation trees. Namespace-scoped rules. Cascade disable across entire hierarchies.</p>
+        <p>KEK-wrapping hierarchy with namespace-scoped rules. Cascade disable across entire key trees.</p>
       </div>
       <div class="value">
         <h3><span class="icon">&#9670;</span> Production-ready</h3>
@@ -189,7 +189,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
   <div class="container">
     <div class="section-label">Architecture</div>
     <h2 class="section-title">How it fits together</h2>
-    <p class="section-desc">KeyRack coordinates between clients, HSM backends, policy engines, and storage — never touching raw key material.</p>
+    <p class="section-desc">KeyRack coordinates between clients, HSM backends, policy engines, and storage — delegating all crypto to the configured provider.</p>
     <div class="arch-box">
 <pre>
 <span class="a-label">  Clients</span>                      <span class="a-label">KeyRack Service</span>                  <span class="a-label">HSM Backends</span>
@@ -223,7 +223,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
       <div class="feature">
         <div class="f-icon">&#x1F332;</div>
         <h3>Hierarchical Key Trees</h3>
-        <p>Deterministic derivation with namespace-scoped rules and cascade operations.</p>
+        <p>KEK-wrapping hierarchy with namespace-scoped rules and cascade operations.</p>
       </div>
       <div class="feature">
         <div class="f-icon">&#x1F6E1;</div>
@@ -233,7 +233,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
       <div class="feature">
         <div class="f-icon">&#x1F512;</div>
         <h3>HSM-backed Crypto</h3>
-        <p>All cryptographic operations happen inside your HSMs. No key material in memory.</p>
+        <p>With HSM/Vault providers, crypto operations run inside the backend. The software provider holds key bytes in process memory (dev/test only).</p>
       </div>
       <div class="feature">
         <div class="f-icon">&#x1F4DD;</div>
@@ -269,7 +269,7 @@ footer p{font-size:0.8rem;color:var(--text-muted)}
       </div>
 <pre>
 <span class="cm"># Clone and start the stack</span>
-<span class="cmd">git clone</span> <span class="url">https://github.com/keyrack/keyrack.git</span>
+<span class="cmd">git clone</span> <span class="url">https://github.com/KeyRack-io/keyrack.git</span>
 <span class="cmd">cd</span> keyrack
 <span class="cmd">docker compose up</span> <span class="flag">-d</span> keyrack-service
 
@@ -303,7 +303,7 @@ KEY_ID=$(<span class="cmd">curl</span> <span class="flag">-s</span> <span class=
     <h2 class="section-title">Links</h2>
     <p class="section-desc">Everything you need to get started, contribute, or report issues.</p>
     <div class="links-grid">
-      <a href="https://github.com/keyrack/keyrack" class="link-card">
+      <a href="https://github.com/KeyRack-io/keyrack" class="link-card">
         <span class="lc-title">GitHub &#8599;</span>
         <span class="lc-desc">Source code, issues, and contributions.</span>
       </a>
@@ -311,11 +311,11 @@ KEY_ID=$(<span class="cmd">curl</span> <span class="flag">-s</span> <span class=
         <span class="lc-title">Documentation &#8599;</span>
         <span class="lc-desc">Guides, API reference, and configuration.</span>
       </a>
-      <a href="https://github.com/keyrack/keyrack/blob/main/SECURITY.md" class="link-card">
+      <a href="https://github.com/KeyRack-io/keyrack/blob/main/SECURITY.md" class="link-card">
         <span class="lc-title">Security &#8599;</span>
         <span class="lc-desc">Vulnerability reporting and security policy.</span>
       </a>
-      <a href="https://github.com/keyrack/keyrack/blob/main/LICENSE" class="link-card">
+      <a href="https://github.com/KeyRack-io/keyrack/blob/main/LICENSE" class="link-card">
         <span class="lc-title">License &#8599;</span>
         <span class="lc-desc">AGPL-3.0-or-later. Commercial licensing available.</span>
       </a>
