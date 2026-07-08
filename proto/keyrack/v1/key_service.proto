@@ -97,6 +97,12 @@ service KeyService {
 
   rpc GetKeyMaterial(GetKeyMaterialRequest) returns (GetKeyMaterialResponse);
   rpc MakeKeyExportable(MakeKeyExportableRequest) returns (MakeKeyExportableResponse);
+  // Soft-revoke: marks the key NonExportable at the KeyRack policy layer so
+  // GetKeyMaterial is refused. No backend key material is destroyed or
+  // re-keyed. On backends whose exportable flag is one-way (e.g. Vault
+  // Transit), this is a POLICY revocation only — the backend key retains its
+  // flag. Full backend-level (cryptographic) revocation requires a separate
+  // explicit destroy/crypto-shred operation.
   rpc RevokeKeyExportability(RevokeKeyExportabilityRequest) returns (RevokeKeyExportabilityResponse);
 }
 

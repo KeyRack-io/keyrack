@@ -359,4 +359,39 @@ pub trait CryptoProvider: Send + Sync {
             "key export not supported by this provider".into(),
         ))
     }
+
+    /// Provider-level action when making a key exportable.
+    ///
+    /// Vault Transit: flips `exportable=true` via the key config endpoint.
+    /// Software/in-memory: no-op (no provider-level state to change).
+    ///
+    /// Called by the service layer after the posture-gate and PDP checks pass.
+    async fn make_key_exportable(&self, _handle: &KeyHandle) -> Result<()> {
+        Ok(())
+    }
+
+    /// Provider-level action when revoking key exportability (soft revoke).
+    ///
+    /// This is a **non-destructive** operation. Providers must NOT destroy,
+    /// re-key, or crypto-shred any key material here. The service layer marks
+    /// the `KeyRecord` as `NonExportable`, which is the authoritative posture
+    /// gate — `GetKeyMaterial` refuses requests for non-exportable records.
+    ///
+    /// Returns `Some(new_handle)` only if the provider replaced the backend
+    /// key (not expected in the soft-revoke model). Returns `None` when no
+    /// provider-level change is needed (the common case for all providers).
+    ///
+    /// **Honesty (one-way backends):** on backends whose exportable flag
+    /// cannot be turned off (e.g. Vault Transit), this is a KeyRack-POLICY
+    /// revocation only — the backend key retains its exportable flag. Full
+    /// backend-level (cryptographic) revocation requires a separate explicit
+    /// destroy/crypto-shred operation, which is outside the scope of
+    /// `RevokeKeyExportability`.
+    ///
+    /// Called by the service layer after the posture-gate checks pass.
+    /// The `first_exported_at is None` guard is enforced by the service layer;
+    /// providers must NOT duplicate that check.
+    async fn revoke_key_exportability(&self, _handle: &KeyHandle) -> Result<Option<KeyHandle>> {
+        Ok(None)
+    }
 }

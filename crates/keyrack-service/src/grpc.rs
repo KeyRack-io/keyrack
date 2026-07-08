@@ -1167,6 +1167,13 @@ impl KeyService for KeyServiceImpl {
                         ops::emit_audit_denied(&state, &export_ctx).await;
                         return Err(denied);
                     }
+
+                    // Provider-level: tell the backend this key is exportable.
+                    entry
+                        .provider
+                        .make_key_exportable(&record.key_versions[0].key_handle)
+                        .await
+                        .map_err(convert::error_to_status)?;
                 }
 
                 state.storage.create_key(&record).await.map_err(convert::error_to_status)?;
@@ -2796,6 +2803,20 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
 
         ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
+            // Provider-level: tell the backend this key is exportable.
+            let entry = state
+                .providers
+                .resolve_for_version(&record, record.current_key_version)
+                .map_err(convert::error_to_status)?;
+            let primary = record
+                .get_version(record.current_key_version)
+                .ok_or_else(|| Status::internal("primary version not found"))?;
+            entry
+                .provider
+                .make_key_exportable(&primary.key_handle)
+                .await
+                .map_err(convert::error_to_status)?;
+
             let mut updated = record.clone();
             updated
                 .transition_exportability(keyrack_core::key::Exportability::Exportable)
@@ -2839,6 +2860,35 @@ impl KeyService for KeyServiceImpl {
             updated
                 .transition_exportability(keyrack_core::key::Exportability::NonExportable)
                 .map_err(Status::failed_precondition)?;
+
+            // Provider-level: notify the backend of the soft revoke. No
+            // provider is expected to destroy or re-key here; this call
+            // exists so backends can perform bookkeeping if needed.
+            let version_handles: Vec<_> = updated
+                .key_versions
+                .iter()
+                .map(|v| (v.version_number, v.key_handle.clone()))
+                .collect();
+            for (vnum, old_handle) in &version_handles {
+                let entry = state
+                    .providers
+                    .resolve_for_version(&updated, *vnum)
+                    .map_err(convert::error_to_status)?;
+                if let Some(new_handle) = entry
+                    .provider
+                    .revoke_key_exportability(old_handle)
+                    .await
+                    .map_err(convert::error_to_status)?
+                {
+                    for v in &mut updated.key_versions {
+                        if v.version_number == *vnum {
+                            v.key_handle = new_handle;
+                            break;
+                        }
+                    }
+                }
+            }
+
             state
                 .storage
                 .update_key(&updated)
