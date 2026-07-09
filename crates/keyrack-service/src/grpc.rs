@@ -1068,17 +1068,9 @@ impl KeyService for KeyServiceImpl {
 
                 // Leaf-only (Q3): reject creating a child whose parent is Exportable.
                 if let Some(parent) = &parent_lid {
-                    let parent_record = state
-                        .storage
-                        .get_key(parent)
+                    crate::domain::enforce_no_child_under_exportable_parent(&state, parent)
                         .await
-                        .map_err(convert::error_to_status)?;
-                    if parent_record.exportability == keyrack_core::key::Exportability::Exportable {
-                        return Err(Status::failed_precondition(
-                            "cannot create a child key under an exportable parent — \
-                             exportable keys must be leaf-only"
-                        ));
-                    }
+                        .map_err(|e| e.to_grpc_status())?;
                 }
 
                 let now = chrono::Utc::now();
@@ -1141,39 +1133,17 @@ impl KeyService for KeyServiceImpl {
                     }],
                 };
 
-                // Born-exportable double-gate (Clarification #2): when exportable=true,
-                // the caller must ALSO be authorized for kms:MakeKeyExportable.
+                // Born-exportable double-gate: shared domain enforcement for
+                // leaf-only, PDP MakeKeyExportable, and provider wiring.
                 if req.exportable {
-                    // Leaf-only (Q3): reject born-exportable if parent set.
-                    if record.parent_lid.is_some() {
-                        return Err(Status::failed_precondition(
-                            "exportable keys must be leaf-only — cannot create with a parent"
-                        ));
-                    }
-
-                    let export_attrs = crate::domain::exportability_resource_attrs(&record);
-                    let export_ctx = OpContext::key(
-                        AuditAction::MakeKeyExportable,
-                        principal_for_export_gate,
-                        &lid.to_string(),
-                    );
-                    if let Err(denied) = ops::authorize_with_resource_attrs(
+                    crate::domain::enforce_born_exportable(
                         &state,
-                        &export_ctx,
-                        export_attrs,
+                        &record,
+                        &principal_for_export_gate,
+                        &entry.provider,
                     )
                     .await
-                    {
-                        ops::emit_audit_denied(&state, &export_ctx).await;
-                        return Err(denied);
-                    }
-
-                    // Provider-level: tell the backend this key is exportable.
-                    entry
-                        .provider
-                        .make_key_exportable(&record.key_versions[0].key_handle)
-                        .await
-                        .map_err(convert::error_to_status)?;
+                    .map_err(|e| e.to_grpc_status())?;
                 }
 
                 state.storage.create_key(&record).await.map_err(convert::error_to_status)?;

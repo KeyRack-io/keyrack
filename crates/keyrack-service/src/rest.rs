@@ -254,6 +254,7 @@ async fn create_key(
         _ => None,
     });
     let principal_id = principal.id.clone();
+    let principal_for_export_gate = principal.clone();
     let mut op_ctx = OpContext::key(AuditAction::CreateKey, principal, "(new)");
     op_ctx.request_id = request_id;
     ops::execute_rest(
@@ -357,6 +358,14 @@ async fn create_key(
             };
             let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_owned();
             let exportable = body.get("exportable").and_then(serde_json::Value::as_bool).unwrap_or(false);
+
+            // Leaf-only enforcement: reject creating a child under an exportable parent.
+            if let Some(ref plid) = parent_lid {
+                crate::domain::enforce_no_child_under_exportable_parent(&state, plid)
+                    .await
+                    .map_err(|e| e.to_rest_error())?;
+            }
+
             let record = keyrack_core::key::KeyRecord {
                 lid,
                 canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
@@ -389,6 +398,19 @@ async fn create_key(
                     is_primary: true,
                 }],
             };
+
+            // Born-exportable double-gate + leaf-only + provider wiring.
+            if exportable {
+                crate::domain::enforce_born_exportable(
+                    &state,
+                    &record,
+                    &principal_for_export_gate,
+                    &entry.provider,
+                )
+                .await
+                .map_err(|e| e.to_rest_error())?;
+            }
+
             state.storage.create_key(&record).await.map_err(map_core_err)?;
             Ok((StatusCode::CREATED, key_json(&record)))
         },
