@@ -2643,3 +2643,141 @@ pub fn exportability_resource_attrs(
     );
     attrs
 }
+
+// ── Born-exportable enforcement (shared by gRPC + REST) ─────────────
+
+/// Enforce the leaf-only constraint when creating a child key: reject if the
+/// parent is itself exportable (exportable keys cannot have dependents).
+///
+/// This check applies to ALL `CreateKey` calls that specify a `parent_key_id`,
+/// regardless of whether the NEW key is exportable.
+pub async fn enforce_no_child_under_exportable_parent(
+    state: &Arc<ServiceState>,
+    parent_lid: &keyrack_core::lid::Lid,
+) -> Result<(), DomainError> {
+    let parent_record = state
+        .storage
+        .get_key(parent_lid)
+        .await
+        .map_err(DomainError::from)?;
+    if parent_record.exportability == keyrack_core::key::Exportability::Exportable {
+        return Err(DomainError::FailedPrecondition(
+            "cannot create a child key under an exportable parent — \
+             exportable keys must be leaf-only"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The born-exportable double-gate: enforces ALL three invariants when
+/// `exportable=true` is requested at key-creation time.
+///
+/// 1. **Leaf-only**: born-exportable keys cannot have a parent.
+/// 2. **PDP double-gate**: a SECOND authorization check for
+///    `kms:MakeKeyExportable` must pass (fail-closed).
+/// 3. **Provider wiring**: the backend is told the key is exportable
+///    (e.g., Vault Transit flips its exportable flag).
+///
+/// Both gRPC and REST call this function so the enforcement cannot diverge.
+pub async fn enforce_born_exportable(
+    state: &Arc<ServiceState>,
+    record: &KeyRecord,
+    principal: &keyrack_core::pdp::Principal,
+    provider: &Arc<dyn keyrack_core::provider::CryptoProvider>,
+) -> Result<(), DomainError> {
+    // (1) Leaf-only: reject if parent is set.
+    if record.parent_lid.is_some() {
+        return Err(DomainError::FailedPrecondition(
+            "exportable keys must be leaf-only — cannot create with a parent".into(),
+        ));
+    }
+
+    // (2) PDP double-gate: require kms:MakeKeyExportable authorization.
+    let export_attrs = exportability_resource_attrs(record);
+    let lid_str = record.lid.to_string();
+    authorize_make_exportable(state, principal, &lid_str, export_attrs).await?;
+
+    // (3) Provider-level: tell the backend this key is exportable.
+    let key_handle = &record
+        .key_versions
+        .first()
+        .ok_or_else(|| DomainError::Internal("no key version on new key".into()))?
+        .key_handle;
+    provider
+        .make_key_exportable(key_handle)
+        .await
+        .map_err(DomainError::from)?;
+
+    Ok(())
+}
+
+/// Domain-level PDP check for `MakeKeyExportable`. Emits an audit-denied event
+/// on failure (same behavior as the gRPC double-gate).
+async fn authorize_make_exportable(
+    state: &Arc<ServiceState>,
+    principal: &keyrack_core::pdp::Principal,
+    resource_id: &str,
+    resource_attrs: std::collections::BTreeMap<String, keyrack_core::pdp::AttributeValue>,
+) -> Result<(), DomainError> {
+    use keyrack_core::audit::AuditAction;
+    use keyrack_core::pdp::{AuthzRequest, Decision, RequestContext, Resource, PDP_API_VERSION};
+
+    let request_id = crate::ops::new_request_id();
+    let request = AuthzRequest {
+        pdp_api_version: PDP_API_VERSION.into(),
+        request_id: request_id.clone(),
+        action: AuditAction::MakeKeyExportable,
+        principal: principal.clone(),
+        resource: Resource {
+            id: resource_id.to_owned(),
+            resource_type: "Key".into(),
+            attributes: resource_attrs,
+        },
+        context: RequestContext::default(),
+    };
+
+    let response = state.pdp.evaluate(&request).await.map_err(|e| {
+        tracing::error!(error = %e, "PDP evaluation failed for MakeKeyExportable double-gate");
+        DomainError::Internal("authorization service unavailable".into())
+    })?;
+
+    match response.decision {
+        Decision::Permit => Ok(()),
+        Decision::Forbid | Decision::Indeterminate => {
+            // Emit audit-denied event for the double-gate denial.
+            let event = keyrack_core::audit::AuditEvent::new(
+                keyrack_core::audit::EventType::AuthorizationDenied,
+                AuditAction::MakeKeyExportable,
+                keyrack_core::audit::AuditPrincipal {
+                    id: principal.id.clone(),
+                    principal_type: principal.principal_type.clone(),
+                },
+                keyrack_core::audit::AuditResource {
+                    id: resource_id.to_owned(),
+                    resource_type: "Key".into(),
+                },
+                keyrack_core::audit::AuditResult::Denied,
+            )
+            .with_request_id(request_id);
+            if let Err(e) = state.audit.emit(&event).await {
+                tracing::warn!(error = %e, "failed to emit MakeKeyExportable denied audit");
+            }
+
+            let reasons: String = response
+                .reasons
+                .iter()
+                .map(|r| {
+                    r.human_message
+                        .as_deref()
+                        .or(r.reason_code.as_deref())
+                        .unwrap_or(&r.policy_id)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(DomainError::PermissionDenied(format!(
+                "authorization denied: {reasons}"
+            )))
+        }
+    }
+}

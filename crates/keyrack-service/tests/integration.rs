@@ -4954,3 +4954,280 @@ async fn default_key_is_non_exportable() {
         "never-exported key has no export timestamp"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// REST / gRPC EXPORTABLE-CREATE PARITY TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+/// REST: born-exportable without `MakeKeyExportable` privilege → 403.
+#[tokio::test]
+async fn rest_born_exportable_denied_without_make_exportable_privilege() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(DenyMakeExportablePdp);
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with(pdp, audit.clone());
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "exportable": true,
+        "description": "rest born-exportable denied"
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "REST born-exportable must be denied (403) when MakeKeyExportable privilege is absent"
+    );
+
+    // Verify audit includes a MakeKeyExportable denied event.
+    let events = audit.events();
+    let export_denied = events.iter().any(|e| {
+        e.action == keyrack_core::audit::AuditAction::MakeKeyExportable
+            && e.result == keyrack_core::audit::AuditResult::Denied
+    });
+    assert!(
+        export_denied,
+        "REST: audit must include MakeKeyExportable denied event for double-gate"
+    );
+}
+
+/// REST: born-exportable with a parent set → rejected (leaf-only).
+#[tokio::test]
+async fn rest_born_exportable_with_parent_rejected() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let app = keyrack_service::rest::router(state.clone());
+
+    // First create a parent key via gRPC (known-good path).
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let parent_id = create_aes_key(&svc).await;
+
+    // REST: attempt born-exportable with parent_key_id set.
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "exportable": true,
+        "parent_key_id": parent_id,
+        "description": "rest born-exportable with parent"
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "REST born-exportable with parent must be rejected (leaf-only)"
+    );
+}
+
+/// REST: creating a child under an exportable parent → rejected (leaf-only).
+#[tokio::test]
+async fn rest_child_under_exportable_parent_rejected() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let app = keyrack_service::rest::router(state.clone());
+
+    // Create an exportable parent via gRPC.
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "exportable parent for REST test".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable parent");
+    let parent_id = resp.into_inner().metadata.unwrap().key_id;
+
+    // REST: attempt to create a NON-exportable child under the exportable parent.
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "parent_key_id": parent_id,
+        "description": "rest child under exportable parent"
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "REST: creating child under exportable parent must be rejected"
+    );
+}
+
+/// REST: born-exportable key is genuinely exportable (`GetKeyMaterial` succeeds).
+#[tokio::test]
+async fn rest_born_exportable_key_is_genuinely_exportable() {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let app = keyrack_service::rest::router(state.clone());
+
+    // Create a born-exportable key via REST.
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "exportable": true,
+        "description": "rest born-exportable"
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CREATED,
+        "REST born-exportable create should succeed with AlwaysAllow"
+    );
+
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let key_id = json["lid"].as_str().expect("response must contain lid");
+
+    // Verify via gRPC GetKeyMaterial that the key is genuinely exportable
+    // (proves provider-level born-exportable wiring worked).
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let material_resp = svc
+        .get_key_material(Request::new(proto::GetKeyMaterialRequest {
+            key_id: key_id.to_owned(),
+            key_version: 0,
+            wrapping_key: None,
+        }))
+        .await;
+    assert!(
+        material_resp.is_ok(),
+        "GetKeyMaterial must succeed on REST-created born-exportable key: {:?}",
+        material_resp.err()
+    );
+    let material = material_resp.unwrap().into_inner();
+    assert!(
+        !material.key_material.is_empty(),
+        "key material must not be empty"
+    );
+}
+
+/// Cross-surface parity: REST and gRPC `create_key` produce the same
+/// exportability outcome and the born-exportable gate fires on both.
+#[tokio::test]
+async fn cross_surface_exportable_parity() {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, pdp, audit) = build_test_state();
+
+    // ── gRPC path ──
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let grpc_resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "grpc exportable parity".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("gRPC born-exportable create");
+    let grpc_meta = grpc_resp.into_inner().metadata.unwrap();
+    let grpc_key_id = grpc_meta.key_id.clone();
+    let grpc_pdp_calls = pdp.count();
+
+    // ── REST path ──
+    let app = keyrack_service::rest::router(state.clone());
+    let body = serde_json::json!({
+        "key_spec": "AES_256",
+        "exportable": true,
+        "description": "rest exportable parity"
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let rest_pdp_calls = pdp.count();
+
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let rest_json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let rest_key_id = rest_json["lid"]
+        .as_str()
+        .expect("REST response must have lid");
+
+    // Both surfaces produce exportable keys (verify via GetKeyMaterial).
+    assert!(grpc_meta.exportable, "gRPC key must be exportable");
+    let grpc_material = svc
+        .get_key_material(Request::new(proto::GetKeyMaterialRequest {
+            key_id: grpc_key_id,
+            key_version: 0,
+            wrapping_key: None,
+        }))
+        .await;
+    assert!(
+        grpc_material.is_ok(),
+        "gRPC-created exportable key must allow GetKeyMaterial"
+    );
+    let rest_material = svc
+        .get_key_material(Request::new(proto::GetKeyMaterialRequest {
+            key_id: rest_key_id.to_owned(),
+            key_version: 0,
+            wrapping_key: None,
+        }))
+        .await;
+    assert!(
+        rest_material.is_ok(),
+        "REST-created exportable key must allow GetKeyMaterial"
+    );
+
+    // Both surfaces trigger the MakeKeyExportable double-gate (2 PDP calls each).
+    assert!(
+        grpc_pdp_calls >= 2,
+        "gRPC must invoke PDP at least twice (CreateKey + MakeKeyExportable), got {grpc_pdp_calls}"
+    );
+    let rest_additional = rest_pdp_calls - grpc_pdp_calls;
+    assert!(
+        rest_additional >= 2,
+        "REST must invoke PDP at least twice for born-exportable (CreateKey + MakeKeyExportable), got {rest_additional}"
+    );
+
+    // Both surfaces emit CreateKey audit events (success path — the double-gate
+    // only emits audit on DENY; success is recorded as part of the outer CreateKey).
+    let events = audit.events();
+    let create_key_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == keyrack_core::audit::AuditAction::CreateKey)
+        .collect();
+    assert!(
+        create_key_events.len() >= 2,
+        "both gRPC and REST must emit CreateKey audit — got {} events",
+        create_key_events.len()
+    );
+}
