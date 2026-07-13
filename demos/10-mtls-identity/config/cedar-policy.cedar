@@ -16,3 +16,11 @@ permit(
   action,
   resource
 );
+
+// The system/service principal for internal callers (cascade, rotation jobs,
+// service-to-service gRPC).
+permit(
+  principal == KeyRack::Principal::"keyrack:system",
+  action,
+  resource
+);

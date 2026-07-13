@@ -933,6 +933,8 @@ async fn sign(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_state_for_key_op(&record, &keyrack_core::audit::AuditAction::Sign)
+            .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
             &state,
             &record,
@@ -1016,6 +1018,8 @@ async fn verify(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_state_for_key_op(&record, &keyrack_core::audit::AuditAction::Verify)
+            .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
             &state,
             &record,
@@ -1159,6 +1163,11 @@ async fn generate_mac(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_state_for_key_op(
+            &record,
+            &keyrack_core::audit::AuditAction::GenerateMac,
+        )
+        .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
             &state,
             &record,
@@ -1223,6 +1232,11 @@ async fn verify_mac(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        crate::domain::enforce_state_for_key_op(
+            &record,
+            &keyrack_core::audit::AuditAction::VerifyMac,
+        )
+        .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
             &state,
             &record,
@@ -1278,6 +1292,11 @@ async fn generate_data_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let ec_hash = body
         .get("encryption_context")
         .and_then(|v| v.as_object())
@@ -1297,6 +1316,16 @@ async fn generate_data_key(
                 "key not in Enabled state",
             ));
         }
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::GenerateDataKey,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let primary = record
             .key_versions
             .iter()
@@ -1358,6 +1387,11 @@ async fn re_encrypt(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
     let dst_key_id = body
         .get("destination_key_id")
         .and_then(|v| v.as_str())
@@ -1385,6 +1419,26 @@ async fn re_encrypt(
             .get_key(&dst_lid)
             .await
             .map_err(map_core_err)?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &src_record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::ReEncrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
+        crate::domain::enforce_scope_for_key_op(
+            &state,
+            &dst_record,
+            None,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::ReEncrypt,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let blob_b64 = body
             .get("ciphertext_blob")
             .and_then(|v| v.as_str())
