@@ -1137,6 +1137,40 @@ pub async fn rotate_key(
     })
 }
 
+// ── State gating (shared by gRPC + REST) ────────────────────────────
+
+/// Reject a crypto operation when the key's state does not permit it.
+///
+/// `encrypt`-direction operations (sign, `generate_mac`, encrypt, `generate_data_key`)
+/// require `permits_encrypt()`; `decrypt`-direction operations (verify, `verify_mac`,
+/// decrypt) require `permits_decrypt()`.
+///
+/// Both gRPC and REST handlers call this so enforcement cannot diverge.
+pub fn enforce_state_for_key_op(
+    record: &keyrack_core::key::KeyRecord,
+    action: &keyrack_core::audit::AuditAction,
+) -> Result<(), DomainError> {
+    use keyrack_core::audit::AuditAction;
+    let permitted = match action {
+        AuditAction::Encrypt
+        | AuditAction::Sign
+        | AuditAction::GenerateMac
+        | AuditAction::GenerateDataKey => record.state.permits_encrypt(),
+        AuditAction::Decrypt | AuditAction::Verify | AuditAction::VerifyMac => {
+            record.state.permits_decrypt()
+        }
+        AuditAction::ReEncrypt => record.state.permits_decrypt(),
+        _ => return Ok(()),
+    };
+    if !permitted {
+        return Err(DomainError::FailedPrecondition(format!(
+            "{action} not permitted in current key state ({})",
+            record.state
+        )));
+    }
+    Ok(())
+}
+
 // ── Crypto operations ───────────────────────────────────────────────
 
 #[cfg(feature = "crypto-endpoints")]
@@ -1298,6 +1332,8 @@ pub mod crypto {
         pub ciphertext_blob: Vec<u8>,
         pub source_encryption_context: Option<EncryptionContext>,
         pub destination_encryption_context: Option<EncryptionContext>,
+        pub principal_scope: Option<String>,
+        pub principal_id: String,
     }
 
     pub struct ReEncryptOutput {
@@ -1323,6 +1359,25 @@ pub mod crypto {
             .get_key(&dst_lid)
             .await
             .map_err(DomainError::from)?;
+
+        super::enforce_scope_for_key_op(
+            state,
+            &src_record,
+            None,
+            input.principal_scope.as_deref(),
+            &input.principal_id,
+            &keyrack_core::audit::AuditAction::ReEncrypt,
+        )
+        .await?;
+        super::enforce_scope_for_key_op(
+            state,
+            &dst_record,
+            None,
+            input.principal_scope.as_deref(),
+            &input.principal_id,
+            &keyrack_core::audit::AuditAction::ReEncrypt,
+        )
+        .await?;
 
         let (header, ciphertext) = CiphertextHeader::unwrap_payload(&input.ciphertext_blob)
             .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
@@ -1527,6 +1582,8 @@ pub mod crypto {
         pub key_spec: Option<KeySpec>,
         pub number_of_bytes: u32,
         pub encryption_context: Option<EncryptionContext>,
+        pub principal_scope: Option<String>,
+        pub principal_id: String,
     }
 
     pub struct GenerateDataKeyOutput {
@@ -1552,6 +1609,16 @@ pub mod crypto {
                 input.key_id, record.state
             )));
         }
+
+        super::enforce_scope_for_key_op(
+            state,
+            &record,
+            None,
+            input.principal_scope.as_deref(),
+            &input.principal_id,
+            &keyrack_core::audit::AuditAction::GenerateDataKey,
+        )
+        .await?;
 
         let primary = record
             .key_versions

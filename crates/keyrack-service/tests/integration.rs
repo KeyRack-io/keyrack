@@ -5231,3 +5231,653 @@ async fn cross_surface_exportable_parity() {
         create_key_events.len()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SECURITY-CORE PARITY TESTS
+// ═══════════════════════════════════════════════════════════════════
+//
+// Fix 1 (A1–A4): state-gating on sign/verify/mac ops
+// Fix 2 (C2):    scope isolation on re_encrypt / generate_data_key
+// Fix 3 (A7–A9): auth on list_keys / list_aliases / generate_random
+
+// ── helpers ─────────────────────────────────────────────────────────
+
+/// Create a key via gRPC and then disable it.
+async fn create_disabled_signing_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Ed25519.into(),
+            description: "disabled signing key".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("create signing key");
+    let key_id = resp.into_inner().metadata.unwrap().key_id;
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .expect("disable key");
+    key_id
+}
+
+/// Create a key via gRPC and then disable it (HMAC).
+async fn create_disabled_hmac_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Hmac256.into(),
+            description: "disabled hmac key".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("create hmac key");
+    let key_id = resp.into_inner().metadata.unwrap().key_id;
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .expect("disable key");
+    key_id
+}
+
+/// Create an enabled HMAC key.
+#[allow(dead_code)]
+async fn create_hmac_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Hmac256.into(),
+            description: "hmac key".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("create hmac key");
+    resp.into_inner().metadata.unwrap().key_id
+}
+
+/// Create an enabled signing key.
+async fn create_signing_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Ed25519.into(),
+            description: "signing key".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("create signing key");
+    resp.into_inner().metadata.unwrap().key_id
+}
+
+// ── Fix 1: state-gate deny (disabled key → FailedPrecondition/409) ──
+
+#[tokio::test]
+async fn grpc_sign_disabled_key_rejected() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_disabled_signing_key(&svc).await;
+
+    let err = svc
+        .sign(Request::new(proto::SignRequest {
+            key_id,
+            message: b"msg".to_vec(),
+            signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("sign on disabled key must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// Verify is permitted on disabled keys (data recovery). The state-gate uses
+/// `permits_decrypt()` which allows Disabled + Compromised.
+#[tokio::test]
+async fn grpc_verify_disabled_key_allowed() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_disabled_signing_key(&svc).await;
+
+    svc.verify(Request::new(proto::VerifyRequest {
+        key_id,
+        message: b"msg".to_vec(),
+        signature: vec![0u8; 64],
+        signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("verify on disabled key must be allowed (data recovery)");
+}
+
+#[tokio::test]
+async fn grpc_generate_mac_disabled_key_rejected() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_disabled_hmac_key(&svc).await;
+
+    let err = svc
+        .generate_mac(Request::new(proto::GenerateMacRequest {
+            key_id,
+            message: b"msg".to_vec(),
+            mac_algorithm: proto::MacAlgorithm::HmacSha256.into(),
+        }))
+        .await
+        .expect_err("generate_mac on disabled key must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+/// `verify_mac` is permitted on disabled keys (data recovery). Same as verify.
+/// The `InMemoryProvider` doesn't support MAC verify, so we assert the failure
+/// is NOT state-gating (`FailedPrecondition`) — it passes the state check.
+#[tokio::test]
+async fn grpc_verify_mac_disabled_key_allowed() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_disabled_hmac_key(&svc).await;
+
+    let result = svc
+        .verify_mac(Request::new(proto::VerifyMacRequest {
+            key_id,
+            message: b"msg".to_vec(),
+            mac: vec![0u8; 32],
+            mac_algorithm: proto::MacAlgorithm::HmacSha256.into(),
+        }))
+        .await;
+    if let Err(e) = result {
+        assert_ne!(
+            e.code(),
+            tonic::Code::FailedPrecondition,
+            "verify_mac on disabled key must NOT be rejected by state gate"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_sign_disabled_key_rejected() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_disabled_signing_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-sign"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "REST sign on disabled key must return 409"
+    );
+}
+
+/// Verify is permitted on disabled keys (data recovery).
+#[tokio::test]
+async fn rest_verify_disabled_key_allowed() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_disabled_signing_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signature": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-verify"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "REST verify on disabled key must be allowed (data recovery)"
+    );
+}
+
+#[tokio::test]
+async fn rest_generate_mac_disabled_key_rejected() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_disabled_hmac_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "mac_algorithm": "HMAC_SHA_256",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-generate-mac"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "REST generate_mac on disabled key must return 409"
+    );
+}
+
+/// `verify_mac` is permitted on disabled keys (data recovery).
+/// `InMemoryProvider` doesn't support MAC verify; assert NOT 409 (state gate).
+#[tokio::test]
+async fn rest_verify_mac_disabled_key_allowed() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_disabled_hmac_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "mac": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        "mac_algorithm": "HMAC_SHA_256",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-verify-mac"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "REST verify_mac on disabled key must NOT be state-gate rejected (409)"
+    );
+}
+
+// ── Fix 1: state-gate allow (enabled key → success) ─────────────────
+
+#[tokio::test]
+async fn grpc_sign_enabled_key_succeeds() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_signing_key(&svc).await;
+
+    svc.sign(Request::new(proto::SignRequest {
+        key_id,
+        message: b"msg".to_vec(),
+        signing_algorithm: proto::SigningAlgorithm::Ed25519Pure.into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("sign on enabled key must succeed");
+}
+
+#[tokio::test]
+async fn rest_sign_enabled_key_succeeds() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_signing_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({
+        "message": base64::engine::general_purpose::STANDARD.encode(b"msg"),
+        "signing_algorithm": "ED25519",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-sign"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "REST sign on enabled key must succeed"
+    );
+}
+
+// ── Fix 2: scope isolation on re_encrypt / generate_data_key ────────
+
+#[tokio::test]
+async fn grpc_scope_deny_generate_data_key() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let err = svc
+        .generate_data_key(Request::new(proto::GenerateDataKeyRequest {
+            key_id: lid.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny generate_data_key");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_generate_data_key() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let body = serde_json::json!({});
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-generate-data-key"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "REST scope must deny generate_data_key"
+    );
+}
+
+#[tokio::test]
+async fn grpc_scope_deny_re_encrypt() {
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let header = keyrack_core::header::CiphertextHeader::new(lid, 1, [0u8; 32]);
+    let blob = header.wrap_payload(&[0u8; 32]);
+
+    let err = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: lid.to_string(),
+            destination_key_id: lid.to_string(),
+            ciphertext_blob: blob,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("scope must deny re_encrypt");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn rest_scope_deny_re_encrypt() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_routed_state();
+    let lid = setup_scoped_key(&state).await;
+    let app = keyrack_service::rest::router(state);
+
+    let header = keyrack_core::header::CiphertextHeader::new(lid, 1, [0u8; 32]);
+    let blob = header.wrap_payload(&[0u8; 32]);
+
+    let body = serde_json::json!({
+        "destination_key_id": lid.to_string(),
+        "ciphertext_blob": base64::engine::general_purpose::STANDARD.encode(&blob),
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{lid}/actions-re-encrypt"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "REST scope must deny re_encrypt"
+    );
+}
+
+// ── Fix 2: scope allow (non-scoped key → success) ───────────────────
+
+#[tokio::test]
+async fn grpc_generate_data_key_non_scoped_succeeds() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let key_id = create_aes_key(&svc).await;
+
+    svc.generate_data_key(Request::new(proto::GenerateDataKeyRequest {
+        key_id,
+        ..Default::default()
+    }))
+    .await
+    .expect("generate_data_key on non-scoped key must succeed");
+}
+
+#[tokio::test]
+async fn rest_generate_data_key_non_scoped_succeeds() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_aes_key(&svc).await;
+
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({ "number_of_bytes": 32 });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-generate-data-key"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "REST generate_data_key on non-scoped key must succeed"
+    );
+}
+
+// ── Fix 3: list_keys / list_aliases / generate_random require auth ──
+
+#[tokio::test]
+async fn grpc_list_keys_requires_auth() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap());
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(RejectingAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        pdp: Arc::new(AlwaysAllow),
+        audit: Arc::new(CapturingSink::new()),
+        authn,
+        metrics_handle: recorder.handle(),
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let err = svc
+        .list_keys(Request::new(proto::ListKeysRequest::default()))
+        .await
+        .expect_err("list_keys must reject unauthenticated");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn grpc_list_aliases_requires_auth() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap());
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(RejectingAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        pdp: Arc::new(AlwaysAllow),
+        audit: Arc::new(CapturingSink::new()),
+        authn,
+        metrics_handle: recorder.handle(),
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let err = svc
+        .list_aliases(Request::new(proto::ListAliasesRequest::default()))
+        .await
+        .expect_err("list_aliases must reject unauthenticated");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn grpc_generate_random_requires_auth() {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap());
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(RejectingAuthenticator),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let state = Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        pdp: Arc::new(AlwaysAllow),
+        audit: Arc::new(CapturingSink::new()),
+        authn,
+        metrics_handle: recorder.handle(),
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    });
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let err = svc
+        .generate_random(Request::new(proto::GenerateRandomRequest {
+            number_of_bytes: 32,
+        }))
+        .await
+        .expect_err("generate_random must reject unauthenticated");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+// ── Fix 3: authenticated callers succeed ────────────────────────────
+
+#[tokio::test]
+async fn grpc_list_keys_authenticated_succeeds() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    svc.list_keys(Request::new(proto::ListKeysRequest::default()))
+        .await
+        .expect("list_keys with InsecureAuth must succeed");
+}
+
+#[tokio::test]
+async fn grpc_list_aliases_authenticated_succeeds() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    svc.list_aliases(Request::new(proto::ListAliasesRequest::default()))
+        .await
+        .expect("list_aliases with InsecureAuth must succeed");
+}
+
+#[tokio::test]
+async fn grpc_generate_random_authenticated_succeeds() {
+    let (state, _, _) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    svc.generate_random(Request::new(proto::GenerateRandomRequest {
+        number_of_bytes: 32,
+    }))
+    .await
+    .expect("generate_random with InsecureAuth must succeed");
+}
+
+#[tokio::test]
+async fn rest_list_keys_requires_auth() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/keys")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rest_list_aliases_requires_auth() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/aliases")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rest_generate_random_requires_auth() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _) = build_rejecting_authn_state();
+    let app = keyrack_service::rest::router(state);
+    let body = serde_json::json!({ "number_of_bytes": 32 });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/generate-random")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}

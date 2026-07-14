@@ -316,6 +316,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let src_key_id = req.source_key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let dst_ec_hash = if req.destination_encryption_context.is_empty() {
                 None
             } else {
@@ -342,6 +348,27 @@ impl KeyService for KeyServiceImpl {
                     .get_key(&dst_lid)
                     .await
                     .map_err(convert::error_to_status)?;
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &src_record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::ReEncrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &dst_record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::ReEncrypt,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let src_ec = build_encryption_context(&req.source_encryption_context);
                 let dst_ec = build_encryption_context(&req.destination_encryption_context);
@@ -447,6 +474,12 @@ impl KeyService for KeyServiceImpl {
             let req = request.into_inner();
             let key_id = req.key_id.clone();
 
+            let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+                keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            let principal_id = principal.id.clone();
+
             let ec_hash = if req.encryption_context.is_empty() {
                 None
             } else {
@@ -470,6 +503,17 @@ impl KeyService for KeyServiceImpl {
                 if !record.state.permits_encrypt() {
                     return Err(Status::failed_precondition("key not in Enabled state"));
                 }
+
+                crate::domain::enforce_scope_for_key_op(
+                    &state,
+                    &record,
+                    None,
+                    principal_scope.as_deref(),
+                    &principal_id,
+                    &keyrack_core::audit::AuditAction::GenerateDataKey,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let primary = record
                     .key_versions
@@ -614,9 +658,11 @@ impl KeyService for KeyServiceImpl {
         #[cfg(feature = "crypto-endpoints")]
         {
             let request_id = Self::request_id(&request);
+            let principal = self.principal(&request).await?;
             let req = request.into_inner();
 
-            let mut op_ctx = OpContext::system(AuditAction::GenerateRandom, "", "System");
+            let mut op_ctx =
+                OpContext::resource(AuditAction::GenerateRandom, principal, "", "System");
             op_ctx.request_id = request_id;
             ops::execute(&self.state, op_ctx, |state| async move {
                 let random_bytes = state
@@ -680,11 +726,11 @@ impl KeyService for KeyServiceImpl {
                     .get_key(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
-                if !record.state.permits_encrypt() {
-                    return Err(Status::failed_precondition(
-                        "sign not permitted in current state",
-                    ));
-                }
+                crate::domain::enforce_state_for_key_op(
+                    &record,
+                    &keyrack_core::audit::AuditAction::Sign,
+                )
+                .map_err(|e| e.to_grpc_status())?;
 
                 crate::domain::enforce_scope_for_key_op(
                     &state,
@@ -775,11 +821,11 @@ impl KeyService for KeyServiceImpl {
                     .get_key(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
-                if !record.state.permits_decrypt() {
-                    return Err(Status::failed_precondition(
-                        "verify not permitted in current state",
-                    ));
-                }
+                crate::domain::enforce_state_for_key_op(
+                    &record,
+                    &keyrack_core::audit::AuditAction::Verify,
+                )
+                .map_err(|e| e.to_grpc_status())?;
 
                 crate::domain::enforce_scope_for_key_op(
                     &state,
@@ -870,11 +916,11 @@ impl KeyService for KeyServiceImpl {
                     .get_key(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
-                if !record.state.permits_encrypt() {
-                    return Err(Status::failed_precondition(
-                        "generate_mac not permitted in current state",
-                    ));
-                }
+                crate::domain::enforce_state_for_key_op(
+                    &record,
+                    &keyrack_core::audit::AuditAction::GenerateMac,
+                )
+                .map_err(|e| e.to_grpc_status())?;
 
                 crate::domain::enforce_scope_for_key_op(
                     &state,
@@ -947,11 +993,11 @@ impl KeyService for KeyServiceImpl {
                     .get_key(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
-                if !record.state.permits_decrypt() {
-                    return Err(Status::failed_precondition(
-                        "verify_mac not permitted in current state",
-                    ));
-                }
+                crate::domain::enforce_state_for_key_op(
+                    &record,
+                    &keyrack_core::audit::AuditAction::VerifyMac,
+                )
+                .map_err(|e| e.to_grpc_status())?;
 
                 crate::domain::enforce_scope_for_key_op(
                     &state,
@@ -1244,7 +1290,9 @@ impl KeyService for KeyServiceImpl {
         request: Request<proto::ListKeysRequest>,
     ) -> Result<Response<proto::ListKeysResponse>, Status> {
         let request_id = Self::request_id(&request);
-        let mut op_ctx = OpContext::system(AuditAction::ListKeys, "", "Key");
+        let principal = self.principal(&request).await?;
+        let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
+        op_ctx.resource_type = "Key".into();
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let req = request.into_inner();
@@ -2065,8 +2113,10 @@ impl KeyService for KeyServiceImpl {
         &self,
         _request: Request<proto::ListAliasesRequest>,
     ) -> Result<Response<proto::ListAliasesResponse>, Status> {
-        let mut op_ctx = OpContext::system(AuditAction::ListAliases, "", "Alias");
-        op_ctx.request_id = ops::extract_request_id_grpc(&_request);
+        let request_id = ops::extract_request_id_grpc(&_request);
+        let principal = self.principal(&_request).await?;
+        let mut op_ctx = OpContext::alias(AuditAction::ListAliases, principal, "");
+        op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let aliases = state
                 .storage
