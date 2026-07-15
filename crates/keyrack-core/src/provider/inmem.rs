@@ -146,6 +146,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_import_key_material_returns_error() {
+        let provider = InMemoryProvider::new();
+        let material = crate::sensitive::Sensitive::new(vec![0u8; 32]);
+        let result = provider
+            .import_key_material(&KeySpec::Aes256, material)
+            .await;
+        let err = result.expect_err("default import must return unsupported error");
+        assert!(
+            err.to_string().contains("key import not supported"),
+            "error message: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn inmem_encrypt_decrypt_round_trip() {
         let provider = InMemoryProvider::new();
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();

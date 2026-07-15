@@ -137,6 +137,7 @@ pub struct KeySpecCapability {
 /// algorithms the configured provider actually supports, and by the
 /// service to report provider capabilities at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProviderCapabilities {
     pub provider_name: String,
     pub key_specs: Vec<KeySpecCapability>,
@@ -151,6 +152,10 @@ pub struct ProviderCapabilities {
     /// never leaves the provider boundary. Declaring `true` while
     /// relying on the trait default is a false security assertion.
     pub supports_atomic_re_encrypt: bool,
+    /// Whether the provider supports importing externally-generated key material
+    /// via [`CryptoProvider::import_key_material`]. Providers that lack this
+    /// capability MUST leave this `false` (fail-closed).
+    pub supports_key_import: bool,
 }
 
 /// Result of an encrypt operation: ciphertext including nonce + tag.
@@ -393,5 +398,24 @@ pub trait CryptoProvider: Send + Sync {
     /// providers must NOT duplicate that check.
     async fn revoke_key_exportability(&self, _handle: &KeyHandle) -> Result<Option<KeyHandle>> {
         Ok(None)
+    }
+
+    /// Import externally-generated key material into the provider.
+    ///
+    /// The provider creates a backend key seeded with `material` and returns
+    /// a handle that can be used in subsequent operations. The caller is
+    /// responsible for enforcing all policy gates (PDP, exportability).
+    ///
+    /// `material` is `Sensitive<Vec<u8>>` — zeroized on drop, never raw bytes.
+    ///
+    /// Default: unsupported. Providers that support BYOK import override this.
+    async fn import_key_material(
+        &self,
+        _spec: &KeySpec,
+        _material: Sensitive<Vec<u8>>,
+    ) -> Result<KeyHandle> {
+        Err(crate::error::KeyRackError::Provider(
+            "key import not supported by this provider".into(),
+        ))
     }
 }

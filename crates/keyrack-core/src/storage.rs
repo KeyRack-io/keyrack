@@ -50,6 +50,9 @@ pub struct KeyFilter {
     pub user_tags: Vec<(String, String)>,
     /// Only return keys in this state (if set).
     pub state: Option<crate::key::KeyState>,
+    /// Only return keys owned by this principal, plus keys with no owner
+    /// (legacy/platform). `None` disables owner filtering.
+    pub owner_principal_id: Option<String>,
     /// Maximum items to return per page.
     pub limit: Option<u32>,
     /// Opaque cursor from a previous `list_keys` call.
@@ -163,6 +166,7 @@ mod tests {
             provider_ref: None,
             exportability: crate::key::Exportability::default(),
             first_exported_at: None,
+            owner_principal_id: None,
             identity_tags: IdentityTags::from_attribute_set(&attrs),
             user_tags: UserTags::new(),
             created_at: chrono::Utc::now(),
@@ -246,6 +250,11 @@ mod tests {
             for (k, v) in &filter.user_tags {
                 items.retain(|r| r.user_tags.get(k) == Some(v.as_str()));
             }
+            items.retain(|r| {
+                filter.owner_principal_id.is_none()
+                    || r.owner_principal_id.is_none()
+                    || r.owner_principal_id.as_deref() == filter.owner_principal_id.as_deref()
+            });
             let limit = filter.limit.unwrap_or(100) as usize;
             items.truncate(limit);
             Ok(Page {
@@ -381,6 +390,67 @@ mod tests {
             err,
             Err(KeyRackError::OptimisticConcurrencyConflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn list_keys_owner_principal_filter() {
+        let store = MemoryStorage::new();
+
+        // Three keys: owned by A, owned by B, and legacy (no owner).
+        let mut key_a = make_test_record(KeyState::Enabled);
+        key_a.owner_principal_id = Some("principal-a".into());
+        let mut attrs_a = AttributeSet::new();
+        attrs_a.insert("k", AttributeValue::String("a".into()));
+        key_a.lid = Lid::derive(
+            CanonicalizationVersion::V1,
+            &canonicalize(CanonicalizationVersion::V1, &attrs_a),
+        );
+
+        let mut key_b = make_test_record(KeyState::Enabled);
+        key_b.owner_principal_id = Some("principal-b".into());
+        let mut attrs_b = AttributeSet::new();
+        attrs_b.insert("k", AttributeValue::String("b".into()));
+        key_b.lid = Lid::derive(
+            CanonicalizationVersion::V1,
+            &canonicalize(CanonicalizationVersion::V1, &attrs_b),
+        );
+
+        let mut key_legacy = make_test_record(KeyState::Enabled);
+        key_legacy.owner_principal_id = None;
+        let mut attrs_l = AttributeSet::new();
+        attrs_l.insert("k", AttributeValue::String("legacy".into()));
+        key_legacy.lid = Lid::derive(
+            CanonicalizationVersion::V1,
+            &canonicalize(CanonicalizationVersion::V1, &attrs_l),
+        );
+
+        store.create_key(&key_a).await.unwrap();
+        store.create_key(&key_b).await.unwrap();
+        store.create_key(&key_legacy).await.unwrap();
+
+        // No owner filter => all three visible.
+        let all = store.list_keys(&KeyFilter::default()).await.unwrap();
+        assert_eq!(all.items.len(), 3);
+
+        // Filter for A => A's key + legacy (owner-less), never B's.
+        let as_a = store
+            .list_keys(&KeyFilter {
+                owner_principal_id: Some("principal-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let a_lids: Vec<_> = as_a.items.iter().map(|r| r.lid).collect();
+        assert!(a_lids.contains(&key_a.lid), "owner match must be visible");
+        assert!(
+            a_lids.contains(&key_legacy.lid),
+            "owner-less legacy key must be visible to everyone"
+        );
+        assert!(
+            !a_lids.contains(&key_b.lid),
+            "mismatched owner must be excluded"
+        );
+        assert_eq!(as_a.items.len(), 2);
     }
 
     #[tokio::test]

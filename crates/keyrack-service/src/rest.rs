@@ -31,6 +31,7 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use base64::Engine as _;
 use keyrack_core::audit::AuditAction;
 use keyrack_core::key::KeyRecord;
 use std::sync::Arc;
@@ -139,7 +140,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/keys/:key_id/actions-report-compromise",
             post(report_key_compromise),
         )
-        .route("/v1/keys/:key_id/actions-rotate", post(rotate_key));
+        .route("/v1/keys/:key_id/actions-rotate", post(rotate_key))
+        .route("/v1/keys/import", post(import_key));
 
     // Crypto operation routes: gated behind the `crypto-endpoints` feature.
     #[cfg(feature = "crypto-endpoints")]
@@ -384,6 +386,7 @@ async fn create_key(
                     keyrack_core::key::Exportability::NonExportable
                 },
                 first_exported_at: None,
+                owner_principal_id: Some(principal_id.clone()),
                 identity_tags,
                 user_tags: keyrack_core::tags::UserTags::new(),
                 created_at: now,
@@ -485,6 +488,9 @@ async fn list_keys(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
+    // Capture the caller's principal id before `principal` is moved into
+    // the OpContext; used to scope listing to the owning principal.
+    let owner_principal_id = principal.id.clone();
     let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
     op_ctx.resource_type = "Key".into();
     op_ctx.request_id = request_id;
@@ -492,6 +498,7 @@ async fn list_keys(
         let filter = keyrack_core::storage::KeyFilter {
             user_tags: vec![],
             state: None,
+            owner_principal_id: Some(owner_principal_id),
             limit: Some(100),
             cursor: None,
         };
@@ -712,6 +719,208 @@ async fn rotate_key(
             .await
             .map_err(map_core_err)?;
         Ok(key_json(&record))
+    })
+    .await
+}
+
+async fn import_key(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
+    let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+        keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    let principal_id = principal.id.clone();
+    let principal_for_export_gate = principal.clone();
+    let mut op_ctx = OpContext::key(AuditAction::ImportKeyMaterial, principal, "(import)");
+    op_ctx.request_id = request_id;
+
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let material_b64 = body
+            .get("key_material")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "key_material is required",
+                )
+            })?;
+        let material_bytes = base64::engine::general_purpose::STANDARD
+            .decode(material_b64)
+            .map_err(|e| {
+                ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    &format!("invalid base64 key_material: {e}"),
+                )
+            })?;
+        let material = keyrack_core::sensitive::Sensitive::new(material_bytes);
+
+        let spec_str = body
+            .get("key_spec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("AES_256");
+        let spec = match spec_str {
+            "AES_256" => keyrack_core::key::KeySpec::Aes256,
+            "ED25519" => keyrack_core::key::KeySpec::Ed25519,
+            "ECDSA_P256" => keyrack_core::key::KeySpec::EcdsaP256Sha256,
+            "RSA_2048" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 2048 },
+            "RSA_3072" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 3072 },
+            "RSA_4096" => keyrack_core::key::KeySpec::RsaPkcs1v15Sha256 { key_size: 4096 },
+            "RSA_PSS_2048" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 2048 },
+            "RSA_PSS_3072" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 3072 },
+            "RSA_PSS_4096" => keyrack_core::key::KeySpec::RsaPssSha256 { key_size: 4096 },
+            "ECC_NIST_P384" => keyrack_core::key::KeySpec::EcdsaP384,
+            "HMAC_256" => keyrack_core::key::KeySpec::Hmac256,
+            "AES_128" => keyrack_core::key::KeySpec::Aes128,
+            _ => {
+                return Err(ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidKeySpec",
+                    &format!("unknown key_spec: {spec_str}"),
+                ))
+            }
+        };
+
+        let mut caller_attrs: std::collections::BTreeMap<String, String> = body
+            .get("attributes")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let namespace = body
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let requested_provider = caller_attrs.remove("keyrack.provider");
+        caller_attrs.remove("backend_id");
+        if !namespace.is_empty() {
+            caller_attrs.insert("namespace".to_string(), namespace);
+        }
+        let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
+        let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+
+        let hsm_connection_id = body
+            .get("hsm_connection_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let backend_id = body
+            .get("backend_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let provider_name = crate::domain::resolve_create_provider(
+            &state.provider_router,
+            &state.providers,
+            &identity_tags,
+            requested_provider.as_deref(),
+            hsm_connection_id,
+            backend_id,
+        )
+        .map_err(|e| e.to_rest_error())?;
+
+        crate::domain::check_scope_owner(
+            &state.storage,
+            &state.audit,
+            &provider_name,
+            principal_scope.as_deref(),
+            &principal_id,
+            &keyrack_core::audit::AuditAction::ImportKeyMaterial,
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
+
+        let entry = state
+            .providers
+            .resolve(&provider_name)
+            .map_err(map_core_err)?;
+
+        crate::domain::enforce_provider_supports_import(&entry.provider)
+            .map_err(|e| e.to_rest_error())?;
+
+        let handle = entry
+            .provider
+            .import_key_material(&spec, material)
+            .await
+            .map_err(map_core_err)?;
+
+        let now = chrono::Utc::now();
+        let key_usage = match spec {
+            keyrack_core::key::KeySpec::Aes256 | keyrack_core::key::KeySpec::Aes128 => {
+                keyrack_core::key::KeyUsage::EncryptDecrypt
+            }
+            keyrack_core::key::KeySpec::Hmac256 => keyrack_core::key::KeyUsage::GenerateVerifyMac,
+            _ => keyrack_core::key::KeyUsage::SignVerify,
+        };
+        let desc = body
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let exportable = body
+            .get("exportable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let record = keyrack_core::key::KeyRecord {
+            lid,
+            canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+            parent_lid: None,
+            occ_version: 1,
+            current_key_version: 1,
+            state: keyrack_core::key::KeyState::Enabled,
+            key_usage,
+            key_spec: spec,
+            origin: keyrack_core::key::KeyOrigin::External,
+            provider_class: entry.class,
+            provider_ref: Some(provider_name.clone()),
+            exportability: if exportable {
+                keyrack_core::key::Exportability::Exportable
+            } else {
+                keyrack_core::key::Exportability::NonExportable
+            },
+            first_exported_at: None,
+            owner_principal_id: Some(principal_id.clone()),
+            identity_tags,
+            user_tags: keyrack_core::tags::UserTags::new(),
+            created_at: now,
+            updated_at: now,
+            scheduled_deletion_at: None,
+            description: desc,
+            key_versions: vec![keyrack_core::key::KeyVersionRecord {
+                version_number: 1,
+                key_handle: handle,
+                provider_ref: Some(provider_name.clone()),
+                created_at: now,
+                is_primary: true,
+            }],
+        };
+
+        if exportable {
+            crate::domain::enforce_born_exportable(
+                &state,
+                &record,
+                &principal_for_export_gate,
+                &entry.provider,
+            )
+            .await
+            .map_err(|e| e.to_rest_error())?;
+        }
+
+        state
+            .storage
+            .create_key(&record)
+            .await
+            .map_err(map_core_err)?;
+        Ok((StatusCode::CREATED, key_json(&record)))
     })
     .await
 }

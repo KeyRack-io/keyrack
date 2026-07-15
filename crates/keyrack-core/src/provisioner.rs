@@ -270,6 +270,7 @@ impl LazyProvisioner {
             provider_ref: Some(provider_name.clone()),
             exportability: crate::key::Exportability::default(),
             first_exported_at: None,
+            owner_principal_id: None,
             identity_tags,
             user_tags: UserTags::new(),
             created_at: now,

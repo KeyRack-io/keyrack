@@ -892,6 +892,7 @@ async fn routing_matching_rule_selects_tenant_b() {
         provider_ref: Some(selected.clone()),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: identity_tags.clone(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1084,6 +1085,7 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         provider_ref: None,
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1580,6 +1582,7 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1693,6 +1696,7 @@ async fn scope_owner_unset_passes_without_check() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1881,6 +1885,7 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -1945,6 +1950,7 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -2386,6 +2392,7 @@ async fn scope_audit_success_on_unscoped_connection() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -2823,6 +2830,7 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -4283,6 +4291,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         provider_ref: Some(prov_failing_ref.clone()),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: chrono::Utc::now(),
@@ -5832,6 +5841,190 @@ async fn grpc_generate_random_authenticated_succeeds() {
     .expect("generate_random with InsecureAuth must succeed");
 }
 
+// ── ListKeys tenant isolation (per-key ownership) ───────────────────
+
+/// Authenticator that always returns a principal with a fixed, configurable
+/// id. Mirrors the forwarded-identity pattern the commercial KMIP shim uses:
+/// the caller's identity determines `principal.id`, which becomes the
+/// server-set owner on created keys.
+struct FixedPrincipalAuthenticator {
+    id: String,
+}
+
+#[async_trait::async_trait]
+impl keyrack_core::authn::Authenticator for FixedPrincipalAuthenticator {
+    async fn authenticate(
+        &self,
+        _metadata: &keyrack_core::authn::RequestMetadata,
+    ) -> Result<Option<keyrack_core::authn::AuthnResult>, keyrack_core::authn::AuthnError> {
+        Ok(Some(keyrack_core::authn::AuthnResult {
+            principal: keyrack_core::pdp::Principal {
+                id: self.id.clone(),
+                principal_type: "Service".into(),
+                attributes: std::collections::BTreeMap::new(),
+            },
+            method: "test-fixed-principal".into(),
+        }))
+    }
+}
+
+/// Build a `ServiceState` that shares the given storage but authenticates as
+/// `principal_id`. Two such states over one storage simulate two tenants
+/// talking to the same `KeyRack`.
+fn build_state_for_principal(
+    storage: Arc<dyn keyrack_core::storage::StorageBackend>,
+    principal_id: &str,
+) -> Arc<ServiceState> {
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use keyrack_core::registry::StaticProviderRegistry;
+    use keyrack_service::routing::ProviderRouter;
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let providers = Arc::new(StaticProviderRegistry::single(
+        provider,
+        ProviderClass::InMemory,
+    ));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+        Box::new(FixedPrincipalAuthenticator {
+            id: principal_id.to_string(),
+        }),
+    ]));
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    Arc::new(ServiceState {
+        storage,
+        providers,
+        provider_router,
+        pdp: Arc::new(AlwaysAllow),
+        audit: Arc::new(CapturingSink::new()),
+        authn,
+        metrics_handle: recorder.handle(),
+        max_plaintext_bytes: 4096,
+        nats_publisher: None,
+    })
+}
+
+#[tokio::test]
+async fn grpc_list_keys_scoped_to_owning_principal() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+
+    let svc_a = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+    let svc_b = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-b",
+    ));
+
+    let key_a = create_aes_key(&svc_a).await;
+    let key_b = create_aes_key(&svc_b).await;
+    assert_ne!(key_a, key_b);
+
+    // A sees only its own key, never B's.
+    let list_a = svc_a
+        .list_keys(Request::new(proto::ListKeysRequest::default()))
+        .await
+        .expect("list_keys as A")
+        .into_inner();
+    let a_ids: Vec<String> = list_a.keys.iter().map(|k| k.key_id.clone()).collect();
+    assert!(a_ids.contains(&key_a), "A must see its own key");
+    assert!(!a_ids.contains(&key_b), "A must NOT see B's key");
+    assert_eq!(a_ids.len(), 1, "A must see exactly one key");
+
+    // B sees only its own key, never A's.
+    let list_b = svc_b
+        .list_keys(Request::new(proto::ListKeysRequest::default()))
+        .await
+        .expect("list_keys as B")
+        .into_inner();
+    let b_ids: Vec<String> = list_b.keys.iter().map(|k| k.key_id.clone()).collect();
+    assert!(b_ids.contains(&key_b), "B must see its own key");
+    assert!(!b_ids.contains(&key_a), "B must NOT see A's key");
+    assert_eq!(b_ids.len(), 1, "B must see exactly one key");
+}
+
+#[tokio::test]
+async fn grpc_list_keys_legacy_unowned_key_visible_to_all() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+
+    // Insert a legacy key directly into storage with no owner.
+    let now = chrono::Utc::now();
+    let mut attrs = keyrack_core::attr::AttributeSet::new();
+    attrs.insert(
+        "_keyrack_key_id",
+        keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
+    );
+    let canonical =
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+    let legacy_lid = keyrack_core::lid::Lid::derive(
+        keyrack_core::canon::CanonicalizationVersion::V1,
+        &canonical,
+    );
+    let legacy = keyrack_core::key::KeyRecord {
+        lid: legacy_lid,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        parent_lid: None,
+        occ_version: 1,
+        current_key_version: 1,
+        state: keyrack_core::key::KeyState::Enabled,
+        key_usage: keyrack_core::key::KeyUsage::EncryptDecrypt,
+        key_spec: keyrack_core::key::KeySpec::Aes256,
+        origin: keyrack_core::key::KeyOrigin::KeyRack,
+        provider_class: keyrack_core::key::ProviderClass::InMemory,
+        provider_ref: None,
+        exportability: keyrack_core::key::Exportability::default(),
+        first_exported_at: None,
+        owner_principal_id: None,
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        user_tags: keyrack_core::tags::UserTags::new(),
+        created_at: now,
+        updated_at: now,
+        scheduled_deletion_at: None,
+        description: "legacy platform key".into(),
+        key_versions: vec![keyrack_core::key::KeyVersionRecord {
+            version_number: 1,
+            key_handle: keyrack_core::provider::KeyHandle {
+                key_id: "legacy-handle".into(),
+                key_spec: keyrack_core::key::KeySpec::Aes256,
+            },
+            provider_ref: None,
+            created_at: now,
+            is_primary: true,
+        }],
+    };
+    storage
+        .create_key(&legacy)
+        .await
+        .expect("insert legacy key");
+    let inserted_key_id = legacy_lid.to_string();
+
+    // Any principal must see the owner-less legacy key.
+    let svc_a = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+    let svc_b = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-b",
+    ));
+
+    for (svc, who) in [(&svc_a, "A"), (&svc_b, "B")] {
+        let list = svc
+            .list_keys(Request::new(proto::ListKeysRequest::default()))
+            .await
+            .expect("list_keys")
+            .into_inner();
+        let ids: Vec<String> = list.keys.iter().map(|k| k.key_id.clone()).collect();
+        assert!(
+            ids.contains(&inserted_key_id),
+            "principal {who} must see owner-less legacy key"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rest_list_keys_requires_auth() {
     use axum::body::Body;
@@ -5846,6 +6039,75 @@ async fn rest_list_keys_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rest_list_keys_scoped_to_owning_principal() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    // Helper: create an AES key via REST for the given state, returning its lid.
+    async fn rest_create(state: Arc<ServiceState>) -> String {
+        let app = keyrack_service::rest::router(state);
+        let body = serde_json::json!({ "key_spec": "AES_256", "description": "rest key" });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "REST create_key"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("lid")
+            .and_then(|v| v.as_str())
+            .expect("lid in create response")
+            .to_string()
+    }
+
+    // Helper: list key lids via REST for the given state.
+    async fn rest_list(state: Arc<ServiceState>) -> Vec<String> {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/keys")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "REST list_keys");
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("items")
+            .and_then(|v| v.as_array())
+            .expect("items array")
+            .iter()
+            .filter_map(|item| item.get("lid").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let state_a = build_state_for_principal(storage.clone(), "tenant-a");
+    let state_b = build_state_for_principal(storage.clone(), "tenant-b");
+
+    let key_a = rest_create(state_a.clone()).await;
+    let key_b = rest_create(state_b.clone()).await;
+    assert_ne!(key_a, key_b);
+
+    let list_a = rest_list(state_a.clone()).await;
+    assert!(list_a.contains(&key_a), "A must see its own key");
+    assert!(!list_a.contains(&key_b), "A must NOT see B's key");
+    assert_eq!(list_a.len(), 1);
+
+    let list_b = rest_list(state_b.clone()).await;
+    assert!(list_b.contains(&key_b), "B must see its own key");
+    assert!(!list_b.contains(&key_a), "B must NOT see A's key");
+    assert_eq!(list_b.len(), 1);
 }
 
 #[tokio::test]
@@ -5880,4 +6142,119 @@ async fn rest_generate_random_requires_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ImportKey tests
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn denied_pdp_blocks_import_key_grpc() {
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysDeny);
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with(pdp, audit);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let req = Request::new(proto::ImportKeyRequest {
+        key_material: vec![0u8; 32],
+        key_spec: proto::KeySpec::Aes256.into(),
+        description: "test import".into(),
+        exportable: true,
+        ..Default::default()
+    });
+
+    let resp = svc.import_key(req).await;
+    assert_eq!(
+        resp.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "AlwaysDeny PDP must block ImportKey"
+    );
+}
+
+#[tokio::test]
+async fn denied_pdp_blocks_import_key_rest() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysDeny);
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with(pdp, audit);
+    let app = keyrack_service::rest::router(state);
+
+    let material_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let body = serde_json::json!({
+        "key_material": material_b64,
+        "key_spec": "AES_256",
+        "description": "test import",
+        "exportable": true,
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/import")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "AlwaysDeny PDP must block REST ImportKey"
+    );
+}
+
+#[tokio::test]
+async fn import_key_unsupported_provider_fails_closed() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let req = Request::new(proto::ImportKeyRequest {
+        key_material: vec![0u8; 32],
+        key_spec: proto::KeySpec::Aes256.into(),
+        description: "test import".into(),
+        exportable: false,
+        ..Default::default()
+    });
+
+    let resp = svc.import_key(req).await;
+    let err = resp.expect_err("InMemoryProvider has supports_key_import=false");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("does not support key import"),
+        "error message must mention import capability: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn import_key_unsupported_provider_fails_closed_rest() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let app = keyrack_service::rest::router(state);
+
+    let material_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let body = serde_json::json!({
+        "key_material": material_b64,
+        "key_spec": "AES_256",
+        "description": "test import",
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/keys/import")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::CONFLICT,
+        "unsupported provider should return FailedPrecondition (409 Conflict in REST)"
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_str.contains("does not support key import"),
+        "response must mention import capability: {body_str}"
+    );
 }

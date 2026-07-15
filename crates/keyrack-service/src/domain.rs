@@ -745,6 +745,7 @@ pub async fn create_key(
         provider_ref: Some(provider_name.clone()),
         exportability: input.exportable,
         first_exported_at: None,
+        owner_principal_id: None,
         identity_tags,
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
@@ -821,6 +822,7 @@ pub async fn list_keys(
     let filter = KeyFilter {
         user_tags: vec![],
         state: None,
+        owner_principal_id: None,
         limit: Some(limit),
         cursor: input.cursor,
     };
@@ -1167,6 +1169,18 @@ pub fn enforce_state_for_key_op(
             "{action} not permitted in current key state ({})",
             record.state
         )));
+    }
+    Ok(())
+}
+
+/// Fail-closed check that the resolved provider supports key import.
+pub fn enforce_provider_supports_import(
+    provider: &Arc<dyn keyrack_core::provider::CryptoProvider>,
+) -> Result<(), DomainError> {
+    if !provider.capabilities().supports_key_import {
+        return Err(DomainError::FailedPrecondition(
+            "the resolved provider does not support key import".into(),
+        ));
     }
     Ok(())
 }
