@@ -1164,6 +1164,7 @@ impl KeyService for KeyServiceImpl {
                         keyrack_core::key::Exportability::NonExportable
                     },
                     first_exported_at: None,
+                    owner_principal_id: Some(principal_id.clone()),
                     identity_tags,
                     user_tags: keyrack_core::tags::UserTags::new(),
                     created_at: now,
@@ -1291,6 +1292,9 @@ impl KeyService for KeyServiceImpl {
     ) -> Result<Response<proto::ListKeysResponse>, Status> {
         let request_id = Self::request_id(&request);
         let principal = self.principal(&request).await?;
+        // Capture the caller's principal id before `principal` is moved into
+        // the OpContext; used to scope listing to the owning principal.
+        let owner_principal_id = principal.id.clone();
         let mut op_ctx = OpContext::key(AuditAction::ListKeys, principal, "");
         op_ctx.resource_type = "Key".into();
         op_ctx.request_id = request_id;
@@ -1304,6 +1308,7 @@ impl KeyService for KeyServiceImpl {
             let filter = keyrack_core::storage::KeyFilter {
                 user_tags: vec![],
                 state: None,
+                owner_principal_id: Some(owner_principal_id),
                 limit: Some(limit),
                 cursor: if req.cursor.is_empty() {
                     None
@@ -2770,13 +2775,21 @@ impl KeyService for KeyServiceImpl {
                  captured bytes are usable forever"
             );
 
-            let mut updated = record.clone();
-            updated.mark_exported();
-            state
-                .storage
-                .update_key(&updated)
-                .await
-                .map_err(convert::error_to_status)?;
+            // The `first_exported_at` latch is set once, on the first export.
+            // Only persist when it actually transitions, so repeated exports of
+            // an already-exported key perform no versioned write. This avoids
+            // spurious optimistic-concurrency conflicts when a KMIP client
+            // (e.g. Percona's `component_keyring_kmip`) issues several parallel
+            // Get requests for the same key during warm boot.
+            if record.first_exported_at.is_none() {
+                let mut updated = record.clone();
+                updated.mark_exported();
+                state
+                    .storage
+                    .update_key(&updated)
+                    .await
+                    .map_err(convert::error_to_status)?;
+            }
 
             Ok(Response::new(proto::GetKeyMaterialResponse {
                 key_material: material.expose().clone(),
@@ -2917,6 +2930,146 @@ impl KeyService for KeyServiceImpl {
 
             Ok(Response::new(proto::RevokeKeyExportabilityResponse {
                 metadata: Some(convert::key_record_to_metadata(&updated)),
+            }))
+        })
+        .await
+    }
+
+    async fn import_key(
+        &self,
+        request: Request<proto::ImportKeyRequest>,
+    ) -> Result<Response<proto::ImportKeyResponse>, Status> {
+        let request_id = Self::request_id(&request);
+        let principal = self.principal(&request).await?;
+        let req = request.into_inner();
+
+        let material = keyrack_core::sensitive::Sensitive::new(req.key_material);
+
+        let principal_scope = principal.attributes.get("scope").and_then(|v| match v {
+            keyrack_core::pdp::AttributeValue::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        let principal_id = principal.id.clone();
+        let principal_for_export_gate = principal.clone();
+        let mut op_ctx = OpContext::key(AuditAction::ImportKeyMaterial, principal, "(import)");
+        op_ctx.request_id = request_id;
+
+        ops::execute(&self.state, op_ctx, |state| async move {
+            let spec = convert::proto_to_key_spec(
+                proto::KeySpec::try_from(req.key_spec).unwrap_or(proto::KeySpec::Unspecified),
+            )
+            .ok_or_else(|| Status::invalid_argument("key_spec is required"))?;
+
+            let mut caller_attrs: std::collections::BTreeMap<String, String> =
+                req.attributes.into_iter().collect();
+            let namespace = req.namespace.unwrap_or_default();
+            let requested_provider = caller_attrs.remove("keyrack.provider");
+            caller_attrs.remove("backend_id");
+            if !namespace.is_empty() {
+                caller_attrs.insert("namespace".to_string(), namespace);
+            }
+            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
+            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+
+            let provider_name = crate::domain::resolve_create_provider(
+                &state.provider_router,
+                &state.providers,
+                &identity_tags,
+                requested_provider.as_deref(),
+                req.hsm_connection_id.as_deref(),
+                req.backend_id.as_deref(),
+            )
+            .map_err(|e| e.to_grpc_status())?;
+
+            crate::domain::check_scope_owner(
+                &state.storage,
+                &state.audit,
+                &provider_name,
+                principal_scope.as_deref(),
+                &principal_id,
+                &keyrack_core::audit::AuditAction::ImportKeyMaterial,
+            )
+            .await
+            .map_err(|e| e.to_grpc_status())?;
+
+            let entry = state
+                .providers
+                .resolve(&provider_name)
+                .map_err(convert::error_to_status)?;
+
+            crate::domain::enforce_provider_supports_import(&entry.provider)
+                .map_err(|e| e.to_grpc_status())?;
+
+            let handle = entry
+                .provider
+                .import_key_material(&spec, material)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            let now = chrono::Utc::now();
+            let key_usage = match spec {
+                keyrack_core::key::KeySpec::Aes256 | keyrack_core::key::KeySpec::Aes128 => {
+                    keyrack_core::key::KeyUsage::EncryptDecrypt
+                }
+                keyrack_core::key::KeySpec::Hmac256 => {
+                    keyrack_core::key::KeyUsage::GenerateVerifyMac
+                }
+                _ => keyrack_core::key::KeyUsage::SignVerify,
+            };
+
+            let record = keyrack_core::key::KeyRecord {
+                lid,
+                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+                parent_lid: None,
+                occ_version: 1,
+                current_key_version: 1,
+                state: keyrack_core::key::KeyState::Enabled,
+                key_usage,
+                key_spec: spec,
+                origin: keyrack_core::key::KeyOrigin::External,
+                provider_class: entry.class,
+                provider_ref: Some(provider_name.clone()),
+                exportability: if req.exportable {
+                    keyrack_core::key::Exportability::Exportable
+                } else {
+                    keyrack_core::key::Exportability::NonExportable
+                },
+                first_exported_at: None,
+                owner_principal_id: Some(principal_id.clone()),
+                identity_tags,
+                user_tags: keyrack_core::tags::UserTags::new(),
+                created_at: now,
+                updated_at: now,
+                scheduled_deletion_at: None,
+                description: req.description,
+                key_versions: vec![keyrack_core::key::KeyVersionRecord {
+                    version_number: 1,
+                    key_handle: handle,
+                    provider_ref: Some(provider_name.clone()),
+                    created_at: now,
+                    is_primary: true,
+                }],
+            };
+
+            if req.exportable {
+                crate::domain::enforce_born_exportable(
+                    &state,
+                    &record,
+                    &principal_for_export_gate,
+                    &entry.provider,
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
+            }
+
+            state
+                .storage
+                .create_key(&record)
+                .await
+                .map_err(convert::error_to_status)?;
+
+            Ok(Response::new(proto::ImportKeyResponse {
+                metadata: Some(convert::key_record_to_metadata(&record)),
             }))
         })
         .await

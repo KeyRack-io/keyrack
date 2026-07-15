@@ -209,10 +209,14 @@ impl StorageBackend for PostgresStorage {
             if filter.state.is_some_and(|s| s != record.state) {
                 continue;
             }
-            if filter
-                .user_tags
-                .iter()
-                .all(|(k, v)| record.user_tags.get(k).is_some_and(|tv| tv == v))
+            let owner_ok = filter.owner_principal_id.is_none()
+                || record.owner_principal_id.is_none()
+                || record.owner_principal_id.as_deref() == filter.owner_principal_id.as_deref();
+            if owner_ok
+                && filter
+                    .user_tags
+                    .iter()
+                    .all(|(k, v)| record.user_tags.get(k).is_some_and(|tv| tv == v))
             {
                 items.push(record);
             }

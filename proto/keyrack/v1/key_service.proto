@@ -104,6 +104,11 @@ service KeyService {
   // flag. Full backend-level (cryptographic) revocation requires a separate
   // explicit destroy/crypto-shred operation.
   rpc RevokeKeyExportability(RevokeKeyExportabilityRequest) returns (RevokeKeyExportabilityResponse);
+
+  // ── Key import ──────────────────────────────────────────────────────
+  // Import externally-generated key material into a governed key. The
+  // provider must support key import (supports_key_import capability).
+  rpc ImportKey(ImportKeyRequest) returns (ImportKeyResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -942,6 +947,29 @@ message RevokeKeyExportabilityRequest {
 }
 
 message RevokeKeyExportabilityResponse {
+  KeyMetadata metadata = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Key import
+// ═══════════════════════════════════════════════════════════════════
+
+message ImportKeyRequest {
+  // The raw key material to import. Treated as Sensitive end-to-end.
+  bytes key_material = 1;
+  KeySpec key_spec = 2;
+  string description = 3;
+  map<string, string> tags = 4;
+  map<string, string> attributes = 5;
+  optional string namespace = 6;
+  // The crypto backend for the import. Same semantics as CreateKey.
+  optional string hsm_connection_id = 7;
+  optional string backend_id = 8;
+  // Imported keys default to exportable=true (KMIP keystore use case).
+  bool exportable = 9;
+}
+
+message ImportKeyResponse {
   KeyMetadata metadata = 1;
 }
 

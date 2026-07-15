@@ -559,6 +559,7 @@ impl CryptoProvider for VaultTransitProvider {
             supports_generate_random: true,
             supports_atomic_data_key: false,
             supports_atomic_re_encrypt: false,
+            supports_key_import: true,
         }
     }
 
@@ -619,6 +620,88 @@ impl CryptoProvider for VaultTransitProvider {
 
         Ok(None)
     }
+
+    async fn import_key_material(
+        &self,
+        spec: &KeySpec,
+        material: Sensitive<Vec<u8>>,
+    ) -> Result<KeyHandle> {
+        let key_name = uuid::Uuid::new_v4().to_string();
+        let key_type = vault_key_type(spec)?;
+
+        let wrapping_key_resp: WrappingKeyResponse = self.vault_get("wrapping_key").await?;
+        let wrapping_pem = wrapping_key_resp.data.public_key;
+
+        let wrapped = wrap_key_for_vault_import(&wrapping_pem, material.expose())?;
+        let ciphertext = B64.encode(&wrapped);
+
+        let body = VaultImportKeyRequest {
+            key_type,
+            ciphertext,
+            exportable: true,
+            allow_rotation: true,
+        };
+        self.vault_post_no_body(&format!("keys/{key_name}/import"), &body)
+            .await?;
+
+        tracing::info!(key_name = %key_name, key_type, "vault transit key imported (BYOK)");
+
+        Ok(KeyHandle {
+            key_id: key_name,
+            key_spec: spec.clone(),
+        })
+    }
+}
+
+// ── Vault BYOK import helpers ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct WrappingKeyResponse {
+    data: WrappingKeyData,
+}
+
+#[derive(Deserialize)]
+struct WrappingKeyData {
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct VaultImportKeyRequest {
+    #[serde(rename = "type")]
+    key_type: &'static str,
+    ciphertext: String,
+    exportable: bool,
+    allow_rotation: bool,
+}
+
+fn wrap_key_for_vault_import(wrapping_pem: &str, key_material: &[u8]) -> Result<Vec<u8>> {
+    use aes_kw::KekAes256;
+    use rand::RngCore;
+    use rsa::{pkcs8::DecodePublicKey, Oaep, RsaPublicKey};
+    use zeroize::Zeroize;
+
+    let rsa_pub = RsaPublicKey::from_public_key_pem(wrapping_pem)
+        .map_err(|e| KeyRackError::Provider(format!("failed to parse vault wrapping key: {e}")))?;
+
+    let mut ephemeral_aes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut ephemeral_aes);
+
+    let kek = KekAes256::new(&ephemeral_aes.into());
+    let mut wrapped_key = vec![0u8; key_material.len() + 8];
+    kek.wrap_with_padding(key_material, &mut wrapped_key)
+        .map_err(|e| KeyRackError::Provider(format!("AES-KWP wrap failed: {e:?}")))?;
+
+    let padding = Oaep::new::<sha2::Sha256>();
+    let mut rng = rand::thread_rng();
+    let wrapped_aes = rsa_pub
+        .encrypt(&mut rng, padding, &ephemeral_aes)
+        .map_err(|e| KeyRackError::Provider(format!("RSA-OAEP wrap failed: {e}")))?;
+
+    ephemeral_aes.zeroize();
+
+    let mut result = wrapped_aes;
+    result.extend_from_slice(&wrapped_key);
+    Ok(result)
 }
 
 #[cfg(test)]

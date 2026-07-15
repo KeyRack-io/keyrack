@@ -387,7 +387,7 @@ pub fn rest_error(
 fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType {
     use keyrack_core::audit::EventType;
     match action {
-        AuditAction::CreateKey => EventType::KeyCreated,
+        AuditAction::CreateKey | AuditAction::ImportKeyMaterial => EventType::KeyCreated,
         AuditAction::RotateKey => EventType::KeyRotated,
         AuditAction::EnableKey
         | AuditAction::DisableKey

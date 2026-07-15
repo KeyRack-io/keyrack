@@ -184,6 +184,7 @@ impl CryptoProvider for ParsecProvider {
             supports_generate_random: false,
             supports_atomic_data_key: false,
             supports_atomic_re_encrypt: false,
+            supports_key_import: false,
         }
     }
 }

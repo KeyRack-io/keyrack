@@ -85,6 +85,8 @@ pub enum AuditAction {
     ReportKeyCompromise,
     #[serde(rename = "kms:RotateKey")]
     RotateKey,
+    #[serde(rename = "kms:ImportKeyMaterial")]
+    ImportKeyMaterial,
 
     // Key metadata / queries
     #[serde(rename = "kms:GetKey")]
@@ -884,6 +886,7 @@ mod tests {
             AuditAction::ScheduleKeyDeletion,
             AuditAction::CancelKeyDeletion,
             AuditAction::RotateKey,
+            AuditAction::ImportKeyMaterial,
             AuditAction::GetKey,
             AuditAction::DescribeKey,
             AuditAction::UpdateKey,

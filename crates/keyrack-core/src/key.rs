@@ -280,6 +280,12 @@ pub struct KeyRecord {
     /// never reset. Gates `RevokeKeyExportability` (tighten only pre-export).
     #[serde(default)]
     pub first_exported_at: Option<DateTime<Utc>>,
+    /// Principal that created this key. Server-set at creation/import; used to
+    /// scope `ListKeys` to the owning principal (tenant isolation). Side property
+    /// — NEVER part of the LID / canonical form. Legacy records deserialize as
+    /// `None` (treated as platform-owned, visible to all callers).
+    #[serde(default)]
+    pub owner_principal_id: Option<String>,
     pub identity_tags: IdentityTags,
     pub user_tags: UserTags,
     pub created_at: DateTime<Utc>,
@@ -568,6 +574,7 @@ pub(crate) mod tests {
             provider_ref: None,
             exportability: Exportability::default(),
             first_exported_at: None,
+            owner_principal_id: None,
             identity_tags: IdentityTags::from_attribute_set(&attrs),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
@@ -634,6 +641,7 @@ pub(crate) mod tests {
             provider_ref: Some(ProviderRef::new("software-default")),
             exportability: Exportability::default(),
             first_exported_at: None,
+            owner_principal_id: None,
             identity_tags: identity_tags.clone(),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
@@ -738,6 +746,7 @@ pub(crate) mod tests {
             provider_ref: None,
             exportability: Exportability::NonExportable,
             first_exported_at: None,
+            owner_principal_id: None,
             identity_tags: identity_tags.clone(),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
