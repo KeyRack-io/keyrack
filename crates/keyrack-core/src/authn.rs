@@ -95,6 +95,17 @@ pub enum AuthnError {
 /// [`AuthnError`].
 #[async_trait]
 pub trait Authenticator: Send + Sync {
+    /// Whether this authenticator can recognise credentials when the server
+    /// transport cannot provide a peer certificate.
+    ///
+    /// The service uses this capability to reject REST API calls explicitly
+    /// when an authentication chain is gRPC/mTLS-only. Health and metrics
+    /// routes remain available, while callers receive a transport error rather
+    /// than a misleading bad-credential response.
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        true
+    }
+
     /// Try to authenticate from the given request metadata.
     ///
     /// Return `Ok(Some(result))` if this authenticator recognised and
@@ -135,6 +146,14 @@ impl AuthenticatorChain {
             }
         }
         Err(AuthnError::NoCredential)
+    }
+
+    /// Return true when at least one configured authenticator can operate on
+    /// a transport which does not expose the client certificate.
+    pub fn supports_requests_without_peer_certificate(&self) -> bool {
+        self.authenticators
+            .iter()
+            .any(|authn| authn.supports_requests_without_peer_certificate())
     }
 }
 
@@ -250,6 +269,10 @@ impl MtlsAuthenticator {
 
 #[async_trait]
 impl Authenticator for MtlsAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
     async fn authenticate(
         &self,
         metadata: &RequestMetadata,
@@ -438,6 +461,12 @@ impl Authenticator for ForwardedIdentityAuthenticator {
 /// Optional headers:
 /// - `x-keyrack-project-id`
 /// - `x-keyrack-domain-id`
+///
+/// With no forwarded identity headers this authenticator returns no-match,
+/// even for a trusted peer, so another independent credential in the chain
+/// may authenticate the request. The presence of any reserved identity header
+/// recognises a delegation attempt: an untrusted peer or an incomplete
+/// principal/tenant pair is an error and stops the chain.
 pub struct MtlsBoundForwardedIdentityAuthenticator {
     trusted_peer: TrustedMtlsPeerAuthenticator,
 }
@@ -489,6 +518,10 @@ fn has_forwarded_identity_headers(metadata: &RequestMetadata) -> bool {
 
 #[async_trait]
 impl Authenticator for MtlsBoundForwardedIdentityAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
     async fn authenticate(
         &self,
         metadata: &RequestMetadata,
@@ -502,6 +535,13 @@ impl Authenticator for MtlsBoundForwardedIdentityAuthenticator {
             }
             return Ok(None);
         };
+
+        // A trusted workload may also present another credential handled by a
+        // later authenticator. Delegation is recognised by the reserved
+        // headers, not merely by the presence of the workload certificate.
+        if !has_forwarded_identity_headers(metadata) {
+            return Ok(None);
+        }
 
         let principal_id =
             forwarded_header(metadata, "x-keyrack-principal-id").ok_or_else(|| {
@@ -713,6 +753,10 @@ impl TrustedMtlsPeerAuthenticator {
 
 #[async_trait]
 impl Authenticator for TrustedMtlsPeerAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
     async fn authenticate(
         &self,
         metadata: &RequestMetadata,
@@ -1459,15 +1503,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_forwarded_identity_requires_identity_from_trusted_peer() {
+    async fn bound_forwarded_identity_without_headers_is_no_match() {
         let ca = test_ca();
         let leaf = test_leaf("essentials", &ca);
         let authn = build_bound_forwarded_authn(&ca);
         let mut metadata = RequestMetadata::default();
         metadata.peer_certificates = vec![leaf.der().to_vec()];
 
-        let result = authn.authenticate(&metadata).await;
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_without_headers_falls_through_chain() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let bound = build_bound_forwarded_authn(&ca);
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(bound),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+
+        let result = chain.authenticate(&metadata).await.unwrap();
+        assert_eq!(result.method, "bootstrap_token");
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_incomplete_attempt_stops_chain() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let bound = build_bound_forwarded_authn(&ca);
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(bound),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata.headers.insert(
+            "x-keyrack-principal-id".into(),
+            "urn:example:iam:tenant-a:user/user-a".into(),
+        );
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+
+        let result = chain.authenticate(&metadata).await;
         assert!(matches!(result, Err(AuthnError::InvalidCredential(_))));
+    }
+
+    #[test]
+    fn peer_certificate_only_chain_reports_transport_requirement() {
+        let ca = test_ca();
+        let peer_only = AuthenticatorChain::new(vec![
+            Box::new(build_bound_forwarded_authn(&ca)),
+            Box::new(MtlsAuthenticator),
+        ]);
+        assert!(!peer_only.supports_requests_without_peer_certificate());
+
+        let with_token_fallback = AuthenticatorChain::new(vec![
+            Box::new(build_bound_forwarded_authn(&ca)),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        assert!(with_token_fallback.supports_requests_without_peer_certificate());
     }
 
     #[tokio::test]

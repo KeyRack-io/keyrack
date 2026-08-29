@@ -393,7 +393,10 @@ pub enum AuthnConfig {
     /// `Mtls` and `ForwardedIdentity`: a chain selects the first successful
     /// identity and does not bind the two credentials. The tenant header is
     /// required and becomes the `scope=tenant:<id>` principal attribute used
-    /// by `scope_owner` enforcement.
+    /// by `scope_owner` enforcement. This profile is gRPC-only unless the
+    /// chain also contains a credential type supported by the REST listener.
+    /// Its CA must be the same PEM material configured as the gRPC TLS client
+    /// CA, and at least one exact SAN/OU workload pin is mandatory.
     MtlsBoundForwardedIdentity {
         trusted_ca_cert_path: String,
         #[serde(default)]
@@ -438,6 +441,56 @@ pub enum AuthnConfig {
     Insecure,
     /// Chain of authenticators tried in order (first match wins).
     Chain { authenticators: Vec<AuthnConfig> },
+}
+
+impl AuthnConfig {
+    /// Validate the startup invariants required by delegated mTLS profiles.
+    ///
+    /// Signature verification happens in the gRPC TLS layer. Requiring that
+    /// layer plus an exact workload pin prevents a header-binding profile from
+    /// silently degrading into an issuer-name-only trust decision.
+    pub fn validate_delegated_mtls_contract(&self, tls: Option<&TlsConfig>) -> Result<(), String> {
+        match self {
+            Self::MtlsBoundForwardedIdentity {
+                trusted_ca_cert_path,
+                required_san,
+                required_ou,
+            } => {
+                if trusted_ca_cert_path.trim().is_empty() {
+                    return Err(
+                        "mtls_bound_forwarded_identity requires trusted_ca_cert_path".into(),
+                    );
+                }
+                let has_san = required_san
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty());
+                let has_ou = required_ou.as_deref().is_some_and(|v| !v.trim().is_empty());
+                if !has_san && !has_ou {
+                    return Err(
+                        "mtls_bound_forwarded_identity requires a non-empty required_san or required_ou workload pin"
+                            .into(),
+                    );
+                }
+                if tls
+                    .and_then(|cfg| cfg.ca_cert.as_deref())
+                    .map_or(true, |path| path.trim().is_empty())
+                {
+                    return Err(
+                        "mtls_bound_forwarded_identity requires tls.ca_cert so the gRPC layer verifies client certificates"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Chain { authenticators } => {
+                for authenticator in authenticators {
+                    authenticator.validate_delegated_mtls_contract(tls)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn default_bootstrap_max_age_secs() -> u64 {
@@ -657,5 +710,58 @@ authn:
             }
             other => panic!("unexpected authn config: {other:?}"),
         }
+    }
+
+    #[test]
+    fn delegated_mtls_requires_server_client_ca_and_workload_pin() {
+        let unpinned = AuthnConfig::MtlsBoundForwardedIdentity {
+            trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
+            required_san: None,
+            required_ou: None,
+        };
+        let tls = TlsConfig {
+            server_cert: "/etc/keyrack/tls/server.crt".into(),
+            server_key: "/etc/keyrack/tls/server.key".into(),
+            ca_cert: Some("/etc/keyrack/tls/delegator-ca.pem".into()),
+        };
+        assert!(unpinned
+            .validate_delegated_mtls_contract(Some(&tls))
+            .unwrap_err()
+            .contains("required_san or required_ou"));
+
+        let pinned = AuthnConfig::MtlsBoundForwardedIdentity {
+            trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
+            required_san: Some("spiffe://cluster.local/ns/essentials/sa/essentials".into()),
+            required_ou: None,
+        };
+        assert!(pinned
+            .validate_delegated_mtls_contract(None)
+            .unwrap_err()
+            .contains("tls.ca_cert"));
+        pinned.validate_delegated_mtls_contract(Some(&tls)).unwrap();
+    }
+
+    #[test]
+    fn delegated_mtls_validation_recurses_through_chain() {
+        let chain = AuthnConfig::Chain {
+            authenticators: vec![
+                AuthnConfig::Jwt {
+                    jwks_url: "https://idp.example/.well-known/jwks.json".into(),
+                    issuer: None,
+                    audience: None,
+                    claims_namespace: None,
+                },
+                AuthnConfig::MtlsBoundForwardedIdentity {
+                    trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
+                    required_san: None,
+                    required_ou: None,
+                },
+            ],
+        };
+
+        assert!(chain
+            .validate_delegated_mtls_contract(None)
+            .unwrap_err()
+            .contains("required_san or required_ou"));
     }
 }

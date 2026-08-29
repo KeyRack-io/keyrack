@@ -137,6 +137,12 @@ proto/
 
 ## REST API
 
+Peer-certificate-only authentication profiles are gRPC-only. When every
+configured authenticator requires a peer certificate, authenticated REST API
+routes return `501 AuthenticationTransportUnsupported`; health and metrics
+remain available. Configure a JWT/bootstrap fallback in the authentication
+chain when REST access is required.
+
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/keys` | Create a key |

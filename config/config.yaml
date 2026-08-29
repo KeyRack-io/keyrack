@@ -41,7 +41,13 @@ authn:
 #       max_age_secs: 300
 
 # mTLS-bound delegated identity (production service-to-service profile):
+# tls:
+#   server_cert: /etc/keyrack/tls/server.crt
+#   server_key: /etc/keyrack/tls/server.key
+#   ca_cert: /etc/keyrack/tls/delegator-ca.pem
 # authn:
 #   type: mtls_bound_forwarded_identity
+#   # Must contain exactly the same PEM material as tls.ca_cert.
 #   trusted_ca_cert_path: /etc/keyrack/tls/delegator-ca.pem
+#   # At least one exact workload pin is mandatory.
 #   required_san: spiffe://cluster.local/ns/essentials/sa/essentials

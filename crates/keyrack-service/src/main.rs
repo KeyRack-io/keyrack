@@ -174,8 +174,23 @@ fn load_config() -> Result<ServiceConfig, Box<dyn std::error::Error>> {
     }
 }
 
+fn validate_same_client_ca_material(
+    delegated_ca: &[u8],
+    grpc_client_ca: &[u8],
+    delegated_ca_path: &str,
+    grpc_client_ca_path: &str,
+) -> Result<(), String> {
+    if delegated_ca == grpc_client_ca {
+        return Ok(());
+    }
+    Err(format!(
+        "mTLS-bound forwarded identity CA '{delegated_ca_path}' must contain exactly the same PEM material as tls.ca_cert '{grpc_client_ca_path}'"
+    ))
+}
+
 async fn build_authenticators(
     config: &keyrack_service::config::AuthnConfig,
+    grpc_client_ca_path: Option<&str>,
 ) -> Result<Vec<Box<dyn keyrack_core::authn::Authenticator>>, Box<dyn std::error::Error>> {
     use keyrack_core::authn::{
         BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator, InsecureAuthenticator,
@@ -229,11 +244,27 @@ async fn build_authenticators(
             required_san,
             required_ou,
         } => {
+            let grpc_client_ca_path =
+                grpc_client_ca_path.ok_or_else(|| -> Box<dyn std::error::Error> {
+                    "mTLS-bound forwarded identity requires tls.ca_cert on the gRPC server".into()
+                })?;
             let pem_bytes =
                 std::fs::read(trusted_ca_cert_path).map_err(|e| -> Box<dyn std::error::Error> {
                     format!("failed to read trusted CA cert at '{trusted_ca_cert_path}': {e}")
                         .into()
                 })?;
+            let grpc_client_ca_pem =
+                std::fs::read(grpc_client_ca_path).map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("failed to read gRPC TLS client CA at '{grpc_client_ca_path}': {e}")
+                        .into()
+                })?;
+            validate_same_client_ca_material(
+                &pem_bytes,
+                &grpc_client_ca_pem,
+                trusted_ca_cert_path,
+                grpc_client_ca_path,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let mut authn = MtlsBoundForwardedIdentityAuthenticator::from_ca_pem(&pem_bytes)
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     format!("mTLS-bound forwarded identity init failed: {e}").into()
@@ -243,12 +274,6 @@ async fn build_authenticators(
             }
             if let Some(ou) = required_ou {
                 authn = authn.with_required_ou(ou.clone());
-            }
-            if required_san.is_none() && required_ou.is_none() {
-                tracing::warn!(
-                    ca_path = %trusted_ca_cert_path,
-                    "mTLS-bound forwarded identity has no SAN/OU pin; every certificate issued by this CA may delegate identities"
-                );
             }
             Ok(vec![Box::new(authn)])
         }
@@ -292,7 +317,8 @@ async fn build_authenticators(
         AuthnConfig::Chain { authenticators } => {
             let mut all: Vec<Box<dyn keyrack_core::authn::Authenticator>> = Vec::new();
             for sub in authenticators {
-                let mut sub_auths = Box::pin(build_authenticators(sub)).await?;
+                let mut sub_auths =
+                    Box::pin(build_authenticators(sub, grpc_client_ca_path)).await?;
                 all.append(&mut sub_auths);
             }
             Ok(all)
@@ -625,7 +651,12 @@ async fn build_state(
     };
 
     let authn: Arc<AuthenticatorChain> = {
-        let authenticators = build_authenticators(&config.authn).await?;
+        config
+            .authn
+            .validate_delegated_mtls_contract(config.tls.as_ref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let grpc_client_ca_path = config.tls.as_ref().and_then(|tls| tls.ca_cert.as_deref());
+        let authenticators = build_authenticators(&config.authn, grpc_client_ca_path).await?;
         Arc::new(AuthenticatorChain::new(authenticators))
     };
 
@@ -668,5 +699,28 @@ async fn shutdown_signal() {
     {
         ctrl_c.await.ok();
         tracing::info!("received Ctrl+C, shutting down");
+    }
+}
+
+#[cfg(test)]
+mod delegated_mtls_startup_tests {
+    use super::validate_same_client_ca_material;
+
+    #[test]
+    fn identical_client_ca_material_is_accepted() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n";
+        validate_same_client_ca_material(pem, pem, "/delegated.pem", "/tls.pem").unwrap();
+    }
+
+    #[test]
+    fn mismatched_client_ca_material_fails_closed() {
+        let err = validate_same_client_ca_material(
+            b"delegated-ca",
+            b"different-tls-ca",
+            "/delegated.pem",
+            "/tls.pem",
+        )
+        .unwrap_err();
+        assert!(err.contains("exactly the same PEM material"));
     }
 }
