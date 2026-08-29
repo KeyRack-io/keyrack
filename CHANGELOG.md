@@ -68,7 +68,11 @@ changes are marked **BREAKING (behaviour)** below.
   declare `supports_key_import: false` and reject the request. This is the
   import primitive a KMIP `Register` front-end needs — **no KMIP `Register`
   operation ships in this release**, and the KMIP provider does not support
-  import.
+  import. **Imported keys are non-exportable unless `exportable` is set
+  explicitly**, on both surfaces (a plain proto3 bool on gRPC, `unwrap_or(false)`
+  on REST); a keystore front-end that needs the material back must set the field
+  itself. The proto comment previously claimed imported keys defaulted to
+  exportable, which was never true of either surface; it has been corrected.
 - **mTLS-bound delegated identity** (`authn.type: mtls_bound_forwarded_identity`).
   A new authenticator that accepts forwarded end-user identity headers
   (`x-keyrack-principal-id`, `x-keyrack-tenant-id`, and optional
@@ -144,10 +148,13 @@ changes are marked **BREAKING (behaviour)** below.
   because `Disabled` permits decrypt but not encrypt, making it a legal source
   and an illegal destination; a dead `ReEncrypt` arm in
   `enforce_state_for_key_op` that mapped both to `permits_decrypt()` was removed
-  rather than wired up. Enforced in the gRPC `ReEncrypt` handler and in
-  `domain::crypto::re_encrypt`; **the REST
-  `POST /v1/keys/{key_id}/actions-re-encrypt` handler is a separate inline
-  implementation and is not yet covered by this gate.**
+  rather than wired up. Enforced on **both** surfaces: the gRPC `ReEncrypt`
+  handler, `domain::crypto::re_encrypt`, and the REST
+  `POST /v1/keys/{key_id}/actions-re-encrypt` handler — the last is a separate
+  inline implementation that calls neither of the first two and so had to be
+  gated explicitly. gRPC reports `FailedPrecondition` and REST
+  `409 InvalidState`, each matching that surface's existing convention for a
+  state refusal.
 - **The deletion reaper now destroys backend key material.** `run_deletion_scan`
   marked keys `Destroyed`, persisted the record, and emitted a signed
   `kms:KeyDestroyed` audit event without ever calling
