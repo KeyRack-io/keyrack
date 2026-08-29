@@ -179,7 +179,8 @@ async fn build_authenticators(
 ) -> Result<Vec<Box<dyn keyrack_core::authn::Authenticator>>, Box<dyn std::error::Error>> {
     use keyrack_core::authn::{
         BootstrapTokenAuthenticator, ForwardedIdentityAuthenticator, InsecureAuthenticator,
-        JwtAuthenticator, MtlsAuthenticator, TrustedMtlsPeerAuthenticator,
+        JwtAuthenticator, MtlsAuthenticator, MtlsBoundForwardedIdentityAuthenticator,
+        TrustedMtlsPeerAuthenticator,
     };
     use keyrack_service::config::AuthnConfig;
 
@@ -223,6 +224,34 @@ async fn build_authenticators(
             ))])
         }
         AuthnConfig::ForwardedIdentity => Ok(vec![Box::new(ForwardedIdentityAuthenticator)]),
+        AuthnConfig::MtlsBoundForwardedIdentity {
+            trusted_ca_cert_path,
+            required_san,
+            required_ou,
+        } => {
+            let pem_bytes =
+                std::fs::read(trusted_ca_cert_path).map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("failed to read trusted CA cert at '{trusted_ca_cert_path}': {e}")
+                        .into()
+                })?;
+            let mut authn = MtlsBoundForwardedIdentityAuthenticator::from_ca_pem(&pem_bytes)
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("mTLS-bound forwarded identity init failed: {e}").into()
+                })?;
+            if let Some(san) = required_san {
+                authn = authn.with_required_san(san.clone());
+            }
+            if let Some(ou) = required_ou {
+                authn = authn.with_required_ou(ou.clone());
+            }
+            if required_san.is_none() && required_ou.is_none() {
+                tracing::warn!(
+                    ca_path = %trusted_ca_cert_path,
+                    "mTLS-bound forwarded identity has no SAN/OU pin; every certificate issued by this CA may delegate identities"
+                );
+            }
+            Ok(vec![Box::new(authn)])
+        }
         AuthnConfig::TrustedMtlsPeer {
             trusted_ca_cert_path,
             required_san,

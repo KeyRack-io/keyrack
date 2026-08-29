@@ -336,15 +336,23 @@ enforce audience restrictions — it is not validated at the authn layer.
 The `claims_namespace` lets you scope custom claims (e.g.
 `https://keyrack.io/v1/tenant_id`).
 
-### Forwarded identity
+### mTLS-bound forwarded identity
 
-Trust the `x-keyrack-principal-id` header set by an already-authenticated
-upstream (e.g. the Barbican shim). **Only safe behind mTLS.**
+For an already-authenticated upstream, bind the asserted principal and tenant
+to a pinned mTLS workload identity:
 
 ```yaml
 authn:
-  type: forwarded_identity
+  type: mtls_bound_forwarded_identity
+  trusted_ca_cert_path: /etc/keyrack/tls/delegator-ca.pem
+  required_san: spiffe://cluster.local/ns/essentials/sa/essentials
 ```
+
+The upstream must set `x-keyrack-principal-id` and
+`x-keyrack-tenant-id`; the latter derives `scope=tenant:<id>`.
+`x-keyrack-project-id` and `x-keyrack-domain-id` are optional. Use the
+unbound `forwarded_identity` authenticator only for legacy compatibility in a
+separately enforced trusted perimeter.
 
 ### Chain (multiple authenticators)
 

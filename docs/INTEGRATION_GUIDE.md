@@ -65,25 +65,32 @@ authn:
       max_age_secs: 3600
 ```
 
-### Forwarded Identity
+### mTLS-bound Forwarded Identity
 
 For service-to-service calls where a trusted gateway has already authenticated the
-caller (e.g., a Barbican shim in front of KeyRack):
+caller, bind the asserted identity to the gateway workload's verified client
+certificate:
 
 ```yaml
 authn:
-  type: chain
-  authenticators:
-    - type: mtls
-    - type: forwarded_identity
+  type: mtls_bound_forwarded_identity
+  trusted_ca_cert_path: /etc/keyrack/tls/delegator-ca.pem
+  required_san: spiffe://cluster.local/ns/essentials/sa/essentials
 ```
 
 The upstream service sets these headers:
 - `x-keyrack-principal-id`
+- `x-keyrack-tenant-id`
 - `x-keyrack-project-id`
 - `x-keyrack-domain-id`
 
-Only trust this behind mTLS or a network perimeter you control.
+The principal and tenant headers are required. KeyRack derives
+`scope=tenant:<tenant-id>` only after the workload certificate matches. The
+project and domain are optional attributes.
+
+Do not express this as a `chain` containing `mtls` followed by
+`forwarded_identity`: a chain selects the mTLS workload as the principal and
+never binds or consumes the delegated identity.
 
 ### Bootstrap Token
 

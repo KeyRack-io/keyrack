@@ -98,7 +98,7 @@ sign_audit_events: true
 audit_signing_key_path: "/var/lib/keyrack/audit-signing-key"
 
 authn:
-  type: jwt              # or: mtls, bootstrap_token, forwarded_identity, chain, insecure
+  type: jwt              # or: mtls, mtls_bound_forwarded_identity, bootstrap_token, chain, insecure
   jwks_url: "https://your-idp/.well-known/jwks.json"
   issuer: "https://your-idp"
 
