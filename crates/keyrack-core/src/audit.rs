@@ -177,6 +177,12 @@ pub enum AuditAction {
     RotationJobExpired,
     #[serde(rename = "kms:KeyDestroyed")]
     KeyDestroyed,
+    /// Outcome of the provider-side material delete performed by the deletion
+    /// worker. Audited separately from `KeyDestroyed` (the record transition)
+    /// so an operator can tell "`KeyRack` says destroyed" from "the backend
+    /// object is actually gone". An `Error` result means the material survives.
+    #[serde(rename = "kms:ProviderDestroyKey")]
+    ProviderDestroyKey,
 
     // Secret-reference custody (HSM PIN custody / Scope B). Emitted when a
     // provider secret reference (e.g. a PKCS#11 `pin_ref`) is resolved.

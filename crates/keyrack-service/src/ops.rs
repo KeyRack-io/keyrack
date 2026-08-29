@@ -450,7 +450,7 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
-        AuditAction::KeyDestroyed => EventType::KeyDeleted,
+        AuditAction::KeyDestroyed | AuditAction::ProviderDestroyKey => EventType::KeyDeleted,
         AuditAction::AccessSecret | AuditAction::GetKeyMaterial => EventType::SecretAccess,
         AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
         AuditAction::MakeKeyExportable | AuditAction::RevokeKeyExportability => {

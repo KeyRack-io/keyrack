@@ -242,12 +242,19 @@ The `zeroize` crate uses `write_volatile` or compiler barriers to prevent the co
 keyrack-service receives ScheduleKeyDeletion request
   → PDP authorizes
   → Key enters "PendingDeletion" state (grace period)
-  → After grace period, key transitions to "Destroyed"
-  → CryptoProvider::destroy_key(handle) called
+  → Export is refused from this point on (KeyState::permits_export)
+  → After grace period, the deletion worker calls
+    CryptoProvider::destroy_key(handle) for every key version
     → Software: HashMap entry removed, KeyMaterial::drop() zeroizes
     → PKCS#11: HSM destroys key object
+    → Vault: transit key deletion enabled, then deleted
+  → Provider outcome audited per version (kms:ProviderDestroyKey)
+  → ONLY if every version was destroyed: key transitions to "Destroyed"
+    and kms:KeyDestroyed is audited
+  → On provider failure: key stays "PendingDeletion", the failure is
+    audited, and the next scan retries — a destruction that did not
+    happen is never audited as one
   → Cascade-disable triggers for all descendant keys
-  → Audit event emitted
 ```
 
 Cascade-disable ensures that destroying a parent key immediately renders all descendant keys inoperable. This is the mechanism behind crypto-shredding for GDPR Article 17 compliance.

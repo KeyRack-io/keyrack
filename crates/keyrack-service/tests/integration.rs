@@ -96,7 +96,119 @@ impl PolicyDecisionPoint for CountingPdp {
     }
 }
 
+/// Provider that records every `destroy_key` call and can be made to fail it.
+///
+/// Lets the deletion-reaper tests distinguish "`KeyRack` marked the record
+/// destroyed" from "the backend material was actually deleted".
+struct RecordingProvider {
+    inner: InMemoryProvider,
+    destroyed: Mutex<Vec<String>>,
+    fail_destroy: bool,
+}
+
+impl RecordingProvider {
+    fn new(fail_destroy: bool) -> Self {
+        Self {
+            inner: InMemoryProvider::new(),
+            destroyed: Mutex::new(Vec::new()),
+            fail_destroy,
+        }
+    }
+
+    fn destroyed_handles(&self) -> Vec<String> {
+        self.destroyed.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl keyrack_core::provider::CryptoProvider for RecordingProvider {
+    async fn generate_key(
+        &self,
+        spec: &keyrack_core::key::KeySpec,
+    ) -> keyrack_core::error::Result<keyrack_core::provider::KeyHandle> {
+        self.inner.generate_key(spec).await
+    }
+
+    async fn encrypt(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> keyrack_core::error::Result<keyrack_core::provider::EncryptOutput> {
+        self.inner.encrypt(handle, plaintext, aad).await
+    }
+
+    async fn decrypt(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.decrypt(handle, ciphertext, aad).await
+    }
+
+    async fn sign(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        algorithm: keyrack_core::provider::SigningAlgorithm,
+        message: &[u8],
+    ) -> keyrack_core::error::Result<Vec<u8>> {
+        self.inner.sign(handle, algorithm, message).await
+    }
+
+    async fn verify(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        algorithm: keyrack_core::provider::SigningAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> keyrack_core::error::Result<bool> {
+        self.inner
+            .verify(handle, algorithm, message, signature)
+            .await
+    }
+
+    async fn generate_random(
+        &self,
+        length: usize,
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.generate_random(length).await
+    }
+
+    async fn destroy_key(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<()> {
+        self.destroyed.lock().unwrap().push(handle.key_id.clone());
+        if self.fail_destroy {
+            return Err(keyrack_core::error::KeyRackError::Provider(
+                "simulated backend delete failure".into(),
+            ));
+        }
+        self.inner.destroy_key(handle).await
+    }
+
+    fn capabilities(&self) -> keyrack_core::provider::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn export_key_material(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.export_key_material(handle).await
+    }
+}
+
 fn build_test_state_with(
+    pdp: Arc<dyn PolicyDecisionPoint>,
+    audit: Arc<dyn AuditSink>,
+) -> Arc<ServiceState> {
+    build_test_state_with_provider(Arc::new(InMemoryProvider::new()), pdp, audit)
+}
+
+fn build_test_state_with_provider(
+    provider: Arc<dyn keyrack_core::provider::CryptoProvider>,
     pdp: Arc<dyn PolicyDecisionPoint>,
     audit: Arc<dyn AuditSink>,
 ) -> Arc<ServiceState> {
@@ -105,7 +217,6 @@ fn build_test_state_with(
     use keyrack_service::routing::ProviderRouter;
 
     let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
-    let provider = Arc::new(InMemoryProvider::new());
     let providers = Arc::new(StaticProviderRegistry::single(
         provider,
         ProviderClass::InMemory,
@@ -6256,5 +6367,276 @@ async fn import_key_unsupported_provider_fails_closed_rest() {
     assert!(
         body_str.contains("does not support key import"),
         "response must mention import capability: {body_str}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KEY-STATE EXPORT GATE + REAL BACKEND DESTRUCTION
+//
+// `GetKeyMaterial` hands the caller the key itself, so it must be gated
+// on key state and not on exportability alone; and the deletion reaper
+// must actually delete the provider-side material before it audits a
+// key as destroyed.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create an exportable AES key and return its key id.
+async fn create_exportable_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "exportable".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable key");
+    resp.into_inner().metadata.unwrap().key_id
+}
+
+/// Move a `PendingDeletion` key's `scheduled_deletion_at` into the past so the
+/// next reaper scan treats it as due.
+async fn backdate_scheduled_deletion(state: &ServiceState, key_id: &str) {
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("parse lid");
+    let mut record = state.storage.get_key(&lid).await.expect("get key");
+    assert_eq!(
+        record.state,
+        keyrack_core::key::KeyState::PendingDeletion,
+        "key must be pending deletion before backdating"
+    );
+    record.scheduled_deletion_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.expect("update key");
+}
+
+async fn key_state(state: &ServiceState, key_id: &str) -> keyrack_core::key::KeyState {
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("parse lid");
+    state.storage.get_key(&lid).await.expect("get key").state
+}
+
+async fn export(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+    key_id: &str,
+) -> Result<proto::GetKeyMaterialResponse, tonic::Status> {
+    svc.get_key_material(Request::new(proto::GetKeyMaterialRequest {
+        key_id: key_id.to_string(),
+        key_version: 0,
+        wrapping_key: None,
+    }))
+    .await
+    .map(tonic::Response::into_inner)
+}
+
+/// Scheduling deletion must immediately stop key-material export, even though
+/// the key is still marked `Exportable`. Also asserts the `Enabled` path still
+/// works, so the Percona/KMIP keystore boot flow does not regress.
+#[tokio::test]
+async fn get_key_material_refused_once_deletion_scheduled() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+
+    // Enabled + exportable: the keystore path must keep working.
+    let material = export(&svc, &key_id).await.expect("enabled export");
+    assert!(
+        !material.key_material.is_empty(),
+        "enabled exportable key must still return material"
+    );
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+
+    let status = export(&svc, &key_id)
+        .await
+        .expect_err("export must be refused once deletion is scheduled");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("export not permitted")
+            && status.message().contains("pending_deletion"),
+        "message must name the offending state and be distinguishable from the \
+         non-exportable refusal: {}",
+        status.message()
+    );
+    assert!(
+        !status.message().contains("is not exportable"),
+        "state refusal must not be reported as an exportability refusal: {}",
+        status.message()
+    );
+
+    // The record is untouched by the refusal — still exportable, still pending.
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+}
+
+/// End-to-end: once the reaper has destroyed a key, export is refused by the
+/// state gate rather than falling through to the provider.
+#[tokio::test]
+async fn get_key_material_refused_after_reaper_destroys_key() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan");
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+
+    let status = export(&svc, &key_id)
+        .await
+        .expect_err("export of a destroyed key must be refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("destroyed"),
+        "message must name the destroyed state: {}",
+        status.message()
+    );
+}
+
+/// The reaper must call `CryptoProvider::destroy_key` for every key version,
+/// not merely relabel the record.
+#[tokio::test]
+async fn deletion_reaper_destroys_provider_material() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .expect("rotate to get a second version");
+
+    let lid: keyrack_core::lid::Lid = key_id.parse().unwrap();
+    let handles: Vec<String> = state
+        .storage
+        .get_key(&lid)
+        .await
+        .unwrap()
+        .key_versions
+        .iter()
+        .map(|v| v.key_handle.key_id.clone())
+        .collect();
+    assert_eq!(handles.len(), 2, "expected two key versions after rotation");
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan");
+
+    let destroyed = provider.destroyed_handles();
+    for handle in &handles {
+        assert!(
+            destroyed.contains(handle),
+            "provider destroy_key must be called for every version handle \
+             (missing {handle}, saw {destroyed:?})"
+        );
+    }
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+
+    let events = audit.events();
+    let provider_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == keyrack_core::audit::AuditAction::ProviderDestroyKey)
+        .collect();
+    assert_eq!(
+        provider_events.len(),
+        2,
+        "provider-destroy outcome must be audited per version"
+    );
+    assert!(
+        provider_events
+            .iter()
+            .all(|e| e.result == keyrack_core::audit::AuditResult::Success),
+        "successful backend deletes must audit as Success"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed),
+        "record destruction must still be audited"
+    );
+}
+
+/// Fail closed: if the backend delete fails the key must stay in
+/// `PendingDeletion` and no destruction may be audited as successful.
+#[tokio::test]
+async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
+    let provider = Arc::new(RecordingProvider::new(true));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan must not abort the whole pass");
+
+    assert!(
+        !provider.destroyed_handles().is_empty(),
+        "the reaper must have attempted the backend delete"
+    );
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion,
+        "a key whose backend material survives must NOT be marked destroyed"
+    );
+
+    let events = audit.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed),
+        "a destruction that did not happen must never be audited"
+    );
+    let failure = events
+        .iter()
+        .find(|e| e.action == keyrack_core::audit::AuditAction::ProviderDestroyKey)
+        .expect("provider-destroy failure must be audited");
+    assert_eq!(failure.result, keyrack_core::audit::AuditResult::Error);
+    assert!(
+        failure.metadata.contains_key("error"),
+        "failure event must carry the provider error for the operator"
     );
 }

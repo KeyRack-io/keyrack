@@ -2747,6 +2747,17 @@ impl KeyService for KeyServiceImpl {
             )));
         }
 
+        // Independent of exportability: a key that may not be used may not be
+        // handed out either. Without this, `PendingDeletion` and `Destroyed`
+        // keys still served plaintext material over KMIP `Get`, making export
+        // more permissive than decrypt.
+        if !record.state.permits_export() {
+            return Err(Status::failed_precondition(format!(
+                "key {key_id} is in state {} — key-material export not permitted",
+                record.state
+            )));
+        }
+
         let resource_attrs = crate::domain::exportability_resource_attrs(&record);
         let mut op_ctx = OpContext::key(AuditAction::GetKeyMaterial, principal, &key_id);
         op_ctx.request_id = request_id;
