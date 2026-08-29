@@ -41,6 +41,9 @@ impl KeyServiceImpl {
         Self { state }
     }
 
+    // tonic::Status is the public gRPC error type; boxing it would only move
+    // the allocation into every call site.
+    #[allow(clippy::result_large_err)]
     async fn principal<T>(
         &self,
         request: &Request<T>,

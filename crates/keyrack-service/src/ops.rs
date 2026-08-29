@@ -140,6 +140,9 @@ impl OpContext {
 ///     |state| async move { /* actual work */ },
 /// ).await?;
 /// ```
+// tonic::Status is the public gRPC error type; boxing it would only move the
+// allocation into every call site.
+#[allow(clippy::result_large_err)]
 pub async fn execute<F, Fut, T>(
     state: &Arc<ServiceState>,
     ctx: OpContext,
@@ -229,6 +232,7 @@ async fn emit_audit(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), tonic::Status> {
     let pdp_start = Instant::now();
 
@@ -468,6 +472,7 @@ pub fn default_principal() -> Principal {
 /// Authorize with explicit resource attributes (for exportable-key operations
 /// that populate `exportable`/`exported` on the PDP resource). Returns
 /// `Err(tonic::Status)` on deny/indeterminate.
+#[allow(clippy::result_large_err)]
 pub async fn authorize_with_resource_attrs(
     state: &Arc<ServiceState>,
     ctx: &OpContext,
@@ -533,6 +538,7 @@ pub async fn emit_audit_denied(state: &Arc<ServiceState>, ctx: &OpContext) {
 
 /// PDP + audit envelope with resource-attribute enrichment. Used by
 /// exportable-key operations that must populate `Resource.attributes`.
+#[allow(clippy::result_large_err)]
 pub async fn execute_with_resource_attrs<F, Fut, T>(
     state: &Arc<ServiceState>,
     ctx: OpContext,
@@ -580,6 +586,7 @@ where
 /// credential, the request is rejected with `Unauthenticated` rather than
 /// downgraded to an anonymous principal. The insecure authenticator never
 /// errors, so dev/test deployments (no real authn) are unaffected.
+#[allow(clippy::result_large_err)]
 pub async fn extract_principal_grpc<T>(
     state: &Arc<ServiceState>,
     request: &tonic::Request<T>,
