@@ -6957,3 +6957,126 @@ async fn re_encrypt_refused_when_destination_state_forbids_encrypt() {
         status.message()
     );
 }
+
+/// The REST `re_encrypt` handler is a separate inline implementation from the
+/// gRPC one and did not share its state gate, so the pair remained a way to
+/// decrypt with a key that refuses a direct `Decrypt` on this surface only.
+/// Cross-surface parity is the recurring defect class here, so both directions
+/// are asserted on REST too.
+#[tokio::test]
+async fn rest_re_encrypt_refused_when_key_state_forbids_the_direction() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn rest_create(state: Arc<ServiceState>) -> String {
+        let app = keyrack_service::rest::router(state);
+        let body = serde_json::json!({ "key_spec": "AES_256", "description": "rest key" });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("lid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    async fn rest_post(state: Arc<ServiceState>, uri: &str) {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "setup call {uri} failed: {}",
+            resp.status()
+        );
+    }
+
+    /// Returns the status and the `error` code from the body.
+    async fn rest_re_encrypt(
+        state: Arc<ServiceState>,
+        src: &str,
+        dst: &str,
+    ) -> (axum::http::StatusCode, String) {
+        let app = keyrack_service::rest::router(state);
+        // The ciphertext blob is deliberately empty: the state gate must be
+        // reached before the blob is parsed, so an empty blob proves ordering.
+        let body = serde_json::json!({
+            "destination_key_id": dst,
+            "ciphertext_blob": "",
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/keys/{src}/actions-re-encrypt"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let code = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        (status, code)
+    }
+
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let st = build_state_for_principal(storage.clone(), "tenant-a");
+
+    // Source scheduled for deletion: forbids decrypt, so it is an illegal source.
+    let src = rest_create(st.clone()).await;
+    let dst = rest_create(st.clone()).await;
+    rest_post(
+        st.clone(),
+        &format!("/v1/keys/{src}/actions-schedule-deletion"),
+    )
+    .await;
+    let (status, code) = rest_re_encrypt(st.clone(), &src, &dst).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "pending-deletion source must be refused on REST"
+    );
+    assert_eq!(code, "InvalidState");
+
+    // Destination disabled: still permits decrypt, so it is a legal source but
+    // an illegal destination. This is the case a single shared predicate gets
+    // wrong.
+    let src2 = rest_create(st.clone()).await;
+    let dst2 = rest_create(st.clone()).await;
+    rest_post(st.clone(), &format!("/v1/keys/{dst2}/actions-disable")).await;
+    let (status, code) = rest_re_encrypt(st.clone(), &src2, &dst2).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "disabled destination must be refused on REST"
+    );
+    assert_eq!(code, "InvalidState");
+
+    // A disabled key remains a LEGAL source, so the gate must not over-refuse:
+    // disabled source into an enabled destination must get past the state gate
+    // and fail later on the empty ciphertext instead.
+    let dst3 = rest_create(st.clone()).await;
+    rest_post(st.clone(), &format!("/v1/keys/{src2}/actions-disable")).await;
+    let (status, _) = rest_re_encrypt(st.clone(), &src2, &dst3).await;
+    assert_ne!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "a disabled source still permits decrypt and must not be refused on state"
+    );
+}
