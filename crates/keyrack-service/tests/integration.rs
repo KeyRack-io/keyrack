@@ -6652,6 +6652,9 @@ async fn key_state(state: &ServiceState, key_id: &str) -> keyrack_core::key::Key
     state.storage.get_key(&lid).await.expect("get key").state
 }
 
+// tonic::Status is the error type the service actually returns; boxing it here
+// would only obscure what the assertions inspect.
+#[allow(clippy::result_large_err)]
 async fn export(
     svc: &keyrack_service::grpc::KeyServiceImpl,
     key_id: &str,
