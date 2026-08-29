@@ -95,6 +95,17 @@ pub enum AuthnError {
 /// [`AuthnError`].
 #[async_trait]
 pub trait Authenticator: Send + Sync {
+    /// Whether this authenticator can recognise credentials when the server
+    /// transport cannot provide a peer certificate.
+    ///
+    /// The service uses this capability to reject REST API calls explicitly
+    /// when an authentication chain is gRPC/mTLS-only. Health and metrics
+    /// routes remain available, while callers receive a transport error rather
+    /// than a misleading bad-credential response.
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        true
+    }
+
     /// Try to authenticate from the given request metadata.
     ///
     /// Return `Ok(Some(result))` if this authenticator recognised and
@@ -135,6 +146,14 @@ impl AuthenticatorChain {
             }
         }
         Err(AuthnError::NoCredential)
+    }
+
+    /// Return true when at least one configured authenticator can operate on
+    /// a transport which does not expose the client certificate.
+    pub fn supports_requests_without_peer_certificate(&self) -> bool {
+        self.authenticators
+            .iter()
+            .any(|authn| authn.supports_requests_without_peer_certificate())
     }
 }
 
@@ -250,6 +269,10 @@ impl MtlsAuthenticator {
 
 #[async_trait]
 impl Authenticator for MtlsAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
     async fn authenticate(
         &self,
         metadata: &RequestMetadata,
@@ -421,6 +444,155 @@ impl Authenticator for ForwardedIdentityAuthenticator {
     }
 }
 
+/// Forwarded identity bound to a specifically trusted mTLS workload.
+///
+/// This is the safe service-to-service delegation profile. The peer
+/// certificate first has to match the configured CA and optional SAN/OU pin;
+/// only then are the forwarded end-user and tenant headers accepted. Unlike a
+/// `Chain` containing `Mtls` followed by `ForwardedIdentity`, this composes the
+/// two proofs: a normal authenticator chain selects the first successful
+/// identity and therefore cannot bind one credential to the other.
+///
+/// Required headers:
+/// - `x-keyrack-principal-id`: the already-authenticated end-user/service ID
+/// - `x-keyrack-tenant-id`: the owning tenant used to derive
+///   `scope=tenant:<id>`
+///
+/// Optional headers:
+/// - `x-keyrack-project-id`
+/// - `x-keyrack-domain-id`
+///
+/// With no forwarded identity headers this authenticator returns no-match,
+/// even for a trusted peer, so another independent credential in the chain
+/// may authenticate the request. The presence of any reserved identity header
+/// recognises a delegation attempt: an untrusted peer or an incomplete
+/// principal/tenant pair is an error and stops the chain.
+pub struct MtlsBoundForwardedIdentityAuthenticator {
+    trusted_peer: TrustedMtlsPeerAuthenticator,
+}
+
+impl MtlsBoundForwardedIdentityAuthenticator {
+    /// Create the authenticator from the CA which signs the delegating
+    /// workload's client certificate.
+    pub fn from_ca_pem(pem_bytes: &[u8]) -> Result<Self, AuthnError> {
+        Ok(Self {
+            trusted_peer: TrustedMtlsPeerAuthenticator::from_ca_pem(pem_bytes)?,
+        })
+    }
+
+    /// Require the delegating workload certificate to carry this exact SAN.
+    #[must_use]
+    pub fn with_required_san(mut self, san: String) -> Self {
+        self.trusted_peer = self.trusted_peer.with_required_san(san);
+        self
+    }
+
+    /// Require the delegating workload certificate to carry this exact OU.
+    #[must_use]
+    pub fn with_required_ou(mut self, ou: String) -> Self {
+        self.trusted_peer = self.trusted_peer.with_required_ou(ou);
+        self
+    }
+}
+
+const FORWARDED_IDENTITY_HEADERS: [&str; 4] = [
+    "x-keyrack-principal-id",
+    "x-keyrack-tenant-id",
+    "x-keyrack-project-id",
+    "x-keyrack-domain-id",
+];
+
+fn forwarded_header<'a>(metadata: &'a RequestMetadata, name: &str) -> Option<&'a str> {
+    metadata
+        .headers
+        .get(name)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn has_forwarded_identity_headers(metadata: &RequestMetadata) -> bool {
+    FORWARDED_IDENTITY_HEADERS
+        .iter()
+        .any(|name| metadata.headers.contains_key(*name))
+}
+
+#[async_trait]
+impl Authenticator for MtlsBoundForwardedIdentityAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
+    async fn authenticate(
+        &self,
+        metadata: &RequestMetadata,
+    ) -> Result<Option<AuthnResult>, AuthnError> {
+        let trusted_peer = self.trusted_peer.authenticate(metadata).await?;
+        let Some(trusted_peer) = trusted_peer else {
+            if has_forwarded_identity_headers(metadata) {
+                return Err(AuthnError::InvalidCredential(
+                    "forwarded identity is not bound to the configured mTLS peer".into(),
+                ));
+            }
+            return Ok(None);
+        };
+
+        // A trusted workload may also present another credential handled by a
+        // later authenticator. Delegation is recognised by the reserved
+        // headers, not merely by the presence of the workload certificate.
+        if !has_forwarded_identity_headers(metadata) {
+            return Ok(None);
+        }
+
+        let principal_id =
+            forwarded_header(metadata, "x-keyrack-principal-id").ok_or_else(|| {
+                AuthnError::InvalidCredential("x-keyrack-principal-id header is required".into())
+            })?;
+        let tenant_id = forwarded_header(metadata, "x-keyrack-tenant-id").ok_or_else(|| {
+            AuthnError::InvalidCredential("x-keyrack-tenant-id header is required".into())
+        })?;
+        if tenant_id.contains(':') || tenant_id.chars().any(char::is_whitespace) {
+            return Err(AuthnError::InvalidCredential(
+                "x-keyrack-tenant-id must be a non-empty scope component".into(),
+            ));
+        }
+
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "tenant_id".into(),
+            AttributeValue::String(tenant_id.to_owned()),
+        );
+        attributes.insert(
+            "scope".into(),
+            AttributeValue::String(format!("tenant:{tenant_id}")),
+        );
+        attributes.insert(
+            "delegating_peer_id".into(),
+            AttributeValue::String(trusted_peer.principal.id),
+        );
+        if let Some(project_id) = forwarded_header(metadata, "x-keyrack-project-id") {
+            attributes.insert(
+                "project_id".into(),
+                AttributeValue::String(project_id.to_owned()),
+            );
+        }
+        if let Some(domain_id) = forwarded_header(metadata, "x-keyrack-domain-id") {
+            attributes.insert(
+                "domain_id".into(),
+                AttributeValue::String(domain_id.to_owned()),
+            );
+        }
+
+        Ok(Some(AuthnResult {
+            principal: Principal {
+                id: principal_id.to_owned(),
+                principal_type: "DelegatedIdentity".into(),
+                attributes,
+            },
+            method: "mtls_bound_forwarded_identity".into(),
+        }))
+    }
+}
+
 /// Trusted mTLS peer authenticator for platform-internal fast-path.
 ///
 /// Authenticates a peer whose client certificate was issued by a specific
@@ -581,6 +753,10 @@ impl TrustedMtlsPeerAuthenticator {
 
 #[async_trait]
 impl Authenticator for TrustedMtlsPeerAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
     async fn authenticate(
         &self,
         metadata: &RequestMetadata,
@@ -1247,6 +1423,162 @@ mod tests {
 
         let result = authn.authenticate(&metadata).await.unwrap();
         assert!(result.is_none(), "wrong SAN should skip");
+    }
+
+    fn build_bound_forwarded_authn(ca: &TestCaBundle) -> MtlsBoundForwardedIdentityAuthenticator {
+        MtlsBoundForwardedIdentityAuthenticator::from_ca_pem(ca.cert.pem().as_bytes()).unwrap()
+    }
+
+    fn delegated_metadata(leaf: &rcgen::Certificate) -> RequestMetadata {
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata.headers.insert(
+            "x-keyrack-principal-id".into(),
+            "urn:example:iam:tenant-a:user/user-a".into(),
+        );
+        metadata
+            .headers
+            .insert("x-keyrack-tenant-id".into(), "tenant-a".into());
+        metadata
+            .headers
+            .insert("x-keyrack-project-id".into(), "project-a".into());
+        metadata
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_derives_tenant_scope() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_san("essentials", "essentials.internal", &ca);
+        let authn =
+            build_bound_forwarded_authn(&ca).with_required_san("essentials.internal".into());
+
+        let result = authn
+            .authenticate(&delegated_metadata(&leaf))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.method, "mtls_bound_forwarded_identity");
+        assert_eq!(result.principal.id, "urn:example:iam:tenant-a:user/user-a");
+        assert_eq!(result.principal.principal_type, "DelegatedIdentity");
+        assert_eq!(
+            result.principal.attributes.get("scope"),
+            Some(&AttributeValue::String("tenant:tenant-a".into()))
+        );
+        assert_eq!(
+            result.principal.attributes.get("tenant_id"),
+            Some(&AttributeValue::String("tenant-a".into()))
+        );
+        assert_eq!(
+            result.principal.attributes.get("project_id"),
+            Some(&AttributeValue::String("project-a".into()))
+        );
+        assert_eq!(
+            result.principal.attributes.get("delegating_peer_id"),
+            Some(&AttributeValue::String("essentials".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_rejects_headers_from_untrusted_peer() {
+        let trusted_ca = test_ca();
+        let other_ca = test_ca_named("Other CA");
+        let leaf = test_leaf("intruder", &other_ca);
+        let authn = build_bound_forwarded_authn(&trusted_ca);
+
+        let result = authn.authenticate(&delegated_metadata(&leaf)).await;
+        assert!(matches!(result, Err(AuthnError::InvalidCredential(_))));
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_requires_tenant() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let authn = build_bound_forwarded_authn(&ca);
+        let mut metadata = delegated_metadata(&leaf);
+        metadata.headers.remove("x-keyrack-tenant-id");
+
+        let result = authn.authenticate(&metadata).await;
+        assert!(matches!(result, Err(AuthnError::InvalidCredential(_))));
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_without_headers_is_no_match() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let authn = build_bound_forwarded_authn(&ca);
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+
+        let result = authn.authenticate(&metadata).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_without_headers_falls_through_chain() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let bound = build_bound_forwarded_authn(&ca);
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(bound),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+
+        let result = chain.authenticate(&metadata).await.unwrap();
+        assert_eq!(result.method, "bootstrap_token");
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_incomplete_attempt_stops_chain() {
+        let ca = test_ca();
+        let leaf = test_leaf("essentials", &ca);
+        let bound = build_bound_forwarded_authn(&ca);
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(bound),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        let mut metadata = RequestMetadata::default();
+        metadata.peer_certificates = vec![leaf.der().to_vec()];
+        metadata.headers.insert(
+            "x-keyrack-principal-id".into(),
+            "urn:example:iam:tenant-a:user/user-a".into(),
+        );
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+
+        let result = chain.authenticate(&metadata).await;
+        assert!(matches!(result, Err(AuthnError::InvalidCredential(_))));
+    }
+
+    #[test]
+    fn peer_certificate_only_chain_reports_transport_requirement() {
+        let ca = test_ca();
+        let peer_only = AuthenticatorChain::new(vec![
+            Box::new(build_bound_forwarded_authn(&ca)),
+            Box::new(MtlsAuthenticator),
+        ]);
+        assert!(!peer_only.supports_requests_without_peer_certificate());
+
+        let with_token_fallback = AuthenticatorChain::new(vec![
+            Box::new(build_bound_forwarded_authn(&ca)),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+        assert!(with_token_fallback.supports_requests_without_peer_certificate());
     }
 
     #[tokio::test]

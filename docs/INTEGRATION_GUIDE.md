@@ -65,25 +65,52 @@ authn:
       max_age_secs: 3600
 ```
 
-### Forwarded Identity
+### mTLS-bound Forwarded Identity
 
 For service-to-service calls where a trusted gateway has already authenticated the
-caller (e.g., a Barbican shim in front of KeyRack):
+caller, bind the asserted identity to the gateway workload's verified client
+certificate:
 
 ```yaml
+tls:
+  server_cert: /etc/keyrack/tls/server.crt
+  server_key: /etc/keyrack/tls/server.key
+  ca_cert: /etc/keyrack/tls/delegator-ca.pem
+
 authn:
-  type: chain
-  authenticators:
-    - type: mtls
-    - type: forwarded_identity
+  type: mtls_bound_forwarded_identity
+  trusted_ca_cert_path: /etc/keyrack/tls/delegator-ca.pem
+  required_san: spiffe://cluster.local/ns/essentials/sa/essentials
 ```
 
 The upstream service sets these headers:
 - `x-keyrack-principal-id`
+- `x-keyrack-tenant-id`
 - `x-keyrack-project-id`
 - `x-keyrack-domain-id`
 
-Only trust this behind mTLS or a network perimeter you control.
+The principal and tenant headers are required. KeyRack derives
+`scope=tenant:<tenant-id>` only after the workload certificate matches. The
+project and domain are optional attributes.
+
+The profile is available on gRPC, where tonic exposes the TLS peer
+certificate. `tls.ca_cert` and `trusted_ca_cert_path` must contain exactly the
+same PEM material, and at least one exact `required_san`/`required_ou` pin is
+mandatory; startup fails otherwise. A REST API request receives
+`501 AuthenticationTransportUnsupported` when every configured authenticator
+requires a peer certificate. Add a JWT/bootstrap authenticator to the chain if
+the REST API must remain usable; health and metrics remain available either
+way.
+
+The presence of a trusted workload certificate alone is not a delegated
+credential. With none of the reserved identity headers the profile returns a
+no-match and a later authenticator may run. Once any reserved identity header
+is present, the profile owns the attempt: the peer, principal and tenant must
+all validate or authentication fails without falling through.
+
+Do not express this as a `chain` containing `mtls` followed by
+`forwarded_identity`: a chain selects the mTLS workload as the principal and
+never binds or consumes the delegated identity.
 
 ### Bootstrap Token
 

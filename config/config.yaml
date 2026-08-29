@@ -40,6 +40,14 @@ authn:
 #     - type: bootstrap_token
 #       max_age_secs: 300
 
-# Forwarded identity (trust upstream header, only behind mTLS):
+# mTLS-bound delegated identity (production service-to-service profile):
+# tls:
+#   server_cert: /etc/keyrack/tls/server.crt
+#   server_key: /etc/keyrack/tls/server.key
+#   ca_cert: /etc/keyrack/tls/delegator-ca.pem
 # authn:
-#   type: forwarded_identity
+#   type: mtls_bound_forwarded_identity
+#   # Must contain exactly the same PEM material as tls.ca_cert.
+#   trusted_ca_cert_path: /etc/keyrack/tls/delegator-ca.pem
+#   # At least one exact workload pin is mandatory.
+#   required_san: spiffe://cluster.local/ns/essentials/sa/essentials

@@ -98,7 +98,7 @@ sign_audit_events: true
 audit_signing_key_path: "/var/lib/keyrack/audit-signing-key"
 
 authn:
-  type: jwt              # or: mtls, bootstrap_token, forwarded_identity, chain, insecure
+  type: jwt              # or: mtls, mtls_bound_forwarded_identity, bootstrap_token, chain, insecure
   jwks_url: "https://your-idp/.well-known/jwks.json"
   issuer: "https://your-idp"
 
@@ -136,6 +136,12 @@ proto/
 ```
 
 ## REST API
+
+Peer-certificate-only authentication profiles are gRPC-only. When every
+configured authenticator requires a peer certificate, authenticated REST API
+routes return `501 AuthenticationTransportUnsupported`; health and metrics
+remain available. Configure a JWT/bootstrap fallback in the authentication
+chain when REST access is required.
 
 | Method | Path | Description |
 |---|---|---|

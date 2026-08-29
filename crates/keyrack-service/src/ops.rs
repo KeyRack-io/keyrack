@@ -140,6 +140,9 @@ impl OpContext {
 ///     |state| async move { /* actual work */ },
 /// ).await?;
 /// ```
+// tonic::Status is the public gRPC error type; boxing it would only move the
+// allocation into every call site.
+#[allow(clippy::result_large_err)]
 pub async fn execute<F, Fut, T>(
     state: &Arc<ServiceState>,
     ctx: OpContext,
@@ -229,6 +232,7 @@ async fn emit_audit(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), tonic::Status> {
     let pdp_start = Instant::now();
 
@@ -468,6 +472,7 @@ pub fn default_principal() -> Principal {
 /// Authorize with explicit resource attributes (for exportable-key operations
 /// that populate `exportable`/`exported` on the PDP resource). Returns
 /// `Err(tonic::Status)` on deny/indeterminate.
+#[allow(clippy::result_large_err)]
 pub async fn authorize_with_resource_attrs(
     state: &Arc<ServiceState>,
     ctx: &OpContext,
@@ -533,6 +538,7 @@ pub async fn emit_audit_denied(state: &Arc<ServiceState>, ctx: &OpContext) {
 
 /// PDP + audit envelope with resource-attribute enrichment. Used by
 /// exportable-key operations that must populate `Resource.attributes`.
+#[allow(clippy::result_large_err)]
 pub async fn execute_with_resource_attrs<F, Fut, T>(
     state: &Arc<ServiceState>,
     ctx: OpContext,
@@ -580,6 +586,7 @@ where
 /// credential, the request is rejected with `Unauthenticated` rather than
 /// downgraded to an anonymous principal. The insecure authenticator never
 /// errors, so dev/test deployments (no real authn) are unaffected.
+#[allow(clippy::result_large_err)]
 pub async fn extract_principal_grpc<T>(
     state: &Arc<ServiceState>,
     request: &tonic::Request<T>,
@@ -627,6 +634,8 @@ pub async fn extract_principal_rest(
 ) -> Result<Principal, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     use keyrack_core::authn::RequestMetadata;
 
+    ensure_rest_authn_transport_supported(&state.authn)?;
+
     let mut meta = RequestMetadata::default();
     for (key, value) in headers {
         if let Ok(v) = value.to_str() {
@@ -644,5 +653,53 @@ pub async fn extract_principal_rest(
                 &format!("authentication failed: {e}"),
             ))
         }
+    }
+}
+
+fn ensure_rest_authn_transport_supported(
+    authn: &keyrack_core::authn::AuthenticatorChain,
+) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    if authn.supports_requests_without_peer_certificate() {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "REST authentication transport unsupported; configured authenticators require a peer certificate"
+    );
+    Err(rest_error(
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        "AuthenticationTransportUnsupported",
+        "the configured authentication profile requires a client certificate exposed by the gRPC transport; use gRPC or configure a REST-capable authenticator in the chain",
+    ))
+}
+
+#[cfg(test)]
+mod authn_transport_tests {
+    use super::ensure_rest_authn_transport_supported;
+    use keyrack_core::authn::{AuthenticatorChain, BootstrapTokenAuthenticator, MtlsAuthenticator};
+
+    #[test]
+    fn rest_rejects_peer_certificate_only_chain_explicitly() {
+        let chain = AuthenticatorChain::new(vec![Box::new(MtlsAuthenticator)]);
+
+        let (status, axum::Json(body)) = ensure_rest_authn_transport_supported(&chain).unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            body["error"],
+            serde_json::Value::String("AuthenticationTransportUnsupported".into())
+        );
+    }
+
+    #[test]
+    fn rest_accepts_chain_with_token_fallback() {
+        let chain = AuthenticatorChain::new(vec![
+            Box::new(MtlsAuthenticator),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ]);
+
+        ensure_rest_authn_transport_supported(&chain).unwrap();
     }
 }
