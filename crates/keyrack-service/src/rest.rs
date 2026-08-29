@@ -1659,6 +1659,27 @@ async fn re_encrypt(
             .get_key(&dst_lid)
             .await
             .map_err(map_core_err)?;
+        // ReEncrypt is a decrypt under the source key followed by an encrypt
+        // under the destination, so each side needs the gate its own direction
+        // would get if called on its own. This handler is a separate inline
+        // implementation from the gRPC one and did not share its gate, so
+        // without this the pair remained a way to decrypt with a key that
+        // refused a direct `Decrypt` — including `Destroyed` keys — on REST
+        // only.
+        if !src_record.state.permits_decrypt() {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "source key not in state for decrypt",
+            ));
+        }
+        if !dst_record.state.permits_encrypt() {
+            return Err(ops::rest_error(
+                StatusCode::CONFLICT,
+                "InvalidState",
+                "destination key not in Enabled state",
+            ));
+        }
         crate::domain::enforce_scope_for_key_op(
             &state,
             &src_record,
