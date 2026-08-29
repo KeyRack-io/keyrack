@@ -1161,7 +1161,11 @@ pub fn enforce_state_for_key_op(
         AuditAction::Decrypt | AuditAction::Verify | AuditAction::VerifyMac => {
             record.state.permits_decrypt()
         }
-        AuditAction::ReEncrypt => record.state.permits_decrypt(),
+        // `ReEncrypt` is deliberately absent: it touches two keys in opposite
+        // directions, so no single-record predicate is correct for it. The
+        // handlers gate the source with `permits_decrypt` and the destination
+        // with `permits_encrypt` themselves. A `ReEncrypt` arm here would have to
+        // pick one and would silently under-gate the other key.
         _ => return Ok(()),
     };
     if !permitted {
@@ -1373,6 +1377,24 @@ pub mod crypto {
             .get_key(&dst_lid)
             .await
             .map_err(DomainError::from)?;
+
+        // ReEncrypt is a decrypt under the source key followed by an encrypt
+        // under the destination, so each side needs the gate its own direction
+        // would get if called on its own. Checking one predicate for both would
+        // let a caller reach either operation through the pair that it could not
+        // reach directly.
+        if !src_record.state.permits_decrypt() {
+            return Err(DomainError::FailedPrecondition(format!(
+                "key {} is in state {} — decrypt not permitted",
+                input.source_key_id, src_record.state
+            )));
+        }
+        if !dst_record.state.permits_encrypt() {
+            return Err(DomainError::FailedPrecondition(format!(
+                "key {} is in state {} — encrypt not permitted",
+                input.destination_key_id, dst_record.state
+            )));
+        }
 
         super::enforce_scope_for_key_op(
             state,

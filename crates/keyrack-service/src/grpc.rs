@@ -352,6 +352,24 @@ impl KeyService for KeyServiceImpl {
                     .await
                     .map_err(convert::error_to_status)?;
 
+                // ReEncrypt is a decrypt under the source key followed by an
+                // encrypt under the destination, so each side needs the gate its
+                // own direction would get if called on its own. Checking one
+                // predicate for both would let a caller reach either operation
+                // through the pair that it could not reach directly.
+                if !src_record.state.permits_decrypt() {
+                    return Err(Status::failed_precondition(format!(
+                        "key {} is in state {} — decrypt not permitted",
+                        req.source_key_id, src_record.state
+                    )));
+                }
+                if !dst_record.state.permits_encrypt() {
+                    return Err(Status::failed_precondition(format!(
+                        "key {} is in state {} — encrypt not permitted",
+                        req.destination_key_id, dst_record.state
+                    )));
+                }
+
                 crate::domain::enforce_scope_for_key_op(
                     &state,
                     &src_record,

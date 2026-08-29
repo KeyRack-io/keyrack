@@ -6640,3 +6640,78 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
         "failure event must carry the provider error for the operator"
     );
 }
+
+/// `ReEncrypt` reached both a decrypt and an encrypt with no state gate on
+/// either key, so a key that was refused for `Decrypt` directly was still
+/// usable for decrypt through the pair.
+#[tokio::test]
+async fn re_encrypt_refused_when_source_state_forbids_decrypt() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let src = create_aes_key(&svc).await;
+    let dst = create_aes_key(&svc).await;
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: src.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+
+    let src_lid: keyrack_core::lid::Lid = src.parse().expect("valid lid");
+    let header = keyrack_core::header::CiphertextHeader::new(src_lid, 1, [0u8; 32]);
+
+    let status = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: src,
+            destination_key_id: dst,
+            ciphertext_blob: header.wrap_payload(&[0u8; 32]),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("re_encrypt must be refused from a pending-deletion source");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("decrypt not permitted"),
+        "refusal must name the source direction: {}",
+        status.message()
+    );
+}
+
+/// A `Disabled` key is the case that proves the two sides need separate gates:
+/// it still permits decrypt, so it is a legal `ReEncrypt` source and an illegal
+/// destination. A single shared predicate would get one of them wrong.
+#[tokio::test]
+async fn re_encrypt_refused_when_destination_state_forbids_encrypt() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let src = create_aes_key(&svc).await;
+    let dst = create_aes_key(&svc).await;
+
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: dst.clone(),
+    }))
+    .await
+    .expect("disable destination key");
+
+    let src_lid: keyrack_core::lid::Lid = src.parse().expect("valid lid");
+    let header = keyrack_core::header::CiphertextHeader::new(src_lid, 1, [0u8; 32]);
+
+    let status = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: src,
+            destination_key_id: dst,
+            ciphertext_blob: header.wrap_payload(&[0u8; 32]),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("re_encrypt must be refused into a disabled destination");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("encrypt not permitted"),
+        "refusal must name the destination direction: {}",
+        status.message()
+    );
+}
