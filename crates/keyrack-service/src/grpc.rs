@@ -1326,9 +1326,24 @@ impl KeyService for KeyServiceImpl {
             } else {
                 req.max_results
             };
+            // An unparseable or `KEY_STATE_UNSPECIFIED` filter is rejected
+            // rather than downgraded to "no filter": silently widening a
+            // narrowing request is how `Locate` came to advertise keys that
+            // `Get` refuses.
+            let state_filter = req
+                .state_filter
+                .map(|raw| {
+                    proto::KeyState::try_from(raw)
+                        .ok()
+                        .and_then(convert::key_state_from_proto)
+                        .ok_or_else(|| {
+                            Status::invalid_argument(format!("unknown state_filter: {raw}"))
+                        })
+                })
+                .transpose()?;
             let filter = keyrack_core::storage::KeyFilter {
                 user_tags: vec![],
-                state: None,
+                state: state_filter,
                 owner_principal_id: Some(owner_principal_id),
                 limit: Some(limit),
                 cursor: if req.cursor.is_empty() {

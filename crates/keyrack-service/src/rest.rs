@@ -218,6 +218,22 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     ops::rest_error(code, kind, &err.to_string())
 }
 
+/// Parse a `KeyState` from its wire spelling, rejecting anything unknown.
+///
+/// An unrecognised value is a 400 rather than a silently-dropped filter:
+/// widening a narrowing request is how `Locate` came to advertise keys that
+/// `Get` refuses.
+fn parse_key_state(s: &str) -> Result<keyrack_core::key::KeyState, RestError> {
+    serde_json::from_value::<keyrack_core::key::KeyState>(serde_json::Value::String(s.to_owned()))
+        .map_err(|_| {
+            ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidKeyState",
+                &format!("unknown state: {s}"),
+            )
+        })
+}
+
 fn transition_err(from: keyrack_core::key::KeyState, to: keyrack_core::key::KeyState) -> RestError {
     ops::rest_error(
         StatusCode::CONFLICT,
@@ -482,8 +498,19 @@ async fn update_key(
     .await
 }
 
+/// Query parameters for `GET /v1/keys`.
+///
+/// `state` uses the same vocabulary the response DTO serializes (`enabled`,
+/// `pending_deletion`, …), so a value read from a listing can be fed straight
+/// back in as a filter. Mirrors `ListKeysRequest.state_filter` on gRPC.
+#[derive(serde::Deserialize, Default)]
+struct ListKeysQuery {
+    state: Option<String>,
+}
+
 async fn list_keys(
     State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ListKeysQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
@@ -495,9 +522,13 @@ async fn list_keys(
     op_ctx.resource_type = "Key".into();
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
+        // Parsed inside the wrapper so authorization runs first: rejecting a
+        // malformed filter before the PDP would let an unauthorized caller
+        // probe which state names exist.
+        let state_filter = query.state.as_deref().map(parse_key_state).transpose()?;
         let filter = keyrack_core::storage::KeyFilter {
             user_tags: vec![],
-            state: None,
+            state: state_filter,
             owner_principal_id: Some(owner_principal_id),
             limit: Some(100),
             cursor: None,

@@ -6221,6 +6221,245 @@ async fn rest_list_keys_scoped_to_owning_principal() {
     assert_eq!(list_b.len(), 1);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ListKeys state filter — gRPC/REST parity
+//
+// `ListKeys` used to hardcode `state: None` when building its `KeyFilter`,
+// so a caller asking to be shown only servable keys was handed every key
+// regardless of state. That is what let the KMIP shim's `Locate` advertise
+// UIDs that `GetKeyMaterial` then refuses on lifecycle grounds.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create one Enabled, one Disabled and one `PendingDeletion` key over gRPC.
+async fn seed_keys_in_three_states(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+) -> (String, String, String) {
+    let enabled = create_aes_key(svc).await;
+    let disabled = create_aes_key(svc).await;
+    let pending = create_aes_key(svc).await;
+
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: disabled.clone(),
+    }))
+    .await
+    .expect("disable_key");
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: pending.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule_key_deletion");
+
+    (enabled, disabled, pending)
+}
+
+async fn grpc_list_ids(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+    state_filter: Option<proto::KeyState>,
+) -> Vec<String> {
+    svc.list_keys(Request::new(proto::ListKeysRequest {
+        state_filter: state_filter.map(|s| s as i32),
+        ..Default::default()
+    }))
+    .await
+    .expect("list_keys")
+    .into_inner()
+    .keys
+    .iter()
+    .map(|k| k.key_id.clone())
+    .collect()
+}
+
+#[tokio::test]
+async fn grpc_list_keys_honours_state_filter() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+
+    let (enabled, disabled, pending) = seed_keys_in_three_states(&svc).await;
+
+    for (filter, expected) in [
+        (proto::KeyState::Enabled, &enabled),
+        (proto::KeyState::Disabled, &disabled),
+        (proto::KeyState::PendingDeletion, &pending),
+    ] {
+        let ids = grpc_list_ids(&svc, Some(filter)).await;
+        assert_eq!(
+            ids,
+            vec![expected.clone()],
+            "state_filter={filter:?} must return exactly the key in that state"
+        );
+    }
+
+    // A state nothing is in returns nothing — not everything.
+    assert!(
+        grpc_list_ids(&svc, Some(proto::KeyState::Destroyed))
+            .await
+            .is_empty(),
+        "state_filter=Destroyed must return no keys"
+    );
+}
+
+#[tokio::test]
+async fn grpc_list_keys_without_filter_still_returns_all() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+
+    let (enabled, disabled, pending) = seed_keys_in_three_states(&svc).await;
+
+    let ids = grpc_list_ids(&svc, None).await;
+    assert_eq!(ids.len(), 3, "an unfiltered list must not narrow anything");
+    for expected in [&enabled, &disabled, &pending] {
+        assert!(
+            ids.contains(expected),
+            "unfiltered list must contain {expected}"
+        );
+    }
+}
+
+/// A filter the server cannot interpret must be refused, never downgraded to
+/// "no filter" — silently widening a narrowing request is the original defect.
+#[tokio::test]
+async fn grpc_list_keys_rejects_unknown_state_filter() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+    create_aes_key(&svc).await;
+
+    for raw in [0_i32, 999_i32] {
+        let err = svc
+            .list_keys(Request::new(proto::ListKeysRequest {
+                state_filter: Some(raw),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("uninterpretable state_filter must be rejected");
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "state_filter={raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_list_keys_honours_state_filter() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn rest_create(state: Arc<ServiceState>) -> String {
+        let app = keyrack_service::rest::router(state);
+        let body = serde_json::json!({ "key_spec": "AES_256", "description": "rest key" });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("lid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    async fn rest_post(state: Arc<ServiceState>, uri: &str) {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "POST {uri} -> {}",
+            resp.status()
+        );
+    }
+
+    /// Returns the response status plus the `lid`s it listed.
+    async fn rest_list(
+        state: Arc<ServiceState>,
+        uri: &str,
+    ) -> (axum::http::StatusCode, Vec<String>) {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let ids = json
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("lid").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (status, ids)
+    }
+
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let st = build_state_for_principal(storage.clone(), "tenant-a");
+
+    let enabled = rest_create(st.clone()).await;
+    let disabled = rest_create(st.clone()).await;
+    let pending = rest_create(st.clone()).await;
+    rest_post(st.clone(), &format!("/v1/keys/{disabled}/actions-disable")).await;
+    rest_post(
+        st.clone(),
+        &format!("/v1/keys/{pending}/actions-schedule-deletion"),
+    )
+    .await;
+
+    // No filter: everything, exactly as before.
+    let (status, all) = rest_list(st.clone(), "/v1/keys").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(all.len(), 3, "an unfiltered list must not narrow anything");
+
+    // The `state` query param uses the same vocabulary the DTO serializes.
+    for (param, expected) in [
+        ("enabled", &enabled),
+        ("disabled", &disabled),
+        ("pending_deletion", &pending),
+    ] {
+        let (status, ids) = rest_list(st.clone(), &format!("/v1/keys?state={param}")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(ids, vec![expected.clone()], "?state={param}");
+    }
+
+    let (status, ids) = rest_list(st.clone(), "/v1/keys?state=destroyed").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(ids.is_empty(), "?state=destroyed must return no keys");
+
+    // Unknown state is a 400, not a silently-ignored filter.
+    let (status, _) = rest_list(st.clone(), "/v1/keys?state=bogus").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn rest_list_aliases_requires_auth() {
     use axum::body::Body;
