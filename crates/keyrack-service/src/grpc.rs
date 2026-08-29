@@ -1330,17 +1330,17 @@ impl KeyService for KeyServiceImpl {
             // rather than downgraded to "no filter": silently widening a
             // narrowing request is how `Locate` came to advertise keys that
             // `Get` refuses.
-            let state_filter = req
-                .state_filter
-                .map(|raw| {
+            let state_filter = match req.state_filter {
+                Some(raw) => Some(
                     proto::KeyState::try_from(raw)
                         .ok()
                         .and_then(convert::key_state_from_proto)
                         .ok_or_else(|| {
                             Status::invalid_argument(format!("unknown state_filter: {raw}"))
-                        })
-                })
-                .transpose()?;
+                        })?,
+                ),
+                None => None,
+            };
             let filter = keyrack_core::storage::KeyFilter {
                 user_tags: vec![],
                 state: state_filter,
