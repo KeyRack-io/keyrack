@@ -76,6 +76,23 @@ impl KeyState {
         matches!(self, Self::Enabled | Self::Disabled | Self::Compromised)
     }
 
+    /// Whether raw key-material export is permitted. `Enabled` only.
+    ///
+    /// Deliberately stricter than [`Self::permits_decrypt`], which grants
+    /// `Disabled` and `Compromised` latitude for data recovery. Export is not a
+    /// data-recovery operation: it hands the caller the key itself, so it is a
+    /// custody-boundary crossing and is strictly more powerful than decrypt —
+    /// the holder of exported bytes can decrypt forever, outside `KeyRack`, with
+    /// no further authorization. Disabling a key is how an operator withdraws
+    /// its use, so continuing to hand out copies would defeat it, and export
+    /// cannot be undone once the bytes have left. `PendingDeletion` and
+    /// `Destroyed` must refuse for destruction to be real rather than a label
+    /// on the record.
+    #[must_use]
+    pub fn permits_export(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
     /// Returns the set of states this state can transition to.
     #[must_use]
     pub fn valid_transitions(&self) -> &'static [KeyState] {
@@ -440,6 +457,36 @@ pub(crate) mod tests {
         assert!(KeyState::Disabled.permits_decrypt());
         assert!(!KeyState::PendingDeletion.permits_decrypt());
         assert!(!KeyState::Destroyed.permits_decrypt());
+    }
+
+    #[test]
+    fn export_permissions() {
+        assert!(!KeyState::Creating.permits_export());
+        assert!(KeyState::Enabled.permits_export());
+        assert!(!KeyState::Disabled.permits_export());
+        assert!(!KeyState::Compromised.permits_export());
+        assert!(!KeyState::PendingDeletion.permits_export());
+        assert!(!KeyState::Destroyed.permits_export());
+    }
+
+    // Export must never be more permissive than decrypt: a state that
+    // forbids decrypting with the key cannot be allowed to hand the key
+    // out, since exported material decrypts outside KeyRack forever.
+    #[test]
+    fn export_is_never_broader_than_decrypt() {
+        for state in [
+            KeyState::Creating,
+            KeyState::Enabled,
+            KeyState::Disabled,
+            KeyState::Compromised,
+            KeyState::PendingDeletion,
+            KeyState::Destroyed,
+        ] {
+            assert!(
+                !state.permits_export() || state.permits_decrypt(),
+                "{state} permits export but not decrypt"
+            );
+        }
     }
 
     #[test]

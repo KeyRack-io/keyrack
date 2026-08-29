@@ -96,7 +96,119 @@ impl PolicyDecisionPoint for CountingPdp {
     }
 }
 
+/// Provider that records every `destroy_key` call and can be made to fail it.
+///
+/// Lets the deletion-reaper tests distinguish "`KeyRack` marked the record
+/// destroyed" from "the backend material was actually deleted".
+struct RecordingProvider {
+    inner: InMemoryProvider,
+    destroyed: Mutex<Vec<String>>,
+    fail_destroy: bool,
+}
+
+impl RecordingProvider {
+    fn new(fail_destroy: bool) -> Self {
+        Self {
+            inner: InMemoryProvider::new(),
+            destroyed: Mutex::new(Vec::new()),
+            fail_destroy,
+        }
+    }
+
+    fn destroyed_handles(&self) -> Vec<String> {
+        self.destroyed.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl keyrack_core::provider::CryptoProvider for RecordingProvider {
+    async fn generate_key(
+        &self,
+        spec: &keyrack_core::key::KeySpec,
+    ) -> keyrack_core::error::Result<keyrack_core::provider::KeyHandle> {
+        self.inner.generate_key(spec).await
+    }
+
+    async fn encrypt(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> keyrack_core::error::Result<keyrack_core::provider::EncryptOutput> {
+        self.inner.encrypt(handle, plaintext, aad).await
+    }
+
+    async fn decrypt(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.decrypt(handle, ciphertext, aad).await
+    }
+
+    async fn sign(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        algorithm: keyrack_core::provider::SigningAlgorithm,
+        message: &[u8],
+    ) -> keyrack_core::error::Result<Vec<u8>> {
+        self.inner.sign(handle, algorithm, message).await
+    }
+
+    async fn verify(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+        algorithm: keyrack_core::provider::SigningAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> keyrack_core::error::Result<bool> {
+        self.inner
+            .verify(handle, algorithm, message, signature)
+            .await
+    }
+
+    async fn generate_random(
+        &self,
+        length: usize,
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.generate_random(length).await
+    }
+
+    async fn destroy_key(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<()> {
+        self.destroyed.lock().unwrap().push(handle.key_id.clone());
+        if self.fail_destroy {
+            return Err(keyrack_core::error::KeyRackError::Provider(
+                "simulated backend delete failure".into(),
+            ));
+        }
+        self.inner.destroy_key(handle).await
+    }
+
+    fn capabilities(&self) -> keyrack_core::provider::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn export_key_material(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.inner.export_key_material(handle).await
+    }
+}
+
 fn build_test_state_with(
+    pdp: Arc<dyn PolicyDecisionPoint>,
+    audit: Arc<dyn AuditSink>,
+) -> Arc<ServiceState> {
+    build_test_state_with_provider(Arc::new(InMemoryProvider::new()), pdp, audit)
+}
+
+fn build_test_state_with_provider(
+    provider: Arc<dyn keyrack_core::provider::CryptoProvider>,
     pdp: Arc<dyn PolicyDecisionPoint>,
     audit: Arc<dyn AuditSink>,
 ) -> Arc<ServiceState> {
@@ -105,7 +217,6 @@ fn build_test_state_with(
     use keyrack_service::routing::ProviderRouter;
 
     let storage = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
-    let provider = Arc::new(InMemoryProvider::new());
     let providers = Arc::new(StaticProviderRegistry::single(
         provider,
         ProviderClass::InMemory,
@@ -6110,6 +6221,245 @@ async fn rest_list_keys_scoped_to_owning_principal() {
     assert_eq!(list_b.len(), 1);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ListKeys state filter — gRPC/REST parity
+//
+// `ListKeys` used to hardcode `state: None` when building its `KeyFilter`,
+// so a caller asking to be shown only servable keys was handed every key
+// regardless of state. That is what let the KMIP shim's `Locate` advertise
+// UIDs that `GetKeyMaterial` then refuses on lifecycle grounds.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create one Enabled, one Disabled and one `PendingDeletion` key over gRPC.
+async fn seed_keys_in_three_states(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+) -> (String, String, String) {
+    let enabled = create_aes_key(svc).await;
+    let disabled = create_aes_key(svc).await;
+    let pending = create_aes_key(svc).await;
+
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: disabled.clone(),
+    }))
+    .await
+    .expect("disable_key");
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: pending.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule_key_deletion");
+
+    (enabled, disabled, pending)
+}
+
+async fn grpc_list_ids(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+    state_filter: Option<proto::KeyState>,
+) -> Vec<String> {
+    svc.list_keys(Request::new(proto::ListKeysRequest {
+        state_filter: state_filter.map(|s| s as i32),
+        ..Default::default()
+    }))
+    .await
+    .expect("list_keys")
+    .into_inner()
+    .keys
+    .iter()
+    .map(|k| k.key_id.clone())
+    .collect()
+}
+
+#[tokio::test]
+async fn grpc_list_keys_honours_state_filter() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+
+    let (enabled, disabled, pending) = seed_keys_in_three_states(&svc).await;
+
+    for (filter, expected) in [
+        (proto::KeyState::Enabled, &enabled),
+        (proto::KeyState::Disabled, &disabled),
+        (proto::KeyState::PendingDeletion, &pending),
+    ] {
+        let ids = grpc_list_ids(&svc, Some(filter)).await;
+        assert_eq!(
+            ids,
+            vec![expected.clone()],
+            "state_filter={filter:?} must return exactly the key in that state"
+        );
+    }
+
+    // A state nothing is in returns nothing — not everything.
+    assert!(
+        grpc_list_ids(&svc, Some(proto::KeyState::Destroyed))
+            .await
+            .is_empty(),
+        "state_filter=Destroyed must return no keys"
+    );
+}
+
+#[tokio::test]
+async fn grpc_list_keys_without_filter_still_returns_all() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+
+    let (enabled, disabled, pending) = seed_keys_in_three_states(&svc).await;
+
+    let ids = grpc_list_ids(&svc, None).await;
+    assert_eq!(ids.len(), 3, "an unfiltered list must not narrow anything");
+    for expected in [&enabled, &disabled, &pending] {
+        assert!(
+            ids.contains(expected),
+            "unfiltered list must contain {expected}"
+        );
+    }
+}
+
+/// A filter the server cannot interpret must be refused, never downgraded to
+/// "no filter" — silently widening a narrowing request is the original defect.
+#[tokio::test]
+async fn grpc_list_keys_rejects_unknown_state_filter() {
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(build_state_for_principal(
+        storage.clone(),
+        "tenant-a",
+    ));
+    create_aes_key(&svc).await;
+
+    for raw in [0_i32, 999_i32] {
+        let err = svc
+            .list_keys(Request::new(proto::ListKeysRequest {
+                state_filter: Some(raw),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("uninterpretable state_filter must be rejected");
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "state_filter={raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_list_keys_honours_state_filter() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn rest_create(state: Arc<ServiceState>) -> String {
+        let app = keyrack_service::rest::router(state);
+        let body = serde_json::json!({ "key_spec": "AES_256", "description": "rest key" });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("lid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    async fn rest_post(state: Arc<ServiceState>, uri: &str) {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "POST {uri} -> {}",
+            resp.status()
+        );
+    }
+
+    /// Returns the response status plus the `lid`s it listed.
+    async fn rest_list(
+        state: Arc<ServiceState>,
+        uri: &str,
+    ) -> (axum::http::StatusCode, Vec<String>) {
+        let app = keyrack_service::rest::router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let ids = json
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("lid").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (status, ids)
+    }
+
+    let storage: Arc<dyn keyrack_core::storage::StorageBackend> =
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    let st = build_state_for_principal(storage.clone(), "tenant-a");
+
+    let enabled = rest_create(st.clone()).await;
+    let disabled = rest_create(st.clone()).await;
+    let pending = rest_create(st.clone()).await;
+    rest_post(st.clone(), &format!("/v1/keys/{disabled}/actions-disable")).await;
+    rest_post(
+        st.clone(),
+        &format!("/v1/keys/{pending}/actions-schedule-deletion"),
+    )
+    .await;
+
+    // No filter: everything, exactly as before.
+    let (status, all) = rest_list(st.clone(), "/v1/keys").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(all.len(), 3, "an unfiltered list must not narrow anything");
+
+    // The `state` query param uses the same vocabulary the DTO serializes.
+    for (param, expected) in [
+        ("enabled", &enabled),
+        ("disabled", &disabled),
+        ("pending_deletion", &pending),
+    ] {
+        let (status, ids) = rest_list(st.clone(), &format!("/v1/keys?state={param}")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(ids, vec![expected.clone()], "?state={param}");
+    }
+
+    let (status, ids) = rest_list(st.clone(), "/v1/keys?state=destroyed").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(ids.is_empty(), "?state=destroyed must return no keys");
+
+    // Unknown state is a 400, not a silently-ignored filter.
+    let (status, _) = rest_list(st.clone(), "/v1/keys?state=bogus").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn rest_list_aliases_requires_auth() {
     use axum::body::Body;
@@ -6256,5 +6606,354 @@ async fn import_key_unsupported_provider_fails_closed_rest() {
     assert!(
         body_str.contains("does not support key import"),
         "response must mention import capability: {body_str}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KEY-STATE EXPORT GATE + REAL BACKEND DESTRUCTION
+//
+// `GetKeyMaterial` hands the caller the key itself, so it must be gated
+// on key state and not on exportability alone; and the deletion reaper
+// must actually delete the provider-side material before it audits a
+// key as destroyed.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create an exportable AES key and return its key id.
+async fn create_exportable_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
+    let resp = svc
+        .create_key(Request::new(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            description: "exportable".into(),
+            exportable: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create exportable key");
+    resp.into_inner().metadata.unwrap().key_id
+}
+
+/// Move a `PendingDeletion` key's `scheduled_deletion_at` into the past so the
+/// next reaper scan treats it as due.
+async fn backdate_scheduled_deletion(state: &ServiceState, key_id: &str) {
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("parse lid");
+    let mut record = state.storage.get_key(&lid).await.expect("get key");
+    assert_eq!(
+        record.state,
+        keyrack_core::key::KeyState::PendingDeletion,
+        "key must be pending deletion before backdating"
+    );
+    record.scheduled_deletion_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.expect("update key");
+}
+
+async fn key_state(state: &ServiceState, key_id: &str) -> keyrack_core::key::KeyState {
+    let lid: keyrack_core::lid::Lid = key_id.parse().expect("parse lid");
+    state.storage.get_key(&lid).await.expect("get key").state
+}
+
+// tonic::Status is the error type the service actually returns; boxing it here
+// would only obscure what the assertions inspect.
+#[allow(clippy::result_large_err)]
+async fn export(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+    key_id: &str,
+) -> Result<proto::GetKeyMaterialResponse, tonic::Status> {
+    svc.get_key_material(Request::new(proto::GetKeyMaterialRequest {
+        key_id: key_id.to_string(),
+        key_version: 0,
+        wrapping_key: None,
+    }))
+    .await
+    .map(tonic::Response::into_inner)
+}
+
+/// Scheduling deletion must immediately stop key-material export, even though
+/// the key is still marked `Exportable`. Also asserts the `Enabled` path still
+/// works, so the Percona/KMIP keystore boot flow does not regress.
+#[tokio::test]
+async fn get_key_material_refused_once_deletion_scheduled() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+
+    // Enabled + exportable: the keystore path must keep working.
+    let material = export(&svc, &key_id).await.expect("enabled export");
+    assert!(
+        !material.key_material.is_empty(),
+        "enabled exportable key must still return material"
+    );
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+
+    let status = export(&svc, &key_id)
+        .await
+        .expect_err("export must be refused once deletion is scheduled");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("export not permitted")
+            && status.message().contains("pending_deletion"),
+        "message must name the offending state and be distinguishable from the \
+         non-exportable refusal: {}",
+        status.message()
+    );
+    assert!(
+        !status.message().contains("is not exportable"),
+        "state refusal must not be reported as an exportability refusal: {}",
+        status.message()
+    );
+
+    // The record is untouched by the refusal — still exportable, still pending.
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+}
+
+/// End-to-end: once the reaper has destroyed a key, export is refused by the
+/// state gate rather than falling through to the provider.
+#[tokio::test]
+async fn get_key_material_refused_after_reaper_destroys_key() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan");
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+
+    let status = export(&svc, &key_id)
+        .await
+        .expect_err("export of a destroyed key must be refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("destroyed"),
+        "message must name the destroyed state: {}",
+        status.message()
+    );
+}
+
+/// The reaper must call `CryptoProvider::destroy_key` for every key version,
+/// not merely relabel the record.
+#[tokio::test]
+async fn deletion_reaper_destroys_provider_material() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .expect("rotate to get a second version");
+
+    let lid: keyrack_core::lid::Lid = key_id.parse().unwrap();
+    let handles: Vec<String> = state
+        .storage
+        .get_key(&lid)
+        .await
+        .unwrap()
+        .key_versions
+        .iter()
+        .map(|v| v.key_handle.key_id.clone())
+        .collect();
+    assert_eq!(handles.len(), 2, "expected two key versions after rotation");
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan");
+
+    let destroyed = provider.destroyed_handles();
+    for handle in &handles {
+        assert!(
+            destroyed.contains(handle),
+            "provider destroy_key must be called for every version handle \
+             (missing {handle}, saw {destroyed:?})"
+        );
+    }
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+
+    let events = audit.events();
+    let provider_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == keyrack_core::audit::AuditAction::ProviderDestroyKey)
+        .collect();
+    assert_eq!(
+        provider_events.len(),
+        2,
+        "provider-destroy outcome must be audited per version"
+    );
+    assert!(
+        provider_events
+            .iter()
+            .all(|e| e.result == keyrack_core::audit::AuditResult::Success),
+        "successful backend deletes must audit as Success"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed),
+        "record destruction must still be audited"
+    );
+}
+
+/// Fail closed: if the backend delete fails the key must stay in
+/// `PendingDeletion` and no destruction may be audited as successful.
+#[tokio::test]
+async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
+    let provider = Arc::new(RecordingProvider::new(true));
+    let pdp = Arc::new(CountingPdp::new());
+    let audit = Arc::new(CapturingSink::new());
+    let state = build_test_state_with_provider(provider.clone(), pdp, audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+    backdate_scheduled_deletion(&state, &key_id).await;
+
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .expect("deletion scan must not abort the whole pass");
+
+    assert!(
+        !provider.destroyed_handles().is_empty(),
+        "the reaper must have attempted the backend delete"
+    );
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion,
+        "a key whose backend material survives must NOT be marked destroyed"
+    );
+
+    let events = audit.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed),
+        "a destruction that did not happen must never be audited"
+    );
+    let failure = events
+        .iter()
+        .find(|e| e.action == keyrack_core::audit::AuditAction::ProviderDestroyKey)
+        .expect("provider-destroy failure must be audited");
+    assert_eq!(failure.result, keyrack_core::audit::AuditResult::Error);
+    assert!(
+        failure.metadata.contains_key("error"),
+        "failure event must carry the provider error for the operator"
+    );
+}
+
+/// `ReEncrypt` reached both a decrypt and an encrypt with no state gate on
+/// either key, so a key that was refused for `Decrypt` directly was still
+/// usable for decrypt through the pair.
+#[tokio::test]
+async fn re_encrypt_refused_when_source_state_forbids_decrypt() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let src = create_aes_key(&svc).await;
+    let dst = create_aes_key(&svc).await;
+
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: src.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .expect("schedule deletion");
+
+    let src_lid: keyrack_core::lid::Lid = src.parse().expect("valid lid");
+    let header = keyrack_core::header::CiphertextHeader::new(src_lid, 1, [0u8; 32]);
+
+    let status = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: src,
+            destination_key_id: dst,
+            ciphertext_blob: header.wrap_payload(&[0u8; 32]),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("re_encrypt must be refused from a pending-deletion source");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("decrypt not permitted"),
+        "refusal must name the source direction: {}",
+        status.message()
+    );
+}
+
+/// A `Disabled` key is the case that proves the two sides need separate gates:
+/// it still permits decrypt, so it is a legal `ReEncrypt` source and an illegal
+/// destination. A single shared predicate would get one of them wrong.
+#[tokio::test]
+async fn re_encrypt_refused_when_destination_state_forbids_encrypt() {
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+
+    let src = create_aes_key(&svc).await;
+    let dst = create_aes_key(&svc).await;
+
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: dst.clone(),
+    }))
+    .await
+    .expect("disable destination key");
+
+    let src_lid: keyrack_core::lid::Lid = src.parse().expect("valid lid");
+    let header = keyrack_core::header::CiphertextHeader::new(src_lid, 1, [0u8; 32]);
+
+    let status = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: src,
+            destination_key_id: dst,
+            ciphertext_blob: header.wrap_payload(&[0u8; 32]),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("re_encrypt must be refused into a disabled destination");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("encrypt not permitted"),
+        "refusal must name the destination direction: {}",
+        status.message()
     );
 }

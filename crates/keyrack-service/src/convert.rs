@@ -35,6 +35,20 @@ pub fn key_state_to_proto(state: &KeyState) -> proto::KeyState {
     }
 }
 
+/// Inverse of [`key_state_to_proto`]. `KEY_STATE_UNSPECIFIED` and unknown
+/// wire values have no domain equivalent and yield `None`.
+pub fn key_state_from_proto(state: proto::KeyState) -> Option<KeyState> {
+    match state {
+        proto::KeyState::Creating => Some(KeyState::Creating),
+        proto::KeyState::Enabled => Some(KeyState::Enabled),
+        proto::KeyState::Disabled => Some(KeyState::Disabled),
+        proto::KeyState::Compromised => Some(KeyState::Compromised),
+        proto::KeyState::PendingDeletion => Some(KeyState::PendingDeletion),
+        proto::KeyState::Destroyed => Some(KeyState::Destroyed),
+        proto::KeyState::Unspecified => None,
+    }
+}
+
 pub fn proto_to_key_spec(spec: proto::KeySpec) -> Option<keyrack_core::key::KeySpec> {
     match spec {
         proto::KeySpec::Aes256 => Some(keyrack_core::key::KeySpec::Aes256),

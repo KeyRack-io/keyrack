@@ -355,8 +355,10 @@ pub trait CryptoProvider: Send + Sync {
     /// Export raw key material for an exportable key.
     ///
     /// The caller (service layer) is responsible for enforcing that the key
-    /// is marked `Exportable` and for setting the `first_exported_at` latch;
-    /// this method simply returns the bytes.
+    /// is marked `Exportable`, that its state satisfies
+    /// [`KeyState::permits_export`](crate::key::KeyState::permits_export), and
+    /// for setting the `first_exported_at` latch; this method simply returns
+    /// the bytes.
     ///
     /// Default: unsupported. Providers that hold raw material override this.
     async fn export_key_material(&self, _handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
