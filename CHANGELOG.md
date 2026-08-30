@@ -146,15 +146,10 @@ changes are marked **BREAKING (behaviour)** below.
   `Destroyed` keys — and re-wrapping was a supported way to keep using a key the
   operator had taken out of service. The two directions need separate predicates
   because `Disabled` permits decrypt but not encrypt, making it a legal source
-  and an illegal destination; a dead `ReEncrypt` arm in
-  `enforce_state_for_key_op` that mapped both to `permits_decrypt()` was removed
-  rather than wired up. Enforced on **both** surfaces: the gRPC `ReEncrypt`
-  handler, `domain::crypto::re_encrypt`, and the REST
-  `POST /v1/keys/{key_id}/actions-re-encrypt` handler — the last is a separate
-  inline implementation that calls neither of the first two and so had to be
-  gated explicitly. gRPC reports `FailedPrecondition` and REST
-  `409 InvalidState`, each matching that surface's existing convention for a
-  state refusal.
+  and an illegal destination. Enforced on **both** surfaces: the gRPC `ReEncrypt`
+  RPC and the REST `POST /v1/keys/{key_id}/actions-re-encrypt` route. gRPC
+  reports `FailedPrecondition` and REST `409 InvalidState`, each matching that
+  surface's existing convention for a state refusal.
 - **The deletion reaper now destroys backend key material.** `run_deletion_scan`
   marked keys `Destroyed`, persisted the record, and emitted a signed
   `kms:KeyDestroyed` audit event without ever calling
