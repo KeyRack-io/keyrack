@@ -4,6 +4,209 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-30
+
+Exportable-key custody: an explicit, audited path for raw key material to leave
+KeyRack, the BYOK import primitive that mirrors it, and an mTLS-bound delegated
+identity profile for service-to-service callers. All wire changes are
+**additive** (no proto breaks). Behaviour is not: this release closes several
+authorization and key-state gaps, so a deployment that relied on the missing
+checks will see requests rejected that 0.3.2 accepted. The breaking behaviour
+changes are marked **BREAKING (behaviour)** below.
+
+### Added
+
+- **Exportable keys.** A key may now be marked exportable and its raw material
+  retrieved through an audited `GetKeyMaterial` RPC. `KeyRecord` gains
+  `exportability` (`non_exportable` | `exportable`, serde-default
+  `non_exportable`) and a write-once `first_exported_at` latch set on the first
+  successful export; both are `#[serde(default)]`, so records written by earlier
+  versions load as non-exportable, and both are excluded from LID derivation, so
+  marking a key exportable does not change its identity. Proto gains
+  `CreateKeyRequest.exportable` (field 10), `KeyMetadata.exportable` (15), and
+  `KeyMetadata.first_exported_at` (16). Guardrails: exportable keys are
+  **leaf-only** (a key with dependents cannot be made exportable, and no child
+  may be created under an exportable parent); creating a born-exportable key
+  requires a **second PDP evaluation** for `kms:MakeKeyExportable` on top of
+  `kms:CreateKey`, and a denial emits an `AuthorizationDenied` audit event;
+  revocation is refused once `first_exported_at` is set. Both gRPC and REST
+  `CreateKey` run this enforcement through the same
+  `domain::enforce_born_exportable`, so the two surfaces cannot drift.
+  New audit actions `kms:GetKeyMaterial`, `kms:MakeKeyExportable`, and
+  `kms:RevokeKeyExportability`; `kms:GetKeyMaterial` records as a
+  `SecretAccess` event. The `first_exported_at` latch is persisted only on the
+  transition, so repeated exports of an already-exported key issue no versioned
+  write and parallel `GetKeyMaterial` calls for one key do not contend on its
+  OCC version.
+- **`GetKeyMaterial`, `MakeKeyExportable`, and `RevokeKeyExportability` are
+  gRPC-only.** There is no REST route for any of the three; REST participates in
+  exportable keys only through `CreateKey`'s `exportable` field and the
+  `exportable` / `first_exported_at` fields on read responses.
+- **Key-material export is implemented by the software, in-memory, and Vault
+  Transit providers only.** `CryptoProvider::export_key_material` defaults to a
+  `Provider` error, and the PKCS#11, KMIP, and Parsec providers do not override
+  it — export against a key held on those backends fails. Vault Transit exports
+  via `GET /transit/export/encryption-key/{name}`, and marks a key exportable via
+  `POST /transit/keys/{name}/config`.
+- **`RevokeKeyExportability` is a policy-level soft revoke.** It flips the
+  `KeyRecord` to `non_exportable`, which is the authoritative gate that
+  `GetKeyMaterial` consults; it destroys nothing and re-keys nothing, so
+  ciphertext produced under the key stays decryptable. On backends whose
+  exportable flag is one-way — Vault Transit cannot unset it — the backend key
+  keeps that flag, so this is a KeyRack-policy revocation and **not** a
+  cryptographic one; material remains reachable by anyone with direct backend
+  access. Cryptographic revocation requires a separate explicit destroy.
+- **`ImportKey` — governed BYOK import.** Externally-generated material can be
+  imported as a first-class governed key record, on gRPC (`ImportKey`) and REST
+  (`POST /v1/keys/import`), authorized as `kms:ImportKeyMaterial` and recorded
+  with `origin = External`. Material is carried as `Sensitive<Vec<u8>>`
+  end-to-end. Gated on a new `supports_key_import` provider capability and
+  **fail-closed**: only the Vault Transit provider implements
+  `CryptoProvider::import_key_material` (wrapping the key with AES-KWP under an
+  ephemeral AES-256 KEK, itself RSA-OAEP/SHA-256-encrypted to Vault's
+  `wrapping_key`); the software, in-memory, PKCS#11, KMIP, and Parsec providers
+  declare `supports_key_import: false` and reject the request. This is the
+  import primitive a KMIP `Register` front-end needs — **no KMIP `Register`
+  operation ships in this release**, and the KMIP provider does not support
+  import. **Imported keys are non-exportable unless `exportable` is set
+  explicitly**, on both surfaces (a plain proto3 bool on gRPC, `unwrap_or(false)`
+  on REST); a keystore front-end that needs the material back must set the field
+  itself. The proto comment previously claimed imported keys defaulted to
+  exportable, which was never true of either surface; it has been corrected.
+- **mTLS-bound delegated identity** (`authn.type: mtls_bound_forwarded_identity`).
+  A new authenticator that accepts forwarded end-user identity headers
+  (`x-keyrack-principal-id`, `x-keyrack-tenant-id`, and optional
+  `x-keyrack-project-id` / `x-keyrack-domain-id`) **only** when the request also
+  presents a client certificate issued by `trusted_ca_cert_path` and matching a
+  `required_san` or `required_ou` pin. This composes the two proofs, which an
+  `authn.type: chain` of `mtls` and `forwarded_identity` cannot do — a chain
+  selects the first authenticator that succeeds and so never binds the header to
+  the certificate. Presenting forwarded headers without a trusted peer is an
+  error, not a silent skip. The tenant header becomes the
+  `scope=tenant:<id>` principal attribute consumed by `scope_owner` enforcement,
+  and the delegating workload is recorded as `delegating_peer_id`. Startup
+  fails closed if `required_san`/`required_ou` is absent, if `tls.ca_cert` is
+  unset, or if `trusted_ca_cert_path` is not byte-identical to `tls.ca_cert`;
+  the check recurses into `chain`. Because certificate verification happens in
+  the gRPC TLS layer, this profile is **gRPC-only** — REST requests under a
+  chain that can only authenticate via peer certificate now return
+  `501 Not Implemented` with `{"error":"AuthenticationTransportUnsupported"}`
+  rather than a misleading credential error.
+- **Formal-methods Tier 0** — `crates/keyrack-core/tests/formal_invariants.rs`
+  adds proptest invariants (encrypt/decrypt round-trip across the symmetric key
+  specs, wrong-AAD always fails, rotation preserves old-version decryptability,
+  cascade-disable reaches all descendants, and no plaintext key bytes in
+  serialized `AuditEvent` / `KeyRecord` JSON). Kani proof harnesses for
+  `Sensitive<T>` redaction live in `crates/keyrack-core/src/kani_proofs.rs`
+  behind `#[cfg(kani)]` and run under `cargo kani`, **not** in the default
+  `cargo test` run. Documented in `docs/FORMAL_VERIFICATION.md`. No production
+  code changed.
+
+### Changed
+
+- **BREAKING (behaviour): `ListKeys`, `ListAliases`, and `GenerateRandom` now
+  authenticate the caller and go through the PDP.** All three previously ran as
+  `OpContext::system` on gRPC, with no principal and no authorization
+  evaluation. They now resolve the caller like every other operation, so a
+  deployment whose policy does not permit these actions for real principals will
+  start seeing denials. Trusted service-to-service callers that arrive as
+  `keyrack:system` need an explicit permit; demo 10's Cedar policy adds one as a
+  reference.
+- **BREAKING (behaviour): `ListKeys` is scoped to the calling principal.**
+  `KeyRecord` gains a server-set `owner_principal_id`, recorded at `CreateKey`
+  and `ImportKey`, and listing now returns only keys owned by the requesting
+  principal plus keys with no recorded owner. Records written by earlier versions
+  have no owner and stay visible to every caller, so this narrows results only
+  for keys created on 0.4.0 or later. The field is serde-default and excluded
+  from the canonical form / LID. `GetKey` and the other per-key reads are
+  unchanged — this is a listing filter, not an ownership authorization model.
+
+### Security
+
+- **BREAKING (behaviour): key-material export is now gated on key state.** A new
+  `KeyState::permits_export()` returns true for `Enabled` only.
+  `GetKeyMaterial` previously checked the `Exportability` flag alone and never
+  the state, so a key in `PendingDeletion` — or one already marked `Destroyed` —
+  still returned plaintext material. The privilege ordering was inverted: those
+  states already fail `permits_decrypt()`, so a caller who could not decrypt
+  with the key could still download the key and decrypt outside KeyRack forever.
+  `permits_export()` is deliberately stricter than `permits_decrypt()`, which
+  admits `Disabled` and `Compromised` for data recovery: export is a
+  custody-boundary crossing, not a recovery operation, and exported bytes cannot
+  be recalled. Refusal is a distinct `FailedPrecondition` naming the state, so an
+  operator can tell it apart from "not exportable". A unit test asserts export is
+  never broader than decrypt for any state. **Operator impact:** a keystore
+  client that enumerates keys and fetches each one will now get an error for keys
+  an operator has disabled or scheduled for deletion, where it previously
+  received material.
+- **BREAKING (behaviour): `ReEncrypt` is now gated on the state of both keys** —
+  the source by `permits_decrypt()` and the destination by `permits_encrypt()`.
+  Neither side had any state check, so a key refused for a direct `Decrypt` was
+  still usable as a `ReEncrypt` source — including `PendingDeletion` and
+  `Destroyed` keys — and re-wrapping was a supported way to keep using a key the
+  operator had taken out of service. The two directions need separate predicates
+  because `Disabled` permits decrypt but not encrypt, making it a legal source
+  and an illegal destination. Enforced on **both** surfaces: the gRPC `ReEncrypt`
+  RPC and the REST `POST /v1/keys/{key_id}/actions-re-encrypt` route. gRPC
+  reports `FailedPrecondition` and REST `409 InvalidState`, each matching that
+  surface's existing convention for a state refusal.
+- **The deletion reaper now destroys backend key material.** `run_deletion_scan`
+  marked keys `Destroyed`, persisted the record, and emitted a signed
+  `kms:KeyDestroyed` audit event without ever calling
+  `CryptoProvider::destroy_key`, which had no caller anywhere in
+  `keyrack-service` — the Vault transit key, HSM object, or KMIP managed object
+  survived indefinitely after KeyRack had reported and audited the key as
+  destroyed. The reaper now resolves the provider for each key version and
+  deletes the material before the state transition, and **fails closed**: on any
+  provider-resolution or delete error the record stays in `PendingDeletion`, no
+  `kms:KeyDestroyed` event is emitted — so the audit chain never asserts a
+  destruction that did not happen — and the next scan retries. A new
+  `kms:ProviderDestroyKey` audit action records the provider-side outcome per
+  version, with an `Error` result meaning the material survives, so a divergence
+  between the record and the backend is visible in the chain. Because a failed
+  pass is retried, `CryptoProvider::destroy_key` implementations must be
+  idempotent for a handle whose material is already gone.
+- **Key-state gating and scope isolation reached the REST surface.** State gating
+  via the shared `domain::enforce_state_for_key_op` was enforced only on gRPC for
+  `Sign`, `Verify`, `GenerateMac`, and `VerifyMac`; REST ran those operations
+  with no state check. Separately, `GenerateDataKey` and `ReEncrypt` had no
+  `scope_owner` isolation on either surface. Both surfaces now call the same
+  shared domain functions, and `ReEncrypt` evaluates scope against the source and
+  destination keys independently.
+
+### Fixed
+
+- **`ListKeys` honours its `state_filter`.** The service layer hard-coded
+  `state: None` when building the `KeyFilter`, so a caller narrowing a listing to
+  one key state received every key regardless; the storage backends had
+  implemented the filter all along. Now honoured on gRPC via the existing
+  `ListKeysRequest.state_filter` field, and on REST via a new `?state=` query
+  parameter on `GET /v1/keys` that uses the same vocabulary the response
+  serializes (`enabled`, `pending_deletion`, …) — REST previously had no way to
+  express the filter at all. A filter that is present but uninterpretable — an
+  unknown enum value or an explicit `KEY_STATE_UNSPECIFIED` on gRPC, an unknown
+  string on REST — is **rejected** (`InvalidArgument`, `400 InvalidKeyState`)
+  rather than downgraded to "no filter": silently widening a narrowing request is
+  the defect being fixed.
+  On REST the value is parsed inside the authorization envelope, so an
+  unauthorized caller cannot probe which state names exist. Callers that send no
+  filter are unaffected.
+- **Claim-integrity pass over the documentation.** Corrected assertions that the
+  code does not support, with no code change: "never stores raw key material" is
+  now scoped per provider (the software provider holds key bytes in process
+  memory and is dev/test only); "deterministic key derivation trees" became
+  "KEK-wrapping hierarchy", since no KDF exists and the LID is a
+  content-addressed identifier; the HYOK "bounded lockout via cache TTL" claim
+  was re-tiered, because an HSM disconnect is immediately fatal in FOSS and the
+  TTL bounds cross-node staleness in the commercial HA tier only; and the audit
+  chain is now described as strong interior tamper-evidence whose
+  tail-truncation detection needs an external anchor, with signing opt-in and
+  ephemeral by default. Also fixed non-canonical `git clone` URLs, a stale
+  minimum Rust version, and several component statuses (`keyrack-pii` and Vault
+  Transit shipped, Parsec a stub).
+- **FOSS docs no longer reference commercial demo directories** by path or name;
+  AWS KMS-compatible access is described neutrally as a commercial extension.
+
 ## [0.3.2] — 2026-07-03
 
 Security patch: corrected false atomic re-wrap / data-key capability declarations

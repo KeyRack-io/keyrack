@@ -1,6 +1,6 @@
 [package]
 name = "keyrack-nats"
-version = "0.3.2"
+version = "0.4.0"
 description = "KeyRack NATS audit sink and event publisher"
 edition.workspace = true
 rust-version.workspace = true

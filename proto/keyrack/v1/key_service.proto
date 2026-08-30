@@ -965,7 +965,12 @@ message ImportKeyRequest {
   // The crypto backend for the import. Same semantics as CreateKey.
   optional string hsm_connection_id = 7;
   optional string backend_id = 8;
-  // Imported keys default to exportable=true (KMIP keystore use case).
+  // Whether the imported key may have its material retrieved via
+  // GetKeyMaterial. Unset means NON-exportable: this is a plain proto3 bool, so
+  // omitting it yields false on gRPC, and the REST `/v1/keys/import` handler
+  // likewise defaults it to false. A KMIP keystore front-end that needs the
+  // material back (the `Register` then `Get` flow) must set this to true
+  // EXPLICITLY; it is not implied by the import being external.
   bool exportable = 9;
 }
 
