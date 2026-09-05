@@ -54,6 +54,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  wrapping-probe:
+    name: SoftHSM wrapping mechanism probe
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y softhsm2 libsofthsm2 protobuf-compiler libprotobuf-dev
+      - run: bash scripts/test-pkcs11-wrapping.sh
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

@@ -1,0 +1,23 @@
+# Copyright 2026 KeyRack Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+FROM rust:1.92.0-bookworm
+ENV RUSTUP_TOOLCHAIN=1.92.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        softhsm2 libsofthsm2 pkg-config protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY proto/ proto/
+COPY examples/ examples/
+COPY scripts/test-pkcs11-wrapping.sh scripts/test-pkcs11-wrapping.sh
+
+RUN cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
+    --test wrapping_probe --no-run
+ENV CARGO_NET_OFFLINE=true
+
+# No token or initialized key material is baked into this image. Every run uses a
+# fresh token store in /tmp, without mounting a host/deployment token directory.
+CMD ["bash", "scripts/test-pkcs11-wrapping.sh"]
