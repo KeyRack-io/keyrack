@@ -352,6 +352,16 @@ pub trait CryptoProvider: Send + Sync {
     /// to accurately reflect their HSM or backend capabilities.
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Exact supported persistent-key wrapping profiles.
+    ///
+    /// This contract is independent of data-key generation and re-encryption
+    /// atomicity. The empty default advertises no hierarchy support. A provider
+    /// must have executable conformance evidence for every tuple it advertises;
+    /// constructing canonical context bytes alone supplies no such evidence.
+    fn wrapping_capabilities(&self) -> crate::wrapping::WrappingCapabilities {
+        crate::wrapping::WrappingCapabilities::default()
+    }
+
     /// Export raw key material for an exportable key.
     ///
     /// The caller (service layer) is responsible for enforcing that the key
