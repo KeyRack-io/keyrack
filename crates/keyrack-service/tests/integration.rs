@@ -5121,6 +5121,76 @@ async fn rest_born_exportable_denied_without_make_exportable_privilege() {
     );
 }
 
+/// REST: the key representation reports exportability.
+///
+/// gRPC `DescribeKey` has always carried `exportable`; REST omitted it, so an
+/// exportable and a non-exportable key were indistinguishable over REST even
+/// though exportability decides whether `GetKeyMaterial` (and KMIP `Get`) can
+/// return raw material.
+#[tokio::test]
+async fn rest_key_response_reports_exportability() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn create(app: axum::Router, exportable: bool) -> serde_json::Value {
+        let body = serde_json::json!({
+            "key_spec": "AES_256",
+            "exportable": exportable,
+            "description": "rest exportability reporting"
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    let (state, _pdp, _audit) = build_test_state();
+
+    let exportable = create(keyrack_service::rest::router(state.clone()), true).await;
+    assert_eq!(
+        exportable.get("exportable"),
+        Some(&serde_json::Value::Bool(true)),
+        "born-exportable key must report exportable=true over REST: {exportable}"
+    );
+
+    let sealed = create(keyrack_service::rest::router(state.clone()), false).await;
+    assert_eq!(
+        sealed.get("exportable"),
+        Some(&serde_json::Value::Bool(false)),
+        "non-exportable key must report exportable=false over REST: {sealed}"
+    );
+
+    // And the field survives a read-back, not just the create response.
+    let lid = exportable.get("lid").unwrap().as_str().unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/keys/{lid}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = keyrack_service::rest::router(state)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let fetched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        fetched.get("exportable"),
+        Some(&serde_json::Value::Bool(true)),
+        "GET must also report exportable=true: {fetched}"
+    );
+}
+
 /// REST: born-exportable with a parent set → rejected (leaf-only).
 #[tokio::test]
 async fn rest_born_exportable_with_parent_rejected() {
