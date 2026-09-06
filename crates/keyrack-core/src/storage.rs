@@ -72,6 +72,71 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    // A2 creation transactions. Unsupported wrappers/backends MUST NOT emulate
+    // these using separate CRUD calls. No production hierarchy activation yet.
+    async fn reserve_creation(
+        &self,
+        _request: &crate::creation::CreationRequest,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn get_creation(
+        &self,
+        _operation: uuid::Uuid,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn stage_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+        _envelope: &[u8],
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn resolve_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+        _closure: &crate::creation::VerifiedA2Closure,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn publish_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+    ) -> Result<KeyRecord> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn read_creation_envelope(&self, _operation: uuid::Uuid) -> Result<Vec<u8>> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn recoverable_creations(
+        &self,
+        _after: Option<uuid::Uuid>,
+        _limit: u32,
+    ) -> Result<crate::creation::CreationPage> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+
     // ── Keys ──────────────────────────────────────────────────────
 
     /// Insert a new key record. Fails if the LID already exists.
