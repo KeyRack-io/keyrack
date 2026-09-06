@@ -4,13 +4,23 @@
 //! public key and owns secret creation/materialization. This wire is provisional.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
+use keyrack_core::{
+    creation::CreationOwner,
+    custody::{
+        AuthorityGrant, AuthorityIdentity, AuthorityScope, Canonical, ClockDomain, CreationResult,
+        CryptoOperation, CustodyContext, CustodyMaterialDescriptor, Evidence, EvidenceKey,
+        RequestBinding, Validity, WrappingIdentifier,
+    },
+};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::num::NonZeroU64;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
+use uuid::Uuid;
 
 struct Harness {
     child: Child,
@@ -19,6 +29,7 @@ struct Harness {
     hello: Value,
     key: SigningKey,
     transcript: String,
+    reservation: Value,
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -28,7 +39,13 @@ impl Drop for Harness {
 }
 impl Harness {
     fn new(vault: bool) -> Self {
+        Self::configured(vault, None)
+    }
+    fn configured(vault: bool, inert_credential: Option<&std::path::Path>) -> Self {
         let key = SigningKey::generate(&mut OsRng);
+        let reservation = json!({"operation": Uuid::new_v4(), "attempt": Uuid::new_v4(),
+            "owner": {"instance": Uuid::new_v4(), "generation": 7},
+            "envelope_ref": "fixture-subprocess-envelope", "principal": "alice"});
         let mut command = Command::new(env!("CARGO_BIN_EXE_keyrack-worker-provisional"));
         command
             .arg("--provisional-harness")
@@ -38,15 +55,30 @@ impl Harness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if vault {
+            command.env("KEYRACK_WORKER_CREATION_PLAN", reservation.to_string());
             for name in [
                 "VAULT_ADDR",
                 "KEYRACK_WORKER_VAULT_TOKEN_FILE",
                 "KEYRACK_WORKER_VAULT_PARENT",
             ] {
-                command.env(
-                    name,
-                    std::env::var(name).expect("live worker fixture configuration required"),
-                );
+                if let Some(path) = inert_credential {
+                    match name {
+                        "VAULT_ADDR" => {
+                            command.env(name, "http://127.0.0.1:1");
+                        }
+                        "KEYRACK_WORKER_VAULT_PARENT" => {
+                            command.env(name, "worker-fixture-inert");
+                        }
+                        _ => {
+                            command.env(name, path);
+                        }
+                    }
+                } else {
+                    command.env(
+                        name,
+                        std::env::var(name).expect("live worker fixture configuration required"),
+                    );
+                }
             }
         }
         let mut child = command.spawn().unwrap();
@@ -66,7 +98,135 @@ impl Harness {
             hello,
             key,
             transcript: line,
+            reservation,
         }
+    }
+    fn create_native(&mut self) {
+        let context = CustodyContext::from_canonical_bytes(
+            &STANDARD
+                .decode(self.hello["custody_context"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let request = RequestBinding::from_canonical_bytes(
+            &STANDARD
+                .decode(self.hello["creation_request"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let owner: CreationOwner =
+            serde_json::from_value(self.reservation["owner"].clone()).unwrap();
+        assert_eq!(request.operation.to_string(), self.reservation["operation"]);
+        assert_eq!(request.attempt.to_string(), self.reservation["attempt"]);
+        assert_eq!(request.context_sha256, context.sha256().unwrap());
+        assert_eq!(
+            STANDARD.encode(request.executor.as_bytes()),
+            self.hello["worker"]
+        );
+        // Independently reconstruct the proposed transcript from launcher intent.
+        let mut bytes = b"KeyRack:PROPOSED-worker-generate-request-v1\0".to_vec();
+        bytes.extend_from_slice(&request.context_sha256);
+        bytes.extend_from_slice(request.operation.as_bytes());
+        bytes.extend_from_slice(request.attempt.as_bytes());
+        bytes.extend_from_slice(owner.instance.as_bytes());
+        bytes.extend_from_slice(&owner.generation.to_be_bytes());
+        for value in [
+            &self.reservation["envelope_ref"],
+            &self.reservation["principal"],
+        ] {
+            let text = value.as_str().unwrap();
+            bytes.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        bytes.extend_from_slice(&256_u16.to_be_bytes());
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(request.request_sha256, expected);
+        let mut authority = Evidence {
+            issuer: WrappingIdentifier::new("development-authority").unwrap(),
+            key_id: WrappingIdentifier::new("development-authority-key").unwrap(),
+            claims: AuthorityGrant {
+                authority: AuthorityIdentity {
+                    issuer: WrappingIdentifier::new("development-authority").unwrap(),
+                    scope: AuthorityScope::SecurityDomain {
+                        provider_ref: context.wrapping.provider_ref.clone(),
+                        security_domain: context.wrapping.security_domain.clone(),
+                    },
+                    generation: NonZeroU64::new(1).unwrap(),
+                },
+                request: request.clone(),
+                principal: WrappingIdentifier::new("alice").unwrap(),
+                operation: CryptoOperation::GenerateWrapped,
+                sequence: NonZeroU64::new(1).unwrap(),
+                validity: Validity {
+                    clock: ClockDomain::ExecutorMonotonicMilliseconds(request.executor),
+                    not_before: 0,
+                    not_after: 30_000,
+                },
+                ancestor_not_after: 30_000,
+            },
+            signature: [0; 64],
+        };
+        authority.signature = self
+            .key
+            .sign(&authority.signing_bytes().unwrap())
+            .to_bytes();
+        let command = json!({"command": "generate", "grant": STANDARD.encode(authority.canonical_bytes().unwrap())});
+        let before = self.request(1, "encrypt", b"data", 30_000);
+        assert_eq!(
+            self.send(&before)["error"],
+            "material unavailable or unauthenticated"
+        );
+        let mut forged = authority.clone();
+        forged.signature[0] ^= 1;
+        assert!(self.send(&json!({"command": "generate", "grant": STANDARD.encode(forged.canonical_bytes().unwrap())})).get("error").is_some());
+        let output = self.send(&command);
+        let receipt = Evidence::<CreationResult>::from_canonical_bytes(
+            &STANDARD
+                .decode(
+                    output["creation"]
+                        .as_str()
+                        .expect("creation evidence required"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let material = CustodyMaterialDescriptor::from_canonical_bytes(
+            &STANDARD
+                .decode(output["material"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let trusted = EvidenceKey {
+            issuer: WrappingIdentifier::new("development-worker-observation").unwrap(),
+            key_id: WrappingIdentifier::new("incarnation-key").unwrap(),
+            // Trusted spawned process channel for this test, not key distribution.
+            key: ed25519_dalek::VerifyingKey::from_bytes(
+                &STANDARD
+                    .decode(self.hello["observation_key"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        receipt
+            .authenticate(&trusted)
+            .unwrap()
+            .claims()
+            .check_attempt(&request, owner, &material)
+            .unwrap();
+        assert_eq!(material.context, context);
+        assert_eq!(
+            material.envelope_ref.as_str(),
+            self.reservation["envelope_ref"]
+        );
+        assert_eq!(
+            STANDARD
+                .decode(output["authority"].as_str().unwrap())
+                .unwrap(),
+            authority.canonical_bytes().unwrap()
+        );
+        assert!(self.send(&command).get("error").is_some());
     }
     fn signed(&self, message: &Value) -> Value {
         let body = serde_json::to_string(message).unwrap();
@@ -78,7 +238,7 @@ impl Harness {
         let hash: [u8; 32] = Sha256::digest(input).into();
         let signed = self.signed(&json!({"kind": "grant", "body": {
             "worker": self.hello["worker"], "principal": "alice", "context_sha256": self.hello["context_sha256"],
-            "operation": operation, "input_sha256": hash, "generation": 1, "sequence": sequence,
+            "operation": operation, "input_sha256": hash, "generation": 1, "sequence": sequence + u64::from(!self.hello["creation_request"].is_null()),
             "not_before_ms": 0, "expires_ms": expires, "ancestor_expires_ms": expires,
             "residency_until_ms": 60_000,
         }}));
@@ -117,6 +277,9 @@ impl Harness {
 
 fn round_trip(vault: bool) {
     let mut worker = Harness::new(vault);
+    if vault {
+        worker.create_native();
+    }
     let request = worker.request(1, "encrypt", b"application data", 30_000);
     let mut forged = request.clone();
     forged["signed"]["signature"][0] = json!(256);
@@ -271,4 +434,25 @@ fn invalid_credential_environment_never_falls_back_to_local_fixture() {
         String::from_utf8(output.stderr).unwrap(),
         "worker credential file must be a private regular file owned by worker uid\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_startup_reaches_authority_wait_without_contacting_vault() {
+    use std::os::unix::fs::PermissionsExt;
+    let token = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token.path(), "inert-startup-test-credential").unwrap();
+    std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    // No server on this fixture address. Construction must reach the grant wait
+    // without a metadata lookup or datakey request; startup used to fail here.
+    let mut worker = Harness::configured(true, Some(token.path()));
+    assert!(worker.hello["creation_request"].is_string());
+    let before = worker.request(1, "encrypt", b"data", 30_000);
+    assert_eq!(
+        worker.send(&before)["error"],
+        "material unavailable or unauthenticated"
+    );
+    assert!(worker.send(&json!({"command": "generate", "grant": STANDARD.encode(b"invalid canonical authority")})).get("error").is_some());
+    assert!(!worker.transcript.contains("inert-startup-test-credential"));
+    worker.finish();
 }

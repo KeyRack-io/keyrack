@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub(crate) mod creation;
+
 pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -190,6 +192,7 @@ pub(crate) struct Worker<S, C> {
     sequence: u64,
     next_lease: u64,
     resident: HashMap<[u8; 32], Resident>,
+    creation: Option<creation::Reservation>,
 }
 
 impl<S: MaterialSource, C: Clock> Worker<S, C> {
@@ -223,6 +226,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             sequence: 0,
             next_lease: 0,
             resident: HashMap::new(),
+            creation: None,
         })
     }
 
@@ -289,6 +293,9 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             return Err(Error::Authority);
         }
         self.check_time(&grant)?;
+        if !self.creation_allows_use() {
+            return Err(Error::Material);
+        }
         if self.fenced
             || grant.generation == 0
             || grant.sequence <= self.sequence
