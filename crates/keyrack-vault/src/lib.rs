@@ -739,18 +739,23 @@ mod tests {
     // Require VAULT_ADDR + VAULT_TOKEN pointing at a running Vault with
     // Transit enabled (`vault secrets enable transit`).
     //
-    // Run: cargo test -p keyrack-vault -- --ignored
+    // Disposable fixture + all ignored tests: bash scripts/test-vault-provider.sh
+    // Existing test Vault only: cargo test -p keyrack-vault -- --ignored
 
-    async fn live_provider() -> Option<VaultTransitProvider> {
-        let addr = std::env::var("VAULT_ADDR").ok()?;
-        let token = std::env::var("VAULT_TOKEN").ok()?;
-        VaultTransitProvider::new(&addr, &token, None).await.ok()
+    async fn live_provider() -> VaultTransitProvider {
+        let addr = std::env::var("VAULT_ADDR")
+            .expect("live Vault required: set VAULT_ADDR or use scripts/test-vault-provider.sh");
+        let token = std::env::var("VAULT_TOKEN")
+            .expect("live Vault required: set VAULT_TOKEN or use scripts/test-vault-provider.sh");
+        VaultTransitProvider::new(&addr, &token, None)
+            .await
+            .unwrap_or_else(|err| panic!("live Vault Transit fixture is unavailable: {err}"))
     }
 
     #[tokio::test]
     #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
     async fn exportable_round_trip() {
-        let provider = live_provider().await.expect("live Vault required");
+        let provider = live_provider().await;
 
         // Create a key, then make it exportable.
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
@@ -774,7 +779,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
     async fn loosen_then_export() {
-        let provider = live_provider().await.expect("live Vault required");
+        let provider = live_provider().await;
 
         // Create a non-exportable key.
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
@@ -796,7 +801,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
     async fn tighten_soft_revoke_preserves_data() {
-        let provider = live_provider().await.expect("live Vault required");
+        let provider = live_provider().await;
 
         // Create and make exportable.
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
@@ -842,7 +847,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Vault (VAULT_ADDR + VAULT_TOKEN)"]
     async fn non_exportable_has_no_export_path() {
-        let provider = live_provider().await.expect("live Vault required");
+        let provider = live_provider().await;
 
         let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
 
