@@ -6,6 +6,17 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **KMIP server error messages are now readable.** Three TTLV tag constants in
+  the KMIP client were wrong. Because KMIP assigns tags in alphabetical order of
+  item name, `RESULT_MESSAGE` and `RESULT_REASON` held the values for
+  *Revocation Reason* (`0x420081`) and *Revocation Message* (`0x420080`) instead
+  of `0x42007D` and `0x42007E`, and `MAC_DATA` held *Data Length* (`0x4200C4`)
+  instead of `0x4200C6`. `RESULT_MESSAGE` was live: `parse_response` looks it up
+  on every response, so a server's failure text was never found and every KMIP
+  error surfaced as `"unknown error"`. Diagnosing a KMIP-backed deployment was
+  effectively impossible. `RESULT_REASON` and `MAC_DATA` had no call sites yet
+  and were latent. The bundled KMIP server had all three correct, so client and
+  server disagreed on the wire.
 - **BREAKING (behaviour): the KMIP provider no longer discards additional
   authenticated data.** `KmipProvider::encrypt` and `KmipProvider::decrypt`
   accepted an `aad` argument and never transmitted it, so every caller that
