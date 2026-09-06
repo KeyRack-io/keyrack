@@ -20,6 +20,11 @@ All notable changes to KeyRack will be documented in this file.
   the default trait implementations. A deployment that was passing an
   encryption context to a KMIP-backed key was already not getting one and will
   now see the operation rejected instead of silently unbound.
+- **`KmipProviderConfig` no longer derives `Debug`.** It holds `password` in
+  plain text, so any log line or error that formatted the config leaked the
+  KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`
+  entirely. Callers that were formatting the config with `{:?}` will no longer
+  compile.
 
 ## [0.4.0] — 2026-08-30
 

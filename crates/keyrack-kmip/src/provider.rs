@@ -61,7 +61,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 /// Configuration for a KMIP connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deliberately does **not** derive `Debug`: it holds `password` in plain
+/// text, and a derived `Debug` puts that password into any log line or error
+/// that formats the config. `Pkcs11ProviderConfig` omits `Debug` for the same
+/// reason.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KmipProviderConfig {
     /// KMIP server endpoint (e.g. `kmip://hsm.example.com:5696`).
     pub endpoint: String,
