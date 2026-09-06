@@ -1,0 +1,33 @@
+[package]
+name = "keyrack-crypto-worker"
+version = "0.1.0"
+description = "Provisional isolated custody-core development harness"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# No service integration or production execution profile is enabled.
+[[bin]]
+name = "keyrack-worker-provisional"
+path = "src/main.rs"
+
+[dependencies]
+keyrack-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+rand = "0.8"
+sha2 = "0.10"
+reqwest = { workspace = true, features = ["blocking"] }
+
+[lints]
+workspace = true
