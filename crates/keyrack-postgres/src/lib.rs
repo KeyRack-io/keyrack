@@ -21,15 +21,23 @@
 //! `PostgreSQL` storage backend for `KeyRack` multi-node deployments.
 //!
 //! Uses `sqlx` with the `postgres` feature for async database access.
-//! Records are stored as JSONB for flexibility during early development;
-//! production workloads benefit from the GIN indexing on JSONB columns.
+//! Records are stored as JSONB. Creation identities, parent dependencies and
+//! recovery cursors have separate scalar indexes.
 //!
 //! Optimistic concurrency is enforced via `WHERE occ_version = $expected`
-//! on every UPDATE.
+//! on key metadata updates. Creation journal transitions additionally validate
+//! owner/revision fencing. Key/journal writes and schema initialization share a
+//! transaction advisory lock in this first correctness-focused profile; this
+//! serialization is not a cloud-scale write-throughput claim.
 
 #![forbid(unsafe_code)]
 
+mod creation;
+
 use async_trait::async_trait;
+use keyrack_core::creation::{
+    CreationJournal, CreationOwner, CreationPage, CreationRequest, VerifiedA2Closure,
+};
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::hsm::HsmConnection;
 use keyrack_core::key::KeyRecord;
@@ -38,6 +46,7 @@ use keyrack_core::rotation::{RotationJob, RotationJobState};
 use keyrack_core::storage::{AliasRecord, KeyFilter, Page, StorageBackend};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool, Row};
+use uuid::Uuid;
 
 const CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS kr_keys (
@@ -60,6 +69,24 @@ CREATE TABLE IF NOT EXISTS kr_rotation_jobs (
     state        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kr_rotation_jobs_state ON kr_rotation_jobs(state);
+CREATE TABLE IF NOT EXISTS kr_creation_journal (
+    operation_id   TEXT COLLATE \"C\" PRIMARY KEY,
+    child_lid      TEXT NOT NULL,
+    child_version  TEXT NOT NULL,
+    parent_lid     TEXT NOT NULL,
+    parent_version TEXT NOT NULL,
+    envelope_ref   TEXT NOT NULL UNIQUE,
+    phase          TEXT NOT NULL CHECK (phase IN ('reserved', 'staged', 'resolved', 'committed')),
+    journal_json   JSONB NOT NULL,
+    envelope       BYTEA CHECK (envelope IS NULL OR octet_length(envelope) BETWEEN 1 AND 65536),
+    UNIQUE (child_lid, child_version)
+);
+CREATE INDEX IF NOT EXISTS idx_kr_creation_parent
+    ON kr_creation_journal(parent_lid, parent_version);
+CREATE INDEX IF NOT EXISTS idx_kr_creation_recovery
+    ON kr_creation_journal(phase, operation_id);
+CREATE INDEX IF NOT EXISTS idx_kr_creation_pending_operation
+    ON kr_creation_journal(operation_id) WHERE phase != 'committed';
 ";
 
 /// `PostgreSQL`-backed storage.
@@ -76,12 +103,7 @@ impl PostgresStorage {
             .await
             .map_err(|e| KeyRackError::Storage(format!("connect: {e}")))?;
 
-        // CREATE_TABLES is multiple statements; the prepared-statement path
-        // (`sqlx::query`) rejects that on Postgres, so use the unprepared
-        // simple-query path via `Executor::execute`.
-        pool.execute(CREATE_TABLES)
-            .await
-            .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        initialize_schema(&pool).await?;
 
         tracing::info!("PostgreSQL storage initialized");
         Ok(Self { pool })
@@ -89,11 +111,24 @@ impl PostgresStorage {
 
     /// Create from an existing pool (useful for testing).
     pub async fn from_pool(pool: PgPool) -> Result<Self> {
-        pool.execute(CREATE_TABLES)
-            .await
-            .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        initialize_schema(&pool).await?;
         Ok(Self { pool })
     }
+}
+
+async fn initialize_schema(pool: &PgPool) -> Result<()> {
+    // IF NOT EXISTS does not serialize concurrent catalog/type creation. The
+    // same lock also coordinates migrations with key/journal writes from peers.
+    let mut transaction = creation::write_transaction(pool).await?;
+    // Multiple DDL statements require the unprepared simple-query path.
+    (&mut *transaction)
+        .execute(CREATE_TABLES)
+        .await
+        .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|e| KeyRackError::Storage(format!("schema commit: {e}")))
 }
 
 fn state_str(state: RotationJobState) -> Result<String> {
@@ -107,26 +142,55 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
-    async fn create_key(&self, record: &KeyRecord) -> Result<()> {
-        let lid_str = record.lid.to_string();
-        let json = serde_json::to_value(record)
-            .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let occ = record.occ_version as i64;
+    async fn reserve_creation(&self, request: &CreationRequest) -> Result<CreationJournal> {
+        self.creation_reserve(request).await
+    }
 
-        sqlx::query("INSERT INTO kr_keys (lid, record_json, occ_version) VALUES ($1, $2, $3)")
-            .bind(&lid_str)
-            .bind(&json)
-            .bind(occ)
-            .execute(&self.pool)
+    async fn get_creation(&self, operation: Uuid) -> Result<CreationJournal> {
+        self.creation_get(operation).await
+    }
+
+    async fn stage_creation(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+        revision: u64,
+        envelope: &[u8],
+    ) -> Result<CreationJournal> {
+        self.creation_stage(operation, owner, revision, envelope)
             .await
-            .map_err(|e| {
-                if is_unique_violation(&e) {
-                    KeyRackError::Other("key already exists".into())
-                } else {
-                    KeyRackError::Storage(format!("create_key: {e}"))
-                }
-            })?;
-        Ok(())
+    }
+
+    async fn resolve_creation(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+        revision: u64,
+        closure: &VerifiedA2Closure,
+    ) -> Result<CreationJournal> {
+        self.creation_resolve(operation, owner, revision, closure)
+            .await
+    }
+
+    async fn publish_creation(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+        revision: u64,
+    ) -> Result<KeyRecord> {
+        self.creation_publish(operation, owner, revision).await
+    }
+
+    async fn read_creation_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
+        self.creation_read_envelope(operation).await
+    }
+
+    async fn recoverable_creations(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {
+        self.creation_recoverable(after, limit).await
+    }
+
+    async fn create_key(&self, record: &KeyRecord) -> Result<()> {
+        self.create_key_guarded(record).await
     }
 
     async fn get_key(&self, lid: &Lid) -> Result<KeyRecord> {
@@ -145,50 +209,7 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn update_key(&self, record: &KeyRecord) -> Result<()> {
-        if record.occ_version == 0 {
-            return Err(KeyRackError::Other(
-                "occ_version must be > 0 for updates".into(),
-            ));
-        }
-        let lid_str = record.lid.to_string();
-        let json = serde_json::to_value(record)
-            .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let new_occ = record.occ_version as i64;
-        let expected_occ = (record.occ_version - 1) as i64;
-
-        let result = sqlx::query(
-            "UPDATE kr_keys SET record_json = $1, occ_version = $2 WHERE lid = $3 AND occ_version = $4",
-        )
-        .bind(&json)
-        .bind(new_occ)
-        .bind(&lid_str)
-        .bind(expected_occ)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| KeyRackError::Storage(format!("update_key: {e}")))?;
-
-        if result.rows_affected() == 0 {
-            let actual = sqlx::query("SELECT occ_version FROM kr_keys WHERE lid = $1")
-                .bind(&lid_str)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| KeyRackError::Storage(format!("occ check: {e}")))?;
-            match actual {
-                Some(row) => {
-                    let v: i64 = row
-                        .try_get("occ_version")
-                        .map_err(|e| KeyRackError::Storage(format!("column: {e}")))?;
-                    Err(KeyRackError::OptimisticConcurrencyConflict {
-                        lid: record.lid,
-                        expected: record.occ_version - 1,
-                        actual: v as u64,
-                    })
-                }
-                None => Err(KeyRackError::KeyNotFound(record.lid)),
-            }
-        } else {
-            Ok(())
-        }
+        self.update_key_guarded(record).await
     }
 
     async fn list_keys(&self, filter: &KeyFilter) -> Result<Page<KeyRecord>> {

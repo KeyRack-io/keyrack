@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
 
 [dev-dependencies]

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+uuid = { workspace = true }
 keyrack-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
