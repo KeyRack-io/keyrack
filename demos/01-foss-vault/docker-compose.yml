@@ -5,7 +5,8 @@ services:
       VAULT_DEV_ROOT_TOKEN_ID: demo-root-token
       VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
     ports:
-      - "8200:8200"
+      # The provider-test runner selects a loopback-only, ephemeral host port.
+      - "${KEYRACK_VAULT_BIND_ADDRESS:-0.0.0.0}:${KEYRACK_VAULT_PORT:-8200}:8200"
     healthcheck:
       test: ["CMD", "sh", "-c", "VAULT_ADDR=http://127.0.0.1:8200 vault status"]
       interval: 2s
@@ -26,6 +27,7 @@ services:
     command:
       - -c
       - |
+        set -eu
         vault secrets enable transit
         echo "Transit engine enabled"
 
