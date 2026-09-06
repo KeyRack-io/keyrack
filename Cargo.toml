@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/keyrack-core",
+    "crates/keyrack-crypto-worker",
     "crates/keyrack-pkcs11",
     "crates/keyrack-kmip",
     "crates/keyrack-postgres",
