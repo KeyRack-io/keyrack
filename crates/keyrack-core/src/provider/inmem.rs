@@ -115,6 +115,12 @@ impl CryptoProvider for InMemoryProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         let mut caps = self.inner.capabilities();
         caps.provider_name = "in_memory".into();
+        // `import_key_material` is deliberately NOT delegated to the inner
+        // SoftwareProvider — this fixture is the "backend without import"
+        // provider that the service's fail-closed import gate is tested
+        // against. Inheriting the inner provider's `true` would make the flag
+        // claim a capability this type does not implement.
+        caps.supports_key_import = false;
         caps
     }
 
@@ -142,6 +148,10 @@ mod tests {
         assert!(
             !caps.supports_atomic_re_encrypt,
             "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
+        assert!(
+            !caps.supports_key_import,
+            "supports_key_import must be false without an import_key_material override"
         );
     }
 

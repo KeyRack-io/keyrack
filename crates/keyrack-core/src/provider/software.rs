@@ -855,7 +855,7 @@ impl CryptoProvider for SoftwareProvider {
             supports_generate_random: true,
             supports_atomic_data_key: false,
             supports_atomic_re_encrypt: false,
-            supports_key_import: false,
+            supports_key_import: true,
         }
     }
 
@@ -873,6 +873,55 @@ impl CryptoProvider for SoftwareProvider {
         })?;
 
         Ok(Sensitive::new(bytes))
+    }
+
+    /// Import externally-generated **symmetric** key material.
+    ///
+    /// Asymmetric specs are rejected: importing them means parsing a PKCS#8 /
+    /// PKCS#1 private key, and accepting a spec we cannot actually seed would
+    /// hand the caller a handle to a key that is not the one they imported.
+    async fn import_key_material(
+        &self,
+        spec: &KeySpec,
+        material: Sensitive<Vec<u8>>,
+    ) -> Result<KeyHandle> {
+        let bytes = material.expose();
+
+        // Length is checked against the spec so a short or over-long import is
+        // refused rather than silently truncated or zero-padded by the cipher.
+        let expect_len = |n: usize| -> Result<Vec<u8>> {
+            if bytes.len() == n {
+                Ok(bytes.clone())
+            } else {
+                Err(KeyRackError::Provider(format!(
+                    "{spec:?} import expects {n} bytes of key material, got {}",
+                    bytes.len()
+                )))
+            }
+        };
+
+        let key_material = match spec {
+            KeySpec::Aes256 => KeyMaterial::Aes256(expect_len(32)?),
+            KeySpec::Aes128 => KeyMaterial::Aes128(expect_len(16)?),
+            KeySpec::Hmac256 => KeyMaterial::Hmac256(expect_len(32)?),
+            other => {
+                return Err(KeyRackError::Provider(format!(
+                    "key import not supported for {other:?} by the software provider \
+                     (symmetric specs only)"
+                )))
+            }
+        };
+
+        let id = Uuid::new_v4().to_string();
+        self.keys
+            .write()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
+            .insert(id.clone(), key_material);
+
+        Ok(KeyHandle {
+            key_id: id,
+            key_spec: spec.clone(),
+        })
     }
 }
 
@@ -1174,6 +1223,87 @@ mod tests {
             .verify_mac(&handle, MacAlgorithm::HmacSha256, b"tampered", &mac)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn import_aes_256_returns_the_imported_material() {
+        let provider = SoftwareProvider::new();
+        let material: Vec<u8> = (0..32).collect();
+
+        let handle = provider
+            .import_key_material(&KeySpec::Aes256, Sensitive::new(material.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(handle.key_spec, KeySpec::Aes256);
+        let exported = provider.export_key_material(&handle).await.unwrap();
+        assert_eq!(exported.expose(), &material);
+    }
+
+    #[tokio::test]
+    async fn imported_aes_key_decrypts_what_it_encrypts() {
+        let provider = SoftwareProvider::new();
+        let handle = provider
+            .import_key_material(&KeySpec::Aes256, Sensitive::new(vec![7u8; 32]))
+            .await
+            .unwrap();
+
+        let ct = provider.encrypt(&handle, b"payload", b"aad").await.unwrap();
+        let pt = provider
+            .decrypt(&handle, &ct.ciphertext, b"aad")
+            .await
+            .unwrap();
+        assert_eq!(pt.expose().as_slice(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn import_hmac_256_produces_a_usable_mac_key() {
+        let provider = SoftwareProvider::new();
+        let handle = provider
+            .import_key_material(&KeySpec::Hmac256, Sensitive::new(vec![3u8; 32]))
+            .await
+            .unwrap();
+
+        let mac = provider
+            .generate_mac(&handle, MacAlgorithm::HmacSha256, b"m")
+            .await
+            .unwrap();
+        assert!(provider
+            .verify_mac(&handle, MacAlgorithm::HmacSha256, b"m", &mac)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_wrong_length_material() {
+        let provider = SoftwareProvider::new();
+        for (spec, len) in [
+            (KeySpec::Aes256, 16usize),
+            (KeySpec::Aes128, 32),
+            (KeySpec::Hmac256, 31),
+        ] {
+            let err = provider
+                .import_key_material(&spec, Sensitive::new(vec![0u8; len]))
+                .await
+                .expect_err("wrong-length import must be refused");
+            assert!(
+                err.to_string().contains("bytes of key material"),
+                "unexpected error for {spec:?}/{len}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_rejects_asymmetric_specs() {
+        let provider = SoftwareProvider::new();
+        let err = provider
+            .import_key_material(&KeySpec::Ed25519, Sensitive::new(vec![0u8; 32]))
+            .await
+            .expect_err("asymmetric import is not implemented");
+        assert!(
+            err.to_string().contains("symmetric specs only"),
+            "error message: {err}"
+        );
     }
 
     // If you flip either flag to true you MUST have overridden the
