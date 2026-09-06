@@ -2727,9 +2727,11 @@ dependencies = [
  "polyval",
  "rand 0.8.6",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "zeroize",
 ]

@@ -35,9 +35,9 @@ fn authenticated_local_fixture_rejects_each_semantic_context_change() {
 #[ignore = "requires the A2-owned live Vault fixture; no mock fallback"]
 fn real_vault_native_wrapped_only_authenticates_every_v1_context_byte() {
     let address = std::env::var("VAULT_ADDR").expect("VAULT_ADDR required");
-    let token = std::fs::read_to_string(
-        std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE").expect("worker token file required"),
-    )
+    let token = crate::credential::load(std::path::Path::new(
+        &std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE").expect("worker token file required"),
+    ))
     .unwrap();
     let parent =
         std::env::var("KEYRACK_WORKER_VAULT_PARENT").expect("derived fixture parent required");
@@ -113,8 +113,10 @@ fn real_vault_parent_loss_respects_separate_authority_and_residency_bounds() {
         std::fs::read_to_string(std::env::var("KEYRACK_WORKER_VAULT_ADMIN_TOKEN_FILE").unwrap())
             .unwrap(),
     );
-    let worker_token =
-        std::fs::read_to_string(std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE").unwrap()).unwrap();
+    let worker_token = crate::credential::load(std::path::Path::new(
+        &std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE").unwrap(),
+    ))
+    .unwrap();
     // Create and destroy only this test's fresh dedicated parent. Never delete
     // the shared fixture parent or any caller-supplied production key name.
     let name = format!("worker-fixture-loss-{}", rand::random::<u64>());

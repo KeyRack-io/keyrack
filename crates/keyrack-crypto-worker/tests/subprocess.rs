@@ -222,3 +222,53 @@ fn blocked_coordinator_output_terminates_without_holding_custody_loop() {
 fn real_vault_worker_subprocess_round_trip() {
     round_trip(true);
 }
+
+#[cfg(unix)]
+#[test]
+fn startup_refuses_group_or_world_accessible_worker_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let token = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token.path(), "credential-sentinel-must-not-be-logged").unwrap();
+    let key = SigningKey::generate(&mut OsRng);
+    for mode in [0o640, 0o604] {
+        std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_keyrack-worker-provisional"))
+            .arg("--provisional-harness")
+            .arg(STANDARD.encode(key.verifying_key().as_bytes()))
+            .env_clear()
+            .env("KEYRACK_WORKER_VAULT_TOKEN_FILE", token.path())
+            // Deliberately no Vault address: credential rejection must happen
+            // first, with no connection or ready event and no token in errors.
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "mode {mode:o}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "worker credential file must be a private regular file owned by worker uid\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_credential_environment_never_falls_back_to_local_fixture() {
+    use std::os::unix::ffi::OsStringExt;
+    let key = SigningKey::generate(&mut OsRng);
+    let output = Command::new(env!("CARGO_BIN_EXE_keyrack-worker-provisional"))
+        .arg("--provisional-harness")
+        .arg(STANDARD.encode(key.verifying_key().as_bytes()))
+        .env_clear()
+        .env(
+            "KEYRACK_WORKER_VAULT_TOKEN_FILE",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "worker credential file must be a private regular file owned by worker uid\n"
+    );
+}

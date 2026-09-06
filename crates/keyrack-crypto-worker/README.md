@@ -67,8 +67,12 @@ Its test launcher needs these environment variables:
 | `KEYRACK_WORKER_VAULT_ADMIN_TOKEN_FILE` | Test-parent create/configure/delete permission for the parent-loss control |
 
 Only the worker token file/address/parent are passed into the subprocess; the
-admin and coordinator tokens stay with the test launcher. Token files should be
-mode 0600 in a private temporary directory. Never point these tests at production.
+admin and coordinator tokens stay with the test launcher. On Unix the worker
+refuses a token file unless the opened file is regular, owned by its effective UID,
+and has no group/world permission bits (0400 or 0600 are suitable). It refuses
+final symlinks, bounds the read, and validates and reads the same file descriptor.
+Platforms without this ownership check refuse Vault startup. Use a private
+temporary directory. Never point these tests at production.
 The parent-loss test creates and deletes a fresh random `worker-fixture-loss-*`
 parent; fixture teardown owns cleanup after a failed run.
 
@@ -93,7 +97,25 @@ canonical lane wiring and run evidence remain required.
 
 ## Limits and integration gates
 
-The boundary/profile proposal is awaiting arbitration. Concrete production
+**UNMET deployment acceptance gate — coordinator/worker credential isolation.**
+The startup ownership/mode checks are enforced; they do not establish distinct
+coordinator and worker identities. A same-UID coordinator or privileged launcher
+can still read an owner-only file. The development subprocess tests run under one
+UID and prove channel non-leakage and unsafe-file refusal, not deployment isolation.
+
+A deployment must run the worker under a dedicated OS identity distinct from the
+coordinator, provision its credential through a trusted supervisor the coordinator
+cannot control, and protect the credential file and parent directories. It must
+deny coordinator access through ACLs, shared mounts, process inspection, privilege
+escalation and equivalent Vault credentials; the authority verification key and
+worker configuration also belong to that trusted supervisor. Demonstrate denial
+from the actual coordinator identity before claiming credential isolation. This
+crate does not enforce or attest those deployment controls. Host-root remains
+trusted under the process profile.
+
+The boundary/profile proposal remains provisional. A2 owns the future shared
+custody-contract module; changes will be concrete diffs against that module once
+available, with the manager as tie-breaker. Concrete production
 profile encoding, shared IPC/authority/evidence codecs, and shared creation
 results are not implemented. Native wrapped-only fixture generation runs at
 trusted test setup, not through an authorized journaled creation API. Its local
