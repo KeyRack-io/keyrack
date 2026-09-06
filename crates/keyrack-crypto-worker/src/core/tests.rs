@@ -329,3 +329,350 @@ fn oversized_input_and_capacity_failure_are_bounded() {
         Err(Error::Limit)
     );
 }
+
+#[derive(Clone, Copy)]
+enum SourceFailure {
+    None,
+    Unavailable,
+    InvalidLength,
+}
+
+struct ObservedSource {
+    inner: LocalFixture,
+    calls: usize,
+    failure: SourceFailure,
+}
+impl MaterialSource for ObservedSource {
+    fn open(&mut self, context: &WrappingContext) -> Result<Secret, Error> {
+        self.calls += 1;
+        match self.failure {
+            SourceFailure::None => self.inner.open(context),
+            SourceFailure::Unavailable => Err(Error::Material),
+            SourceFailure::InvalidLength => Ok(Secret(Zeroizing::new(vec![0; 31]))),
+        }
+    }
+}
+
+fn observed() -> (Worker<ObservedSource, TestClock>, SigningKey, TestClock) {
+    let (worker, key, clock) = setup();
+    let worker = Worker::new(
+        key.verifying_key(),
+        "development-only".into(),
+        ObservedSource {
+            inner: worker.source,
+            calls: 0,
+            failure: SourceFailure::None,
+        },
+        clock.clone(),
+        worker.limits,
+    )
+    .unwrap();
+    (worker, key, clock)
+}
+
+#[test]
+fn failed_open_consumes_request_without_allocating_residency_and_fresh_request_recovers() {
+    for failure in [SourceFailure::Unavailable, SourceFailure::InvalidLength] {
+        let (mut worker, key, _) = observed();
+        worker.source.failure = failure;
+        let signed = sign(
+            &key,
+            &AuthorityMessage::Grant(grant(&worker, 1, Operation::Encrypt, b"data")),
+        );
+        assert_eq!(
+            worker.execute(&signed, "alice", &context(), Operation::Encrypt, b"data"),
+            Err(Error::Material)
+        );
+        assert!(worker.resident.is_empty());
+        assert_eq!(worker.next_lease, 0);
+        worker.source.failure = SourceFailure::None;
+        assert_eq!(
+            worker.execute(&signed, "alice", &context(), Operation::Encrypt, b"data"),
+            Err(Error::Replay)
+        );
+        assert_eq!(worker.source.calls, 1);
+        let fresh = sign(
+            &key,
+            &AuthorityMessage::Grant(grant(&worker, 2, Operation::Encrypt, b"data")),
+        );
+        assert!(worker
+            .execute(&fresh, "alice", &context(), Operation::Encrypt, b"data")
+            .is_ok());
+        assert_eq!(worker.source.calls, 2);
+        assert_eq!(worker.resident.len(), 1);
+    }
+}
+
+#[test]
+fn warm_hit_avoids_provider_and_expiry_reopen_gets_new_lease_without_renewing_authority() {
+    let (mut worker, key, clock) = observed();
+    worker.limits.residence_ms = 100;
+    for sequence in 1..=2 {
+        let signed = sign(
+            &key,
+            &AuthorityMessage::Grant(grant(&worker, sequence, Operation::Encrypt, b"data")),
+        );
+        assert!(worker
+            .execute(&signed, "alice", &context(), Operation::Encrypt, b"data")
+            .is_ok());
+    }
+    assert_eq!(worker.source.calls, 1);
+    let binding = context_digest(&context()).unwrap();
+    let old_lease = worker.resident[&binding].lease;
+    clock.0.set(100);
+    let cleanup = worker.expire();
+    assert_eq!(cleanup.len(), 1);
+    assert_eq!(cleanup[0].lease, old_lease);
+    assert_eq!(cleanup[0].context_sha256, binding);
+    assert!(worker.expire().is_empty());
+    let signed = sign(
+        &key,
+        &AuthorityMessage::Grant(grant(&worker, 3, Operation::Encrypt, b"data")),
+    );
+    assert!(worker
+        .execute(&signed, "alice", &context(), Operation::Encrypt, b"data")
+        .is_ok());
+    assert_eq!(worker.source.calls, 2);
+    assert_ne!(worker.resident[&binding].lease, old_lease);
+    // Neither reopening nor cache activity extends the signed ancestor deadline.
+    clock.0.set(400);
+    let expired = sign(
+        &key,
+        &AuthorityMessage::Grant(grant(&worker, 4, Operation::Encrypt, b"data")),
+    );
+    assert_eq!(
+        worker.execute(&expired, "alice", &context(), Operation::Encrypt, b"data"),
+        Err(Error::Expired)
+    );
+    assert_eq!(worker.source.calls, 2);
+}
+
+#[test]
+fn rejected_fences_preserve_cache_and_authority_state_before_valid_fence() {
+    let (mut worker, key, clock) = setup();
+    encrypt(&mut worker, &key, 1).unwrap();
+    clock.0.set(10);
+    let binding = context_digest(&context()).unwrap();
+    let lease = worker.resident[&binding].lease;
+    for case in 0..5 {
+        let mut fence = Fence {
+            worker: worker.instance.clone(),
+            security_domain: "development-only".into(),
+            generation: 2,
+            expires_ms: 1_000,
+        };
+        match case {
+            0 => fence.expires_ms = 10,
+            1 => fence.generation = 0,
+            2 => fence.generation = 1,
+            _ => {}
+        }
+        let mut signed = sign(&key, &AuthorityMessage::Fence(fence));
+        if case == 3 {
+            signed.signature[0] ^= 1;
+        }
+        if case == 4 {
+            signed = sign(
+                &key,
+                &AuthorityMessage::Grant(grant(&worker, 2, Operation::Encrypt, b"data")),
+            );
+        }
+        assert!(worker.fence(&signed).is_err());
+        assert_eq!(worker.generation, Some(1));
+        assert_eq!(worker.sequence, 1);
+        assert!(!worker.fenced);
+        assert_eq!(worker.resident.len(), 1);
+        assert_eq!(worker.resident[&binding].lease, lease);
+    }
+    let signed = sign(
+        &key,
+        &AuthorityMessage::Fence(Fence {
+            worker: worker.instance.clone(),
+            security_domain: "development-only".into(),
+            generation: 2,
+            expires_ms: 1_000,
+        }),
+    );
+    assert_eq!(worker.fence(&signed).unwrap().purged.len(), 1);
+}
+
+struct IndexedSource(HashMap<[u8; 32], LocalFixture>);
+impl MaterialSource for IndexedSource {
+    fn open(&mut self, context: &WrappingContext) -> Result<Secret, Error> {
+        self.0
+            .get_mut(&context_digest(context)?)
+            .ok_or(Error::Material)?
+            .open(context)
+    }
+}
+
+#[test]
+fn domain_fence_purges_every_exact_context_and_lease_without_reopening() {
+    let (baseline, key, clock) = setup();
+    let first = context();
+    let mut second = context();
+    second.child.version = std::num::NonZeroU64::new(2).unwrap();
+    let contexts = [first, second];
+    let source = IndexedSource(
+        contexts
+            .iter()
+            .map(|ctx| {
+                (
+                    context_digest(ctx).unwrap(),
+                    LocalFixture::new(ctx).unwrap(),
+                )
+            })
+            .collect(),
+    );
+    let mut limits = baseline.limits;
+    limits.resident_keys = 2;
+    let mut worker = Worker::new(
+        key.verifying_key(),
+        "development-only".into(),
+        source,
+        clock,
+        limits,
+    )
+    .unwrap();
+    for (sequence, ctx) in [1, 2].into_iter().zip(&contexts) {
+        let mut g = grant(&worker, sequence, Operation::Encrypt, b"data");
+        g.context_sha256 = context_digest(ctx).unwrap();
+        let signed = sign(&key, &AuthorityMessage::Grant(g));
+        assert!(worker
+            .execute(&signed, "alice", ctx, Operation::Encrypt, b"data")
+            .is_ok());
+    }
+    let mut expected: Vec<_> = worker
+        .resident
+        .iter()
+        .map(|(binding, entry)| (*binding, entry.lease))
+        .collect();
+    expected.sort_unstable();
+    let fence = sign(
+        &key,
+        &AuthorityMessage::Fence(Fence {
+            worker: worker.instance.clone(),
+            security_domain: "development-only".into(),
+            generation: 2,
+            expires_ms: 1_000,
+        }),
+    );
+    let observation = worker.fence(&fence).unwrap();
+    let mut actual: Vec<_> = observation
+        .purged
+        .iter()
+        .map(|cleanup| {
+            assert_eq!(cleanup.worker, worker.instance);
+            (cleanup.context_sha256, cleanup.lease)
+        })
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(worker.resident.is_empty());
+    for ctx in &contexts {
+        let mut g = grant(&worker, 3, Operation::Encrypt, b"data");
+        g.context_sha256 = context_digest(ctx).unwrap();
+        let signed = sign(&key, &AuthorityMessage::Grant(g));
+        assert_eq!(
+            worker.execute(&signed, "alice", ctx, Operation::Encrypt, b"data"),
+            Err(Error::Replay)
+        );
+    }
+    assert!(worker.resident.is_empty());
+}
+
+#[test]
+fn restart_with_same_envelope_refuses_old_grants_and_fences_then_requires_fresh_authority() {
+    let (mut old, key, clock) = observed();
+    let old_grant = sign(
+        &key,
+        &AuthorityMessage::Grant(grant(&old, 1, Operation::Encrypt, b"data")),
+    );
+    let ciphertext = old
+        .execute(&old_grant, "alice", &context(), Operation::Encrypt, b"data")
+        .unwrap();
+    let old_fence = sign(
+        &key,
+        &AuthorityMessage::Fence(Fence {
+            worker: old.instance.clone(),
+            security_domain: "development-only".into(),
+            generation: 2,
+            expires_ms: 1_000,
+        }),
+    );
+    old.fence(&old_fence).unwrap();
+    let mut restarted = Worker::new(
+        key.verifying_key(),
+        "development-only".into(),
+        old.source,
+        clock,
+        old.limits,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.execute(&old_grant, "alice", &context(), Operation::Encrypt, b"data"),
+        Err(Error::Authority)
+    );
+    assert_eq!(restarted.fence(&old_fence).unwrap_err(), Error::Authority);
+    assert_eq!(restarted.source.calls, 1); // No open in the new incarnation yet.
+    assert!(restarted.resident.is_empty());
+    assert_eq!(restarted.generation, None);
+    let mut g = grant(&restarted, 1, Operation::Decrypt, &ciphertext);
+    g.generation = 3; // The external test authority explicitly authorizes this boot.
+    let fresh = sign(&key, &AuthorityMessage::Grant(g));
+    assert_eq!(
+        restarted
+            .execute(&fresh, "alice", &context(), Operation::Decrypt, &ciphertext)
+            .unwrap(),
+        b"data"
+    );
+    assert_eq!(restarted.source.calls, 2);
+}
+
+#[test]
+fn lease_counter_exhaustion_never_wraps_or_leaves_a_resident_key() {
+    let (mut worker, key, _) = observed();
+    worker.next_lease = u64::MAX;
+    let signed = sign(
+        &key,
+        &AuthorityMessage::Grant(grant(&worker, 1, Operation::Encrypt, b"data")),
+    );
+    assert_eq!(
+        worker.execute(&signed, "alice", &context(), Operation::Encrypt, b"data"),
+        Err(Error::Limit)
+    );
+    assert!(worker.resident.is_empty());
+    assert_eq!(worker.next_lease, u64::MAX);
+    assert_eq!(
+        worker.execute(&signed, "alice", &context(), Operation::Encrypt, b"data"),
+        Err(Error::Replay)
+    );
+    assert_eq!(worker.source.calls, 1);
+}
+
+#[test]
+fn slow_open_exceeding_residency_limit_is_denied_even_with_valid_authority() {
+    let (worker, key, clock) = setup();
+    let mut limits = worker.limits;
+    limits.residence_ms = 100;
+    let mut delayed = Worker::new(
+        key.verifying_key(),
+        "development-only".into(),
+        DelayedSource {
+            source: worker.source,
+            clock: clock.clone(),
+        },
+        clock,
+        limits,
+    )
+    .unwrap();
+    let mut g = grant(&delayed, 1, Operation::Encrypt, b"data");
+    g.expires_ms = 1_000;
+    g.ancestor_expires_ms = 1_000;
+    let signed = sign(&key, &AuthorityMessage::Grant(g));
+    assert_eq!(
+        delayed.execute(&signed, "alice", &context(), Operation::Encrypt, b"data"),
+        Err(Error::Expired)
+    );
+    assert!(delayed.resident.is_empty());
+}

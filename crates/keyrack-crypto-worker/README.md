@@ -43,14 +43,38 @@ cargo fmt --all -- --check
 
 Unit tests cover scoped/forged authority, replay, restarts, warm expiry, slow
 materialization, use/capacity/input limits, authenticated context changes and
-fencing. Subprocess tests keep the signer in the parent and materialization in a
+fencing. Failure coverage also checks failed-open replay consumption, warm hits
+without provider calls, lease replacement after expiry, rejected-fence state
+preservation, domain-wide purge across multiple residents, restart with the same
+envelope and old grants/fences, and lease-counter exhaustion. Subprocess tests keep the signer in the parent and materialization in a
 different PID, exercise encryption/decryption, denial and fencing, and force
 output backpressure.
 
 ## Contribution to the existing Vault lane
 
-`docker-vault-ci-lane` belongs to the A2 track. This crate supplies a consumer
-script, **not a second maintained CI stack**:
+`docker-vault-ci-lane` belongs to the A2 track. Its `vault-provider` job
+(**Vault provider export tests**) in `.github/workflows/ci.yml` exists at
+`a85272c`. It runs `scripts/test-vault-provider.sh`, which preserves and guards the
+four original provider tests and exposes a post-test command hook using the same
+`demos/01-foss-vault` fixture. This crate supplies that hook's worker consumer,
+**not a second maintained CI stack**.
+
+After integrating the worker files, the A2 job owner can invoke both suites by
+extending its existing run step to:
+
+```sh
+bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
+```
+
+The worker helper provisions temporary restricted worker/coordinator tokens and a
+test parent within that already-running demo fixture. Token files are created
+privately and cleaned up; tokens/policies and the parent are revoked/deleted
+after the worker tests. A2 still owns the server and its final teardown. The helper
+refuses an address/token outside the expected localhost demo setup. It is trusted
+test provisioning, not a deployment supervisor or isolation proof.
+
+For an already-provisioned worker fixture, the same consumer also accepts the
+explicit variables below without provisioning anything:
 
 ```sh
 bash scripts/test-worker-vault-contribution.sh
@@ -91,9 +115,12 @@ Warm use after out-of-band parent deletion is possible until the independently
 signed ancestor deadline; at the bound it fails, and a cold reopen fails against
 the deleted parent. That test does not claim immediate deletion detection.
 
-The A2 lane must retain its **four original ignored Vault-provider tests**, in
-addition to invoking this script. Local passes do not establish final acceptance;
-canonical lane wiring and run evidence remain required.
+The A2 lane retains its **four original ignored Vault-provider tests**. The worker
+script additionally guards discovery of its own four ignored live tests, so a
+renamed, removed, or un-ignored test fails before running the suite. Local hook
+passes do not establish CI acceptance. A2 must adopt the hook in its existing job
+and supply run evidence. The owner reports that the existing job runs but is not
+yet required by branch protection; worker integration does not change that rule.
 
 ## Limits and integration gates
 
