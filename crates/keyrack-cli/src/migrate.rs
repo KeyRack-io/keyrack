@@ -23,6 +23,19 @@ use keyrack_core::key::{KeyRecord, KeyState};
 use keyrack_core::migration::{self, MigrationAction, MigrationEntry, MigrationPlan};
 use keyrack_core::storage::{KeyFilter, StorageBackend};
 
+fn require_resident_metadata_migration(
+    versions: &[keyrack_core::key::KeyVersionRecord],
+) -> anyhow::Result<()> {
+    for version in versions {
+        version.resident_handle().map_err(|_| {
+            anyhow::anyhow!(
+                "parent-wrapped keys require service-side rewrap; metadata migration refused"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 pub struct MigrateArgs {
     #[command(subcommand)]
@@ -291,6 +304,11 @@ async fn apply_migration(plan_file: &std::path::Path, storage_path: &str) -> any
             }
         };
 
+        if let Err(e) = require_resident_metadata_migration(&record.key_versions) {
+            tracing::error!(lid = %record.lid, error = %e, "identity migration refused");
+            errors += 1;
+            continue;
+        }
         let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version);
         let new_lid_str = new_lid.to_string();
 
@@ -347,16 +365,6 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
             continue;
         }
 
-        let alias_name = format!("migration:{}", entry.old_lid);
-        match db.delete_alias(&alias_name).await {
-            Ok(()) => {
-                tracing::info!(alias = %alias_name, "removed migration alias");
-            }
-            Err(e) => {
-                tracing::warn!(alias = %alias_name, error = %e, "failed to remove alias");
-            }
-        }
-
         if let Some(new_lid_str) = &entry.new_lid {
             let new_lid: keyrack_core::lid::Lid = match new_lid_str.parse() {
                 Ok(l) => l,
@@ -369,6 +377,13 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
 
             match db.get_key(&new_lid).await {
                 Ok(record) => {
+                    // Validate the exact snapshot passed to the OCC update.
+                    // Do not remove its alias on refusal or read/update error.
+                    if let Err(e) = require_resident_metadata_migration(&record.key_versions) {
+                        tracing::error!(lid = %new_lid, error = %e, "migration rollback refused");
+                        errors += 1;
+                        continue;
+                    }
                     let mut destroyed = record.clone();
                     destroyed.state = KeyState::Destroyed;
                     destroyed.occ_version += 1;
@@ -379,12 +394,22 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
                     }
                     tracing::info!(lid = %new_lid_str, "marked migrated key copy as destroyed");
                 }
+                Err(keyrack_core::error::KeyRackError::KeyNotFound(_)) => {
+                    tracing::info!(lid = %new_lid_str, "migrated key already absent");
+                }
                 Err(e) => {
-                    tracing::warn!(lid = %new_lid_str, error = %e, "migrated key not found, may have been cleaned up already");
+                    tracing::error!(lid = %new_lid_str, error = %e, "cannot inspect migrated key");
+                    errors += 1;
+                    continue;
                 }
             }
         }
 
+        let alias_name = format!("migration:{}", entry.old_lid);
+        match db.delete_alias(&alias_name).await {
+            Ok(()) => tracing::info!(alias = %alias_name, "removed migration alias"),
+            Err(e) => tracing::warn!(alias = %alias_name, error = %e, "failed to remove alias"),
+        }
         rolled_back += 1;
     }
 
@@ -577,6 +602,13 @@ async fn apply_rule_change(
             }
         };
 
+        if require_resident_metadata_migration(&record.key_versions).is_err() {
+            tracing::error!(lid = %key_lid,
+                "parent-wrapped keys require service-side rewrap; metadata migration refused");
+            errors += 1;
+            continue;
+        }
+
         // Resolve the new parent LID from the new rules
         let attrs = record.identity_tags.as_map();
         let new_parent_lid =
@@ -642,6 +674,7 @@ async fn rollback_rule_change(
 
     let mut rolled_back = 0usize;
     let mut skipped = 0usize;
+    let mut errors = 0usize;
 
     for entry in &plan.entries {
         if !entry.applied || entry.action != RuleChangeAction::Rewrap {
@@ -665,6 +698,13 @@ async fn rollback_rule_change(
             }
         };
 
+        if require_resident_metadata_migration(&record.key_versions).is_err() {
+            tracing::error!(lid = %key_lid,
+                "parent-wrapped keys require service-side rewrap; metadata rollback refused");
+            errors += 1;
+            continue;
+        }
+
         let old_parent_lid = entry.old_parent_lid.as_ref().and_then(|s| s.parse().ok());
         let mut reverted = record.clone();
         reverted.parent_lid = old_parent_lid;
@@ -672,11 +712,59 @@ async fn rollback_rule_change(
 
         if let Err(e) = db.update_key(&reverted).await {
             tracing::error!(lid = %entry.key_lid, error = %e, "rollback failed");
+            errors += 1;
         } else {
             rolled_back += 1;
         }
     }
 
     eprintln!("rule-change rollback: {rolled_back} reverted, {skipped} skipped");
+    if errors > 0 {
+        anyhow::bail!("{errors} key(s) failed during rule-change rollback");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod material_migration_tests {
+    use super::require_resident_metadata_migration;
+    use keyrack_core::key::{KeyMaterial, KeyVersionRecord, ParentWrappedMaterial, ProviderRef};
+    use keyrack_core::provider::KeyHandle;
+    use keyrack_core::wrapping::{
+        VersionedKeyId, WrappedKeyFormat, WrappingContextVersion, WrappingIdentifier,
+    };
+
+    #[test]
+    fn metadata_migration_accepts_only_resident_histories() {
+        let resident = KeyVersionRecord::provider_resident(
+            1,
+            KeyHandle {
+                key_id: "resident".into(),
+                key_spec: keyrack_core::key::KeySpec::Aes256,
+            },
+            None,
+            chrono::Utc::now(),
+            true,
+        );
+        assert!(require_resident_metadata_migration(std::slice::from_ref(&resident)).is_ok());
+        let descriptor = ParentWrappedMaterial::new(
+            ProviderRef::new("test-provider"),
+            WrappingIdentifier::new("test-domain").unwrap(),
+            VersionedKeyId::new(keyrack_core::lid::Lid::from_bytes([7; 32]), 1).unwrap(),
+            WrappingContextVersion::V1,
+            WrappedKeyFormat::RawSecret,
+            WrappingIdentifier::new("unqualified-test-profile").unwrap(),
+            WrappingIdentifier::new("envelope:test-only").unwrap(),
+        )
+        .unwrap();
+        let wrapped = KeyVersionRecord {
+            version_number: 2,
+            material: KeyMaterial::ParentWrapped(descriptor),
+            created_at: chrono::Utc::now(),
+            is_primary: false,
+        };
+        assert!(require_resident_metadata_migration(std::slice::from_ref(&wrapped)).is_err());
+        assert!(require_resident_metadata_migration(&[resident.clone(), wrapped.clone()]).is_err());
+        assert!(require_resident_metadata_migration(&[wrapped, resident]).is_err());
+    }
 }

@@ -120,6 +120,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             | KeyRackError::DepthLimitExceeded { .. }
             | KeyRackError::CycleDetected { .. } => Self::InvalidArgument(e.to_string()),
             KeyRackError::ProviderUnavailable(_) => Self::ProviderUnavailable(e.to_string()),
+            KeyRackError::OptimisticConcurrencyConflict { .. } => Self::Core(e),
             _ => Self::Internal(e.to_string()),
         }
     }
@@ -671,15 +672,13 @@ pub async fn enforce_scope_for_key_op(
             .key_versions
             .iter()
             .find(|v| v.version_number == ver)
-            .and_then(|v| v.provider_ref.as_ref())
+            .and_then(KeyVersionRecord::provider_ref)
             .or(record.provider_ref.as_ref()),
         None => {
             // Primary version.
             record
-                .key_versions
-                .iter()
-                .find(|v| v.is_primary)
-                .and_then(|v| v.provider_ref.as_ref())
+                .primary_version()
+                .and_then(KeyVersionRecord::provider_ref)
                 .or(record.provider_ref.as_ref())
         }
     };
@@ -777,13 +776,13 @@ pub async fn create_key(
         updated_at: now,
         scheduled_deletion_at: None,
         description: input.description.unwrap_or_default(),
-        key_versions: vec![KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(provider_name.clone()),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(provider_name.clone()),
+            now,
+            true,
+        )],
     };
 
     state
@@ -1080,15 +1079,26 @@ pub struct RotateKeyResult {
     pub jobs_failed: usize,
 }
 
+/// Guard operations that mutate a whole version history. Wrapped lifecycle
+/// support must replace this guard explicitly; ordinary generation/export or
+/// deletion must never be used as a fallback for wrapped material.
+pub fn require_resident_versions(record: &KeyRecord) -> Result<(), DomainError> {
+    for version in &record.key_versions {
+        version.resident_handle().map_err(|_| {
+            DomainError::FailedPrecondition(
+                "parent-wrapped material is not supported by this operation".into(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Rotate `lid` to a new primary version and queue rotation jobs for its
 /// descendants.
 ///
 /// This is the **single** implementation behind both the gRPC and the REST
-/// `RotateKey` handlers. Before this existed the two surfaces disagreed: gRPC
-/// walked the hierarchy and created a `RotationJob` per descendant, REST created
-/// none, so a key rotated over REST left every dependent bound to the old
-/// version with nothing scheduled to re-key it.
-///
+/// `RotateKey` handlers. The rotated history is preflighted before provider effects;
+/// the result counts persisted jobs separately from failed enqueue attempts.
 /// See [`disable_key`] for why `lid` and `key_id` are both parameters.
 pub async fn rotate_key(
     state: &Arc<ServiceState>,
@@ -1107,6 +1117,17 @@ pub async fn rotate_key(
         ));
     }
 
+    require_resident_versions(&record)?;
+    let new_version = record
+        .current_key_version
+        .checked_add(1)
+        .ok_or_else(|| DomainError::FailedPrecondition("key version number exhausted".into()))?;
+    if record.get_version(new_version).is_some() {
+        return Err(DomainError::FailedPrecondition(
+            "next key version already exists".into(),
+        ));
+    }
+
     // Resolve the provider for the current primary version BEFORE pushing
     // the new version, so resolution uses the existing binding.
     let entry = state
@@ -1114,25 +1135,51 @@ pub async fn rotate_key(
         .resolve_for_primary(&record)
         .map_err(DomainError::from)?;
 
+    // Finish fallible traversal before creating material or committing rotation.
+    // This is logical ancestry, not a cryptographic dependency index or saga.
+    let mut queue = vec![lid];
+    let mut visited = HashSet::from([lid]);
+    let mut dependents = Vec::new();
+    while let Some(parent_lid) = queue.pop() {
+        for dep in state
+            .storage
+            .list_children(&parent_lid)
+            .await
+            .map_err(DomainError::from)?
+        {
+            if visited.insert(dep.lid) {
+                dependents.push(dep.lid);
+                queue.push(dep.lid);
+            }
+        }
+    }
+
     let new_handle = entry
         .provider
         .generate_key(&record.key_spec)
         .await
         .map_err(DomainError::from)?;
 
-    // The new version inherits the key's record-level provider binding.
-    let new_version_provider_ref = record.provider_ref.clone();
-    let new_version = record.current_key_version + 1;
+    // Persist the binding actually used for generation, including a version
+    // override or the registry default. A record-level default can differ.
+    let new_version_provider_ref = Some(
+        record
+            .effective_provider_ref(record.current_key_version)
+            .unwrap_or_else(|| state.providers.default_ref())
+            .clone(),
+    );
     for v in &mut record.key_versions {
         v.is_primary = false;
     }
-    record.key_versions.push(KeyVersionRecord {
-        version_number: new_version,
-        key_handle: new_handle,
-        provider_ref: new_version_provider_ref,
-        created_at: chrono::Utc::now(),
-        is_primary: true,
-    });
+    record
+        .key_versions
+        .push(KeyVersionRecord::provider_resident(
+            new_version,
+            new_handle,
+            new_version_provider_ref,
+            chrono::Utc::now(),
+            true,
+        ));
     record.current_key_version = new_version;
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
@@ -1142,43 +1189,27 @@ pub async fn rotate_key(
         .await
         .map_err(DomainError::from)?;
 
-    // Create rotation jobs for all descendant keys (BFS)
-    let mut queue = vec![lid];
-    let mut visited = HashSet::new();
-    visited.insert(lid);
+    // Rotation has committed; enqueue the preflighted logical descendants.
+    // Durable atomic enqueue/recovery remains separate lifecycle work.
     let mut jobs_created = 0usize;
     let mut jobs_failed = 0usize;
-    while let Some(parent_lid) = queue.pop() {
-        let children = state
-            .storage
-            .list_children(&parent_lid)
-            .await
-            .map_err(DomainError::from)?;
-        for dep in &children {
-            if !visited.insert(dep.lid) {
-                continue;
-            }
-            let job = keyrack_core::rotation::RotationJob::new(
-                uuid::Uuid::new_v4().to_string(),
-                lid,
-                dep.lid,
-                new_version,
+    for dependent_lid in dependents {
+        let job = keyrack_core::rotation::RotationJob::new(
+            uuid::Uuid::new_v4().to_string(),
+            lid,
+            dependent_lid,
+            new_version,
+        );
+        if let Err(e) = state.storage.create_rotation_job(&job).await {
+            tracing::warn!(
+                parent = %lid,
+                dependent = %dependent_lid,
+                error = %e,
+                "failed to create rotation job for dependent"
             );
-            // Count what was persisted, not what was attempted. Counting
-            // attempts told operators a job existed for a dependent that had
-            // none queued, which is the opposite of what the number is for.
-            if let Err(e) = state.storage.create_rotation_job(&job).await {
-                tracing::warn!(
-                    parent = %lid,
-                    dependent = %dep.lid,
-                    error = %e,
-                    "failed to create rotation job for dependent"
-                );
-                jobs_failed += 1;
-            } else {
-                jobs_created += 1;
-            }
-            queue.push(dep.lid);
+            jobs_failed += 1;
+        } else {
+            jobs_created += 1;
         }
     }
     if jobs_created > 0 {
@@ -1307,9 +1338,7 @@ pub mod crypto {
         }
 
         let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
+            .primary_version()
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
         let entry = state
@@ -1333,7 +1362,11 @@ pub mod crypto {
 
         let output = entry
             .provider
-            .encrypt(&primary.key_handle, &input.plaintext, &aad)
+            .encrypt(
+                primary.resident_handle().map_err(DomainError::from)?,
+                &input.plaintext,
+                &aad,
+            )
             .await
             .map_err(DomainError::from)?;
 
@@ -1410,7 +1443,13 @@ pub mod crypto {
 
         let plaintext = entry
             .provider
-            .decrypt(&version_record.key_handle, ciphertext, &aad)
+            .decrypt(
+                version_record
+                    .resident_handle()
+                    .map_err(DomainError::from)?,
+                ciphertext,
+                &aad,
+            )
             .await
             .map_err(DomainError::from)?;
 
@@ -1517,9 +1556,7 @@ pub mod crypto {
         let src_aad = header.build_aad(&src_ec_aad);
 
         let dst_primary = dst_record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
+            .primary_version()
             .ok_or_else(|| DomainError::Internal("destination has no primary version".into()))?;
 
         let dst_ec_hash = input
@@ -1536,6 +1573,9 @@ pub mod crypto {
             .map(EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
+        // Validate both representations before invoking either provider.
+        let src_handle = src_version.resident_handle().map_err(DomainError::from)?;
+        let dst_handle = dst_primary.resident_handle().map_err(DomainError::from)?;
 
         // Same-provider path: calls `re_encrypt` on the shared provider.
         // NOTE: no in-tree provider currently overrides `re_encrypt`, so the
@@ -1546,24 +1586,18 @@ pub mod crypto {
         let output = if Arc::ptr_eq(&src_entry.provider, &dst_entry.provider) {
             src_entry
                 .provider
-                .re_encrypt(
-                    &src_version.key_handle,
-                    ciphertext,
-                    &src_aad,
-                    &dst_primary.key_handle,
-                    &dst_aad,
-                )
+                .re_encrypt(src_handle, ciphertext, &src_aad, dst_handle, &dst_aad)
                 .await
                 .map_err(DomainError::from)?
         } else {
             let plaintext = src_entry
                 .provider
-                .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                .decrypt(src_handle, ciphertext, &src_aad)
                 .await
                 .map_err(DomainError::from)?;
             dst_entry
                 .provider
-                .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                .encrypt(dst_handle, plaintext.expose(), &dst_aad)
                 .await
                 .map_err(DomainError::from)?
         };
@@ -1606,9 +1640,7 @@ pub mod crypto {
         }
 
         let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
+            .primary_version()
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
         let entry = state
@@ -1618,7 +1650,11 @@ pub mod crypto {
 
         let signature = entry
             .provider
-            .sign(&primary.key_handle, input.signing_algorithm, &input.message)
+            .sign(
+                primary.resident_handle().map_err(DomainError::from)?,
+                input.signing_algorithm,
+                &input.message,
+            )
             .await
             .map_err(DomainError::from)?;
 
@@ -1661,9 +1697,7 @@ pub mod crypto {
         }
 
         let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
+            .primary_version()
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
         let entry = state
@@ -1674,7 +1708,7 @@ pub mod crypto {
         let valid = entry
             .provider
             .verify(
-                &primary.key_handle,
+                primary.resident_handle().map_err(DomainError::from)?,
                 input.signing_algorithm,
                 &input.message,
                 &input.signature,
@@ -1733,9 +1767,7 @@ pub mod crypto {
         .await?;
 
         let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
+            .primary_version()
             .ok_or_else(|| DomainError::Internal("no primary key version".into()))?;
 
         let entry = state
@@ -1761,7 +1793,11 @@ pub mod crypto {
 
         let output = entry
             .provider
-            .generate_data_key(&primary.key_handle, dek_len, &aad)
+            .generate_data_key(
+                primary.resident_handle().map_err(DomainError::from)?,
+                dek_len,
+                &aad,
+            )
             .await
             .map_err(DomainError::from)?;
 
@@ -2374,6 +2410,21 @@ mod resolve_tests {
     use keyrack_core::tags::IdentityTags;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn domain_preserves_rotation_conflict_status() {
+        let error = DomainError::from(
+            keyrack_core::error::KeyRackError::OptimisticConcurrencyConflict {
+                lid: Lid::from_bytes([9; 32]),
+                expected: 2,
+                actual: 3,
+            },
+        );
+        assert_eq!(error.to_grpc_status().code(), tonic::Code::Aborted);
+        let (status, body) = error.to_rest_error();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body.0["error"], "OccConflict");
+    }
+
     fn entry() -> ProviderEntry {
         ProviderEntry {
             provider: Arc::new(InMemoryProvider::new()),
@@ -2866,6 +2917,7 @@ pub async fn enforce_born_exportable(
     provider: &Arc<dyn keyrack_core::provider::CryptoProvider>,
 ) -> Result<(), DomainError> {
     // (1) Leaf-only: reject if parent is set.
+    require_resident_versions(record)?;
     if record.parent_lid.is_some() {
         return Err(DomainError::FailedPrecondition(
             "exportable keys must be leaf-only — cannot create with a parent".into(),
@@ -2878,11 +2930,12 @@ pub async fn enforce_born_exportable(
     authorize_make_exportable(state, principal, &lid_str, export_attrs).await?;
 
     // (3) Provider-level: tell the backend this key is exportable.
-    let key_handle = &record
+    let key_handle = record
         .key_versions
         .first()
         .ok_or_else(|| DomainError::Internal("no key version on new key".into()))?
-        .key_handle;
+        .resident_handle()
+        .map_err(DomainError::from)?;
     provider
         .make_key_exportable(key_handle)
         .await

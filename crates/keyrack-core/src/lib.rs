@@ -37,6 +37,7 @@ pub mod hsm;
 pub mod key;
 pub mod lid;
 pub mod lint;
+pub mod material;
 pub mod migration;
 pub mod pdp;
 pub mod provider;

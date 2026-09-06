@@ -48,6 +48,8 @@ use crate::tags::{IdentityTags, UserTags};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use crate::material::{KeyMaterial, ParentWrappedMaterial};
+
 /// Key lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -237,25 +239,70 @@ pub enum Exportability {
 /// Old versions are retained for decrypt/verify of existing ciphertext.
 /// The `KeyRecord.current_key_version` field points to the active
 /// version for encrypt/sign.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct KeyVersionRecord {
     /// Sequential version number (1, 2, 3, ...).
     pub version_number: u64,
-    /// Provider-side handle to the material for this version.
-    pub key_handle: KeyHandle,
-    /// Which configured provider backs THIS version's material.
-    ///
-    /// Per-version (not just per-key) so a single logical key can
-    /// straddle two backends during an HSM-to-HSM migration: old
-    /// versions stay on the source provider while a newly rotated
-    /// version lives on the destination. `None` => inherit the key's
-    /// default binding, falling back to the registry default.
-    #[serde(default)]
-    pub provider_ref: Option<ProviderRef>,
+    /// Exclusive durable representation; wrapped material has no resident handle.
+    /// Serialization preserves the flat legacy shape for provider-resident keys.
+    pub material: KeyMaterial,
     /// When this version was created (initial creation or rotation).
     pub created_at: DateTime<Utc>,
     /// Whether this version is the current primary for encrypt/sign.
     pub is_primary: bool,
+}
+
+impl KeyVersionRecord {
+    /// Construct an independently provider-resident version without changing its
+    /// legacy provider-inheritance or primary-selection semantics.
+    pub fn provider_resident(
+        version_number: u64,
+        key_handle: KeyHandle,
+        provider_ref: Option<ProviderRef>,
+        created_at: DateTime<Utc>,
+        is_primary: bool,
+    ) -> Self {
+        Self {
+            version_number,
+            material: KeyMaterial::ProviderResident {
+                key_handle,
+                provider_ref,
+            },
+            created_at,
+            is_primary,
+        }
+    }
+
+    /// Explicit version binding. Only resident versions may inherit a binding.
+    #[must_use]
+    pub fn provider_ref(&self) -> Option<&ProviderRef> {
+        match &self.material {
+            KeyMaterial::ProviderResident { provider_ref, .. } => provider_ref.as_ref(),
+            KeyMaterial::ParentWrapped(material) => Some(material.provider_ref()),
+        }
+    }
+
+    /// Obtain a durable resident handle, refusing wrapped material.
+    /// A wrapped reference is never a provider handle or an operation lease.
+    pub fn resident_handle(&self) -> crate::error::Result<&KeyHandle> {
+        match &self.material {
+            KeyMaterial::ProviderResident { key_handle, .. } => Ok(key_handle),
+            KeyMaterial::ParentWrapped(_) => Err(crate::error::KeyRackError::Provider(
+                "parent-wrapped material is not supported by this operation".into(),
+            )),
+        }
+    }
+
+    /// Mutable resident handle access for provider-controlled handle replacement.
+    /// Refuses wrapped material without creating an independently usable copy.
+    pub fn resident_handle_mut(&mut self) -> crate::error::Result<&mut KeyHandle> {
+        match &mut self.material {
+            KeyMaterial::ProviderResident { key_handle, .. } => Ok(key_handle),
+            KeyMaterial::ParentWrapped(_) => Err(crate::error::KeyRackError::Provider(
+                "parent-wrapped material is not supported by this operation".into(),
+            )),
+        }
+    }
 }
 
 /// The primary key record. Stored in the storage backend.
@@ -356,7 +403,7 @@ impl KeyRecord {
     #[must_use]
     pub fn effective_provider_ref(&self, version_number: u64) -> Option<&ProviderRef> {
         self.get_version(version_number)
-            .and_then(|v| v.provider_ref.as_ref())
+            .and_then(KeyVersionRecord::provider_ref)
             .or(self.provider_ref.as_ref())
     }
 
@@ -566,7 +613,10 @@ pub(crate) mod tests {
 
         let parsed: KeyRecord = serde_json::from_str(&legacy).unwrap();
         assert_eq!(parsed.provider_ref, None);
-        assert!(parsed.key_versions.iter().all(|v| v.provider_ref.is_none()));
+        assert!(parsed
+            .key_versions
+            .iter()
+            .all(|v| v.provider_ref().is_none()));
         assert_eq!(parsed.effective_provider_ref(1), None);
     }
 
@@ -585,7 +635,11 @@ pub(crate) mod tests {
         );
 
         // Version-level binding overrides the key default (migration case).
-        record.key_versions[0].provider_ref = Some(ProviderRef::new("tenant-hsm"));
+        if let KeyMaterial::ProviderResident { provider_ref, .. } =
+            &mut record.key_versions[0].material
+        {
+            *provider_ref = Some(ProviderRef::new("tenant-hsm"));
+        }
         assert_eq!(
             record.effective_provider_ref(1),
             Some(&ProviderRef::new("tenant-hsm"))
@@ -628,16 +682,16 @@ pub(crate) mod tests {
             updated_at: Utc::now(),
             scheduled_deletion_at: None,
             description: String::new(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "test-handle".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: None,
-                created_at: Utc::now(),
-                is_primary: true,
-            }],
+                None,
+                Utc::now(),
+                true,
+            )],
         }
     }
 
@@ -695,32 +749,32 @@ pub(crate) mod tests {
             updated_at: Utc::now(),
             scheduled_deletion_at: None,
             description: String::new(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "handle-a".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: Some(ProviderRef::new("software-default")),
-                created_at: Utc::now(),
-                is_primary: true,
-            }],
+                Some(ProviderRef::new("software-default")),
+                Utc::now(),
+                true,
+            )],
         };
 
         let record_hsm = KeyRecord {
             lid,
             provider_class: ProviderClass::Pkcs11,
             provider_ref: Some(ProviderRef::new("hsm-tenant-a")),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "handle-b".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: Some(ProviderRef::new("hsm-tenant-a")),
-                created_at: Utc::now(),
-                is_primary: true,
-            }],
+                Some(ProviderRef::new("hsm-tenant-a")),
+                Utc::now(),
+                true,
+            )],
             ..record_software.clone()
         };
 
@@ -800,16 +854,16 @@ pub(crate) mod tests {
             updated_at: Utc::now(),
             scheduled_deletion_at: None,
             description: String::new(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "handle-1".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: None,
-                created_at: Utc::now(),
-                is_primary: true,
-            }],
+                None,
+                Utc::now(),
+                true,
+            )],
         };
 
         let record_exportable = KeyRecord {
