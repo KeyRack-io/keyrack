@@ -4,6 +4,23 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **BREAKING (behaviour): the KMIP provider no longer discards additional
+  authenticated data.** `KmipProvider::encrypt` and `KmipProvider::decrypt`
+  accepted an `aad` argument and never transmitted it, so every caller that
+  supplied an encryption context against a KMIP-backed key believed in a
+  binding that did not exist. KMIP 2.1 does define the transport
+  (`Authenticated Encryption Additional Data`, tag `0x4200FE`, paired with
+  `Authenticated Encryption Tag`, `0x4200FF`), but this client implements
+  neither the AAD field nor the tag exchange that would authenticate it, so
+  the binding cannot be delivered or verified. Both operations now **fail
+  closed** on a non-empty `aad`; an empty `aad` asserts no binding and still
+  succeeds. `re_encrypt` and `generate_data_key` inherit the refusal through
+  the default trait implementations. A deployment that was passing an
+  encryption context to a KMIP-backed key was already not getting one and will
+  now see the operation rejected instead of silently unbound.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave
