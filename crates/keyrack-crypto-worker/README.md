@@ -1,4 +1,4 @@
-# Provisional crypto worker — milestone 2
+# Provisional crypto worker — custody creation consumer
 
 This unpublished crate implements a private isolated-process development harness.
 It is not an enabled A3 provider, a production daemon, or a shared IPC/authority
@@ -6,13 +6,49 @@ contract. No service depends on it. Start requires the explicit
 `--provisional-harness` flag and a base64 Ed25519 verification key supplied by a
 trusted launcher. The test authority holds the signing key outside the worker.
 
-The implementation reuses `keyrack-core` V1 `WrappingContext` and existing
-`ParentWrappedMaterial` accessors. It changes neither shared type. Its private
+The implementation consumes `keyrack_core::custody` from `a74f884` for native
+creation, and retains V1 `WrappingContext` and `ParentWrappedMaterial` accessors
+for the provisional encrypt/decrypt adapter. It changes none of these shared types. Its private
 fixture descriptor is only checked structurally; no worker lifecycle is inferred
 from it. There is no public library, persisted worker envelope, hierarchy database,
 production capability advertisement, or provider-object closure receipt.
 
-## Implemented behavior
+## Native creation admission
+
+Vault startup now configures only the client. It performs no metadata lookup or
+key generation before the worker creates its fresh incarnation and installs a
+trusted test-launcher reservation. The private `generate` command carries base64
+canonical `Evidence<AuthorityGrant>`; the configured verifier, exact issuer/key
+names, provider/domain scope, generation, principal, request, attempt, clock and
+ancestor bounds are checked before any provider access. The local software fixture
+also defers plaintext seeding until the first authorized use; it cannot issue a
+native-wrapped-only creation result.
+
+The reservation is supplied in `KEYRACK_WORKER_CREATION_PLAN` as JSON containing
+`operation`, `attempt`, `owner` (`instance` and `generation`), `envelope_ref`, and
+`principal`. It is trusted harness setup, **not an A2 journal reservation or proof
+of owner currentness**. The coordinator request stream cannot install or replace
+it. The [creation consumer proposal](CREATION_CONSUMER_PROPOSAL.md) specifies the
+proposed operation transcript and the remaining contract-owner decisions.
+
+A single reservation bounds state. Admission consumes both the shared worker
+sequence and the attempt before metadata access. The worker rechecks authority
+after metadata, after native generation, and after signing the observation.
+Timeouts, malformed replies, and post-call expiry leave the attempt consumed and
+the ciphertext unusable. Neither a newer sequence nor another request can replace
+that unresolved attempt within the incarnation. Restart rejects old-incarnation
+grants; **durable reconciliation and cross-restart duplicate prevention remain
+UNMET** and belong to storage integration.
+
+Success returns canonical `Evidence<CreationResult>`, the exact independently
+signed authority evidence, and a canonical `CustodyMaterialDescriptor`. The result
+binds request/attempt/executor, storage owner, and complete material digest, with
+`NativeWrappedOnlyGenerated`. It is neither provider-object closure nor verified
+A2 publication permission. The observer key is created inside the worker; its
+advertisement over the trusted test child channel is **not production key
+distribution or attestation**. No other receipt family is migrated in this slice.
+
+## Existing private crypto behavior
 
 - AES-256-GCM application encryption/decryption with complete V1 context as AAD,
   worker-generated nonces, and bounded plaintext/ciphertext input.
@@ -101,16 +137,19 @@ The parent-loss test creates and deletes a fresh random `worker-fixture-loss-*`
 parent; fixture teardown owns cleanup after a failed run.
 
 The Vault adapter is a development qualification probe. It calls native
-`datakey/wrapped` with an exact parent version and the entire V1 canonical byte
-string as the derived parent's `context`, then supplies the same bytes on
+`datakey/wrapped` with an exact parent version and the entire canonical `CustodyContext` frame (V1 plus explicit profile) as the derived parent's `context`, then supplies the same bytes on
 decrypt. It verifies parent settings, bounds responses and rejects unexpected
-generation plaintext. This uses Vault's native derivation; `context` is not the
+generation plaintext or malformed/wrong-version ciphertext. The exact profile is
+`UNQUALIFIED-vault-derived-worker-fixture-v1`; it enables no production capability.
+This uses Vault's native derivation; `context` is not the
 same parameter as `associated_data`. See the
 [native Vault API](https://developer.hashicorp.com/vault/api-docs/secret/transit#generate-data-key).
 
 Live tests require the actual fixture and fail if absent; they do not fall back
-to mocks. They verify every-byte context perturbation rejection, a valid
-coordinator token's decrypt denial, separate-process crypto, and parent loss.
+to mocks. They verify every-byte custody-frame perturbation rejection (the historical
+`every_v1_context_byte` test name is retained for the lane discovery guard), a valid
+coordinator token's decrypt denial, authorized native generation with canonical provenance followed by separate-process
+crypto, and parent loss.
 Warm use after out-of-band parent deletion is possible until the independently
 signed ancestor deadline; at the bound it fails, and a cold reopen fails against
 the deleted parent. That test does not claim immediate deletion detection.
@@ -140,13 +179,14 @@ from the actual coordinator identity before claiming credential isolation. This
 crate does not enforce or attest those deployment controls. Host-root remains
 trusted under the process profile.
 
-The boundary/profile proposal remains provisional. A2 owns the future shared
-custody-contract module; changes will be concrete diffs against that module once
-available, with the manager as tie-breaker. Concrete production
-profile encoding, shared IPC/authority/evidence codecs, and shared creation
-results are not implemented. Native wrapped-only fixture generation runs at
-trusted test setup, not through an authorized journaled creation API. Its local
-observation is not a qualified durable creation result.
+The shared canonical custody frame is adopted for native creation and Vault parent
+operations. **Vault derived-parent construction is UNQUALIFIED**, as required by
+`docs/CUSTODY_CONTRACT.md`; codec conformance and perturbation tests do not qualify
+that construction. A2 owns review of the proposed transcript/profile and eventual
+storage acceptance. Encrypt/decrypt test grants, application-data AAD, local lease
+cleanup and local fencing still use their explicitly provisional adapters; this
+is not a completed shared IPC/authority migration. Native creation does not publish
+anything into the hierarchy or bypass `VerifiedA2Closure` requirements.
 
 The current test engine supports one authority domain and AES-256 leaves. It has
 no durable revocation authority, all-holder completion, explicit export, ancestor
@@ -165,5 +205,7 @@ state are not proved erased. In particular, the pinned POLYVAL ARM PMULL backend
 does not implement zeroizing Drop. This prototype makes no full-memory erasure,
 host-root exclusion, hardware-custody, or child-HYOK claim.
 
-The branch base is `27e0f51`; it lacks PKCS#11 concurrency fix `f63b347` present on
+The original branch base is `27e0f51`; `a74f884` and its A2-owned prerequisites
+were merged without modifying their contract, storage, or workflow files. This
+ancestry still lacks PKCS#11 concurrency fix `f63b347` present on
 public main `e54c14d`. This slice does not exercise concurrent PKCS#11 login.
