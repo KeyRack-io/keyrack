@@ -421,16 +421,16 @@ fn full_key_lifecycle_with_tags() {
         updated_at: chrono::Utc::now(),
         scheduled_deletion_at: None,
         description: "E2E test key".into(),
-        key_versions: vec![KeyVersionRecord {
-            version_number: 1,
-            key_handle: keyrack_core::provider::KeyHandle {
+        key_versions: vec![KeyVersionRecord::provider_resident(
+            1,
+            keyrack_core::provider::KeyHandle {
                 key_id: "test".into(),
                 key_spec: KeySpec::Aes256,
             },
-            provider_ref: None,
-            created_at: chrono::Utc::now(),
-            is_primary: true,
-        }],
+            None,
+            chrono::Utc::now(),
+            true,
+        )],
     };
 
     // creating → enabled
@@ -940,15 +940,15 @@ fn make_test_record(state: KeyState) -> KeyRecord {
         updated_at: chrono::Utc::now(),
         scheduled_deletion_at: None,
         description: String::new(),
-        key_versions: vec![KeyVersionRecord {
-            version_number: 1,
-            key_handle: keyrack_core::provider::KeyHandle {
+        key_versions: vec![KeyVersionRecord::provider_resident(
+            1,
+            keyrack_core::provider::KeyHandle {
                 key_id: "test".into(),
                 key_spec: KeySpec::Aes256,
             },
-            provider_ref: None,
-            created_at: chrono::Utc::now(),
-            is_primary: true,
-        }],
+            None,
+            chrono::Utc::now(),
+            true,
+        )],
     }
 }

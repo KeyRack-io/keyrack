@@ -398,16 +398,16 @@ proptest! {
             updated_at: chrono::Utc::now(),
             scheduled_deletion_at: None,
             description: String::new(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "opaque-handle-id".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: None,
-                created_at: chrono::Utc::now(),
-                is_primary: true,
-            }],
+                None,
+                chrono::Utc::now(),
+                true,
+            )],
         };
 
         let json_bytes = serde_json::to_vec(&record).unwrap();

@@ -277,13 +277,13 @@ impl LazyProvisioner {
             updated_at: now,
             scheduled_deletion_at: None,
             description: "auto-provisioned by lazy resolver".into(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
                 key_handle,
-                provider_ref: Some(provider_name.clone()),
-                created_at: now,
-                is_primary: true,
-            }],
+                Some(provider_name.clone()),
+                now,
+                true,
+            )],
         };
 
         match self.storage.create_key(&record).await {

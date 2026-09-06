@@ -131,7 +131,21 @@ pub async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::
 /// already have been destroyed by then, `CryptoProvider::destroy_key` must be
 /// idempotent for a handle whose material is already gone.
 async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> bool {
+    // Preflight the entire history before deleting even a resident sibling.
+    // Wrapped envelope cleanup is a different lifecycle, not destroy_key.
     for version in &record.key_versions {
+        if let Err(e) = version.resident_handle() {
+            let reason = e.to_string();
+            tracing::error!(lid = %record.lid, error = %reason,
+                "unsupported material lifecycle; key NOT destroyed");
+            emit_destroy_event(state, record, version.version_number, Err(&reason)).await;
+            return false;
+        }
+    }
+    for version in &record.key_versions {
+        let Ok(handle) = version.resident_handle() else {
+            return false;
+        };
         let entry = match state
             .providers
             .resolve_for_version(record, version.version_number)
@@ -150,7 +164,7 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
             }
         };
 
-        match entry.provider.destroy_key(&version.key_handle).await {
+        match entry.provider.destroy_key(handle).await {
             Ok(()) => {
                 emit_destroy_event(state, record, version.version_number, Ok(())).await;
             }

@@ -530,5 +530,79 @@ mod tests {
         store.ping().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn mixed_material_survives_database_reopen_and_stale_update() {
+        use keyrack_core::key::{KeyMaterial, KeyState};
+        use keyrack_test_support::fixtures::mixed_material_key_record;
+
+        let record = mixed_material_key_record(KeyState::Enabled);
+        let path = std::env::temp_dir().join(format!("keyrack-material-{}.sqlite", record.lid));
+        // Reserve only our unique fixture path; never overwrite an existing DB.
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+
+        let store = SqliteStorage::open(&path).unwrap();
+        store.create_key(&record).await.unwrap();
+        let json = store
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT record_json FROM keys WHERE lid = ?1",
+                        [record.lid.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| map_sql(&error))
+            })
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(wire["key_versions"][0].get("key_handle").is_some());
+        assert!(wire["key_versions"][1].get("key_handle").is_none());
+        let parent = record.parent_lid.unwrap();
+        assert_eq!(
+            wire["key_versions"][1]["material"]["parent_lid"],
+            serde_json::to_value(parent.as_bytes()).unwrap()
+        );
+        drop(store);
+
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let fetched = reopened.get_key(&record.lid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&fetched).unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+        assert!(matches!(
+            fetched.key_versions[1].material,
+            KeyMaterial::ParentWrapped(_)
+        ));
+        assert!(fetched.key_versions[1].resident_handle().is_err());
+        let mut updated = fetched;
+        updated.occ_version += 1;
+        updated.description = "updated after reopening".into();
+        reopened.update_key(&updated).await.unwrap();
+        drop(reopened);
+
+        let reopened_again = SqliteStorage::open(&path).unwrap();
+        let mut stale = record.clone();
+        stale.occ_version += 1;
+        stale.key_versions.truncate(1);
+        stale.current_key_version = 1;
+        assert!(matches!(
+            reopened_again.update_key(&stale).await,
+            Err(KeyRackError::OptimisticConcurrencyConflict { .. })
+        ));
+        let actual = reopened_again.get_key(&record.lid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&updated).unwrap()
+        );
+        drop(reopened_again);
+        std::fs::remove_file(&path).unwrap();
+    }
+
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }
