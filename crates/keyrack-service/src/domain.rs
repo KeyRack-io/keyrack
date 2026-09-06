@@ -1065,17 +1065,37 @@ pub async fn report_key_compromise(
     Ok(record)
 }
 
+/// Outcome of [`rotate_key`].
 pub struct RotateKeyResult {
+    /// The key record carrying its new primary version.
     pub record: KeyRecord,
+    /// The version number just made primary.
     pub new_version: u64,
+    /// Descendant rotation jobs that were **actually persisted**.
     pub jobs_created: usize,
+    /// Descendants whose rotation job could not be persisted.
+    ///
+    /// Non-zero means those descendants will not be re-keyed by the rotation
+    /// worker; the rotation of this key itself still succeeded.
+    pub jobs_failed: usize,
 }
 
+/// Rotate `lid` to a new primary version and queue rotation jobs for its
+/// descendants.
+///
+/// This is the **single** implementation behind both the gRPC and the REST
+/// `RotateKey` handlers. Before this existed the two surfaces disagreed: gRPC
+/// walked the hierarchy and created a `RotationJob` per descendant, REST created
+/// none, so a key rotated over REST left every dependent bound to the old
+/// version with nothing scheduled to re-key it.
+///
+/// See [`disable_key`] for why `lid` and `key_id` are both parameters.
 pub async fn rotate_key(
     state: &Arc<ServiceState>,
+    lid: &Lid,
     key_id: &str,
 ) -> Result<RotateKeyResult, DomainError> {
-    let lid = parse_lid(key_id)?;
+    let lid = *lid;
     let mut record = state
         .storage
         .get_key(&lid)
@@ -1126,7 +1146,8 @@ pub async fn rotate_key(
     let mut queue = vec![lid];
     let mut visited = HashSet::new();
     visited.insert(lid);
-    let mut total_jobs = 0usize;
+    let mut jobs_created = 0usize;
+    let mut jobs_failed = 0usize;
     while let Some(parent_lid) = queue.pop() {
         let children = state
             .storage
@@ -1143,6 +1164,9 @@ pub async fn rotate_key(
                 dep.lid,
                 new_version,
             );
+            // Count what was persisted, not what was attempted. Counting
+            // attempts told operators a job existed for a dependent that had
+            // none queued, which is the opposite of what the number is for.
             if let Err(e) = state.storage.create_rotation_job(&job).await {
                 tracing::warn!(
                     parent = %lid,
@@ -1150,17 +1174,30 @@ pub async fn rotate_key(
                     error = %e,
                     "failed to create rotation job for dependent"
                 );
+                jobs_failed += 1;
+            } else {
+                jobs_created += 1;
             }
-            total_jobs += 1;
             queue.push(dep.lid);
         }
     }
-    if total_jobs > 0 {
+    if jobs_created > 0 {
         tracing::info!(
             key = %key_id,
             new_version,
-            jobs_created = total_jobs,
+            jobs_created,
             "rotation jobs created for descendants (recursive)"
+        );
+    }
+    if jobs_failed > 0 {
+        // The key itself rotated and is persisted, so failing the call here
+        // would report a rotation that in fact happened. Say plainly instead
+        // that these dependents have nothing queued to re-key them.
+        tracing::error!(
+            key = %key_id,
+            new_version,
+            jobs_failed,
+            "dependents left without a rotation job; they will not be re-keyed"
         );
     }
 
@@ -1173,7 +1210,8 @@ pub async fn rotate_key(
     Ok(RotateKeyResult {
         record,
         new_version,
-        jobs_created: total_jobs,
+        jobs_created,
+        jobs_failed,
     })
 }
 

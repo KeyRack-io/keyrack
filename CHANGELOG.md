@@ -31,6 +31,19 @@ All notable changes to KeyRack will be documented in this file.
   events. A deployment that disabled keys over REST should expect descendants
   that were previously left enabled to be disabled from now on; existing keys
   are not retroactively re-evaluated.
+- **REST `RotateKey` now queues descendant rotation jobs, as gRPC already
+  did**, via the same single `domain::rotate_key`. A key rotated over REST
+  previously left every dependent bound to the superseded version with no
+  `RotationJob` scheduled to re-key it. REST's error body for rotating a
+  non-`Enabled` key keeps its `409` status but its `error` field changes from
+  `InvalidState` to `FailedPrecondition`, which is the shared mapper's spelling.
+- **Rotation now reports the number of descendant jobs it actually created.**
+  The recursive walk incremented its job counter even when
+  `create_rotation_job` failed, so the log line told operators a job was queued
+  for a dependent that had none. Failures are counted separately and logged at
+  `error` naming the dependents that will not be re-keyed. The rotation itself
+  still succeeds, because the new key version is already committed by that
+  point and failing the call would report a rotation that did happen.
 - **`KmipProviderConfig` no longer derives `Debug`.** It holds `password` in
   plain text, so any log line or error that formatted the config leaked the
   KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`

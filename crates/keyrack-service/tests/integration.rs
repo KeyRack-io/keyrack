@@ -7270,3 +7270,86 @@ async fn cross_surface_disable_cascade_handles_non_enabled_descendants_alike() {
         "a pending-deletion child must be left alone, not forced to Disabled"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// RotateKey descendant jobs — gRPC/REST parity
+//
+// gRPC's RotateKey walked the hierarchy and queued a RotationJob per
+// descendant so the rotation worker could re-key them. REST's created none, so
+// a key rotated over REST left every dependent bound to the superseded version
+// with nothing scheduled to fix that. Both surfaces now run the single
+// `domain::rotate_key`.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Rotation jobs recorded against `parent`, by dependent LID.
+async fn rotation_job_dependents(state: &ServiceState, parent: &str) -> Vec<String> {
+    let parent_lid: keyrack_core::lid::Lid = parent.parse().expect("parse lid");
+    let mut dependents: Vec<String> = state
+        .storage
+        .list_rotation_jobs(None)
+        .await
+        .expect("list rotation jobs")
+        .into_iter()
+        .filter(|j| j.parent_lid == parent_lid)
+        .map(|j| j.dependent_lid.to_string())
+        .collect();
+    dependents.sort();
+    dependents
+}
+
+#[tokio::test]
+async fn cross_surface_rotate_descendant_jobs_parity() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+
+    // ── gRPC path ──
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: grpc_root.clone(),
+    }))
+    .await
+    .expect("gRPC rotate_key");
+
+    // ── REST path ──
+    let app = keyrack_service::rest::router(state.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{rest_root}/actions-rotate"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "REST rotate must succeed, got {}",
+        resp.status()
+    );
+
+    let via_grpc = rotation_job_dependents(&state, &grpc_root).await;
+    let via_rest = rotation_job_dependents(&state, &rest_root).await;
+
+    let mut expected_grpc = vec![grpc_child.clone(), grpc_grandchild.clone()];
+    expected_grpc.sort();
+    assert_eq!(
+        via_grpc, expected_grpc,
+        "gRPC rotate must queue a job for every descendant, recursively"
+    );
+
+    let mut expected_rest = vec![rest_child.clone(), rest_grandchild.clone()];
+    expected_rest.sort();
+    assert_eq!(
+        via_rest, expected_rest,
+        "REST rotate must queue the same descendant jobs as gRPC (it used to \
+         queue none)"
+    );
+    assert_eq!(
+        via_rest.len(),
+        via_grpc.len(),
+        "the two surfaces must queue the same number of descendant jobs"
+    );
+}

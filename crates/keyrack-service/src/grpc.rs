@@ -1571,98 +1571,14 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
-            let mut record = state
-                .storage
-                .get_key(&lid)
+            let outcome = crate::domain::rotate_key(&state, &lid, &key_id)
                 .await
-                .map_err(convert::error_to_status)?;
-            if record.state != keyrack_core::key::KeyState::Enabled {
-                return Err(Status::failed_precondition("key must be Enabled to rotate"));
-            }
-            let rot_entry = state
-                .providers
-                .resolve_for_primary(&record)
-                .map_err(convert::error_to_status)?;
-            let new_handle = rot_entry
-                .provider
-                .generate_key(&record.key_spec)
-                .await
-                .map_err(convert::error_to_status)?;
-            let new_version_provider_ref = record.provider_ref.clone();
-            let new_version = record.current_key_version + 1;
-            for v in &mut record.key_versions {
-                v.is_primary = false;
-            }
-            record
-                .key_versions
-                .push(keyrack_core::key::KeyVersionRecord {
-                    version_number: new_version,
-                    key_handle: new_handle,
-                    provider_ref: new_version_provider_ref,
-                    created_at: chrono::Utc::now(),
-                    is_primary: true,
-                });
-            record.current_key_version = new_version;
-            record.occ_version += 1;
-            record.updated_at = chrono::Utc::now();
-            state
-                .storage
-                .update_key(&record)
-                .await
-                .map_err(convert::error_to_status)?;
-
-            // Create rotation jobs for all descendant keys recursively (§5.6)
-            let mut queue = vec![lid];
-            let mut visited = std::collections::HashSet::new();
-            visited.insert(lid);
-            let mut total_jobs = 0usize;
-            while let Some(parent_lid) = queue.pop() {
-                let children = state
-                    .storage
-                    .list_children(&parent_lid)
-                    .await
-                    .map_err(convert::error_to_status)?;
-                for dep in &children {
-                    if !visited.insert(dep.lid) {
-                        continue;
-                    }
-                    let job = keyrack_core::rotation::RotationJob::new(
-                        uuid::Uuid::new_v4().to_string(),
-                        lid,
-                        dep.lid,
-                        new_version,
-                    );
-                    if let Err(e) = state.storage.create_rotation_job(&job).await {
-                        tracing::warn!(
-                            parent = %lid,
-                            dependent = %dep.lid,
-                            error = %e,
-                            "failed to create rotation job for dependent"
-                        );
-                    }
-                    total_jobs += 1;
-                    queue.push(dep.lid);
-                }
-            }
-            if total_jobs > 0 {
-                tracing::info!(
-                    key = %key_id,
-                    new_version,
-                    jobs_created = total_jobs,
-                    "rotation jobs created for descendants (recursive)"
-                );
-            }
-
-            if let Some(nats) = &state.nats_publisher {
-                if let Err(e) = nats.publish_rotation_started(&lid, new_version).await {
-                    tracing::warn!(lid = %lid, error = %e, "NATS rotation-started publish failed");
-                }
-            }
+                .map_err(|e| e.to_grpc_status())?;
 
             #[allow(clippy::cast_possible_truncation)]
             Ok(Response::new(proto::RotateKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
-                new_version: new_version as u32,
+                metadata: Some(convert::key_record_to_metadata(&outcome.record)),
+                new_version: outcome.new_version as u32,
             }))
         })
         .await

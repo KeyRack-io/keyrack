@@ -704,46 +704,10 @@ async fn rotate_key(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        if record.state != keyrack_core::key::KeyState::Enabled {
-            return Err(ops::rest_error(
-                StatusCode::CONFLICT,
-                "InvalidState",
-                "key must be Enabled to rotate",
-            ));
-        }
-        let rot_entry = state
-            .providers
-            .resolve_for_primary(&record)
-            .map_err(map_core_err)?;
-        let handle = rot_entry
-            .provider
-            .generate_key(&record.key_spec)
+        let outcome = crate::domain::rotate_key(&state, &lid, &key_id)
             .await
-            .map_err(map_core_err)?;
-        let new_version_provider_ref = record.provider_ref.clone();
-        let new_version = record.current_key_version + 1;
-        for v in &mut record.key_versions {
-            v.is_primary = false;
-        }
-        record
-            .key_versions
-            .push(keyrack_core::key::KeyVersionRecord {
-                version_number: new_version,
-                key_handle: handle,
-                provider_ref: new_version_provider_ref,
-                created_at: chrono::Utc::now(),
-                is_primary: true,
-            });
-        record.current_key_version = new_version;
-        record.occ_version += 1;
-        record.updated_at = chrono::Utc::now();
-        state
-            .storage
-            .update_key(&record)
-            .await
-            .map_err(map_core_err)?;
-        Ok(key_json(&record))
+            .map_err(|e| e.to_rest_error())?;
+        Ok(key_json(&outcome.record))
     })
     .await
 }
