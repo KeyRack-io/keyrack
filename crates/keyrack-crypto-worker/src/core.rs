@@ -23,6 +23,8 @@ pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum Error {
+    #[error("worker credential file must be a private regular file owned by worker uid")]
+    Credential,
     #[error("invalid authority")]
     Authority,
     #[error("expired authority")]

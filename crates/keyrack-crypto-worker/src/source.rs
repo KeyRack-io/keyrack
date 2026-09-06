@@ -113,11 +113,10 @@ impl VaultFixture {
     /// launcher, never the coordinator request stream. Redirects are disabled.
     pub(crate) fn new(
         address: &str,
-        token: String,
+        token: Zeroizing<String>,
         parent: String,
         context: &WrappingContext,
     ) -> Result<Self, Error> {
-        let token = Zeroizing::new(token);
         if !parent
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')

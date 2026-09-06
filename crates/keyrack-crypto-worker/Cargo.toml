@@ -29,5 +29,11 @@ rand = "0.8"
 sha2 = "0.10"
 reqwest = { workspace = true, features = ["blocking"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

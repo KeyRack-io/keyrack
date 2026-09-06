@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Private line-based development harness. Not a cross-track IPC contract.
 mod core;
+mod credential;
 mod fixture;
 mod source;
 
@@ -62,9 +63,14 @@ fn run() -> Result<(), Error> {
     )
     .map_err(|_| Error::Context)?;
     core::match_descriptor(&descriptor, &context)?;
-    let source = if let Ok(token_file) = std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE") {
+    let token_file = match std::env::var("KEYRACK_WORKER_VAULT_TOKEN_FILE") {
+        Ok(path) => Some(path),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(Error::Credential),
+    };
+    let source = if let Some(token_file) = token_file {
         // The trusted launcher supplies the credential separately from stdin.
-        let token = std::fs::read_to_string(token_file).map_err(|_| Error::Material)?;
+        let token = credential::load(std::path::Path::new(&token_file))?;
         let vault = VaultFixture::new(
             &std::env::var("VAULT_ADDR").map_err(|_| Error::Context)?,
             token,
