@@ -103,8 +103,10 @@ impl A2ClosureVerifier for TestClosureVerifier {
 pub fn closure(request: &CreationRequest) -> VerifiedA2Closure {
     VerifiedA2Closure::verify(
         request,
+        TEST_ENVELOPE,
         A2ClosureClaim {
             intent_fingerprint: request.fingerprint().unwrap(),
+            envelope_digest: *blake3::hash(TEST_ENVELOPE).as_bytes(),
             fact: A2ClosureFact::SessionClosed {
                 session: request.correlation.clone(),
             },
@@ -116,6 +118,10 @@ pub fn closure(request: &CreationRequest) -> VerifiedA2Closure {
 
 pub async fn staged(store: &dyn StorageBackend, request: &CreationRequest) {
     store.reserve_creation(request).await.unwrap();
+    store
+        .claim_creation_dispatch(request.operation, request.owner)
+        .await
+        .unwrap();
     store
         .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
         .await
@@ -150,6 +156,14 @@ pub async fn publication_and_retry(store: &dyn StorageBackend) {
         .is_err());
     let again = store.reserve_creation(&request).await.unwrap();
     assert_eq!(again.revision, 1);
+    assert!(store
+        .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
+        .await
+        .is_err());
+    store
+        .claim_creation_dispatch(request.operation, request.owner)
+        .await
+        .unwrap();
     store
         .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
         .await
@@ -209,6 +223,10 @@ pub async fn conflicts_and_fencing(store: &dyn StorageBackend) {
     let (parent, request) = fixture();
     store.create_key(&parent).await.unwrap();
     store.reserve_creation(&request).await.unwrap();
+    store
+        .claim_creation_dispatch(request.operation, request.owner)
+        .await
+        .unwrap();
     let mut conflict = request.clone();
     conflict.attempt = Uuid::new_v4();
     conflict.correlation = creation_correlation(conflict.operation, conflict.attempt);
@@ -500,18 +518,65 @@ mod tests {
         let (_, request) = fixture();
         let claim = A2ClosureClaim {
             intent_fingerprint: request.fingerprint().unwrap(),
+            envelope_digest: *blake3::hash(TEST_ENVELOPE).as_bytes(),
             fact: A2ClosureFact::SessionClosed {
                 session: request.correlation.clone(),
             },
         };
-        assert!(VerifiedA2Closure::verify(&request, claim.clone(), &DenyVerifier).is_err());
+        assert!(
+            VerifiedA2Closure::verify(&request, TEST_ENVELOPE, claim.clone(), &DenyVerifier)
+                .is_err()
+        );
+        assert!(VerifiedA2Closure::verify(
+            &request,
+            b"wrong envelope",
+            claim.clone(),
+            &TestClosureVerifier
+        )
+        .is_err());
         let mut wrong = claim.clone();
         wrong.fact = A2ClosureFact::SessionClosed {
             session: "different-session".into(),
         };
-        assert!(VerifiedA2Closure::verify(&request, wrong, &TestClosureVerifier).is_err());
+        assert!(
+            VerifiedA2Closure::verify(&request, TEST_ENVELOPE, wrong, &TestClosureVerifier)
+                .is_err()
+        );
         let (_, different) = fixture();
-        assert!(VerifiedA2Closure::verify(&different, claim, &TestClosureVerifier).is_err());
+        assert!(
+            VerifiedA2Closure::verify(&different, TEST_ENVELOPE, claim, &TestClosureVerifier)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn independently_verified_closure_for_other_bytes_cannot_resolve_staged_envelope() {
+        let (_, request) = fixture();
+        let mut journal = CreationJournal::reserved(request.clone()).unwrap();
+        journal.claim_dispatch(request.owner).unwrap();
+        journal.stage(request.owner, 1, TEST_ENVELOPE).unwrap();
+        let other_bytes = b"another envelope for the same intent";
+        let other_proof = VerifiedA2Closure::verify(
+            &request,
+            other_bytes,
+            A2ClosureClaim {
+                intent_fingerprint: request.fingerprint().unwrap(),
+                envelope_digest: *blake3::hash(other_bytes).as_bytes(),
+                fact: A2ClosureFact::SessionClosed {
+                    session: request.correlation.clone(),
+                },
+            },
+            &TestClosureVerifier,
+        )
+        .unwrap();
+        let before = journal.clone();
+        assert!(journal.resolve(request.owner, 2, &other_proof).is_err());
+        assert!(same_json(&before, &journal).unwrap());
+        journal
+            .resolve(request.owner, 2, &closure(&request))
+            .unwrap();
+        journal.closure.as_mut().unwrap().envelope_digest[0] ^= 1;
+        assert!(journal.validate().is_err());
     }
 
     #[test]
@@ -551,7 +616,7 @@ mod tests {
         }
 
         #[test]
-        fn rejected_journal_transitions_are_atomic(steps in prop::collection::vec(0_u8..6, 0..80)) {
+        fn rejected_journal_transitions_are_atomic(steps in prop::collection::vec(0_u8..7, 0..80)) {
             let (parent, request) = fixture();
             let proof = closure(&request);
             let mut journal = CreationJournal::reserved(request.clone()).unwrap();
@@ -563,6 +628,7 @@ mod tests {
                     2 => journal.resolve(request.owner, 2, &proof),
                     3 => journal.publication(request.owner, 3, None, &parent).map(|_| ()),
                     4 => journal.stage(CreationOwner { instance: Uuid::nil(), generation: 1 }, journal.revision, TEST_ENVELOPE),
+                    5 => journal.claim_dispatch(request.owner).map(|_| ()),
                     _ => journal.resolve(request.owner, 999, &proof),
                 };
                 if result.is_err() { prop_assert!(same_json(&before, &journal).unwrap()); }

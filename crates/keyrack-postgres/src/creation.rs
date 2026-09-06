@@ -11,8 +11,8 @@
 
 use keyrack_core::creation::{
     guard_referenced_parent, invalid, same_json, validate_envelope, validate_page_size,
-    CreationJournal, CreationOwner, CreationPage, CreationPhase, CreationRequest,
-    VerifiedA2Closure,
+    CreationDispatch, CreationJournal, CreationOwner, CreationPage, CreationPhase, CreationRequest,
+    CreationSnapshot, VerifiedA2Closure,
 };
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeyRecord;
@@ -256,6 +256,62 @@ impl PostgresStorage {
     pub(super) async fn creation_get(&self, operation: Uuid) -> Result<CreationJournal> {
         let mut connection = self.pool.acquire().await.map_err(database_error)?;
         Ok(require_creation(&mut connection, operation).await?.journal)
+    }
+
+    pub(super) async fn creation_claim_dispatch(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationDispatch> {
+        let mut transaction = write_transaction(&self.pool).await?;
+        let mut stored = require_creation(&mut transaction, operation).await?;
+        let started = stored.journal.claim_dispatch(owner)?;
+        if started {
+            let current = load_key(&mut transaction, &stored.journal.request.record.lid).await?;
+            let parent = load_key(
+                &mut transaction,
+                &stored.journal.request.material()?.parent().lid,
+            )
+            .await?
+            .ok_or(invalid("parent key not found"))?;
+            stored
+                .journal
+                .request
+                .validate_records(current.as_ref(), &parent)?;
+            stored.journal.validate()?;
+            let json = serde_json::to_value(&stored.journal)
+                .map_err(|_| invalid("journal serialization failed"))?;
+            let changed = sqlx::query(
+                "UPDATE kr_creation_journal SET journal_json = $1 WHERE operation_id = $2",
+            )
+            .bind(json)
+            .bind(operation.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if changed.rows_affected() != 1 {
+                return Err(invalid("creation disappeared during dispatch claim"));
+            }
+        }
+        // Only a successfully committed first claim can authorize dispatch.
+        // Once committed, a lost response remains consumed: retries are Existing.
+        transaction.commit().await.map_err(database_error)?;
+        Ok(if started {
+            CreationDispatch::Started(stored.journal)
+        } else {
+            CreationDispatch::Existing(stored.journal)
+        })
+    }
+
+    pub(super) async fn creation_read_snapshot(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationSnapshot> {
+        let mut connection = self.pool.acquire().await.map_err(database_error)?;
+        // require_creation reads and validates the entire row in one SQL read.
+        let stored = require_creation(&mut connection, operation).await?;
+        CreationSnapshot::new(stored.journal, stored.envelope, owner)
     }
 
     pub(super) async fn creation_stage(

@@ -15,12 +15,20 @@ canonical V1 context bytes, or external authority protocol is changed.
   child version, parent snapshot, envelope reference and recovery correlation
   before provider effects. Identical retries return recorded progress; conflicting
   intents, child versions and envelope references fail.
+- Claim dispatch once, durably, before Generate. Only the transaction that
+  first commits `dispatch_started = true` returns `CreationDispatch::Started`.
+  Identical retries return `Existing`, including after a lost commit response.
+  This marker does not advance the four publication revisions. Claiming also
+  rechecks the child and exact parent snapshot; it is not provider authorization.
 - Stage an immutable envelope of 1–65,536 bytes. The complete proposed record
   stays in the journal, outside normal key reads. Neither staging nor resolution
-  exposes the envelope through the committed-envelope read method.
+  exposes the envelope through the committed-envelope read method. Staging
+  requires the dispatch marker. The internal owner-fenced `creation_snapshot`
+  returns journal and exact staged bytes from a single validated row read.
 - Resolve a creation object only using `VerifiedA2Closure`, obtained through a
   trusted `A2ClosureVerifier`. The evidence binds the complete intent, including
-  operation, attempt, owner and exact material/context. There is no production
+  operation, attempt, owner, exact material/context, and BLAKE3 digest of the
+  staged envelope. There is no production
   verifier or provider ceremony in this slice. Tests explicitly use a test-only
   verifier and non-cryptographic fixture bytes.
 - Publish the key/version, committed dependency state and terminal journal/result
@@ -62,7 +70,8 @@ dependency retirement are later operations, not an implicit cascade here.
   are not implemented. A restarted database connection can resume the same
   recorded attempt; a new owner cannot simply claim it.
 - A creation-object closure is not a working-lease closure or an authority-fencing
-  receipt. Only the first has a type in this slice. The verifier is a trusted
+  receipt. Only the first is accepted by this storage protocol; the separately
+  defined shared custody results are not implicitly converted into it. The verifier is a trusted
   integration extension point, not a defense against arbitrary code execution in
   that integration or a proof against a malicious coordinator.
 - All writers must use the new transaction protocol once journaled creation is
@@ -76,14 +85,25 @@ dependency retirement are later operations, not an implicit cascade here.
 
 ## Deliberately not activated
 
-The schema is additive and legacy record codecs remain compatible. Existing
+The SQL schema is additive and legacy **key-record** codecs remain compatible.
+The experimental creation-journal codec is deliberately stricter: old journals
+without `dispatch_started`, and old closure claims without `envelope_digest`,
+are rejected. There is no automatic backfill or migration asserting that an old
+Reserved attempt had no provider effects. Existing experimental journals require
+explicit inventory and qualified reconciliation before upgrade/use; do not
+delete unresolved rows or silently default their marker to false. Normal key
+records with no creation journal are unaffected. All writers must be quiesced
+for any such reconciliation; mixed-version creation is unsupported.
+
+Existing
 material-only `ParentWrapped` descriptors are not retroactively qualified or given
 committed creation records. Storage backends/wrappers without transaction support
 fail closed through default methods; in particular the service caching wrapper is
 not wired to these methods yet. No REST/gRPC creation/rotation path invokes them.
 
 Remaining activation work includes a qualified provider adapter and creation
-verifier, provider-side preflight/cleanup recovery, complete per-version lifecycle,
+verifier implementing the [unregistered lifecycle driver](A2_CREATION_LIFECYCLE.md),
+provider-side preflight/cleanup recovery, complete per-version lifecycle,
 recursive dependency resolution, owned operation leases, authority validation,
 cache integration, service orchestration and destructive-operation coordination.
 Ordinary service/provider side effects are not made atomic by these database
@@ -103,6 +123,10 @@ and child-OCC preemption, rotation history, and bounded recovery. Backend-specif
 tests cover reconnects at each durable phase, competing database connections,
 and an injected SQL failure after the key write but before journal publication.
 SQLite additionally tests half-staging rollback and corrupted persisted bindings.
+Dispatch tests cover competing connections, owner fencing, parent preemption,
+rollback of the marker write, and owner-bound exact snapshots; SQLite also rejects
+pre-marker journal JSON. The driver's SQLite fault tests exercise uncertain
+responses, caller cancellation and repeated cleanup without another Generate.
 Property tests exercise context perturbations and atomic rejection of arbitrary
 journal transition sequences. These do not simulate an actual HSM process crash
 or establish provider custody. The four real-Vault export tests have their own

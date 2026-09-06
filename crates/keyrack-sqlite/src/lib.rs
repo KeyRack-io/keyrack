@@ -162,6 +162,20 @@ impl StorageBackend for SqliteStorage {
     async fn read_creation_envelope(&self, operation: uuid::Uuid) -> Result<Vec<u8>> {
         self.read_a2_envelope(operation)
     }
+    async fn claim_creation_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationDispatch> {
+        self.claim_a2_dispatch(operation, owner)
+    }
+    async fn creation_snapshot(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationSnapshot> {
+        self.snapshot_a2(operation, owner)
+    }
     async fn recoverable_creations(
         &self,
         after: Option<uuid::Uuid>,
