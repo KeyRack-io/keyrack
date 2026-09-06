@@ -68,6 +68,16 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y softhsm2 libsofthsm2 protobuf-compiler libprotobuf-dev
       - run: bash scripts/test-pkcs11-wrapping.sh
 
+  vault-provider:
+    name: Vault provider export tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/test-vault-provider.sh
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest
