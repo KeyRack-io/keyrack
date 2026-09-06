@@ -29,6 +29,13 @@ and cleanup failures fail the lane. Ordinary `cargo test --workspace` still leav
 these live tests ignored. Existing demo-01 PR canary and release coverage remain
 unchanged; this lane adds provider export-policy coverage, not the first Vault E2E.
 
+As of the 2026-09-07 owner review, this job and **SoftHSM wrapping mechanism probe**
+run but do not gate merges: neither is a required branch-protection context on
+`main`. The owner plans to add both after integration. Workflow presence alone
+does not make a job a merge gate; re-check the required-context list before
+reporting otherwise. The workflow triggers on pushes to `main` and PRs targeting
+`main`, not every feature-branch push.
+
 Additional integration assertions can share this fixture:
 
 ```bash

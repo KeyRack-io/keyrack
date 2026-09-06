@@ -31,6 +31,7 @@ pub mod authn;
 pub mod canon;
 pub mod cascade;
 pub mod creation;
+pub mod custody;
 pub mod encryption_context;
 pub mod error;
 pub mod header;
