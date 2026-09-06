@@ -2822,6 +2822,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2883,6 +2884,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2892,6 +2894,7 @@ dependencies = [
  "chrono",
  "keyrack-core",
  "keyrack-service",
+ "proptest",
  "serde_json",
  "tokio",
  "tonic 0.12.3",

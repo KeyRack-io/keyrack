@@ -26,6 +26,8 @@
 
 #![forbid(unsafe_code)]
 
+mod creation;
+
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::hsm::HsmConnection;
@@ -72,6 +74,8 @@ impl SqliteStorage {
             Connection::open(path).map_err(|e| KeyRackError::Storage(format!("open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(creation::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -83,6 +87,8 @@ impl SqliteStorage {
             .map_err(|e| KeyRackError::Storage(format!("open in-memory: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(creation::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -115,13 +121,64 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for SqliteStorage {
+    async fn reserve_creation(
+        &self,
+        request: &keyrack_core::creation::CreationRequest,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.reserve_a2(request)
+    }
+    async fn get_creation(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.get_a2(operation)
+    }
+    async fn stage_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        envelope: &[u8],
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.stage_a2(operation, owner, revision, envelope)
+    }
+    async fn resolve_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        closure: &keyrack_core::creation::VerifiedA2Closure,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.resolve_a2(operation, owner, revision, closure)
+    }
+    async fn publish_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+    ) -> Result<KeyRecord> {
+        self.publish_a2(operation, owner, revision)
+    }
+    async fn read_creation_envelope(&self, operation: uuid::Uuid) -> Result<Vec<u8>> {
+        self.read_a2_envelope(operation)
+    }
+    async fn recoverable_creations(
+        &self,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Result<keyrack_core::creation::CreationPage> {
+        self.recover_a2(after, limit)
+    }
+
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         let lid_str = record.lid.to_string();
         let json = serde_json::to_string(record)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let occ = record.occ_version as i64;
+        let occ = i64::try_from(record.occ_version)
+            .map_err(|_| keyrack_core::creation::invalid("key OCC out of range"))?;
 
-        self.with_conn(|conn| {
+        self.creation_tx(|conn| {
+            creation::guard_create(conn, &record.lid)?;
             conn.execute(
                 "INSERT INTO keys (lid, record_json, occ_version) VALUES (?1, ?2, ?3)",
                 rusqlite::params![lid_str, json, occ],
@@ -165,10 +222,18 @@ impl StorageBackend for SqliteStorage {
         let lid_str = record.lid.to_string();
         let json = serde_json::to_string(record)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let new_occ = record.occ_version as i64;
-        let expected_occ = (record.occ_version - 1) as i64;
+        let new_occ = i64::try_from(record.occ_version)
+            .map_err(|_| keyrack_core::creation::invalid("key OCC out of range"))?;
+        let expected_occ = new_occ - 1;
 
-        self.with_conn(|conn| {
+        self.creation_tx(|conn| {
+            let previous = creation::key(conn, &record.lid)?.ok_or(KeyRackError::KeyNotFound(record.lid))?;
+            if previous.occ_version != record.occ_version - 1 {
+                return Err(KeyRackError::OptimisticConcurrencyConflict {
+                    lid: record.lid, expected: record.occ_version - 1, actual: previous.occ_version,
+                });
+            }
+            creation::guard_update(conn, &previous, record)?;
             let rows = conn
                 .execute(
                     "UPDATE keys SET record_json = ?1, occ_version = ?2 WHERE lid = ?3 AND occ_version = ?4",
@@ -605,4 +670,5 @@ mod tests {
     }
 
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
+    keyrack_test_support::creation_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }

@@ -32,5 +32,6 @@
 #![forbid(unsafe_code)]
 
 pub mod conformance;
+pub mod creation_conformance;
 pub mod fixtures;
 pub mod service_conformance;
