@@ -2901,6 +2901,7 @@ name = "keyrack-sqlite"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "keyrack-core",
  "keyrack-test-support",
@@ -2916,6 +2917,7 @@ dependencies = [
 name = "keyrack-test-support"
 version = "0.4.0"
 dependencies = [
+ "blake3",
  "chrono",
  "keyrack-core",
  "keyrack-service",

@@ -7,8 +7,8 @@
 use super::{map_sql, SqliteStorage};
 use keyrack_core::creation::{
     guard_referenced_parent, invalid, same_json, validate_envelope, validate_page_size,
-    CreationJournal, CreationOwner, CreationPage, CreationPhase, CreationRequest,
-    VerifiedA2Closure,
+    CreationDispatch, CreationJournal, CreationOwner, CreationPage, CreationPhase, CreationRequest,
+    CreationSnapshot, VerifiedA2Closure,
 };
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeyRecord;
@@ -56,10 +56,16 @@ pub(super) fn key(conn: &Connection, lid: &Lid) -> Result<Option<KeyRecord>> {
 }
 
 fn journal(conn: &Connection, operation: Uuid) -> Result<Option<CreationJournal>> {
-    let row = conn.query_row("SELECT operation_id,child_lid,child_version,parent_lid,parent_version,envelope_ref,phase,journal_json,envelope
+    stored_journal(conn, operation)?
+        .as_ref()
+        .map(decode)
+        .transpose()
+}
+
+fn stored_journal(conn: &Connection, operation: Uuid) -> Result<Option<StoredJournal>> {
+    conn.query_row("SELECT operation_id,child_lid,child_version,parent_lid,parent_version,envelope_ref,phase,journal_json,envelope
         FROM creation_journal WHERE operation_id=?1", [operation.to_string()], stored_row)
-        .optional().map_err(|e| map_sql(&e))?;
-    row.as_ref().map(decode).transpose()
+        .optional().map_err(|e| map_sql(&e))
 }
 
 struct StoredJournal {
@@ -228,6 +234,40 @@ impl SqliteStorage {
         self.with_conn(|conn| required_journal(conn, operation))
     }
 
+    pub(super) fn claim_a2_dispatch(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationDispatch> {
+        self.creation_tx(|conn| {
+            let mut value = required_journal(conn, operation)?;
+            if !value.claim_dispatch(owner)? {
+                return Ok(CreationDispatch::Existing(value));
+            }
+            let current = key(conn, &value.request.record.lid)?;
+            let parent_lid = value.request.material()?.parent().lid;
+            let parent = key(conn, &parent_lid)?.ok_or(KeyRackError::KeyNotFound(parent_lid))?;
+            value.request.validate_records(current.as_ref(), &parent)?;
+            save(conn, &value)?;
+            // creation_tx commits before returning this one-shot permission.
+            // A lost response remains consumed; a retry is only Existing.
+            Ok(CreationDispatch::Started(value))
+        })
+    }
+
+    pub(super) fn snapshot_a2(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationSnapshot> {
+        self.with_conn(|conn| {
+            // Read the journal and envelope from one row in one SQL snapshot.
+            let row = stored_journal(conn, operation)?.ok_or(invalid("creation not found"))?;
+            let value = decode(&row)?;
+            CreationSnapshot::new(value, row.envelope, owner)
+        })
+    }
+
     pub(super) fn stage_a2(
         &self,
         operation: Uuid,
@@ -373,6 +413,22 @@ mod tests {
             CreationPhase::Reserved
         );
         assert!(store.get_key(&request.record.lid).await.is_err());
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Started(_)
+        ));
+        drop(store);
+        let store = SqliteStorage::open(&path).unwrap();
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Existing(_)
+        ));
         store
             .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
             .await
@@ -459,6 +515,13 @@ mod tests {
         let (parent, request) = fixture();
         store.create_key(&parent).await.unwrap();
         store.reserve_creation(&request).await.unwrap();
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Started(_)
+        ));
         store
             .with_conn(|conn| {
                 conn.execute_batch(
@@ -509,12 +572,20 @@ mod tests {
             .unwrap();
         assert!(store.get_creation(request.operation).await.is_err());
         assert!(store
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .is_err());
+        assert!(store
             .publish_creation(request.operation, request.owner, 3)
             .await
             .is_err());
         store.with_conn(|conn| conn.execute("UPDATE creation_journal SET envelope=?1,parent_version='9000' WHERE operation_id=?2",
             params![TEST_ENVELOPE, request.operation.to_string()]).map(|_| ()).map_err(|e| map_sql(&e))).unwrap();
         assert!(store.get_creation(request.operation).await.is_err());
+        assert!(store
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .is_err());
         assert!(store
             .publish_creation(request.operation, request.owner, 3)
             .await
@@ -548,5 +619,180 @@ mod tests {
         let (one, two) = tokio::join!(one, two);
         assert_ne!(one.unwrap().is_ok(), two.unwrap().is_ok());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn competing_connections_issue_only_one_dispatch_and_snapshot_is_owner_fenced() {
+        let path = database_path();
+        let first = SqliteStorage::open(&path).unwrap();
+        let second = SqliteStorage::open(&path).unwrap();
+        let (parent, request) = fixture();
+        first.create_key(&parent).await.unwrap();
+        first.reserve_creation(&request).await.unwrap();
+        let initial = first
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .unwrap();
+        assert!(!initial.journal.dispatch_started);
+        assert!(initial.envelope.is_none());
+        let operation = request.operation;
+        let owner = request.owner;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let one = tokio::spawn(async move {
+            barrier.wait();
+            first.claim_creation_dispatch(operation, owner).await
+        });
+        let two = tokio::spawn(async move {
+            other_barrier.wait();
+            second.claim_creation_dispatch(operation, owner).await
+        });
+        let (one, two) = tokio::join!(one, two);
+        let results = [one.unwrap().unwrap(), two.unwrap().unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(value, CreationDispatch::Started(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(value, CreationDispatch::Existing(_)))
+                .count(),
+            1
+        );
+
+        let store = SqliteStorage::open(&path).unwrap();
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(operation, owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Existing(_)
+        ));
+        let mut wrong_owner = owner;
+        wrong_owner.generation += 1;
+        assert!(store
+            .claim_creation_dispatch(operation, wrong_owner)
+            .await
+            .is_err());
+        assert!(store
+            .creation_snapshot(operation, wrong_owner)
+            .await
+            .is_err());
+        store
+            .stage_creation(operation, owner, 1, TEST_ENVELOPE)
+            .await
+            .unwrap();
+        let snapshot = store.creation_snapshot(operation, owner).await.unwrap();
+        assert_eq!(snapshot.journal.phase, CreationPhase::Staged);
+        assert!(snapshot.journal.dispatch_started);
+        assert_eq!(snapshot.envelope.as_deref(), Some(TEST_ENVELOPE));
+        assert!(store.read_creation_envelope(operation).await.is_err());
+        assert!(store.get_key(&request.record.lid).await.is_err());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_dispatch_rechecks_parent_and_failed_claim_does_not_consume_marker() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let (mut parent, request) = fixture();
+        store.create_key(&parent).await.unwrap();
+        store.reserve_creation(&request).await.unwrap();
+        parent.state = keyrack_core::key::KeyState::Disabled;
+        parent.occ_version += 1;
+        store.update_key(&parent).await.unwrap();
+        assert!(store
+            .claim_creation_dispatch(request.operation, request.owner)
+            .await
+            .is_err());
+        assert!(
+            !store
+                .creation_snapshot(request.operation, request.owner)
+                .await
+                .unwrap()
+                .journal
+                .dispatch_started
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_failure_is_not_a_started_decision() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let (parent, request) = fixture();
+        store.create_key(&parent).await.unwrap();
+        store.reserve_creation(&request).await.unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_dispatch BEFORE UPDATE OF journal_json ON creation_journal \
+             BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END;",
+        ).map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        let result = store
+            .claim_creation_dispatch(request.operation, request.owner)
+            .await;
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_dispatch")
+                    .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected dispatch failure"));
+        assert!(
+            !store
+                .creation_snapshot(request.operation, request.owner)
+                .await
+                .unwrap()
+                .journal
+                .dispatch_started
+        );
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_dispatch_status_is_not_treated_as_fresh() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let (parent, request) = fixture();
+        store.create_key(&parent).await.unwrap();
+        let journal = store.reserve_creation(&request).await.unwrap();
+        let mut legacy = serde_json::to_value(journal).unwrap();
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("dispatch_started")
+            .is_some());
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE creation_journal SET journal_json=?1 WHERE operation_id=?2",
+                    params![legacy.to_string(), request.operation.to_string()],
+                )
+                .map(|_| ())
+                .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        assert!(store.get_creation(request.operation).await.is_err());
+        assert!(store
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .is_err());
+        assert!(store
+            .claim_creation_dispatch(request.operation, request.owner)
+            .await
+            .is_err());
     }
 }

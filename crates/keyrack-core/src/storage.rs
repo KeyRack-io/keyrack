@@ -90,6 +90,29 @@ pub trait StorageBackend: Send + Sync {
             "transactional creation unsupported",
         ))
     }
+    /// Atomically permit at most one provider dispatch. A lost response is
+    /// ambiguous, never permission to retry Generate. Publication revisions are
+    /// unchanged; the separately persisted decision is monotonic.
+    async fn claim_creation_dispatch(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+    ) -> Result<crate::creation::CreationDispatch> {
+        Err(crate::creation::invalid(
+            "transactional dispatch unsupported",
+        ))
+    }
+    /// Owner-fenced internal recovery, including immutable staged bytes. Not a
+    /// public envelope read or a substitute for current authority checks.
+    async fn creation_snapshot(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+    ) -> Result<crate::creation::CreationSnapshot> {
+        Err(crate::creation::invalid(
+            "transactional recovery snapshot unsupported",
+        ))
+    }
     async fn stage_creation(
         &self,
         _operation: uuid::Uuid,
