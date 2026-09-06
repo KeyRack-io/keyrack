@@ -260,6 +260,9 @@ pub enum A2ClosureFact {
 #[serde(deny_unknown_fields)]
 pub struct A2ClosureClaim {
     pub intent_fingerprint: [u8; 32],
+    /// Exact staged-byte binding, using the journal's BLAKE3 consistency digest.
+    /// This is not the custody contract's SHA-256 or an authenticity proof.
+    pub envelope_digest: [u8; 32],
     pub fact: A2ClosureFact,
 }
 
@@ -293,12 +296,19 @@ pub struct VerifiedA2Closure {
 }
 
 impl VerifiedA2Closure {
-    pub fn verify(
+    pub fn verify<V: A2ClosureVerifier + ?Sized>(
         request: &CreationRequest,
+        envelope: &[u8],
         claim: A2ClosureClaim,
-        verifier: &dyn A2ClosureVerifier,
+        verifier: &V,
     ) -> Result<Self> {
         claim.validate_for(request)?;
+        if envelope.is_empty()
+            || envelope.len() > MAX_CREATION_ENVELOPE_BYTES
+            || claim.envelope_digest != *blake3::hash(envelope).as_bytes()
+        {
+            return Err(invalid("closure envelope mismatch"));
+        }
         verifier.verify(request, &claim)?;
         Ok(Self { claim })
     }
@@ -308,6 +318,10 @@ impl VerifiedA2Closure {
 #[serde(deny_unknown_fields)]
 pub struct CreationJournal {
     pub request: CreationRequest,
+    /// Durable, one-shot provider-dispatch decision, independent of publication
+    /// revision. Required on decode: an old Reserved row cannot safely be assumed
+    /// to have had no provider effects. No automatic migration guesses that fact.
+    pub dispatch_started: bool,
     pub revision: u64,
     pub phase: CreationPhase,
     pub envelope_digest: Option<[u8; 32]>,
@@ -320,6 +334,7 @@ impl CreationJournal {
         request.validate()?;
         Ok(Self {
             request,
+            dispatch_started: false,
             revision: 1,
             phase: CreationPhase::Reserved,
             envelope_digest: None,
@@ -337,6 +352,7 @@ impl CreationJournal {
             CreationPhase::Committed => 4,
         };
         if self.revision != expected_revision
+            || (self.phase != CreationPhase::Reserved && !self.dispatch_started)
             || self.envelope_digest.is_some() != (self.phase != CreationPhase::Reserved)
             || self.closure.is_some()
                 != matches!(
@@ -349,6 +365,9 @@ impl CreationJournal {
         }
         if let Some(claim) = &self.closure {
             claim.validate_for(&self.request)?;
+            if Some(claim.envelope_digest) != self.envelope_digest {
+                return Err(invalid("closure does not bind staged envelope"));
+            }
         }
         if let Some(record) = &self.committed_record {
             if !same_json(record, &self.request.record)? {
@@ -366,6 +385,24 @@ impl CreationJournal {
         Ok(())
     }
 
+    /// Storage must execute this under its writer transaction and return `true`
+    /// only after committing the decision. An identical retry is NOT another
+    /// dispatch ticket, including after a lost commit response.
+    pub fn claim_dispatch(&mut self, owner: CreationOwner) -> Result<bool> {
+        self.validate()?;
+        if owner != self.request.owner {
+            return Err(invalid("stale creation owner"));
+        }
+        if self.dispatch_started {
+            return Ok(false);
+        }
+        if self.phase != CreationPhase::Reserved {
+            return Err(invalid("creation is not reserved"));
+        }
+        self.dispatch_started = true;
+        Ok(true)
+    }
+
     pub fn stage(
         &mut self,
         owner: CreationOwner,
@@ -373,6 +410,9 @@ impl CreationJournal {
         envelope: &[u8],
     ) -> Result<()> {
         self.validate()?;
+        if !self.dispatch_started {
+            return Err(invalid("provider dispatch was not claimed"));
+        }
         if envelope.is_empty() || envelope.len() > MAX_CREATION_ENVELOPE_BYTES {
             return Err(invalid("invalid envelope length"));
         }
@@ -400,7 +440,9 @@ impl CreationJournal {
         closure: &VerifiedA2Closure,
     ) -> Result<()> {
         self.validate()?;
-        if closure.claim.intent_fingerprint != self.request.fingerprint()? {
+        if closure.claim.intent_fingerprint != self.request.fingerprint()?
+            || Some(closure.claim.envelope_digest) != self.envelope_digest
+        {
             return Err(invalid("closure target mismatch"));
         }
         if self.request.owner == owner
@@ -456,6 +498,44 @@ impl CreationJournal {
             return Ok(self.committed_record.clone());
         }
         Ok(None)
+    }
+}
+
+/// A fresh claim is an execution decision, not authority or provider evidence.
+/// Losing its response strands the attempt for reconciliation; no retry can
+/// manufacture a second `Started`. Backends without this transaction deny.
+#[derive(Debug)]
+pub enum CreationDispatch {
+    Started(CreationJournal),
+    Existing(CreationJournal),
+}
+
+/// Internal recovery snapshot. Its owner check is storage fencing, not client
+/// authorization. This read must not be exposed as ordinary key/envelope access.
+#[derive(Debug, Clone)]
+pub struct CreationSnapshot {
+    pub journal: CreationJournal,
+    pub envelope: Option<Vec<u8>>,
+}
+
+impl CreationSnapshot {
+    pub fn new(
+        journal: CreationJournal,
+        envelope: Option<Vec<u8>>,
+        owner: CreationOwner,
+    ) -> Result<Self> {
+        journal.validate()?;
+        if journal.request.owner != owner {
+            return Err(invalid("stale creation owner"));
+        }
+        match (&envelope, journal.phase) {
+            (None, CreationPhase::Reserved) => {}
+            (Some(bytes), phase) if phase != CreationPhase::Reserved => {
+                validate_envelope(&journal, bytes)?;
+            }
+            _ => return Err(invalid("snapshot envelope phase mismatch")),
+        }
+        Ok(Self { journal, envelope })
     }
 }
 

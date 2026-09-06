@@ -41,7 +41,9 @@ keyrack_test_support::creation_conformance_tests!(make_store().await);
 
 mod creation_postgres {
     use super::PostgresStorage;
-    use keyrack_core::creation::{creation_correlation, same_json, CreationPhase};
+    use keyrack_core::creation::{
+        creation_correlation, same_json, CreationDispatch, CreationPhase,
+    };
     use keyrack_core::error::KeyRackError;
     use keyrack_core::key::{KeyMaterial, ParentWrappedMaterial};
     use keyrack_core::storage::StorageBackend;
@@ -215,6 +217,13 @@ mod creation_postgres {
             }
             match phase {
                 CreationPhase::Reserved => {
+                    assert!(matches!(
+                        store
+                            .claim_creation_dispatch(request.operation, request.owner)
+                            .await
+                            .unwrap(),
+                        CreationDispatch::Started(_)
+                    ));
                     store
                         .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
                         .await
@@ -253,6 +262,81 @@ mod creation_postgres {
                 }
             }
         }
+        drop(store);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn independent_pools_issue_one_dispatch_and_snapshot_is_owner_fenced() {
+        let (first_pool, first) = pool_store().await;
+        let (second_pool, second) = pool_store().await;
+        let (parent, request) = fixture();
+        first.create_key(&parent).await.unwrap();
+        first.reserve_creation(&request).await.unwrap();
+        let initial = first
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .unwrap();
+        assert!(!initial.journal.dispatch_started);
+        assert!(initial.envelope.is_none());
+        let (one, two) = tokio::join!(
+            first.claim_creation_dispatch(request.operation, request.owner),
+            second.claim_creation_dispatch(request.operation, request.owner)
+        );
+        let results = [one.unwrap(), two.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(value, CreationDispatch::Started(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(value, CreationDispatch::Existing(_)))
+                .count(),
+            1
+        );
+        drop(first);
+        drop(second);
+        first_pool.close().await;
+        second_pool.close().await;
+
+        let (pool, store) = pool_store().await;
+        assert!(matches!(
+            store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .unwrap(),
+            CreationDispatch::Existing(_)
+        ));
+        let mut wrong_owner = request.owner;
+        wrong_owner.generation += 1;
+        assert!(store
+            .claim_creation_dispatch(request.operation, wrong_owner)
+            .await
+            .is_err());
+        assert!(store
+            .creation_snapshot(request.operation, wrong_owner)
+            .await
+            .is_err());
+        store
+            .stage_creation(request.operation, request.owner, 1, TEST_ENVELOPE)
+            .await
+            .unwrap();
+        let snapshot = store
+            .creation_snapshot(request.operation, request.owner)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.journal.phase, CreationPhase::Staged);
+        assert!(snapshot.journal.dispatch_started);
+        assert_eq!(snapshot.envelope.as_deref(), Some(TEST_ENVELOPE));
+        assert!(store
+            .read_creation_envelope(request.operation)
+            .await
+            .is_err());
+        assert!(store.get_key(&request.record.lid).await.is_err());
         drop(store);
         pool.close().await;
     }

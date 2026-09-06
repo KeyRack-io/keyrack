@@ -43,8 +43,17 @@ bash scripts/test-vault-provider.sh -- path/to/additional-test-runner
 ```
 
 The extra command runs only after the mandatory provider tests pass and inherits
-`VAULT_ADDR` and `VAULT_TOKEN`. Add future worker assertions through this extension
-in the same CI job; they are not implemented or claimed here.
+`VAULT_ADDR` and `VAULT_TOKEN`. The existing CI job now uses this extension for the
+[provisional worker](../crates/keyrack-crypto-worker/README.md):
+
+```bash
+bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
+```
+
+Both suites run from one checkout against the same fixture. The worker helper
+guards four explicitly ignored live tests and provisions restricted test tokens;
+it does not create a second maintained Vault stack. This adopts the provisional
+worker contribution, not production A3 qualification or a branch-protection gate.
 
 These tests exercise real Vault export and soft-revoke semantics. In particular,
 soft revocation does not unset Vault's one-way exportable flag: the KeyRack

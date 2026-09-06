@@ -36,7 +36,8 @@ mod creation;
 
 use async_trait::async_trait;
 use keyrack_core::creation::{
-    CreationJournal, CreationOwner, CreationPage, CreationRequest, VerifiedA2Closure,
+    CreationDispatch, CreationJournal, CreationOwner, CreationPage, CreationRequest,
+    CreationSnapshot, VerifiedA2Closure,
 };
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::hsm::HsmConnection;
@@ -183,6 +184,22 @@ impl StorageBackend for PostgresStorage {
 
     async fn read_creation_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
         self.creation_read_envelope(operation).await
+    }
+
+    async fn claim_creation_dispatch(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationDispatch> {
+        self.creation_claim_dispatch(operation, owner).await
+    }
+
+    async fn creation_snapshot(
+        &self,
+        operation: Uuid,
+        owner: CreationOwner,
+    ) -> Result<CreationSnapshot> {
+        self.creation_read_snapshot(operation, owner).await
     }
 
     async fn recoverable_creations(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {
