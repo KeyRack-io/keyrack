@@ -32,5 +32,8 @@ ENV SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf
 ENV KMS_PKCS11_LIB=/usr/lib/softhsm/libsofthsm2.so
 ENV KMS_PKCS11_TOKEN_LABEL=keyrack-e2e
 ENV KMS_PKCS11_PIN=1234
+# This is the existing public test PIN, not a deployment credential.
+RUN printf '%s' '1234' > /etc/softhsm/e2e-user.pin && chmod 0600 /etc/softhsm/e2e-user.pin
+ENV KMS_PKCS11_PIN_FILE=/etc/softhsm/e2e-user.pin
 
 CMD ["cargo", "test", "--workspace", "--features", "keyrack-pkcs11/softhsm-tests", "--", "--nocapture"]

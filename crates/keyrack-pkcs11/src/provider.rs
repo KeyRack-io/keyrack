@@ -175,9 +175,18 @@ impl Pkcs11Provider {
             let session = ctx
                 .open_rw_session(slot)
                 .map_err(|e| map_pkcs11_error("open session", &e))?;
-            session
-                .login(UserType::User, Some(&make_auth_pin(&pin)))
-                .map_err(|e| map_pkcs11_error("login", &e))?;
+            // Login state is shared by this process's sessions on the token.
+            // Another operation may already have authenticated it. Accept only
+            // that precise state; constructor login remains strict so a new
+            // provider cannot inherit authentication instead of proving its PIN.
+            match session.login(UserType::User, Some(&make_auth_pin(&pin))) {
+                Ok(())
+                | Err(cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::UserAlreadyLoggedIn,
+                    _,
+                )) => {}
+                Err(error) => return Err(map_pkcs11_error("login", &error)),
+            }
             f(&session)
         })
         .await
@@ -849,5 +858,115 @@ mod tests {
             0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(hash, expected);
+    }
+}
+
+#[cfg(all(test, feature = "softhsm-tests"))]
+mod concurrent_login_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
+
+    /// Requires a disposable `SoftHSM` token. Missing fixture configuration fails
+    /// the test; it never silently skips. This performs one incorrect-PIN check
+    /// without ambient login, so it must not target a production token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sessions_reuse_login_without_weakening_constructor() {
+        let pin_file = std::env::var("KMS_PKCS11_PIN_FILE")
+            .expect("KMS_PKCS11_PIN_FILE is required for the SoftHSM regression");
+        let config = Pkcs11ProviderConfig {
+            lib_path: std::env::var("KMS_PKCS11_LIB")
+                .expect("KMS_PKCS11_LIB is required for the SoftHSM regression"),
+            token_label: std::env::var("KMS_PKCS11_TOKEN_LABEL")
+                .expect("KMS_PKCS11_TOKEN_LABEL is required for the SoftHSM regression"),
+            pin: std::fs::read_to_string(pin_file)
+                .expect("SoftHSM regression PIN file is unavailable"),
+        };
+        assert!(
+            !config.pin.is_empty() && config.pin.is_ascii(),
+            "fixture PIN must be nonempty ASCII"
+        );
+        // Each constructor proves its PIN before an anchor or worker exists.
+        let first = Arc::new(Pkcs11Provider::new(&config).expect("first provider initialization"));
+        let second =
+            Arc::new(Pkcs11Provider::new(&config).expect("second provider initialization"));
+        let handle = first
+            .generate_key(&KeySpec::Aes256)
+            .await
+            .expect("regression key generation");
+        let anchor = first
+            .ctx
+            .open_rw_session(first.slot)
+            .expect("anchor session open");
+        anchor
+            .login(UserType::User, Some(&make_auth_pin(&config.pin)))
+            .expect("anchor session login");
+        // Keep the wrong PIN the same valid length, rather than testing a length error.
+        let mut wrong_config = config.clone();
+        let replacement = if wrong_config.pin.starts_with('1') {
+            "2"
+        } else {
+            "1"
+        };
+        wrong_config.pin.replace_range(0..1, replacement);
+        let ambient_wrong_pin_denied = Pkcs11Provider::new(&wrong_config).is_err();
+        // The anchor makes the original strict per-operation login fail even if
+        // a scheduler would otherwise serialize these short crypto operations.
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = JoinSet::new();
+        for index in 0..8 {
+            let provider = if index % 2 == 0 {
+                Arc::clone(&first)
+            } else {
+                Arc::clone(&second)
+            };
+            let handle = handle.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                barrier.wait().await;
+                let plaintext = format!("concurrent-login-regression-{index}").into_bytes();
+                let aad = b"concurrent-login-regression-aad";
+                let ciphertext = provider.encrypt(&handle, &plaintext, aad).await?;
+                let decrypted = provider
+                    .decrypt(&handle, &ciphertext.ciphertext, aad)
+                    .await?;
+                if decrypted.expose().as_slice() != plaintext.as_slice() {
+                    return Err(KeyRackError::Provider(
+                        "regression round trip mismatch".into(),
+                    ));
+                }
+                Ok::<(), KeyRackError>(())
+            });
+        }
+        let mut completed = 0;
+        while let Some(result) = tasks.join_next().await {
+            if matches!(result, Ok(Ok(()))) {
+                completed += 1;
+            }
+        }
+        drop(anchor);
+        let cold_wrong_pin_denied = Pkcs11Provider::new(&wrong_config).is_err();
+        let cold_correct_pin_accepted = Pkcs11Provider::new(&config).is_ok();
+        first
+            .destroy_key(&handle)
+            .await
+            .expect("regression key cleanup");
+        assert!(
+            ambient_wrong_pin_denied,
+            "constructor bypassed credential validation"
+        );
+        assert!(
+            cold_wrong_pin_denied,
+            "constructor accepted an incorrect PIN"
+        );
+        assert!(
+            cold_correct_pin_accepted,
+            "correct credentials could not authenticate again"
+        );
+        assert_eq!(
+            completed, 8,
+            "concurrent real crypto operations must all complete"
+        );
     }
 }
