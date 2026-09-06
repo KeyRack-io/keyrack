@@ -20,6 +20,17 @@ All notable changes to KeyRack will be documented in this file.
   the default trait implementations. A deployment that was passing an
   encryption context to a KMIP-backed key was already not getting one and will
   now see the operation rejected instead of silently unbound.
+- **BREAKING (behaviour): REST `DisableKey` now cascades to descendants, as
+  gRPC already did.** The gRPC handler walked the key hierarchy and disabled
+  every enabled descendant, emitted a `kms:CascadeDisable` audit record, and
+  published a NATS state-changed event; the REST handler transitioned only the
+  target key and left the entire subtree enabled and usable. The admin CLI
+  speaks gRPC, which is why the gap went unnoticed. Both surfaces now call a
+  single `domain::disable_key`, so they share the traversal, the fail-closed
+  behaviour on a descendant write failure, the audit records, and the NATS
+  events. A deployment that disabled keys over REST should expect descendants
+  that were previously left enabled to be disabled from now on; existing keys
+  are not retroactively re-evaluated.
 - **`KmipProviderConfig` no longer derives `Debug`.** It holds `password` in
   plain text, so any log line or error that formatted the config leaked the
   KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`

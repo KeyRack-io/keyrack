@@ -20,9 +20,32 @@
 
 //! Domain service layer: protocol-agnostic business logic.
 //!
-//! Both gRPC and REST handlers delegate to functions in this module.
-//! This eliminates behavioral divergence between the two API surfaces
-//! (Issue 3 / Option A from the project conclusion plan).
+//! # What is actually shared, and what is not
+//!
+//! This module was documented as the layer both surfaces delegate to. It is
+//! not that, and reading it as if it were has already cost us: REST `DisableKey`
+//! shipped without the cascade that gRPC performs, because a `disable_key` here
+//! looked like the shared path while both handlers in fact had their own copies.
+//!
+//! The honest picture:
+//!
+//! - The **enforcement and resolution helpers** — [`resolve_create_provider`],
+//!   [`check_scope_owner`], [`enforce_scope_for_key_op`],
+//!   [`enforce_state_for_key_op`], [`enforce_born_exportable`],
+//!   [`enforce_no_child_under_exportable_parent`], [`generate_key_lid_from_attrs`],
+//!   [`explain_routing`] — are genuinely called by both `grpc.rs` and `rest.rs`.
+//! - [`disable_key`] is genuinely shared: it is the single implementation behind
+//!   both surfaces' `DisableKey` handler.
+//! - Most of the remaining **full lifecycle functions here have no callers at
+//!   all** (`create_key`, `rotate_key`, `list_keys`, the alias/tag/HSM/rotation-job
+//!   functions, and the whole [`crypto`] submodule). They are `pub` in a library
+//!   crate, so the compiler does not flag them. Several have drifted from the
+//!   live handlers — some set `owner_principal_id` to `None` and skip owner
+//!   scoping.
+//!
+//! **Before routing a handler into a function here, check that the function has
+//! live callers and matches current handler behaviour.** If it does not, fix the
+//! function first — do not assume this module is authoritative.
 //!
 //! ## Provider resolution precedence (ADR-0001 Amendment 1)
 //!
@@ -40,7 +63,9 @@
 //!
 //! Functions here are called *inside* [`ops::execute`] /
 //! [`ops::execute_rest`] closures, so PDP authorization and audit
-//! emission remain structurally guaranteed by the ops layer.
+//! emission remain structurally guaranteed by the ops layer. That is why the
+//! shared functions do not authorize or emit the primary audit record
+//! themselves — `ops` is the real structural choke point for both surfaces.
 
 use crate::state::ServiceState;
 use keyrack_core::key::{KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord};
@@ -860,30 +885,48 @@ pub async fn enable_key(state: &Arc<ServiceState>, key_id: &str) -> Result<KeyRe
     Ok(record)
 }
 
+/// Outcome of [`disable_key`].
 pub struct DisableKeyResult {
+    /// The target key, transitioned to `Disabled`.
     pub record: KeyRecord,
+    /// How many enabled descendants were disabled beneath it.
     pub cascade_count: u64,
 }
 
+/// Disable `lid` and cascade to every enabled key beneath it.
+///
+/// This is the **single** implementation behind both the gRPC and the REST
+/// `DisableKey` handlers. Before this existed the two surfaces disagreed: gRPC
+/// cascaded, REST transitioned only the target key and left every descendant
+/// enabled. The admin CLI speaks gRPC, which is why that went unnoticed.
+///
+/// Errors are [`KeyRackError`] rather than [`DomainError`] so each surface keeps
+/// the error mapper it already uses — `convert::error_to_status` for gRPC,
+/// `map_core_err` for REST — and neither surface's status codes shift as a
+/// result of sharing the body.
+///
+/// `lid` is parsed by the caller, because a malformed key id has to be rejected
+/// with each surface's own bad-request code. `key_id` is the caller's spelling
+/// of the same key and is used verbatim as the cascade audit record's resource
+/// id, so the record matches the request that produced it.
+///
+/// Failure semantics are fail-closed: if any descendant write fails, the whole
+/// operation fails. Descendants already disabled or in a state that cannot
+/// transition to `Disabled` are skipped, not treated as errors.
 pub async fn disable_key(
     state: &Arc<ServiceState>,
+    lid: &Lid,
     key_id: &str,
-) -> Result<DisableKeyResult, DomainError> {
-    let lid = parse_lid(key_id)?;
-    let mut record = state
-        .storage
-        .get_key(&lid)
-        .await
-        .map_err(DomainError::from)?;
+) -> Result<DisableKeyResult, keyrack_core::error::KeyRackError> {
+    use keyrack_core::error::KeyRackError;
+
+    let lid = *lid;
+    let mut record = state.storage.get_key(&lid).await?;
     let old_state = record.state.to_string();
     record
         .transition_to(KeyState::Disabled)
-        .map_err(|(f, t)| transition_err(f, t))?;
-    state
-        .storage
-        .update_key(&record)
-        .await
-        .map_err(DomainError::from)?;
+        .map_err(|(from, to)| KeyRackError::InvalidStateTransition { lid, from, to })?;
+    state.storage.update_key(&record).await?;
 
     if let Some(nats) = &state.nats_publisher {
         if let Err(e) = nats
@@ -899,11 +942,7 @@ pub async fn disable_key(
     let mut cascade_count = 0u64;
     let mut queue = vec![lid];
     while let Some(parent) = queue.pop() {
-        let children = state
-            .storage
-            .list_children(&parent)
-            .await
-            .map_err(DomainError::from)?;
+        let children = state.storage.list_children(&parent).await?;
         for mut child in children {
             if child.state == KeyState::Enabled && child.transition_to(KeyState::Disabled).is_ok() {
                 if let Err(e) = state.storage.update_key(&child).await {
@@ -912,10 +951,9 @@ pub async fn disable_key(
                         error = %e,
                         "failed to disable descendant key during cascade"
                     );
-                    return Err(DomainError::Internal(format!(
-                        "cascade disable failed on descendant {}: {e}",
-                        child.lid
-                    )));
+                    return Err(KeyRackError::CascadeDisableFailed {
+                        reason: format!("descendant {}: {e}", child.lid),
+                    });
                 }
                 cascade_count += 1;
                 queue.push(child.lid);

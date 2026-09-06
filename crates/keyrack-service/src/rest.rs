@@ -583,16 +583,10 @@ async fn disable_key(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        record
-            .transition_to(keyrack_core::key::KeyState::Disabled)
-            .map_err(|(f, t)| transition_err(f, t))?;
-        state
-            .storage
-            .update_key(&record)
+        let outcome = crate::domain::disable_key(&state, &lid, &key_id)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&record))
+        Ok(key_json(&outcome.record))
     })
     .await
 }
