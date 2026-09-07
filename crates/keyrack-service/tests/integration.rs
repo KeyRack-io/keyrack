@@ -105,6 +105,14 @@ struct RecordingProvider {
     destroyed: Mutex<Vec<String>>,
     calls: Mutex<Vec<&'static str>>,
     fail_destroy: bool,
+    fail_destroy_at: Option<usize>,
+    destroy_gate: Option<Arc<DestroyGate>>,
+}
+
+#[derive(Default)]
+struct DestroyGate {
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 impl RecordingProvider {
@@ -114,6 +122,8 @@ impl RecordingProvider {
             destroyed: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             fail_destroy,
+            fail_destroy_at: None,
+            destroy_gate: None,
         }
     }
 
@@ -197,7 +207,11 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
     ) -> keyrack_core::error::Result<()> {
         self.record_call("destroy_key");
         self.destroyed.lock().unwrap().push(handle.key_id.clone());
-        if self.fail_destroy {
+        if let Some(gate) = &self.destroy_gate {
+            gate.started.notify_one();
+            gate.resume.notified().await;
+        }
+        if self.fail_destroy || self.fail_destroy_at == Some(self.destroyed.lock().unwrap().len()) {
             return Err(keyrack_core::error::KeyRackError::Provider(
                 "simulated backend delete failure".into(),
             ));
@@ -7287,6 +7301,295 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
         failure.metadata.contains_key("error"),
         "failure event must carry the provider error for the operator"
     );
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.destroyed_handles().len(),
+        1,
+        "ambiguous failure must not redispatch"
+    );
+    assert!(svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_call() {
+    use tower::ServiceExt;
+
+    let gate = Arc::new(DestroyGate::default());
+    let mut recording = RecordingProvider::new(false);
+    recording.destroy_gate = Some(gate.clone());
+    let provider = Arc::new(recording);
+    let state = build_test_state_with_provider(
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    let scan_state = state.clone();
+    let scan = tokio::spawn(async move {
+        keyrack_service::workers::run_deletion_scan(&scan_state)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    let denied = svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert!(denied.message().contains("destruction-fenced"));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-cancel-deletion"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let response = keyrack_service::rest::router(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(provider.destroyed_handles().len(), 1);
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn cancellation_before_destruction_claim_has_no_provider_effect() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let state = build_test_state_with_provider(
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    svc.cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert!(provider.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Disabled
+    );
+}
+
+#[tokio::test]
+async fn destruction_pins_provider_across_runtime_registry_replacement() {
+    use keyrack_core::key::{KeyMaterial, ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
+
+    let gate = Arc::new(DestroyGate::default());
+    let mut recording = RecordingProvider::new(false);
+    recording.destroy_gate = Some(gate.clone());
+    let original = Arc::new(recording);
+    let replacement = Arc::new(RecordingProvider::new(false));
+    let binding = ProviderRef::new("default");
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(
+            [(
+                binding.clone(),
+                ProviderEntry {
+                    provider: original.clone(),
+                    class: ProviderClass::InMemory,
+                },
+            )],
+            binding.clone(),
+        )
+        .unwrap(),
+    );
+    let mut state = build_test_state_with_provider(
+        original.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    Arc::get_mut(&mut state).unwrap().providers = registry.clone();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    // Exercise legacy default and explicit default as the SAME binding.
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    record.provider_ref = None;
+    if let KeyMaterial::ProviderResident { provider_ref, .. } = &mut record.key_versions[0].material
+    {
+        *provider_ref = None;
+    }
+    record.occ_version += 1;
+    let handles: Vec<_> = record
+        .key_versions
+        .iter()
+        .map(|v| v.resident_handle().unwrap().key_id.clone())
+        .collect();
+    state.storage.update_key(&record).await.unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    let scan_state = state.clone();
+    let scan = tokio::spawn(async move {
+        keyrack_service::workers::run_deletion_scan(&scan_state)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    registry
+        .register(
+            binding,
+            ProviderEntry {
+                provider: replacement.clone(),
+                class: ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.destroyed_handles(), handles);
+    assert!(replacement.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn unknown_provider_on_later_version_prevents_all_destruction_effects() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let audit = Arc::new(CapturingSink::new());
+    let state =
+        build_test_state_with_provider(provider.clone(), Arc::new(AlwaysAllow), audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    if let keyrack_core::key::KeyMaterial::ProviderResident { provider_ref, .. } =
+        &mut record.key_versions[1].material
+    {
+        *provider_ref = Some(keyrack_core::key::ProviderRef::new("missing-provider"));
+    }
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert!(provider.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+    assert!(!audit
+        .events()
+        .iter()
+        .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed));
+}
+
+#[tokio::test]
+async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
+    let mut recording = RecordingProvider::new(false);
+    recording.fail_destroy_at = Some(2);
+    let provider = Arc::new(recording);
+    let audit = Arc::new(CapturingSink::new());
+    let state =
+        build_test_state_with_provider(provider.clone(), Arc::new(AlwaysAllow), audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(provider.destroyed_handles().len(), 2);
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+    assert!(svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
+        .await
+        .is_err());
+    assert!(!audit
+        .events()
+        .iter()
+        .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed));
 }
 
 /// `ReEncrypt` reached both a decrypt and an encrypt with no state gate on

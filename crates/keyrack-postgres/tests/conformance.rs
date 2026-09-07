@@ -38,6 +38,73 @@ async fn make_store() -> PostgresStorage {
 
 keyrack_test_support::storage_conformance_tests!(make_store().await);
 keyrack_test_support::creation_conformance_tests!(make_store().await);
+keyrack_test_support::destruction_conformance_tests!(make_store().await);
+
+#[tokio::test]
+async fn independent_pools_issue_one_destruction_ticket() {
+    keyrack_test_support::destruction_conformance::competing_claims(
+        &make_store().await,
+        &make_store().await,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn destruction_claim_survives_reconnect_and_completion_rollback() {
+    use keyrack_core::key::KeyState;
+    use keyrack_core::storage::StorageBackend;
+    use keyrack_test_support::destruction_conformance::due;
+    use keyrack_test_support::fixtures::unique_test_key_record;
+
+    let pool = sqlx::PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let store = PostgresStorage::from_pool(pool.clone()).await.unwrap();
+    let record = due(unique_test_key_record(KeyState::Enabled));
+    store.create_key(&record).await.unwrap();
+    let claim = store
+        .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(store);
+    let reopened = make_store().await;
+    assert!(reopened
+        .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    let name = format!("destruction_failure_{}", uuid::Uuid::new_v4().simple());
+    let function = format!("{name}_fn");
+    sqlx::query(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected destruction completion failure'; END; $$"))
+        .execute(&pool).await.unwrap();
+    sqlx::query(&format!("CREATE TRIGGER {name} BEFORE UPDATE OF completed ON kr_destruction_journal FOR EACH ROW WHEN (NEW.operation_id = '{}') EXECUTE FUNCTION {function}()", claim.operation()))
+        .execute(&pool).await.unwrap();
+    let result = reopened.complete_destruction(claim).await;
+    sqlx::query(&format!("DROP TRIGGER {name} ON kr_destruction_journal"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP FUNCTION {function}()"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected destruction completion failure"));
+    let mut still_fenced = reopened.get_key(&record.lid).await.unwrap();
+    assert_eq!(still_fenced.state, KeyState::PendingDeletion);
+    assert_eq!(still_fenced.occ_version, record.occ_version + 1);
+    still_fenced.transition_to(KeyState::Disabled).unwrap();
+    assert!(reopened.update_key(&still_fenced).await.is_err());
+    assert!(reopened
+        .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    pool.close().await;
+}
 
 mod creation_postgres {
     use super::PostgresStorage;

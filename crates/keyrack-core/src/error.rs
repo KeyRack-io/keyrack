@@ -29,6 +29,9 @@ pub enum KeyRackError {
     #[error("key not found: {0}")]
     KeyNotFound(Lid),
 
+    #[error("key {0} is destruction-fenced; lifecycle reconciliation is required")]
+    KeyDestructionFenced(Lid),
+
     #[error("invalid state transition from {from:?} to {to:?} for key {lid}")]
     InvalidStateTransition {
         lid: Lid,

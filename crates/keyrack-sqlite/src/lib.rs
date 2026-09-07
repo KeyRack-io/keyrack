@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 mod creation;
+mod destruction;
 
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
@@ -60,6 +61,12 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
     state        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rotation_jobs_state ON rotation_jobs(state);
+CREATE TABLE IF NOT EXISTS destruction_journal (
+    lid TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    record_json TEXT NOT NULL,
+    completed INTEGER NOT NULL CHECK(completed IN (0,1))
+);
 ";
 
 /// `SQLite`-backed storage.
@@ -121,6 +128,22 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for SqliteStorage {
+    async fn claim_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<keyrack_core::destruction::DestructionClaim>> {
+        self.destruction_claim(lid, expected_occ, now)
+    }
+
+    async fn complete_destruction(
+        &self,
+        claim: keyrack_core::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        self.destruction_complete(claim)
+    }
+
     async fn reserve_creation(
         &self,
         request: &keyrack_core::creation::CreationRequest,
@@ -193,6 +216,7 @@ impl StorageBackend for SqliteStorage {
 
         self.creation_tx(|conn| {
             creation::guard_create(conn, &record.lid)?;
+            destruction::guard_write(conn, record)?;
             conn.execute(
                 "INSERT INTO keys (lid, record_json, occ_version) VALUES (?1, ?2, ?3)",
                 rusqlite::params![lid_str, json, occ],
@@ -248,6 +272,7 @@ impl StorageBackend for SqliteStorage {
                 });
             }
             creation::guard_update(conn, &previous, record)?;
+            destruction::guard_update(conn, record)?;
             let rows = conn
                 .execute(
                     "UPDATE keys SET record_json = ?1, occ_version = ?2 WHERE lid = ?3 AND occ_version = ?4",
@@ -685,4 +710,5 @@ mod tests {
 
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
     keyrack_test_support::creation_conformance_tests!(SqliteStorage::in_memory().unwrap());
+    keyrack_test_support::destruction_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }

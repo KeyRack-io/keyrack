@@ -29,7 +29,7 @@ const JOURNAL_SELECT: &str = "SELECT operation_id, child_lid, child_version, par
 
 // Consume the database error so this adapter can be passed directly to map_err.
 #[allow(clippy::needless_pass_by_value)]
-fn database_error(error: sqlx::Error) -> KeyRackError {
+pub(super) fn database_error(error: sqlx::Error) -> KeyRackError {
     KeyRackError::Storage(format!("creation storage: {error}"))
 }
 
@@ -121,7 +121,10 @@ fn decode_key(row: &PgRow, lid: &Lid) -> Result<KeyRecord> {
     Ok(record)
 }
 
-async fn load_key(connection: &mut PgConnection, lid: &Lid) -> Result<Option<KeyRecord>> {
+pub(super) async fn load_key(
+    connection: &mut PgConnection,
+    lid: &Lid,
+) -> Result<Option<KeyRecord>> {
     sqlx::query("SELECT record_json, occ_version FROM kr_keys WHERE lid = $1")
         .bind(lid.to_string())
         .fetch_optional(connection)
@@ -176,7 +179,7 @@ async fn insert_key(connection: &mut PgConnection, record: &KeyRecord) -> Result
     Ok(())
 }
 
-async fn replace_key(
+pub(super) async fn replace_key(
     connection: &mut PgConnection,
     record: &KeyRecord,
     expected_occ: u64,
@@ -208,6 +211,7 @@ impl PostgresStorage {
     ) -> Result<CreationJournal> {
         request.validate()?;
         let mut transaction = write_transaction(&self.pool).await?;
+        crate::destruction::guard_write(&mut transaction, &request.record).await?;
         if let Some(stored) = load_creation(&mut transaction, request.operation).await? {
             if !same_json(&stored.journal.request, request)? {
                 return Err(invalid("operation already has different intent"));
@@ -448,6 +452,7 @@ impl PostgresStorage {
 
     pub(super) async fn create_key_guarded(&self, record: &KeyRecord) -> Result<()> {
         let mut transaction = write_transaction(&self.pool).await?;
+        crate::destruction::guard_write(&mut transaction, record).await?;
         let reserved: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM kr_creation_journal WHERE child_lid = $1)",
         )
@@ -486,6 +491,12 @@ impl PostgresStorage {
             });
         }
         let previous = decode_key(&row, &record.lid)?;
+        crate::destruction::guard_write(&mut transaction, record).await?;
+        if record.state == keyrack_core::key::KeyState::Destroyed {
+            return Err(keyrack_core::destruction::invalid(
+                "Destroyed requires fenced completion",
+            ));
+        }
         let guards = sqlx::query(
             "SELECT \
              EXISTS (SELECT 1 FROM kr_creation_journal WHERE child_lid = $1) AS child_tracked, \

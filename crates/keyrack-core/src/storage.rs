@@ -72,6 +72,34 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Commit a one-shot resident destruction fence before any provider effect.
+    /// Re-read state, due time, OCC and full material history in the transaction;
+    /// reject all parent/child creation references. All writers must honor the
+    /// fence. None means already claimed, NEVER permission to dispatch again.
+    /// A commit/response failure is ambiguous and must not be retried as work.
+    async fn claim_destruction(
+        &self,
+        _lid: &Lid,
+        _expected_occ: u64,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::destruction::DestructionClaim>> {
+        Err(crate::destruction::invalid(
+            "transactional fencing unsupported",
+        ))
+    }
+
+    /// Atomically publish Destroyed for the exact claim after ALL provider
+    /// destroys succeeded. Consume the ticket; errors retain the durable fence.
+    /// This is a trusted service/storage boundary, not external authorization.
+    async fn complete_destruction(
+        &self,
+        _claim: crate::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        Err(crate::destruction::invalid(
+            "transactional fencing unsupported",
+        ))
+    }
+
     // A2 creation transactions. Unsupported wrappers/backends MUST NOT emulate
     // these using separate CRUD calls. No production hierarchy activation yet.
     async fn reserve_creation(
@@ -291,6 +319,22 @@ mod tests {
                 rotation_jobs: Mutex::new(HashMap::new()),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_destruction_fencing_fails_closed() {
+        let store = MemoryStorage::new();
+        let mut record = make_test_record(KeyState::PendingDeletion);
+        record.scheduled_deletion_at = Some(chrono::Utc::now());
+        store.create_key(&record).await.unwrap();
+        assert!(store
+            .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+            .await
+            .is_err());
+        assert_eq!(
+            store.get_key(&record.lid).await.unwrap().state,
+            KeyState::PendingDeletion
+        );
     }
 
     #[async_trait]

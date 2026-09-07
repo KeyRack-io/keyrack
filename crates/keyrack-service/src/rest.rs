@@ -210,6 +210,7 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
+        KeyRackError::KeyDestructionFenced(_) => (StatusCode::CONFLICT, "KeyDestructionFenced"),
         KeyRackError::InvalidStateTransition { .. } => {
             (StatusCode::CONFLICT, "InvalidStateTransition")
         }

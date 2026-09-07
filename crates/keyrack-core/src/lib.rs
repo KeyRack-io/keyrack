@@ -33,6 +33,7 @@ pub mod cascade;
 pub mod creation;
 pub mod creation_driver;
 pub mod custody;
+pub mod destruction;
 pub mod encryption_context;
 pub mod error;
 pub mod header;

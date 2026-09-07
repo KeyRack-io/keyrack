@@ -213,6 +213,7 @@ impl SqliteStorage {
     pub(super) fn reserve_a2(&self, request: &CreationRequest) -> Result<CreationJournal> {
         request.validate()?;
         self.creation_tx(|conn| {
+            crate::destruction::guard_write(conn, &request.record)?;
             if let Some(existing) = journal(conn, request.operation)? {
                 if existing.request.fingerprint()? != request.fingerprint()? { return Err(invalid("operation intent conflict")); }
                 return Ok(existing);

@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 mod creation;
+mod destruction;
 
 use async_trait::async_trait;
 use keyrack_core::creation::{
@@ -70,6 +71,12 @@ CREATE TABLE IF NOT EXISTS kr_rotation_jobs (
     state        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kr_rotation_jobs_state ON kr_rotation_jobs(state);
+CREATE TABLE IF NOT EXISTS kr_destruction_journal (
+    lid TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    record_json JSONB NOT NULL,
+    completed BOOLEAN NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kr_creation_journal (
     operation_id   TEXT COLLATE \"C\" PRIMARY KEY,
     child_lid      TEXT NOT NULL,
@@ -143,6 +150,22 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
+    async fn claim_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<keyrack_core::destruction::DestructionClaim>> {
+        self.destruction_claim(lid, expected_occ, now).await
+    }
+
+    async fn complete_destruction(
+        &self,
+        claim: keyrack_core::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        self.destruction_complete(claim).await
+    }
+
     async fn reserve_creation(&self, request: &CreationRequest) -> Result<CreationJournal> {
         self.creation_reserve(request).await
     }

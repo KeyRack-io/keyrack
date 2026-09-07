@@ -114,6 +114,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
                 Self::NotFound(e.to_string())
             }
             KeyRackError::InvalidStateTransition { .. }
+            | KeyRackError::KeyDestructionFenced(_)
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
             | KeyRackError::EncryptionContextMismatch
@@ -144,6 +145,7 @@ impl DomainError {
                         tonic::Status::aborted(msg)
                     }
                     KeyRackError::InvalidStateTransition { .. }
+                    | KeyRackError::KeyDestructionFenced(_)
                     | KeyRackError::OperationNotPermitted { .. }
                     | KeyRackError::ImmutableTag { .. }
                     | KeyRackError::DepthLimitExceeded { .. }
@@ -176,6 +178,9 @@ impl DomainError {
                     KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
                     KeyRackError::OptimisticConcurrencyConflict { .. } => {
                         (StatusCode::CONFLICT, "OccConflict")
+                    }
+                    KeyRackError::KeyDestructionFenced(_) => {
+                        (StatusCode::CONFLICT, "KeyDestructionFenced")
                     }
                     KeyRackError::InvalidStateTransition { .. } => {
                         (StatusCode::CONFLICT, "InvalidStateTransition")
