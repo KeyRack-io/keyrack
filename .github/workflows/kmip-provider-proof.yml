@@ -40,18 +40,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: kmip-proof-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      # Same provisioning as the other Rust jobs in ci.yml: the service's
+      # build script needs protoc, and the runner does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # The whole proof, through the same entry point a contributor runs
       # locally. A CI-only variant of the script would be a second thing to
