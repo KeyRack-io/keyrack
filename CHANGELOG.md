@@ -6,6 +6,22 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **Docs: the keyless audit-verification claim now states its bounds
+  everywhere it is made.** Making chaining unconditional was correct, but the
+  documentation of it landed unevenly: `docs/OPERATOR.md` and the
+  `09-audit-tamper-evidence` demo said what keyless verification does *not*
+  cover, while `QUICKSTART.md`, `docs/INTEGRATION_GUIDE.md` and
+  `docs/compliance/COMPLIANCE_POSTURE.md` claimed detection flatly — the
+  compliance posture said interior tampering is "always detectable". It is not:
+  repairing the chain after an edit only means recomputing every link from that
+  point forward, so anyone able to rewrite the whole log defeats the keyless
+  check, and tail-truncation breaks no link at all. All three now state both
+  bounds and which mechanism closes each (signing for the first, an external
+  anchor for the second). No behaviour change. A new control,
+  `keyless_audit_claims_state_their_bounds` in
+  `crates/keyrack-core/tests/doc_claims.rs`, fails if any doc makes the keyless
+  claim without both bounds, since review of the prose is what let the split
+  through.
 - **The audit hash chain no longer depends on signing.** `previous_hash` was
   assigned in exactly one place, `AuditSigner::sign_event`, and
   `sign_audit_events` defaults to `false`. A default deployment therefore wrote
