@@ -113,7 +113,8 @@ erasure in the test process or Vault.
    a provider-object closure receipt nor proof that every allocator copy vanished.
 5. Obtain A2 acceptance of the proposal and profile, trusted authority/observer-key
    provisioning, durable creation/restart reconciliation and the A3 adapter before
-   activation. Distinct-UID deployment isolation remains **UNMET**. No native
+   activation. The [two-user supervisor fixture](SUPERVISOR_ISOLATION.md) separately demonstrates
+   credential-file isolation; production deployments must preserve its controls. No native
    creation result is converted to `VerifiedA2Closure` by this crate.
 
 ## Reproduction and evidence limits

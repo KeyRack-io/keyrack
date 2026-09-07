@@ -92,8 +92,9 @@ incarnation for the same unresolved storage attempt. Production must obtain a
 current, durable reservation and reconcile lost responses before issuing another
 generation authorization. Durable owner currentness, restart reuse prevention,
 publication and production profile approval are **UNMET**, not implied by typed evidence.
-Distinct-UID deployment credential isolation remains UNMET and is explicitly
-intended for deployment ownership, pending named-owner acceptance and evidence.
+The [two-user supervisor fixture](SUPERVISOR_ISOLATION.md) now demonstrates
+credential-file isolation across restart and rotation in Linux CI. Deployments
+must preserve those demonstrated controls; this is not production attestation.
 A2 merge `bfa0060` carries the hook contribution, but the workflow at base
 `4e639ad` does not invoke it. A2 corrected the invocation at `c730a3a`, present
 on the fetched target `27b5923`. Actual CI run evidence for each worker revision
