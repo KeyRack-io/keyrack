@@ -43,6 +43,9 @@ use tonic::Request;
 
 use base64::Engine as _;
 
+#[path = "integration/reencrypt_authorization.rs"]
+mod reencrypt_authorization;
+
 /// Audit sink that captures events for test assertions.
 struct CapturingSink {
     events: Mutex<Vec<AuditEvent>>,
@@ -99,12 +102,14 @@ impl PolicyDecisionPoint for CountingPdp {
     }
 }
 
-/// Provider that records every `destroy_key` call and can be made to fail it.
+/// Provider that records crypto calls and can be made to fail `destroy_key`.
 ///
 /// Lets the deletion-reaper tests distinguish "`KeyRack` marked the record
 /// destroyed" from "the backend material was actually deleted".
+/// Authorization tests also use the call log to assert zero provider effects.
 struct RecordingProvider {
     inner: InMemoryProvider,
+    calls: Mutex<Vec<&'static str>>,
     destroyed: Mutex<Vec<String>>,
     fail_destroy: bool,
 }
@@ -113,6 +118,7 @@ impl RecordingProvider {
     fn new(fail_destroy: bool) -> Self {
         Self {
             inner: InMemoryProvider::new(),
+            calls: Mutex::new(Vec::new()),
             destroyed: Mutex::new(Vec::new()),
             fail_destroy,
         }
@@ -120,6 +126,10 @@ impl RecordingProvider {
 
     fn destroyed_handles(&self) -> Vec<String> {
         self.destroyed.lock().unwrap().clone()
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
     }
 }
 
@@ -129,6 +139,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         spec: &keyrack_core::key::KeySpec,
     ) -> keyrack_core::error::Result<keyrack_core::provider::KeyHandle> {
+        self.calls.lock().unwrap().push("generate_key");
         self.inner.generate_key(spec).await
     }
 
@@ -138,6 +149,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> keyrack_core::error::Result<keyrack_core::provider::EncryptOutput> {
+        self.calls.lock().unwrap().push("encrypt");
         self.inner.encrypt(handle, plaintext, aad).await
     }
 
@@ -147,6 +159,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.calls.lock().unwrap().push("decrypt");
         self.inner.decrypt(handle, ciphertext, aad).await
     }
 
@@ -156,6 +169,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         algorithm: keyrack_core::provider::SigningAlgorithm,
         message: &[u8],
     ) -> keyrack_core::error::Result<Vec<u8>> {
+        self.calls.lock().unwrap().push("sign");
         self.inner.sign(handle, algorithm, message).await
     }
 
@@ -166,6 +180,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         message: &[u8],
         signature: &[u8],
     ) -> keyrack_core::error::Result<bool> {
+        self.calls.lock().unwrap().push("verify");
         self.inner
             .verify(handle, algorithm, message, signature)
             .await
@@ -175,6 +190,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         length: usize,
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.calls.lock().unwrap().push("generate_random");
         self.inner.generate_random(length).await
     }
 
@@ -182,6 +198,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         handle: &keyrack_core::provider::KeyHandle,
     ) -> keyrack_core::error::Result<()> {
+        self.calls.lock().unwrap().push("destroy_key");
         self.destroyed.lock().unwrap().push(handle.key_id.clone());
         if self.fail_destroy {
             return Err(keyrack_core::error::KeyRackError::Provider(
@@ -199,6 +216,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         handle: &keyrack_core::provider::KeyHandle,
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
+        self.calls.lock().unwrap().push("export_key_material");
         self.inner.export_key_material(handle).await
     }
 }

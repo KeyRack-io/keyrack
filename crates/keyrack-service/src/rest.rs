@@ -1656,7 +1656,7 @@ async fn re_encrypt(
         .and_then(build_ec)
         .as_ref()
         .map(keyrack_core::encryption_context::EncryptionContext::hash);
-    let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &key_id);
+    let mut op_ctx = OpContext::re_encrypt(principal, &key_id, &dst_key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
     let legacy_audit_context = op_ctx.clone();
@@ -1689,10 +1689,19 @@ async fn re_encrypt(
                 "destination key not in Enabled state",
             ));
         }
+        let blob_b64 = body
+            .get("ciphertext_blob")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let blob = base64_decode(blob_b64)?;
+        let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
+            .map_err(|e| {
+                ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
+            })?;
         crate::domain::enforce_scope_for_key_op(
             &state,
             &src_record,
-            None,
+            Some(header.key_version),
             principal_scope.as_deref(),
             &principal_id,
             &keyrack_core::audit::AuditAction::ReEncrypt,
@@ -1709,15 +1718,6 @@ async fn re_encrypt(
         )
         .await
         .map_err(|e| e.to_rest_error())?;
-        let blob_b64 = body
-            .get("ciphertext_blob")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let blob = base64_decode(blob_b64)?;
-        let (header, ciphertext) = keyrack_core::header::CiphertextHeader::unwrap_payload(&blob)
-            .map_err(|e| {
-                ops::rest_error(StatusCode::BAD_REQUEST, "InvalidCiphertext", &e.to_string())
-            })?;
         let src_ec = body
             .get("source_encryption_context")
             .and_then(|v| v.as_object())
