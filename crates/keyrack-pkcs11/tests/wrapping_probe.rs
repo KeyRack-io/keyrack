@@ -33,6 +33,9 @@
 
 #![cfg(feature = "softhsm-tests")]
 
+#[path = "support/native_creation.rs"]
+mod native_creation;
+
 use std::error::Error as StdError;
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
@@ -323,6 +326,93 @@ fn verify_gcm_parent_policy(session: &Session, handle: ObjectHandle) -> ProbeRes
     )
 }
 
+/// Exercise the candidate's real Generate/readback/GCM-Wrap/Close path on the
+/// disposable token. This is an UNQUALIFIED mechanism probe: its parent lacks a
+/// trusted-wrap policy and the deliberate `false` is not an A2 profile fallback.
+fn native_creation_owner_probe(
+    module: &Pkcs11,
+    slot: Slot,
+    control: &Session,
+    parent_label: &str,
+) -> ProbeResult<()> {
+    use keyrack_test_support::creation_conformance::fixture;
+    use native_creation::{NativeCreation, NativeCreationError, NativeWrapOutput};
+
+    let (_, request) = fixture();
+    let session = module.open_rw_session(slot)?;
+    let parent = parent_handle(&session, parent_label)?;
+    let mut owner = NativeCreation::new(session, parent, request.clone())?;
+    let outcome = (|| {
+        let policy = [
+            Attribute::Token(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Wrap(true),
+            Attribute::Unwrap(true),
+            Attribute::Encrypt(false),
+            Attribute::Decrypt(false),
+        ];
+        let mut iv = [0; 12];
+        control.generate_random_slice(&mut iv)?;
+        match owner.generate_and_wrap(&request, &policy, false, iv) {
+            Err(NativeCreationError::Native(Error::Pkcs11(
+                RvError::MechanismInvalid,
+                cryptoki::context::Function::WrapKey,
+            ))) => {}
+            Err(error) => {
+                return Err(
+                    format!("native owner: expected GCM mechanism refusal, got {error}").into(),
+                )
+            }
+            Ok(_) => {
+                return Err(
+                    "native owner: unexpected successful GCM wrapping; review qualification".into(),
+                )
+            }
+        }
+        // The original child exists after the failed Wrap and is still owed
+        // cleanup. This observation is a probe assertion, NEVER closure proof.
+        check(
+            find_label(control, &request.correlation)?.len() == 1,
+            "native owner lost its creation child before explicit close",
+        )?;
+        check(
+            owner
+                .generate_and_wrap(&request, &policy, false, iv)
+                .is_err(),
+            "native owner repeated Generate after failure",
+        )?;
+        check(
+            owner.closed_session().is_none(),
+            "native owner claimed premature closure",
+        )
+    })();
+    let outcome = finish(outcome, owner.close().map_err(Into::into));
+    outcome?;
+    let identity = owner.closed_session();
+    check(
+        identity.is_some(),
+        "native owner did not observe explicit session close",
+    )?;
+    owner.close()?;
+    check(
+        owner.closed_session() == identity,
+        "native owner changed closure identity on retry",
+    )?;
+    check(
+        find_label(control, &request.correlation)?.is_empty(),
+        "native creation child survived original session close",
+    )?;
+    let forged = NativeWrapOutput {
+        iv: [0; 12],
+        ciphertext: vec![0; 48],
+    };
+    check(
+        owner.verify_closed_output(&request, &forged).is_err(),
+        "native owner certified an output after failed wrapping",
+    )
+}
+
 fn probe(module: &Pkcs11, slot: Slot, control: &Session, labels: &Labels) -> ProbeResult<()> {
     at_stage("mechanism profile", check_mechanisms(module, slot))?;
     let parent = at_stage(
@@ -346,6 +436,10 @@ fn probe(module: &Pkcs11, slot: Slot, control: &Session, labels: &Labels) -> Pro
     at_stage(
         "GCM probe parent unrestricted mechanism policy",
         verify_gcm_parent_policy(control, gcm_probe_parent),
+    )?;
+    at_stage(
+        "native creation owner",
+        native_creation_owner_probe(module, slot, control, &labels.wrong_parent),
     )?;
 
     let generated = SessionKey::create(module, slot, |session| {

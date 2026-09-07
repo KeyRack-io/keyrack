@@ -40,6 +40,30 @@ bash scripts/test-pkcs11-wrapping.sh
 chooses its own token label and test PIN. Do not use this probe against production
 tokens or treat its token initialization as a deployment persistence recipe.
 
+## Native creation ownership groundwork
+
+`crates/keyrack-pkcs11/tests/support/native_creation.rs` is a test-only candidate
+that retains the original creation session across Generate, scalar attribute
+checks, native GCM Wrap and explicit Close. It consumes an attempt before native
+calls, refuses regeneration after errors or unwinding, and never treats Drop,
+a replacement session or an empty object search as closure evidence. A failed
+explicit Close remains unconfirmed even if destructor cleanup subsequently runs.
+
+The live probe exercises this owner through a native GCM `C_WrapKey` refusal,
+checks that the generated child exists until explicit close, and checks its
+absence afterwards. Its deliberately untrusted wrapping policy tests mechanism
+behavior, **not a qualified A2 profile**. Scripted fault tests run without a token:
+
+```sh
+cargo test --locked -p keyrack-pkcs11 --test native_creation_owner
+```
+
+This code is not linked into the runtime provider, implements no
+`A2CreationProvider`, and produces no A2 closure claim. The IV/ciphertext pair is
+an in-memory primitive result, not a new envelope encoding. Trusted parent
+resolution, exact backend qualification, native wrap/unwrap policy, bounded nonce
+allocation, authority/currentness and runtime orchestration remain required.
+
 ## Remaining profile gate: authenticated context
 
 AES-KW protects wrapped key bytes, but does not bind external child identity,
