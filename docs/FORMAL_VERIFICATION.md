@@ -92,11 +92,23 @@ cargo kani -p keyrack-core
 
 # Run a specific harness
 cargo kani -p keyrack-core --harness sensitive_debug_never_leaks_key_material
-cargo kani -p keyrack-core --harness audit_event_serialization_no_plaintext_leak
 
 # With verbose output
 cargo kani -p keyrack-core --harness sensitive_debug_never_leaks_key_material --verbose
 ```
+
+The harness names accepted by `--harness` are exactly the five in the table
+above. "No plaintext in a serialized `AuditEvent`" is **not** among them: it is
+a proptest, not a Kani harness, because full `serde_json` serialization is out
+of CBMC's reach (see Limitations below). Run it with:
+
+```bash
+cargo test -p keyrack-core --test formal_invariants
+```
+
+`crates/keyrack-core/tests/doc_claims.rs` asserts that every `--harness` name
+appearing in this document resolves to a real `#[kani::proof]`, so this list
+cannot drift back out of sync with the code.
 
 ### Limitations and follow-ups
 
