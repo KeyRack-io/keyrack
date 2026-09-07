@@ -9,7 +9,7 @@ name: Demo PR checks
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**", "fix/**", "handback/**"]
 
 jobs:
   meta-lint:
