@@ -6,6 +6,19 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **Docs: the audit-detection claim control now matches the claim rather than
+  one phrasing of it.** The first version of
+  `keyless_audit_claims_state_their_bounds` triggered only on wording that
+  mentions the absence of a key, so it missed `docs/WHY_KEYRACK.md`, which
+  asserts detection without mentioning keys at all ("is detectable by
+  replaying the hash chain") and stated only one of the two bounds. That file
+  is now correct and the trigger matches assertions of detectability. Two
+  further tightenings: the bounds must appear in the same section as the
+  claim, not anywhere in the file, and a mention of truncation only counts as
+  the truncation bound when the section also names the remedy — otherwise
+  unrelated prose satisfies it, as the TLV "truncation attacks" discussion in
+  `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` would have.
+
 - **Docs: three docs still said an ephemeral audit signing key is the
   default.** Making `audit_signing_key_ephemeral` an explicit opt-in left
   `README.md`, `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` and
