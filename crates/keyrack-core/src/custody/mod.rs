@@ -424,6 +424,9 @@ pub struct RevocationCommand {
 /// Neither variant permits a new usable-output commit under fenced authority
 /// after that point. Output irrevocably committed before it is not retractable
 /// and is not included in the suppression claim.
+/// This is ONE scope-wide result: a mix of prior commits and suppressed pending
+/// responses is `OutputsSuppressed`, not an unrepresentable outcome. The scope
+/// comes from `RevocationResult.authority.scope`, never `observed_leases`.
 ///
 /// A consuming profile must qualify its irrevocable usable-output release point.
 /// With encrypted staging and an atomic one-use key-capsule commit, staging alone

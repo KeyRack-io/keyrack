@@ -107,6 +107,13 @@ no third successful "partially delivered" or "unknown but fenced" disposition.
 The classification is local to the exact command's entire authority scope and
 executor incarnation, not to the bounded diagnostic lease list.
 
+**The ordinary mixed case emits one `OutputsSuppressed` receipt.** This is a
+fence-wide postcondition, not a per-operation outcome vector. The existing
+`RevocationResult.authority.scope` is the explicit scope, authenticated together
+with its issuer/generation, executor and exact command digest. No additional
+scope field or per-operation wire granularity is needed for this completion
+claim. `observed_leases` neither selects a subset nor narrows that scope.
+
 Let **F** be the linearization point at which authenticated fence application has
 established the applicable admission/use fence and the selected disposition's
 postcondition, serialized with irrevocable usable-output release. It is not
@@ -138,6 +145,22 @@ key-capsule release (see its [transport description](../crates/keyrack-crypto-wo
 | Capsule committed before F and no other work/release obligation remains | `Drained`; do not relabel the prior commit as suppressed |
 | Some prior commits plus other responses cancelled at F | `OutputsSuppressed` for the unreleased set; prior commits are not recalled |
 | Usable bytes partly released and continuation/scope coverage unresolved | Neither; do not emit a successful `RevocationResult` |
+
+For example, under **one** fence, operations A and B have committed capsules,
+C has only staged ciphertext, and D is computing. If the gate permanently
+cancels C's release capability and rejects D's eventual result, emit **one
+`OutputsSuppressed`** for the full command scope. A/B remain prior released output;
+neither is claimed suppressed. C/D and every other unreleased result are covered
+whether or not their leases appear in diagnostics. Waiting for A/B's recipient
+to read the pipe is not a prerequisite for this receipt.
+
+The aggregation rule is: any still-unresolved affected release path means no
+completion receipt; otherwise a scope with suppressed pending/future results
+uses `OutputsSuppressed`, including a mix with prior commits. Use `Drained` when
+all computation and release obligations have finished/terminated and none remains
+pending. **Mixed prior commits plus suppression is not the unresolved case.**
+The rule describes the producer's runtime obligation; it does not authorize
+combining arbitrary receipts from different commands, scopes or incarnations.
 
 The last row is an unqualified/incomplete execution state, not a new successful
 wire outcome. A future raw-stream profile must establish its own complete release
