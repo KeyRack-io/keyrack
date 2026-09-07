@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 IMAGE="kr-pykmip:proof"
 CONTAINER="kr-pykmip-proof"
-REST="http://[::1]:8080"  # the service binds IPv6 loopback
+REST="http://127.0.0.1:8080"  # pinned in the proof configs
 SERVICE_PID=""
 
 PYTHON="${PYTHON:-python3}"

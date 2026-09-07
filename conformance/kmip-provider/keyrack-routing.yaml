@@ -5,6 +5,12 @@
 #
 # Shape copied from the multi-provider section of docs/OPERATOR.md.
 
+# Pinned to IPv4 loopback rather than the default [::1], so the proof does not
+# depend on the host having IPv6 loopback. A CI runner without it would fail
+# here for a reason that has nothing to do with KMIP.
+grpc_addr: "127.0.0.1:50051"
+rest_addr: "127.0.0.1:8080"
+
 storage:
   type: memory
 

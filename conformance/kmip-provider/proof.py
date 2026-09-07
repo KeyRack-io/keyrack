@@ -19,8 +19,8 @@ import sys
 import urllib.error
 import urllib.request
 
-# The service binds IPv6 loopback by default.
-BASE = os.environ.get("KEYRACK_REST", "http://[::1]:8080")
+# The proof configs pin the service to IPv4 loopback.
+BASE = os.environ.get("KEYRACK_REST", "http://127.0.0.1:8080")
 PLAINTEXT = b"kmip-provider-proof"
 
 results = []

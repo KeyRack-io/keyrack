@@ -1,0 +1,100 @@
+name: KMIP provider proof
+
+# Runs the KMIP provider against a third-party KMIP server on every pull
+# request. On the per-PR lane deliberately, not behind workflow_dispatch or a
+# release gate: the checks it carries are the only thing standing between the
+# wire format and a repeat of what it just caught, and four constants named the
+# wrong value while the whole workspace test suite passed.
+#
+# Its two halves cover different failure modes:
+#
+#   - check-constants.py compares every wire constant against a third-party
+#     implementation's tables. It is the control for a class of defect that no
+#     test in this repository can see, because our encoder and decoder share
+#     the table and agree with each other whatever the values are.
+#   - the #[ignore]d tests in crates/keyrack-kmip/tests/neutral_server.rs
+#     assert properties only a live server can settle. They are ignored so a
+#     workspace run without a server reports "not run" rather than a pass,
+#     which means this job is the only place they execute.
+#
+# The status check this job publishes is named `Proof against a neutral KMIP
+# server`, which is the string to add to the branch protection rule. Renaming
+# the job silently detaches it from that rule, so the two have to move
+# together.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: kmip-provider-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: Proof against a neutral KMIP server
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: kmip-proof-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # The whole proof, through the same entry point a contributor runs
+      # locally. A CI-only variant of the script would be a second thing to
+      # keep true, and the local path is the one that gets exercised.
+      - name: Run the proof
+        run: |
+          set -euo pipefail
+          mkdir -p conformance/kmip-provider/run
+          ./conformance/kmip-provider/run-proof.sh \
+            | tee conformance/kmip-provider/run/proof-output.txt
+
+      # The proof asserts its own outcomes, so this guards against the other
+      # failure: a harness that passes because it stopped doing anything.
+      # Silence is the shape that mistake takes.
+      - name: Confirm the proof actually asserted something
+        run: |
+          set -euo pipefail
+          log=conformance/kmip-provider/run/proof-output.txt
+          if [ ! -f "$log" ]; then
+            echo "the proof produced no transcript, so it proved nothing"
+            exit 1
+          fi
+          passes=$(grep -c '^\[PASS\]' "$log" || true)
+          echo "$passes operations passed"
+          # Ten REST-level operations plus the routing shape are proven today.
+          # A drop means coverage was removed, which needs to be deliberate
+          # rather than a quiet side effect.
+          if [ "$passes" -lt 11 ]; then
+            echo "expected at least 11 passing operations, saw $passes"
+            exit 1
+          fi
+          grep -q 'constants compared' "$log" \
+            || { echo "the constant cross-check did not run"; exit 1; }
+          grep -q '3 passed' "$log" \
+            || { echo "the live server-guarantee tests did not run"; exit 1; }
+
+      - name: Upload the transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmip-provider-proof
+          path: |
+            conformance/kmip-provider/run/proof-output.txt
+            conformance/kmip-provider/run/keyrack-service.log
+            conformance/kmip-provider/run/keyrack-routing.log
+          if-no-files-found: warn
