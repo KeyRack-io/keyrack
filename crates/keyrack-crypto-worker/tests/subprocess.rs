@@ -155,6 +155,7 @@ impl Harness {
                 .split_whitespace()
                 .map(|v| v.parse().unwrap())
                 .collect();
+            assert_eq!(uids.len(), 4);
             assert!(uids.iter().all(|value| *value == expected));
             let capabilities = status
                 .lines()
@@ -330,7 +331,12 @@ impl Harness {
         )
         .unwrap();
         self.input.as_mut().unwrap().flush().unwrap();
-        response(&mut self.output, &mut self.transcript)
+        let value = response(&mut self.output, &mut self.transcript);
+        // Scan logical responses too: encoding/staging must not hide a leak from
+        // the existing token/sentinel assertions.
+        self.transcript.push_str(&value.to_string());
+        self.transcript.push('\n');
+        value
     }
 
     fn finish(&mut self) {
