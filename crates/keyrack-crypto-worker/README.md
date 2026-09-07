@@ -95,8 +95,8 @@ four original provider tests and exposes a post-test command hook using the same
 `demos/01-foss-vault` fixture. This crate supplies that hook's worker consumer,
 **not a second maintained CI stack**.
 
-After integrating the worker files, the A2 job owner can invoke both suites by
-extending its existing run step to:
+A2 adopted the worker hook in `f4d7bfc`; the existing job now invokes both suites
+with this run step:
 
 ```sh
 bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
@@ -157,9 +157,10 @@ the deleted parent. That test does not claim immediate deletion detection.
 The A2 lane retains its **four original ignored Vault-provider tests**. The worker
 script additionally guards discovery of its own four ignored live tests, so a
 renamed, removed, or un-ignored test fails before running the suite. Local hook
-passes do not establish CI acceptance. A2 must adopt the hook in its existing job
-and supply run evidence. The owner reports that the existing job runs but is not
-yet required by branch protection; worker integration does not change that rule.
+passes do not establish CI acceptance. The hook is wired by A2 at `f4d7bfc`; CI
+run evidence for this revision and required branch-protection contexts remain
+separate from that wiring. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
+for its trigger and gating scope.
 
 ## Limits and integration gates
 
@@ -178,6 +179,12 @@ worker configuration also belong to that trusted supervisor. Demonstrate denial
 from the actual coordinator identity before claiming credential isolation. This
 crate does not enforce or attest those deployment controls. Host-root remains
 trusted under the process profile.
+
+The worker track intends to hand implementation and demonstration of these OS
+controls to deployment. A named receiving owner must explicitly accept the handoff;
+that assignment and deployment evidence are still pending. The worker retains the
+loader/refusal tests and keeps this gate visible as **UNMET** until the deployed
+coordinator is demonstrably denied worker-equivalent access.
 
 The shared canonical custody frame is adopted for native creation and Vault parent
 operations. **Vault derived-parent construction is UNQUALIFIED**, as required by
