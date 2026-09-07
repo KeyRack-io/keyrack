@@ -319,18 +319,28 @@ creating ──► enabled ◄──► disabled
 | `creating` | no | no |
 | `enabled` | yes | yes |
 | `disabled` | no | yes (data recovery) |
+| `compromised` | no | no (dangerous legacy decrypt opt-in only) |
 | `pending_deletion` | no | no |
 | `destroyed` | no | no |
 
 ### 7.2 Valid transitions
 
+The state predicates above are also constrained by persisted logical-key
+compromise history: `KeyRecord` refuses encrypt/decrypt/export if
+`was_compromised` is set, regardless of the current enum. The legacy exception
+applies only while the current state is Compromised, with per-use evidence.
+Verification retains its separate mathematical predicate; see
+[the operator guide](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in).
+
 | From | To | API | Notes |
 |---|---|---|---|
 | `creating` | `enabled` | `CreateKey` | Sync for software; async (`TaskRef`) for HSM |
 | `enabled` | `disabled` | `DisableKey` | Blocks encrypt/sign; decrypt still allowed |
-| `disabled` | `enabled` | `EnableKey` | |
+| `disabled` | `enabled` | `EnableKey` | Only without compromise history |
 | `enabled` | `pending_deletion` | `ScheduleKeyDeletion` | 7–30 day grace period |
 | `disabled` | `pending_deletion` | `ScheduleKeyDeletion` | |
+| `enabled` / `disabled` | `compromised` | `ReportKeyCompromise` | Sets durable compromise history |
+| `compromised` | `pending_deletion` | `ScheduleKeyDeletion` | Retains compromise history |
 | `pending_deletion` | `disabled` | `CancelKeyDeletion` | Returns to disabled, not enabled |
 | `pending_deletion` | `destroyed` | Background worker | HSM material erased, terminal |
 

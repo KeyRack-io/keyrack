@@ -28,6 +28,7 @@
 
 pub mod cache;
 pub mod cert_reload;
+pub mod compromise;
 pub mod config;
 pub mod convert;
 pub mod domain;

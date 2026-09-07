@@ -51,6 +51,7 @@ pub fn test_key_record(state: KeyState) -> KeyRecord {
         occ_version: 1,
         current_key_version: 1,
         state,
+        was_compromised: false,
         key_usage: KeyUsage::EncryptDecrypt,
         key_spec: KeySpec::Aes256,
         origin: KeyOrigin::KeyRack,

@@ -263,6 +263,7 @@ impl LazyProvisioner {
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: self.config.default_key_usage,
             key_spec,
             origin: KeyOrigin::KeyRack,

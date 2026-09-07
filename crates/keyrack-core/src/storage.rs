@@ -74,14 +74,25 @@ pub struct AliasRecord {
 pub trait StorageBackend: Send + Sync {
     // ── Keys ──────────────────────────────────────────────────────
 
-    /// Insert a new key record. Fails if the LID already exists.
+    /// Insert a new key record. Fails if the LID already exists. Persist
+    /// `was_compromised` as true whenever `has_compromise_history()` is true.
     async fn create_key(&self, record: &KeyRecord) -> Result<()>;
 
     /// Fetch a key by LID. Returns `KeyNotFound` if absent.
     async fn get_key(&self, lid: &Lid) -> Result<KeyRecord>;
 
+    /// Fetch authoritative lifecycle state before a key-use decision.
+    /// Cache decorators must bypass cached records here: a cached enabled key
+    /// is not evidence that its current lifecycle state permits an operation.
+    /// Backends without a record cache can use the default implementation.
+    async fn get_key_for_use(&self, lid: &Lid) -> Result<KeyRecord> {
+        self.get_key(lid).await
+    }
+
     /// Atomic update with OCC. Checks `occ_version` matches; on
-    /// mismatch returns `OptimisticConcurrencyConflict`.
+    /// mismatch returns `OptimisticConcurrencyConflict`. Refuse to clear
+    /// persisted compromise history, including legacy records whose live state
+    /// is compromised, and normalize that history into `was_compromised`.
     async fn update_key(&self, record: &KeyRecord) -> Result<()>;
 
     /// List keys with optional filtering and pagination.
@@ -159,6 +170,7 @@ mod tests {
             occ_version: 1,
             current_key_version: 1,
             state,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,

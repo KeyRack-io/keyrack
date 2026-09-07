@@ -412,6 +412,7 @@ async fn create_key(
                     keyrack_core::key::Exportability::NonExportable
                 },
                 first_exported_at: None,
+                was_compromised: false,
                 owner_principal_id: Some(principal_id.clone()),
                 identity_tags,
                 user_tags: keyrack_core::tags::UserTags::new(),
@@ -568,7 +569,11 @@ async fn enable_key(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let mut record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         record
             .transition_to(keyrack_core::key::KeyState::Enabled)
             .map_err(|(f, t)| transition_err(f, t))?;
@@ -613,7 +618,11 @@ async fn schedule_key_deletion(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let mut record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         let days = body
             .get("grace_period_days")
             .and_then(serde_json::Value::as_u64)
@@ -647,7 +656,11 @@ async fn cancel_key_deletion(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let mut record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         if record.state != keyrack_core::key::KeyState::PendingDeletion {
             return Err(ops::rest_error(
                 StatusCode::CONFLICT,
@@ -680,7 +693,11 @@ async fn report_key_compromise(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let mut record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let mut record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         let old_state = record.state.to_string();
         record
             .transition_to(keyrack_core::key::KeyState::Compromised)
@@ -887,6 +904,7 @@ async fn import_key(
                 keyrack_core::key::Exportability::NonExportable
             },
             first_exported_at: None,
+            was_compromised: false,
             owner_principal_id: Some(principal_id.clone()),
             identity_tags,
             user_tags: keyrack_core::tags::UserTags::new(),
@@ -952,8 +970,12 @@ async fn encrypt(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        if !record.state.permits_encrypt() {
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
+        if !record.permits_encrypt() {
             return Err(ops::rest_error(
                 StatusCode::CONFLICT,
                 "InvalidState",
@@ -1042,16 +1064,16 @@ async fn decrypt(
     let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
+    let legacy_audit_context = op_ctx.clone();
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        if !record.state.permits_decrypt() {
-            return Err(ops::rest_error(
-                StatusCode::CONFLICT,
-                "InvalidState",
-                "key not in state for decrypt",
-            ));
-        }
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
+        let decrypt_permission = crate::compromise::check_decrypt(&state, &record)
+            .map_err(|e| ops::rest_error(StatusCode::CONFLICT, "InvalidState", &e.to_string()))?;
         let blob_b64 = body
             .get("ciphertext_blob")
             .and_then(|v| v.as_str())
@@ -1109,6 +1131,9 @@ async fn decrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let aad = header.build_aad(&ec_aad);
+        decrypt_permission
+            .record_use(&state, &record, &legacy_audit_context)
+            .await;
         let plaintext = dec_entry
             .provider
             .decrypt(&version_record.key_handle, ciphertext, &aad)
@@ -1140,7 +1165,11 @@ async fn sign(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         crate::domain::enforce_state_for_key_op(&record, &keyrack_core::audit::AuditAction::Sign)
             .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
@@ -1225,7 +1254,11 @@ async fn verify(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         crate::domain::enforce_state_for_key_op(&record, &keyrack_core::audit::AuditAction::Verify)
             .map_err(|e| e.to_rest_error())?;
         crate::domain::enforce_scope_for_key_op(
@@ -1370,7 +1403,11 @@ async fn generate_mac(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         crate::domain::enforce_state_for_key_op(
             &record,
             &keyrack_core::audit::AuditAction::GenerateMac,
@@ -1439,7 +1476,11 @@ async fn verify_mac(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
         crate::domain::enforce_state_for_key_op(
             &record,
             &keyrack_core::audit::AuditAction::VerifyMac,
@@ -1516,8 +1557,12 @@ async fn generate_data_key(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        if !record.state.permits_encrypt() {
+        let record = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(map_core_err)?;
+        if !record.permits_encrypt() {
             return Err(ops::rest_error(
                 StatusCode::CONFLICT,
                 "InvalidState",
@@ -1614,17 +1659,18 @@ async fn re_encrypt(
     let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &key_id);
     op_ctx.encryption_context_hash = ec_hash;
     op_ctx.request_id = request_id;
+    let legacy_audit_context = op_ctx.clone();
     ops::execute_rest(&state, op_ctx, |state| async move {
         let src_lid = parse_lid_rest(&key_id)?;
         let dst_lid = parse_lid_rest(&dst_key_id)?;
         let src_record = state
             .storage
-            .get_key(&src_lid)
+            .get_key_for_use(&src_lid)
             .await
             .map_err(map_core_err)?;
         let dst_record = state
             .storage
-            .get_key(&dst_lid)
+            .get_key_for_use(&dst_lid)
             .await
             .map_err(map_core_err)?;
         // ReEncrypt is a decrypt under the source key followed by an encrypt
@@ -1634,14 +1680,9 @@ async fn re_encrypt(
         // without this the pair remained a way to decrypt with a key that
         // refused a direct `Decrypt` — including `Destroyed` keys — on REST
         // only.
-        if !src_record.state.permits_decrypt() {
-            return Err(ops::rest_error(
-                StatusCode::CONFLICT,
-                "InvalidState",
-                "source key not in state for decrypt",
-            ));
-        }
-        if !dst_record.state.permits_encrypt() {
+        let decrypt_permission = crate::compromise::check_decrypt(&state, &src_record)
+            .map_err(|e| ops::rest_error(StatusCode::CONFLICT, "InvalidState", &e.to_string()))?;
+        if !dst_record.permits_encrypt() {
             return Err(ops::rest_error(
                 StatusCode::CONFLICT,
                 "InvalidState",
@@ -1734,6 +1775,9 @@ async fn re_encrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
+        decrypt_permission
+            .record_use(&state, &src_record, &legacy_audit_context)
+            .await;
         let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
             src_re_entry
                 .provider

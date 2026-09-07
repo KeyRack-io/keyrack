@@ -36,6 +36,9 @@ use keyrack_service::proto;
 use keyrack_service::proto::key_service_server::KeyService;
 use keyrack_service::state::ServiceState;
 use std::sync::{Arc, Mutex};
+
+#[path = "integration/compromised_domain.rs"]
+mod compromised_domain;
 use tonic::Request;
 
 use base64::Engine as _;
@@ -237,6 +240,7 @@ fn build_test_state_with_provider(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     })
 }
 
@@ -887,6 +891,7 @@ fn build_two_provider_state(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     })
 }
 
@@ -1003,6 +1008,7 @@ async fn routing_matching_rule_selects_tenant_b() {
         provider_ref: Some(selected.clone()),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: identity_tags.clone(),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -1196,6 +1202,7 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         provider_ref: None,
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -1416,6 +1423,7 @@ fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -1488,6 +1496,7 @@ fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -1693,6 +1702,7 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -1807,6 +1817,7 @@ async fn scope_owner_unset_passes_without_check() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -1996,6 +2007,7 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -2061,6 +2073,7 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -2503,6 +2516,7 @@ async fn scope_audit_success_on_unscoped_connection() {
         provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -2648,6 +2662,7 @@ fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -2840,6 +2855,7 @@ fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -2884,6 +2900,7 @@ fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<Capturing
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -2941,6 +2958,7 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -3410,6 +3428,7 @@ fn build_rejecting_authn_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     (state, audit)
 }
@@ -3445,6 +3464,7 @@ fn build_invalid_cred_authn_state() -> Arc<ServiceState> {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     })
 }
 
@@ -3715,6 +3735,7 @@ async fn grpc_authn_reject_no_credential() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -3822,6 +3843,7 @@ async fn mtls_valid_cert_principal_reaches_pdp_audit() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -3879,6 +3901,7 @@ async fn mtls_no_cert_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -3954,6 +3977,7 @@ async fn mtls_untrusted_ca_tls_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4072,6 +4096,7 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4151,6 +4176,7 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4374,6 +4400,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     // Insert a key record directly in storage, bound to the failing
@@ -4402,6 +4429,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         provider_ref: Some(prov_failing_ref.clone()),
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -4604,6 +4632,7 @@ async fn trusted_mtls_peer_denied_on_tenant_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4694,6 +4723,7 @@ async fn trusted_mtls_peer_passes_platform_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -5519,7 +5549,7 @@ async fn grpc_sign_disabled_key_rejected() {
 }
 
 /// Verify is permitted on disabled keys (data recovery). The state-gate uses
-/// `permits_decrypt()` which allows Disabled + Compromised.
+/// `permits_verify()` which preserves Disabled + Compromised verification.
 #[tokio::test]
 async fn grpc_verify_disabled_key_allowed() {
     let (state, _, _) = build_test_state();
@@ -5905,6 +5935,7 @@ async fn grpc_list_keys_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -5941,6 +5972,7 @@ async fn grpc_list_aliases_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -5977,6 +6009,7 @@ async fn grpc_generate_random_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -6083,6 +6116,7 @@ fn build_state_for_principal(
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        legacy_compromised_key_decrypt: false,
     })
 }
 
@@ -6159,6 +6193,7 @@ async fn grpc_list_keys_legacy_unowned_key_visible_to_all() {
         provider_ref: None,
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
         user_tags: keyrack_core::tags::UserTags::new(),

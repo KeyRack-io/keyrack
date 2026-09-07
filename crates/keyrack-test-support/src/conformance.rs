@@ -240,6 +240,62 @@ macro_rules! storage_conformance_tests {
         }
 
         #[tokio::test]
+        async fn conformance_compromise_history_is_monotonic() {
+            use keyrack_core::key::KeyState;
+            use keyrack_core::storage::StorageBackend;
+            use keyrack_test_support::fixtures::{test_key_record, test_lid};
+
+            let store = $storage_expr;
+            let mut record = test_key_record(KeyState::Enabled);
+            record.lid = test_lid("conformance-compromise-history-monotonic");
+            store.create_key(&record).await.unwrap();
+            record.transition_to(KeyState::Compromised).unwrap();
+            store.update_key(&record).await.unwrap();
+            record.transition_to(KeyState::PendingDeletion).unwrap();
+            store.update_key(&record).await.unwrap();
+
+            let mut fetched = store.get_key_for_use(&record.lid).await.unwrap();
+            assert!(fetched.was_compromised);
+            fetched.transition_to(KeyState::Disabled).unwrap();
+            store.update_key(&fetched).await.unwrap();
+            assert!(fetched.transition_to(KeyState::Enabled).is_err());
+            assert!(!fetched.permits_decrypt());
+            assert!(!fetched.permits_export());
+
+            // Even a caller that reconstructs the public record fields may
+            // not persist a cleared marker through the storage API.
+            fetched.was_compromised = false;
+            fetched.occ_version += 1;
+            assert!(store.update_key(&fetched).await.is_err());
+            let preserved = store.get_key_for_use(&record.lid).await.unwrap();
+            assert!(preserved.was_compromised);
+            assert_eq!(preserved.occ_version, fetched.occ_version - 1);
+        }
+
+        #[tokio::test]
+        async fn conformance_compromised_live_state_normalizes_history() {
+            use keyrack_core::key::KeyState;
+            use keyrack_core::storage::StorageBackend;
+            use keyrack_test_support::fixtures::{test_key_record, test_lid};
+
+            let store = $storage_expr;
+            let mut record = test_key_record(KeyState::Compromised);
+            record.lid = test_lid("conformance-compromised-normalization");
+            assert!(!record.was_compromised);
+            store.create_key(&record).await.unwrap();
+            assert!(store.get_key(&record.lid).await.unwrap().was_compromised);
+
+            // A metadata writer holding a legacy record with no explicit
+            // marker remains valid while the live state is Compromised.
+            record.description = "metadata update retains compromise history".into();
+            record.occ_version += 1;
+            store.update_key(&record).await.unwrap();
+            let fetched = store.get_key(&record.lid).await.unwrap();
+            assert!(fetched.was_compromised);
+            assert_eq!(fetched.description, record.description);
+        }
+
+        #[tokio::test]
         async fn conformance_alias_round_trip() {
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::{AliasRecord, StorageBackend};

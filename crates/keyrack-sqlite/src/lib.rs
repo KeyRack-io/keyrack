@@ -117,7 +117,9 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 impl StorageBackend for SqliteStorage {
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         let lid_str = record.lid.to_string();
-        let json = serde_json::to_string(record)
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        let json = serde_json::to_string(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let occ = record.occ_version as i64;
 
@@ -162,13 +164,30 @@ impl StorageBackend for SqliteStorage {
                 "occ_version must be > 0 for updates".into(),
             ));
         }
+        let current = self.get_key(&record.lid).await?;
+        if current.occ_version != record.occ_version - 1 {
+            return Err(KeyRackError::OptimisticConcurrencyConflict {
+                lid: record.lid,
+                expected: record.occ_version - 1,
+                actual: current.occ_version,
+            });
+        }
+        if current.has_compromise_history() && !record.has_compromise_history() {
+            return Err(KeyRackError::Other(
+                "cannot clear a key's compromise history".into(),
+            ));
+        }
         let lid_str = record.lid.to_string();
-        let json = serde_json::to_string(record)
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        let json = serde_json::to_string(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let new_occ = record.occ_version as i64;
         let expected_occ = (record.occ_version - 1) as i64;
 
         self.with_conn(|conn| {
+            // The OCC predicate also rejects changes made after the history
+            // check above, so a concurrent compromise cannot be overwritten.
             let rows = conn
                 .execute(
                     "UPDATE keys SET record_json = ?1, occ_version = ?2 WHERE lid = ?3 AND occ_version = ?4",
@@ -523,11 +542,89 @@ impl StorageBackend for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keyrack_core::key::KeyState;
+    use keyrack_test_support::fixtures::test_key_record;
 
     #[tokio::test]
     async fn open_in_memory() {
         let store = SqliteStorage::in_memory().unwrap();
         store.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compromise_history_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compromise.sqlite");
+        let mut record = test_key_record(KeyState::Enabled);
+        {
+            let store = SqliteStorage::open(&path).unwrap();
+            store.create_key(&record).await.unwrap();
+            record.transition_to(KeyState::Compromised).unwrap();
+            store.update_key(&record).await.unwrap();
+            record.transition_to(KeyState::PendingDeletion).unwrap();
+            store.update_key(&record).await.unwrap();
+        }
+
+        let store = SqliteStorage::open(&path).unwrap();
+        let mut reloaded = store.get_key_for_use(&record.lid).await.unwrap();
+        assert_eq!(reloaded.state, KeyState::PendingDeletion);
+        assert!(reloaded.was_compromised);
+        reloaded.transition_to(KeyState::Disabled).unwrap();
+        store.update_key(&reloaded).await.unwrap();
+        assert!(reloaded.transition_to(KeyState::Enabled).is_err());
+        assert!(!reloaded.permits_decrypt());
+        assert!(!reloaded.permits_export());
+    }
+
+    #[tokio::test]
+    async fn legacy_compromised_json_cannot_lose_history_on_update() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let record = test_key_record(KeyState::Compromised);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("was_compromised");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO keys (lid, record_json, occ_version) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![record.lid.to_string(), value.to_string(), 1_i64],
+                )
+                .map_err(|e| map_sql(&e))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut legacy = store.get_key_for_use(&record.lid).await.unwrap();
+        assert!(!legacy.was_compromised);
+        assert!(legacy.has_compromise_history());
+        let mut cleared = legacy.clone();
+        cleared.state = KeyState::PendingDeletion;
+        cleared.occ_version += 1;
+        assert!(store.update_key(&cleared).await.is_err());
+
+        legacy.description = "legacy metadata update".into();
+        legacy.occ_version += 1;
+        store.update_key(&legacy).await.unwrap();
+        let updated = store.get_key_for_use(&record.lid).await.unwrap();
+        assert!(updated.was_compromised);
+        assert_eq!(updated.description, legacy.description);
+    }
+
+    #[tokio::test]
+    async fn stale_pre_compromise_write_keeps_occ_conflict_semantics() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let mut record = test_key_record(KeyState::Enabled);
+        store.create_key(&record).await.unwrap();
+        let mut stale = record.clone();
+        record.transition_to(KeyState::Compromised).unwrap();
+        store.update_key(&record).await.unwrap();
+
+        stale.description = "write obtained before compromise".into();
+        stale.occ_version += 1;
+        assert!(matches!(
+            store.update_key(&stale).await,
+            Err(KeyRackError::OptimisticConcurrencyConflict { .. })
+        ));
+        assert!(store.get_key(&record.lid).await.unwrap().was_compromised);
     }
 
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());

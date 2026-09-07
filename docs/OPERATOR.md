@@ -54,6 +54,57 @@ With `bootstrap_token` auth, set the token via the `KMS_BOOTSTRAP_TOKEN`
 environment variable. The token is hashed at startup — the plaintext is
 not retained in memory.
 
+### Compromised-key default denial and dangerous legacy opt-in
+
+Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.
+This is the default even when the following setting is absent:
+
+```yaml
+legacy_compromised_key_decrypt: false
+```
+
+An explicit `legacy_compromised_key_decrypt: true` restores dangerous legacy
+decrypt behavior for keys currently in `Compromised` state only. It does not
+permit encrypt, sign, MAC generation, data-key generation, destination-side
+ReEncrypt, rotation or raw key-material export. Normal authorization and scope
+checks still apply. It is not a controlled recovery mechanism.
+
+The setting emits a named WARN on every startup. Each exceptional decrypt or
+source-side ReEncrypt emits another named WARN and a structured audit event
+immediately before provider dispatch, with
+`metadata.legacy_compromised_key_decrypt = "true"`,
+`metadata.phase = "provider_dispatch"` and `metadata.key_state = "compromised"`.
+The event names the source key, authenticated principal, operation and request
+ID. Its `success` means the override was exercised, not that the subsequent
+crypto operation succeeded; the ordinary operation event records that outcome.
+Audit delivery is **best-effort**: an emit failure is logged, but does not withhold
+the operation or result. This change does not implement audit-failure release
+suppression or the separate controlled-recovery contract.
+
+Compromise history is a persisted, monotonic `was_compromised` marker on the
+logical key, independent of its current state and versions. Deletion cancellation
+still returns to `Disabled`, but a historically compromised key cannot be enabled,
+decrypted or exported from that state. Keys never marked compromised retain the
+existing deletion-cancellation and `Disabled` behavior. Rotation cannot clear the
+marker. Verify and VerifyMac retain their previous mathematical verification
+behavior for Enabled, Disabled and Compromised; validity does not establish
+trustworthy key provenance.
+
+Crypto and lifecycle decisions read authoritative storage through
+`get_key_for_use`, bypassing the metadata cache. Do not rely on cache TTL to
+enforce compromise. Deploy the companion AWS shim change that forwards every
+Decrypt to the service: older shim plaintext caches can bypass fresh service
+decisions. Metadata caching remains available for queries.
+
+**Upgrade all writers and serving replicas together.** Old binaries can ignore
+or erase the new JSON marker on a subsequent write, so mixed-version operation
+or rollback to those binaries is unsafe. Existing live Compromised records are
+recognized and latched when written. History already erased by the old laundering
+path cannot be reconstructed from a current Enabled, Disabled or PendingDeletion
+record; review historical incident/audit records before treating those keys as
+uncompromised. This does not protect against direct database tampering or cancel
+already-dispatched provider operations.
+
 ### Environment variables
 
 | Variable | Description | Default |
@@ -604,7 +655,7 @@ nats_notify:
 
 ## Key record cache
 
-Enable in-memory caching of key records to reduce storage round-trips:
+Enable in-memory caching of key metadata queries to reduce storage round-trips:
 
 ```yaml
 cache:
@@ -612,9 +663,11 @@ cache:
   max_capacity: 10000    # maximum cached entries (default: 10,000)
 ```
 
-The cache is invalidated on key state changes and rotation. For HYOK
-deployments, `ttl_secs` is the upper bound on time-to-lockout after a
-tenant disconnects their HSM — lower it if faster revocation is required.
+Local writes replace cached entries; other replicas' metadata can remain stale
+until expiry. No cross-replica invalidation subscriber is wired in this service.
+Crypto, raw export, rotation and lifecycle transitions use authoritative
+`get_key_for_use` reads instead. `ttl_secs` is not an authorization lease,
+revocation bound or guarantee about already-dispatched operations.
 
 If omitted, caching is disabled and every operation hits the storage backend.
 

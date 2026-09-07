@@ -25,6 +25,17 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **Compromised keys now deny decrypt by default, including ReEncrypt sources.**
+  Persisted compromise history prevents deletion cancellation or rotation from
+  restoring decrypt or raw export. Security-sensitive reads bypass metadata
+  caches, including a fresh export check after PDP authorization. An explicit,
+  default-off `legacy_compromised_key_decrypt` flag restores only dangerous legacy
+  decrypt behavior with startup/per-use warnings and structured, best-effort
+  audit markers. It is not controlled recovery or audit-failure release
+  suppression. Disabled and mathematical verification behavior are unchanged.
+  Upgrade all service/storage writers together and deploy the companion shim
+  plaintext-cache bypass fix; old writers can discard the sticky JSON marker.
+  See the operator guide for migration limits and per-use marker semantics.
 - **KMIP wire format: four constants named the wrong thing.** Each collided
   with a value the specification does define, so requests were well-formed and
   meant something else: `SymmetricKey` was `0x01` (Certificate) — which is

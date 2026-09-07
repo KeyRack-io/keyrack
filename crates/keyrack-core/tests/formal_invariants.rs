@@ -384,6 +384,7 @@ proptest! {
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,

@@ -162,9 +162,12 @@ There is no separate "mark for rotation" API. To rotate a specific key:
   `SetKeyRotationPolicy(key_id, { enabled: true, interval_days: N })`.
   Once the background scheduler is wired, this will auto-rotate.
 - **Compromise**: Call `ReportKeyCompromise(key_id)`. This transitions
-  the key to `Compromised` state (decrypt/verify still allowed, but
-  encrypt/sign is blocked). This is a lifecycle action, not rotation —
-  the operator should then rotate or create a replacement key.
+  the key to `Compromised` state and persistently marks its history.
+  Decrypt denies by default; mathematical verification remains allowed.
+  Encrypt, sign, rotation and raw export are blocked. This is a lifecycle
+  action, not rotation: create a replacement logical key; a new version or
+  deletion cancellation cannot rehabilitate this key. The explicitly dangerous
+  legacy decrypt opt-in is documented in [the operator guide](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in).
 
 ---
 
@@ -341,7 +344,7 @@ and is consumed by:
 | `SetKeyRotationPolicy(key_id, policy)` | Persist automatic rotation interval |
 | `EnableKeyRotation(key_id)` | Shorthand: enable auto-rotation |
 | `DisableKeyRotation(key_id)` | Shorthand: disable auto-rotation |
-| `ReportKeyCompromise(key_id)` | Mark key as compromised (not rotation — blocks encrypt/sign) |
+| `ReportKeyCompromise(key_id)` | Persist compromise history; deny decrypt by default, encrypt/sign, rotation and raw export |
 | `DisableKey(key_id)` | Disable key + cascade to descendants |
 | `ScheduleKeyDeletion(key_id, days)` | Schedule destruction after grace period |
 

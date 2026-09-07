@@ -56,30 +56,42 @@ pub enum KeyState {
     Enabled,
     Disabled,
     /// NIST SP 800-57: key material may have been exposed.
-    /// Decrypt/verify allowed for existing data; encrypt/sign forbidden.
+    /// Decrypt is denied by default; mathematical verification is unchanged.
     Compromised,
     PendingDeletion,
     Destroyed,
 }
 
 impl KeyState {
-    /// Whether encrypt and sign operations are permitted.
+    /// Whether encrypt and sign operations are permitted by the live state.
+    /// Use [`KeyRecord::permits_encrypt`] to enforce compromise history too.
     #[must_use]
     pub fn permits_encrypt(&self) -> bool {
         matches!(self, Self::Enabled)
     }
 
-    /// Whether decrypt and verify operations are permitted.
+    /// Whether decrypt operations are permitted by the live state.
     /// Disabled keys allow decrypt for data recovery.
+    /// Service callers must use [`KeyRecord::permits_decrypt`] so compromise
+    /// history is also enforced after deletion cancellation.
     #[must_use]
     pub fn permits_decrypt(&self) -> bool {
+        matches!(self, Self::Enabled | Self::Disabled)
+    }
+
+    /// Whether mathematical signature or MAC verification is permitted.
+    /// This preserves existing behavior; it does not establish trustworthy
+    /// provenance for a compromised key.
+    #[must_use]
+    pub fn permits_verify(&self) -> bool {
         matches!(self, Self::Enabled | Self::Disabled | Self::Compromised)
     }
 
     /// Whether raw key-material export is permitted. `Enabled` only.
+    /// Use [`KeyRecord::permits_export`] to enforce compromise history too.
     ///
     /// Deliberately stricter than [`Self::permits_decrypt`], which grants
-    /// `Disabled` and `Compromised` latitude for data recovery. Export is not a
+    /// `Disabled` latitude for data recovery. Export is not a
     /// data-recovery operation: it hands the caller the key itself, so it is a
     /// custody-boundary crossing and is strictly more powerful than decrypt —
     /// the holder of exported bytes can decrypt forever, outside `KeyRack`, with
@@ -106,7 +118,8 @@ impl KeyState {
         }
     }
 
-    /// Check whether transitioning to `target` is valid.
+    /// Check whether the live-state edge to `target` exists. This cannot check
+    /// compromise history; mutations must use [`KeyRecord::transition_to`].
     #[must_use]
     pub fn can_transition_to(&self, target: Self) -> bool {
         self.valid_transitions().contains(&target)
@@ -279,6 +292,12 @@ pub struct KeyRecord {
     pub current_key_version: u64,
 
     pub state: KeyState,
+    /// Durable, logical-key-wide compromise history. Once set, never clear it:
+    /// deletion cancellation and new material versions cannot rehabilitate a
+    /// compromised key. Legacy records without the field deserialize as false;
+    /// [`Self::has_compromise_history`] also recognizes their live state.
+    #[serde(default)]
+    pub was_compromised: bool,
     pub key_usage: KeyUsage,
     pub key_spec: KeySpec,
     pub origin: KeyOrigin,
@@ -315,13 +334,43 @@ pub struct KeyRecord {
 }
 
 impl KeyRecord {
+    /// Whether this logical key is, or was previously, marked compromised.
+    /// The live-state check handles pre-marker records until their next state
+    /// transition persists the latch. History already erased by an older
+    /// deployment cannot be reconstructed from an otherwise enabled record.
+    #[must_use]
+    pub fn has_compromise_history(&self) -> bool {
+        self.was_compromised || self.state == KeyState::Compromised
+    }
+
+    /// Whether encryption, signing, MAC generation and rotation are permitted.
+    #[must_use]
+    pub fn permits_encrypt(&self) -> bool {
+        !self.has_compromise_history() && self.state.permits_encrypt()
+    }
+
+    /// Whether ordinary decrypt is permitted, including durable history.
+    #[must_use]
+    pub fn permits_decrypt(&self) -> bool {
+        !self.has_compromise_history() && self.state.permits_decrypt()
+    }
+
+    /// Whether raw material export is permitted, including durable history.
+    #[must_use]
+    pub fn permits_export(&self) -> bool {
+        !self.has_compromise_history() && self.state.permits_export()
+    }
+
     /// Attempt a state transition. Returns `Err` if the transition is invalid.
     pub fn transition_to(
         &mut self,
         target: KeyState,
     ) -> std::result::Result<KeyState, (KeyState, KeyState)> {
         let from = self.state;
-        if from.can_transition_to(target) {
+        if from.can_transition_to(target)
+            && !(target == KeyState::Enabled && self.has_compromise_history())
+        {
+            self.was_compromised = self.has_compromise_history() || target == KeyState::Compromised;
             self.state = target;
             self.occ_version += 1;
             self.updated_at = Utc::now();
@@ -455,8 +504,29 @@ pub(crate) mod tests {
         assert!(!KeyState::Creating.permits_decrypt());
         assert!(KeyState::Enabled.permits_decrypt());
         assert!(KeyState::Disabled.permits_decrypt());
+        assert!(!KeyState::Compromised.permits_decrypt());
         assert!(!KeyState::PendingDeletion.permits_decrypt());
         assert!(!KeyState::Destroyed.permits_decrypt());
+    }
+
+    #[test]
+    fn verify_permissions_preserve_existing_behavior() {
+        for state in [
+            KeyState::Creating,
+            KeyState::Enabled,
+            KeyState::Disabled,
+            KeyState::Compromised,
+            KeyState::PendingDeletion,
+            KeyState::Destroyed,
+        ] {
+            assert_eq!(
+                state.permits_verify(),
+                matches!(
+                    state,
+                    KeyState::Enabled | KeyState::Disabled | KeyState::Compromised
+                ),
+            );
+        }
     }
 
     #[test]
@@ -512,6 +582,102 @@ pub(crate) mod tests {
         assert!(record.transition_to(KeyState::Disabled).is_ok());
         assert_eq!(record.state, KeyState::Disabled);
         assert!(record.transition_to(KeyState::Enabled).is_ok());
+        assert!(!record.has_compromise_history());
+        assert!(record.permits_decrypt());
+        assert!(record.permits_export());
+    }
+
+    #[test]
+    fn compromise_history_blocks_deletion_cancellation_laundering() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.transition_to(KeyState::Compromised).unwrap();
+        assert!(record.was_compromised);
+        record.transition_to(KeyState::PendingDeletion).unwrap();
+        record.transition_to(KeyState::Disabled).unwrap();
+
+        let before = record.occ_version;
+        assert!(record.transition_to(KeyState::Enabled).is_err());
+        assert_eq!(record.occ_version, before);
+        assert_eq!(record.state, KeyState::Disabled);
+        assert!(record.was_compromised);
+        assert!(!record.permits_decrypt());
+        assert!(!record.permits_encrypt());
+        assert!(!record.permits_export());
+    }
+
+    #[test]
+    fn compromise_history_survives_pending_deletion_json_round_trip() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.transition_to(KeyState::Compromised).unwrap();
+        record.transition_to(KeyState::PendingDeletion).unwrap();
+        let persisted = serde_json::to_vec(&record).unwrap();
+        let mut reloaded: KeyRecord = serde_json::from_slice(&persisted).unwrap();
+
+        assert_eq!(reloaded.state, KeyState::PendingDeletion);
+        assert!(reloaded.was_compromised);
+        reloaded.transition_to(KeyState::Disabled).unwrap();
+        assert!(reloaded.transition_to(KeyState::Enabled).is_err());
+        assert!(!reloaded.permits_decrypt());
+        assert!(!reloaded.permits_export());
+    }
+
+    #[test]
+    fn legacy_compromised_record_latches_before_leaving_live_state() {
+        let mut value = serde_json::to_value(make_test_record(KeyState::Compromised)).unwrap();
+        value.as_object_mut().unwrap().remove("was_compromised");
+        let mut record: KeyRecord = serde_json::from_value(value).unwrap();
+        assert!(!record.was_compromised);
+        assert!(record.has_compromise_history());
+        assert!(!record.permits_decrypt());
+
+        record.transition_to(KeyState::PendingDeletion).unwrap();
+        assert!(record.was_compromised);
+        record.transition_to(KeyState::Disabled).unwrap();
+        assert!(record.transition_to(KeyState::Enabled).is_err());
+        assert!(!record.permits_decrypt());
+    }
+
+    #[test]
+    fn legacy_never_compromised_record_preserves_deletion_cancellation() {
+        let mut value = serde_json::to_value(make_test_record(KeyState::PendingDeletion)).unwrap();
+        value.as_object_mut().unwrap().remove("was_compromised");
+        let mut record: KeyRecord = serde_json::from_value(value).unwrap();
+        assert!(!record.has_compromise_history());
+        record.transition_to(KeyState::Disabled).unwrap();
+        record.transition_to(KeyState::Enabled).unwrap();
+        assert!(record.permits_decrypt());
+        assert!(record.permits_export());
+    }
+
+    #[test]
+    fn new_version_cannot_clear_logical_key_compromise_history() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.transition_to(KeyState::Compromised).unwrap();
+        record.key_versions[0].is_primary = false;
+        let mut new_version = record.key_versions[0].clone();
+        new_version.version_number = 2;
+        new_version.key_handle.key_id = "fresh-material".into();
+        new_version.is_primary = true;
+        record.key_versions.push(new_version);
+        record.current_key_version = 2;
+
+        // Even accidentally installing fresh material cannot make the logical
+        // record usable; service rotation itself must reject this state.
+        assert!(record.get_version(1).is_some());
+        assert!(record.get_version(2).is_some());
+        assert!(record.has_compromise_history());
+        assert!(!record.permits_decrypt());
+        assert!(!record.permits_encrypt());
+        assert!(!record.permits_export());
+    }
+
+    #[test]
+    fn historical_compromise_denies_use_even_with_inconsistent_enabled_state() {
+        let mut record = make_test_record(KeyState::Enabled);
+        record.was_compromised = true;
+        assert!(!record.permits_decrypt());
+        assert!(!record.permits_encrypt());
+        assert!(!record.permits_export());
     }
 
     #[test]
@@ -614,6 +780,7 @@ pub(crate) mod tests {
             occ_version: 1,
             current_key_version: 1,
             state,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
@@ -681,6 +848,7 @@ pub(crate) mod tests {
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
@@ -786,6 +954,7 @@ pub(crate) mod tests {
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
