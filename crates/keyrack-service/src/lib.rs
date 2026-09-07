@@ -34,6 +34,7 @@ pub mod convert;
 pub mod domain;
 pub mod grpc;
 pub mod hsm_registration;
+pub mod identity_input;
 pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;

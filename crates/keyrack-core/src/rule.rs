@@ -76,6 +76,7 @@ pub const DEFAULT_MAX_DEPTH: u32 = 16;
 pub struct RoutingRule {
     /// Pattern to match against a key's attribute set.
     /// Values starting with `$` are variable bindings.
+    #[serde(deserialize_with = "crate::attr::deserialize_flat")]
     pub match_pattern: BTreeMap<String, String>,
 
     /// What parent to resolve to.
@@ -106,7 +107,7 @@ pub enum ParentRef {
 
     /// An inline attribute pattern for the parent. Variables from the
     /// match pattern are interpolated.
-    Pattern(BTreeMap<String, String>),
+    Pattern(#[serde(deserialize_with = "crate::attr::deserialize_flat")] BTreeMap<String, String>),
 }
 
 fn deserialize_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(), D::Error> {
@@ -134,7 +135,11 @@ pub struct Namespace {
 
     /// Attachment context: attributes that link this namespace to its
     /// parent namespace. `None` for the infrastructure namespace.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_attachment_map"
+    )]
     pub attachment: Option<BTreeMap<String, String>>,
 
     pub routing_rules: Vec<RoutingRule>,
@@ -142,6 +147,16 @@ pub struct Namespace {
     /// Maximum resolution depth. Defaults to [`DEFAULT_MAX_DEPTH`].
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
+}
+
+fn deserialize_attachment_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Flat(
+        #[serde(deserialize_with = "crate::attr::deserialize_flat")] BTreeMap<String, String>,
+    );
+    Option::<Flat>::deserialize(deserializer).map(|value| value.map(|flat| flat.0))
 }
 
 fn default_max_depth() -> u32 {
@@ -153,6 +168,12 @@ fn default_max_depth() -> u32 {
 pub struct Specificity {
     pub concrete_count: u32,
     pub variable_count: u32,
+}
+
+fn normalize_pattern(
+    map: &BTreeMap<String, String>,
+) -> crate::error::Result<BTreeMap<String, String>> {
+    Ok(crate::attr::normalize_flat(map)?)
 }
 
 impl RoutingRule {
@@ -174,59 +195,82 @@ impl RoutingRule {
         }
     }
 
-    /// Check if this rule matches the given attributes.
+    /// Normalize a rule before validating or using its patterns.
+    fn normalized(&self) -> crate::error::Result<Self> {
+        let mut rule = self.clone();
+        rule.match_pattern = normalize_pattern(&self.match_pattern)?;
+        let mut variables = std::collections::HashSet::new();
+        for value in rule.match_pattern.values().filter(|v| v.starts_with('$')) {
+            if value.len() == 1 || !variables.insert(value) {
+                return Err(crate::error::KeyRackError::Other(format!(
+                    "empty or duplicate normalized variable binding: {value}"
+                )));
+            }
+        }
+        if let ParentRef::Pattern(parent) = &self.parent {
+            rule.parent = ParentRef::Pattern(normalize_pattern(parent)?);
+        }
+        Ok(rule)
+    }
+
+    /// Check a normalized pattern against normalized attributes.
+    fn matches_normalized(&self, attrs: &BTreeMap<String, String>) -> bool {
+        self.match_pattern.iter().all(|(key, pattern)| {
+            attrs
+                .get(key)
+                .is_some_and(|value| pattern.starts_with('$') || pattern == value)
+        })
+    }
+
+    /// Check if this rule matches the given attributes after NFC normalization.
+    /// Ambiguous normalized keys or variable bindings never match.
     #[must_use]
     pub fn matches(&self, attrs: &BTreeMap<String, String>) -> bool {
-        for (key, pattern) in &self.match_pattern {
-            match attrs.get(key) {
-                None => return false,
-                Some(value) => {
-                    if !pattern.starts_with('$') && pattern != value {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
+        let (Ok(rule), Ok(attrs)) = (self.normalized(), normalize_pattern(attrs)) else {
+            return false;
+        };
+        rule.matches_normalized(&attrs)
     }
 
-    /// Extract variable bindings from a match.
+    /// Extract normalized variable bindings from a valid match.
     #[must_use]
     pub fn extract_bindings(&self, attrs: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-        let mut bindings = BTreeMap::new();
-        for (key, pattern) in &self.match_pattern {
-            if pattern.starts_with('$') {
-                if let Some(value) = attrs.get(key) {
-                    bindings.insert(pattern.clone(), value.clone());
-                }
-            }
+        let (Ok(rule), Ok(attrs)) = (self.normalized(), normalize_pattern(attrs)) else {
+            return BTreeMap::new();
+        };
+        if !rule.matches_normalized(&attrs) {
+            return BTreeMap::new();
         }
-        bindings
+        rule.match_pattern
+            .iter()
+            .filter(|(_, pattern)| pattern.starts_with('$'))
+            .map(|(key, pattern)| (pattern.clone(), attrs[key].clone()))
+            .collect()
     }
 
-    /// Interpolate the parent pattern with the given variable bindings.
-    /// Returns `None` for root rules and attachment boundaries.
+    /// Interpolate the normalized parent pattern with normalized bindings.
+    /// Returns `None` for root rules, attachment boundaries, invalid patterns,
+    /// or missing variable bindings. A missing variable is never a literal value.
     #[must_use]
     pub fn resolve_parent(
         &self,
         bindings: &BTreeMap<String, String>,
     ) -> Option<BTreeMap<String, String>> {
-        match &self.parent {
+        let rule = self.normalized().ok()?;
+        let bindings = normalize_pattern(bindings).ok()?;
+        match &rule.parent {
             ParentRef::Root | ParentRef::Attachment => None,
-            ParentRef::Pattern(parent) => {
-                let resolved = parent
-                    .iter()
-                    .map(|(k, v)| {
-                        let val = if v.starts_with('$') {
-                            bindings.get(v).cloned().unwrap_or_else(|| v.clone())
-                        } else {
-                            v.clone()
-                        };
-                        (k.clone(), val)
-                    })
-                    .collect();
-                Some(resolved)
-            }
+            ParentRef::Pattern(parent) => parent
+                .iter()
+                .map(|(key, value)| {
+                    let resolved = if value.starts_with('$') {
+                        bindings.get(value)?.clone()
+                    } else {
+                        value.clone()
+                    };
+                    Some((key.clone(), resolved))
+                })
+                .collect(),
         }
     }
 
@@ -284,48 +328,54 @@ impl RuleRegistry {
             .map_err(|e| crate::error::KeyRackError::Other(format!("YAML parse: {e}")))?;
 
         let mut registry = Self::new();
-        let mut seen_names = std::collections::HashSet::new();
-
         for ns in config.namespaces {
-            if !seen_names.insert(ns.name.clone()) {
-                return Err(crate::error::KeyRackError::Other(format!(
-                    "duplicate namespace: {}",
-                    ns.name
-                )));
-            }
-
-            if !(1..=256).contains(&ns.max_depth) {
-                return Err(crate::error::KeyRackError::Other(format!(
-                    "namespace {}: max_depth must be 1–256, got {}",
-                    ns.name, ns.max_depth
-                )));
-            }
-
-            let mut seen_patterns = std::collections::HashSet::new();
-            for rule in &ns.routing_rules {
-                let key: Vec<_> = rule.match_pattern.iter().collect();
-                let pattern_key = format!("{key:?}");
-                if !seen_patterns.insert(pattern_key) {
-                    return Err(crate::error::KeyRackError::Other(format!(
-                        "namespace {}: duplicate rule with pattern {:?}",
-                        ns.name, rule.match_pattern
-                    )));
-                }
-            }
-
-            registry.register(ns);
+            registry.register(ns)?;
         }
-
-        // Static cycle detection: for each rule whose parent is a
-        // Pattern, check if following parent patterns loops back.
         registry.detect_static_cycles()?;
-
         Ok(registry)
     }
 
-    /// Register a namespace.
-    pub fn register(&mut self, namespace: Namespace) {
+    /// Normalize and validate a namespace before storing it.
+    pub fn register(&mut self, mut namespace: Namespace) -> crate::error::Result<()> {
+        namespace.name = crate::canon::normalize_text(&namespace.name);
+        if namespace.name.is_empty() {
+            return Err(crate::error::KeyRackError::Other(
+                "empty namespace name".into(),
+            ));
+        }
+        if self.namespaces.iter().any(|ns| ns.name == namespace.name) {
+            return Err(crate::error::KeyRackError::Other(format!(
+                "duplicate namespace: {}",
+                namespace.name
+            )));
+        }
+        if !(1..=256).contains(&namespace.max_depth) {
+            return Err(crate::error::KeyRackError::Other(format!(
+                "namespace {}: max_depth must be 1–256, got {}",
+                namespace.name, namespace.max_depth
+            )));
+        }
+        namespace.attachment = namespace
+            .attachment
+            .as_ref()
+            .map(normalize_pattern)
+            .transpose()?;
+        namespace.routing_rules = namespace
+            .routing_rules
+            .iter()
+            .map(RoutingRule::normalized)
+            .collect::<crate::error::Result<_>>()?;
+        let mut seen_patterns = std::collections::HashSet::new();
+        for rule in &namespace.routing_rules {
+            if !seen_patterns.insert(rule.match_pattern.clone()) {
+                return Err(crate::error::KeyRackError::Other(format!(
+                    "namespace {}: duplicate rule with pattern {:?}",
+                    namespace.name, rule.match_pattern
+                )));
+            }
+        }
         self.namespaces.push(namespace);
+        Ok(())
     }
 
     /// Detect cycles reachable from static parent patterns alone.
@@ -348,11 +398,11 @@ impl RuleRegistry {
                         }
                         if let Some(m) = self.match_rule(&current) {
                             match &m.rule.parent {
-                                ParentRef::Pattern(next) => {
-                                    current = m
-                                        .rule
-                                        .resolve_parent(&m.bindings)
-                                        .unwrap_or_else(|| next.clone());
+                                ParentRef::Pattern(_) => {
+                                    let Some(parent) = m.rule.resolve_parent(&m.bindings) else {
+                                        break;
+                                    };
+                                    current = parent;
                                 }
                                 _ => break,
                             }
@@ -400,6 +450,7 @@ impl RuleRegistry {
     /// Get a namespace by name.
     #[must_use]
     pub fn get_namespace(&self, name: &str) -> Option<&Namespace> {
+        let name = crate::canon::normalize_text(name);
         self.namespaces.iter().find(|ns| ns.name == name)
     }
 
@@ -539,19 +590,20 @@ mod tests {
             max_depth: DEFAULT_MAX_DEPTH,
             routing_rules: vec![
                 RoutingRule {
-                    match_pattern: BTreeMap::from([("kind".into(), "dek".into())]),
+                    match_pattern: BTreeMap::from([("kind".into(), "$K".into())]),
                     parent: ParentRef::Root,
                     priority: 10,
                     key_spec: None,
                 },
                 RoutingRule {
-                    match_pattern: BTreeMap::from([("kind".into(), "dek".into())]),
+                    match_pattern: BTreeMap::from([("kind".into(), "$OTHER".into())]),
                     parent: ParentRef::Pattern(BTreeMap::from([("kind".into(), "kek".into())])),
                     priority: 20,
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         let attrs = BTreeMap::from([("kind".into(), "dek".into())]);
         let m = reg.match_rule(&attrs).unwrap();
@@ -656,8 +708,8 @@ mod tests {
     #[test]
     fn cross_namespace_resolution() {
         let mut reg = RuleRegistry::new();
-        reg.register(infra_namespace());
-        reg.register(app_namespace());
+        reg.register(infra_namespace()).unwrap();
+        reg.register(app_namespace()).unwrap();
 
         // App-level DEK match
         let dek_attrs = BTreeMap::from([
@@ -702,8 +754,8 @@ mod tests {
     #[test]
     fn specificity_ordering_across_namespaces() {
         let mut reg = RuleRegistry::new();
-        reg.register(infra_namespace());
-        reg.register(app_namespace());
+        reg.register(infra_namespace()).unwrap();
+        reg.register(app_namespace()).unwrap();
 
         // Infra tenant-root has (1 concrete, 1 var) = (1,1)
         // App dek has (1 concrete, 2 var) = (1,2)
@@ -720,7 +772,7 @@ mod tests {
     #[test]
     fn namespace_listing() {
         let mut reg = RuleRegistry::new();
-        reg.register(infra_namespace());
+        reg.register(infra_namespace()).unwrap();
         assert_eq!(reg.namespaces().len(), 1);
         assert!(reg.get_namespace("_infrastructure_").is_some());
         assert!(reg.get_namespace("nonexistent").is_none());
@@ -817,5 +869,145 @@ namespaces:
         assert_eq!(reg.namespaces().len(), 2);
         let app = reg.get_namespace("app").unwrap();
         assert!(app.attachment.is_some());
+    }
+
+    #[test]
+    fn normalized_namespace_is_stored_and_found_by_either_spelling() {
+        let mut ns = infra_namespace();
+        ns.name = "cafe\u{301}".into();
+        ns.attachment = Some(BTreeMap::from([(
+            "re\u{301}gion".into(),
+            "e\u{301}".into(),
+        )]));
+        let mut registry = RuleRegistry::new();
+        registry.register(ns.clone()).unwrap();
+        assert_eq!(registry.namespaces()[0].name, "café");
+        assert_eq!(
+            registry
+                .get_namespace("cafe\u{301}")
+                .unwrap()
+                .attachment
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([("région".into(), "é".into())])
+        );
+        ns.name = "café".into();
+        assert!(registry.register(ns).is_err());
+        assert_eq!(registry.namespaces().len(), 1);
+    }
+
+    #[test]
+    fn normalized_patterns_match_and_bind_before_parent_resolution() {
+        let rule = RoutingRule {
+            match_pattern: BTreeMap::from([
+                ("te\u{301}nant".into(), "e\u{301}".into()),
+                ("user".into(), "$E\u{301}".into()),
+            ]),
+            parent: ParentRef::Pattern(BTreeMap::from([("pare\u{301}nt".into(), "$É".into())])),
+            priority: 0,
+            key_spec: None,
+        };
+        let attrs = BTreeMap::from([
+            ("ténant".into(), "é".into()),
+            ("user".into(), "$e\u{301}".into()),
+        ]);
+        assert!(rule.matches(&attrs));
+        let bindings = rule.extract_bindings(&attrs);
+        assert_eq!(bindings, BTreeMap::from([("$É".into(), "$é".into())]));
+        assert_eq!(
+            rule.resolve_parent(&bindings),
+            Some(BTreeMap::from([("parént".into(), "$é".into())]))
+        );
+        assert!(rule.resolve_parent(&BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn normalized_duplicate_attribute_keys_fail_closed_even_with_identical_values() {
+        let rule = RoutingRule {
+            match_pattern: BTreeMap::from([("é".into(), "$E".into())]),
+            parent: ParentRef::Root,
+            priority: 0,
+            key_spec: None,
+        };
+        let invalid = BTreeMap::from([
+            ("é".into(), "same".into()),
+            ("e\u{301}".into(), "same".into()),
+        ]);
+        assert!(!rule.matches(&invalid));
+        assert!(rule.extract_bindings(&invalid).is_empty());
+        let invalid_rule = RoutingRule {
+            match_pattern: invalid,
+            ..rule
+        };
+        assert!(!invalid_rule.matches(&BTreeMap::from([("é".into(), "same".into())])));
+        let mut ns = infra_namespace();
+        ns.routing_rules = vec![invalid_rule];
+        assert!(RuleRegistry::new().register(ns).is_err());
+    }
+
+    #[test]
+    fn normalized_duplicate_rules_parents_and_attachments_are_rejected() {
+        let rule = RoutingRule {
+            match_pattern: BTreeMap::from([("tenant".into(), "é".into())]),
+            parent: ParentRef::Root,
+            priority: 0,
+            key_spec: None,
+        };
+        let mut ns = infra_namespace();
+        ns.routing_rules = vec![
+            rule.clone(),
+            RoutingRule {
+                match_pattern: BTreeMap::from([("tenant".into(), "e\u{301}".into())]),
+                ..rule.clone()
+            },
+        ];
+        assert!(RuleRegistry::new().register(ns.clone()).is_err());
+        let duplicate = BTreeMap::from([("é".into(), "a".into()), ("e\u{301}".into(), "b".into())]);
+        ns.routing_rules = vec![RoutingRule {
+            parent: ParentRef::Pattern(duplicate.clone()),
+            ..rule.clone()
+        }];
+        assert!(RuleRegistry::new().register(ns.clone()).is_err());
+        ns.routing_rules = vec![rule];
+        ns.attachment = Some(duplicate);
+        assert!(RuleRegistry::new().register(ns).is_err());
+    }
+
+    #[test]
+    fn normalized_duplicate_variable_names_are_rejected() {
+        let rule = RoutingRule {
+            match_pattern: BTreeMap::from([
+                ("a".into(), "$É".into()),
+                ("b".into(), "$E\u{301}".into()),
+            ]),
+            parent: ParentRef::Root,
+            priority: 0,
+            key_spec: None,
+        };
+        assert!(!rule.matches(&BTreeMap::from([
+            ("a".into(), "one".into()),
+            ("b".into(), "two".into())
+        ])));
+        let mut ns = infra_namespace();
+        ns.routing_rules = vec![rule];
+        assert!(RuleRegistry::new().register(ns).is_err());
+    }
+
+    #[test]
+    fn yaml_duplicate_raw_and_normalized_keys_are_rejected_before_collection() {
+        for duplicate_key in ["é", "e\u{301}"] {
+            for location in ["match_pattern", "parent", "attachment"] {
+                let duplicate = format!("é: same\n          {duplicate_key}: same");
+                let yaml = match location {
+                    "match_pattern" => format!("namespaces:\n  - name: test\n    routing_rules:\n      - match_pattern:\n          {duplicate}\n        parent: null\n"),
+                    "parent" => format!("namespaces:\n  - name: test\n    routing_rules:\n      - match_pattern: {{kind: child}}\n        parent:\n          {duplicate}\n"),
+                    _ => format!("namespaces:\n  - name: test\n    attachment:\n      é: same\n      {duplicate_key}: same\n    routing_rules: []\n"),
+                };
+                assert!(
+                    RuleRegistry::from_yaml(&yaml).is_err(),
+                    "{location}: {duplicate_key}"
+                );
+            }
+        }
     }
 }

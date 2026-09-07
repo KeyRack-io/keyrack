@@ -158,8 +158,8 @@ mod tests {
     fn test_lid(name: &str) -> Lid {
         let mut attrs = AttributeSet::new();
         attrs.insert("name", AttributeValue::String(name.into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        Lid::derive(CanonicalizationVersion::V1, &form)
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        Lid::derive(CanonicalizationVersion::V2, &form)
     }
 
     #[test]

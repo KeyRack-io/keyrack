@@ -727,7 +727,7 @@ BLAKE3 produces a 256-bit hash. Birthday-bound collision probability:
 - After 2^128 distinct inputs: probability of collision ≈ 50%
 - This is the same collision resistance as SHA-256
 
-For KeyRack's use case (each LID is derived from a unique attribute set with an injected UUID), collisions are structurally impossible — the UUID ensures uniqueness regardless of hash function collision resistance. The BLAKE3 hash provides a compact, fixed-size identifier.
+For KeyRack's use case (each LID is derived from a unique attribute set with an injected UUID), UUID injection reduces accidental reuse of the same preimage; neither UUIDs nor hashing make collisions impossible. The BLAKE3 hash provides a compact, fixed-size identifier.
 
 **Birthday-bound implications for a KMS:**
 
@@ -735,22 +735,22 @@ Even without the UUID injection, a system would need to create 2^128 keys before
 
 **Canonicalization versioning:**
 
-The `CanonicalizationVersion` enum (currently only `V1`) is included in the hash input, domain-separating different versions:
+The `CanonicalizationVersion` enum (only `V2`) is included in the hash input, domain-separating different versions:
 
 ```rust
 pub enum CanonicalizationVersion {
-    V1 = 1,
+    V2 = 2,
 }
 ```
 
-The version is encoded as `u32 LE` and prepended to the canonical form before hashing. This ensures that a future V2 canonicalization produces different LIDs even for the same attribute set.
+The version is encoded as `u32 LE` and prepended to the canonical form before hashing. V2 uses a different prefix from the removed V1 format, so it re-identifies even unchanged canonical bytes.
 
-**Migration path:** If canonicalization changes (e.g., adding new attribute types, changing sort order, or addressing a security issue), the alias-based migration documented in `MIGRATION.md` allows coexistence of old and new LIDs via aliases. This is a sound migration strategy.
+**Migration status:** This baseline rejects V1 records and has no supported V1 transition. The earlier alias proposal was not an operational upgrade path; see [MIGRATION.md](../MIGRATION.md).
 
 **Auditor assessment:**
 1. The TLV encoding is deterministic and unambiguous (tag-length-value prevents extension/truncation attacks).
-2. NFC normalization prevents Unicode equivalence issues.
-3. BTreeMap ordering ensures sort-order determinism.
+2. V2 applies NFC before validation, sorting, duplicate detection, identity-tag storage and rule matching. The Unicode reference corpus checks NFC independently; generated properties check agreement with rule observations.
+3. Normalized-key BTreeMap ordering determines sort order; ambiguous normalized duplicates are rejected.
 4. Version domain separation is correctly implemented.
 5. The UUID injection (invariant 9 in `SECURITY.md`) makes the LID more of a unique identifier than a content hash — this is safe.
 

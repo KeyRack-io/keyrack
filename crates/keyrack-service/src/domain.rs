@@ -116,6 +116,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             KeyRackError::InvalidStateTransition { .. }
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
+            | KeyRackError::InvalidIdentity(_)
             | KeyRackError::EncryptionContextMismatch
             | KeyRackError::DepthLimitExceeded { .. }
             | KeyRackError::CycleDetected { .. } => Self::InvalidArgument(e.to_string()),
@@ -216,8 +217,10 @@ fn transition_err(from: KeyState, to: KeyState) -> DomainError {
 /// attributes repeat (keys stay unique/opaque); the caller attributes enrich
 /// `identity_tags` so routing rules can match on them.
 pub fn generate_key_lid_from_attrs(
-    caller_attrs: std::collections::BTreeMap<String, String>,
-) -> (Lid, keyrack_core::attr::AttributeSet) {
+    caller_attrs: &std::collections::BTreeMap<String, String>,
+) -> Result<(Lid, keyrack_core::attr::AttributeSet), DomainError> {
+    let caller_attrs = keyrack_core::attr::normalize_flat(caller_attrs)
+        .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
     let mut attrs = keyrack_core::attr::AttributeSet::new();
     for (k, v) in caller_attrs {
         attrs.insert(&k, keyrack_core::attr::AttributeValue::String(v));
@@ -227,9 +230,10 @@ pub fn generate_key_lid_from_attrs(
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &canonical);
-    (lid, attrs)
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
+    let lid = Lid::derive(keyrack_core::canon::CanonicalizationVersion::V2, &canonical);
+    Ok((lid, attrs))
 }
 
 /// Generate a unique LID for a new key.
@@ -237,8 +241,8 @@ pub fn generate_key_lid_from_attrs(
 /// Seeds the attribute set with a UUID so that every `CreateKey` call
 /// produces a distinct LID even when the caller supplies no identity
 /// attributes.
-pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
-    generate_key_lid_from_attrs(std::collections::BTreeMap::new())
+pub fn generate_key_lid() -> Result<(Lid, keyrack_core::attr::AttributeSet), DomainError> {
+    generate_key_lid_from_attrs(&std::collections::BTreeMap::new())
 }
 
 // ── Key lifecycle ───────────────────────────────────────────────────
@@ -719,8 +723,9 @@ pub async fn create_key(
     if !namespace.is_empty() {
         caller_attrs.insert("namespace".to_string(), namespace);
     }
-    let (lid, attrs) = generate_key_lid_from_attrs(caller_attrs);
-    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+    let (lid, attrs) = generate_key_lid_from_attrs(&caller_attrs)?;
+    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs)
+        .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
 
     // Resolve the binding (tag routing + explicit selectors) in one place.
     let provider_name = resolve_create_provider(
@@ -758,7 +763,7 @@ pub async fn create_key(
 
     let record = KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid,
         occ_version: 1,
         current_key_version: 1,
@@ -2410,10 +2415,11 @@ mod resolve_tests {
             )],
             ProviderRef::new("shared"),
         )
+        .unwrap()
     }
 
     fn no_rules_router() -> ProviderRouter {
-        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+        ProviderRouter::new(vec![], ProviderRef::new("shared")).unwrap()
     }
 
     fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
@@ -2421,8 +2427,8 @@ mod resolve_tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let (_, attr_set) = generate_key_lid_from_attrs(attrs);
-        IdentityTags::from_attribute_set(&attr_set)
+        let (_, attr_set) = generate_key_lid_from_attrs(&attrs).unwrap();
+        IdentityTags::from_attribute_set(&attr_set).unwrap()
     }
 
     #[test]
@@ -2666,10 +2672,11 @@ mod explain_tests {
             )],
             ProviderRef::new("shared"),
         )
+        .unwrap()
     }
 
     fn no_rules_router() -> ProviderRouter {
-        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+        ProviderRouter::new(vec![], ProviderRef::new("shared")).unwrap()
     }
 
     fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
@@ -2677,7 +2684,7 @@ mod explain_tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        IdentityTags::from_map(map)
+        IdentityTags::from_map(map).unwrap()
     }
 
     #[test]

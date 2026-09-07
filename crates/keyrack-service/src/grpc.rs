@@ -1097,8 +1097,8 @@ impl KeyService for KeyServiceImpl {
                 if !namespace.is_empty() {
                     caller_attrs.insert("namespace".to_string(), namespace);
                 }
-                let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
-                let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+                let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(&caller_attrs).map_err(|e| e.to_grpc_status())?;
+                let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
                 // Resolve the binding (tag routing + explicit selectors) once.
                 let provider_name = crate::domain::resolve_create_provider(
@@ -1169,7 +1169,7 @@ impl KeyService for KeyServiceImpl {
 
                 let record = keyrack_core::key::KeyRecord {
                     lid,
-                    canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+                    canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
                     parent_lid,
                     occ_version: 1,
                     current_key_version: 1,
@@ -2577,7 +2577,8 @@ impl KeyService for KeyServiceImpl {
             caller_attrs.insert("namespace".to_string(), namespace);
         }
 
-        let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs);
+        let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let result = crate::domain::explain_routing(
             &self.state.provider_router,
@@ -2879,8 +2880,10 @@ impl KeyService for KeyServiceImpl {
             if !namespace.is_empty() {
                 caller_attrs.insert("namespace".to_string(), namespace);
             }
-            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
-            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(&caller_attrs)
+                .map_err(|e| e.to_grpc_status())?;
+            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
             let provider_name = crate::domain::resolve_create_provider(
                 &state.provider_router,
@@ -2930,7 +2933,7 @@ impl KeyService for KeyServiceImpl {
 
             let record = keyrack_core::key::KeyRecord {
                 lid,
-                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
                 parent_lid: None,
                 occ_version: 1,
                 current_key_version: 1,

@@ -657,7 +657,7 @@ async fn build_state(
         });
     }
 
-    let provider_router = ProviderRouter::with_rules(routing_rules, default_ref);
+    let provider_router = ProviderRouter::with_rules(routing_rules, default_ref)?;
 
     let pdp_config = config
         .resolved_pdp()

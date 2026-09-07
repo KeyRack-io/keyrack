@@ -18,14 +18,129 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
+use crate::canon::{normalize_text, CanonicalizationError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+const MAX_IDENTITY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ATTRIBUTE_DEPTH: usize = 64;
+
+fn charge(budget: &mut usize, bytes: usize) -> Result<(), CanonicalizationError> {
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or(CanonicalizationError::LimitExceeded)?;
+    Ok(())
+}
+
+fn text(value: &str, budget: &mut usize) -> Result<String, CanonicalizationError> {
+    if value.len() > MAX_IDENTITY_BYTES {
+        return Err(CanonicalizationError::LimitExceeded);
+    }
+    let normalized = normalize_text(value);
+    charge(budget, normalized.len() + 5)?;
+    Ok(normalized)
+}
+
+/// Normalize before sorting/duplicate detection. Equal-valued duplicate names
+/// are still ambiguous and rejected. The input map is never modified on error.
+pub fn normalize_flat(
+    map: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, CanonicalizationError> {
+    let mut normalized = BTreeMap::new();
+    let mut budget = MAX_IDENTITY_BYTES;
+    for (key, value) in map {
+        let key = text(key, &mut budget)?;
+        if normalized.contains_key(&key) {
+            return Err(CanonicalizationError::DuplicateName(key));
+        }
+        normalized.insert(key, text(value, &mut budget)?);
+    }
+    Ok(normalized)
+}
+
+/// Lossless typed normalization for canonical encoding, including nested records.
+pub fn normalize_attributes(attrs: &AttributeSet) -> Result<AttributeSet, CanonicalizationError> {
+    fn map(
+        input: &BTreeMap<String, AttributeValue>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<BTreeMap<String, AttributeValue>, CanonicalizationError> {
+        if depth > MAX_ATTRIBUTE_DEPTH {
+            return Err(CanonicalizationError::LimitExceeded);
+        }
+        let mut out = BTreeMap::new();
+        for (key, value) in input {
+            let key = text(key, budget)?;
+            if out.contains_key(&key) {
+                return Err(CanonicalizationError::DuplicateName(key));
+            }
+            let value = match value {
+                AttributeValue::String(s) => AttributeValue::String(text(s, budget)?),
+                AttributeValue::I64(n) => {
+                    charge(budget, 13)?;
+                    AttributeValue::I64(*n)
+                }
+                AttributeValue::Bool(b) => {
+                    charge(budget, 6)?;
+                    AttributeValue::Bool(*b)
+                }
+                AttributeValue::ListOfString(items) => {
+                    charge(budget, 9)?;
+                    AttributeValue::ListOfString(
+                        items
+                            .iter()
+                            .map(|s| text(s, budget))
+                            .collect::<Result<_, _>>()?,
+                    )
+                }
+                AttributeValue::Record(inner) => {
+                    charge(budget, 5)?;
+                    AttributeValue::Record(map(inner, depth + 1, budget)?)
+                }
+            };
+            out.insert(key, value);
+        }
+        Ok(out)
+    }
+    let mut budget = MAX_IDENTITY_BYTES;
+    Ok(AttributeSet(map(&attrs.0, 0, &mut budget)?))
+}
+
+/// Deserialize identity maps without allowing a map collector to discard duplicate
+/// names first. Usable on request/config fields with `serde(deserialize_with)`.
+pub fn deserialize_flat<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct FlatVisitor;
+    impl<'de> serde::de::Visitor<'de> for FlatVisitor {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an identity map with unique NFC names")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut input: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = input.next_entry::<String, String>()? {
+                let key = normalize_text(&key);
+                if out.insert(key.clone(), normalize_text(&value)).is_some() {
+                    return Err(serde::de::Error::custom(
+                        CanonicalizationError::DuplicateName(key),
+                    ));
+                }
+            }
+            normalize_flat(&out).map_err(serde::de::Error::custom)
+        }
+    }
+    deserializer.deserialize_map(FlatVisitor)
+}
 
 /// A single attribute value in an attribute set.
 ///
 /// The type set mirrors `PDP_WIRE_FORMAT_REQS.md` R-Q11:
 /// strings, integers, booleans, lists of strings, and records.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum AttributeValue {
     String(String),
@@ -35,12 +150,61 @@ pub enum AttributeValue {
     Record(BTreeMap<String, AttributeValue>),
 }
 
+impl<'de> Deserialize<'de> for AttributeValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            String(String),
+            I64(i64),
+            Bool(bool),
+            List(Vec<String>),
+            Record(AttributeSet),
+        }
+        Ok(match Value::deserialize(d)? {
+            Value::String(s) => Self::String(normalize_text(&s)),
+            Value::I64(n) => Self::I64(n),
+            Value::Bool(b) => Self::Bool(b),
+            Value::List(v) => Self::ListOfString(v.iter().map(|s| normalize_text(s)).collect()),
+            Value::Record(v) => Self::Record(v.0),
+        })
+    }
+}
+
 /// An ordered map of attribute key-value pairs.
 ///
 /// Uses `BTreeMap` for deterministic iteration order — canonicalization
 /// depends on this. Keys are always UTF-8 strings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttributeSet(pub BTreeMap<String, AttributeValue>);
+
+impl<'de> Deserialize<'de> for AttributeSet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct MapVisitor;
+        impl<'de> serde::de::Visitor<'de> for MapVisitor {
+            type Value = AttributeSet;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("unique NFC attribute names")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut input: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((key, value)) = input.next_entry::<String, AttributeValue>()? {
+                    let key = normalize_text(&key);
+                    if out.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(
+                            CanonicalizationError::DuplicateName(key),
+                        ));
+                    }
+                }
+                normalize_attributes(&AttributeSet(out)).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_map(MapVisitor)
+    }
+}
 
 impl AttributeSet {
     #[must_use]

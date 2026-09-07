@@ -126,8 +126,8 @@ fn bench_canonicalize_and_lid(c: &mut Criterion) {
 
     c.bench_function("canonicalize + LID derive (4 attrs)", |b| {
         b.iter(|| {
-            let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-            let lid = keyrack_core::lid::Lid::derive(CanonicalizationVersion::V1, &form);
+            let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+            let lid = keyrack_core::lid::Lid::derive(CanonicalizationVersion::V2, &form);
             criterion::black_box(lid);
         });
     });

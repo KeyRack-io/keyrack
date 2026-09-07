@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-keyrack-core = "0.3"
+keyrack-core = { path = "../keyrack/crates/keyrack-core" }
 ```
 
 ### Resolving a key hierarchy
@@ -45,9 +45,9 @@ let mut attrs = AttributeSet::new();
 attrs.insert("tenant", AttributeValue::String("acme".into()));
 attrs.insert("kind", AttributeValue::String("root".into()));
 
-let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-let lid = Lid::derive(CanonicalizationVersion::V1, &form);
-println!("LID: {lid}"); // lid:a1b2c3...
+let form = canonicalize(CanonicalizationVersion::V2, &attrs)?;
+let lid = Lid::derive(CanonicalizationVersion::V2, &form);
+println!("LID: {lid}"); // lid_a1b2c3...
 ```
 
 ### Encrypt / Decrypt with the software provider

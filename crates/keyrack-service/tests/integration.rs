@@ -224,7 +224,7 @@ fn build_test_state_with_provider(
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::InsecureAuthenticator),
     ]));
@@ -870,7 +870,7 @@ fn build_two_provider_state(
     );
 
     let default_ref = ProviderRef::new("default");
-    let provider_router = ProviderRouter::new(routing_rules, default_ref);
+    let provider_router = ProviderRouter::new(routing_rules, default_ref).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> =
         Arc::new(keyrack_core::pdp::AlwaysAllow);
@@ -959,7 +959,7 @@ async fn routing_matching_rule_selects_tenant_b() {
         "tenant",
         keyrack_core::attr::AttributeValue::String("acme".into()),
     );
-    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap();
 
     let selected = state.provider_router.select(&identity_tags);
     assert_eq!(selected, ProviderRef::new("tenant-b"));
@@ -987,16 +987,17 @@ async fn routing_matching_rule_selects_tenant_b() {
         keyrack_core::attr::AttributeValue::String("acme".into()),
     );
     let canonical = keyrack_core::canon::canonicalize(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &attrs2,
-    );
+    )
+    .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -1181,16 +1182,17 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
 
     // provider_ref: None on both record and version (legacy format).
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -1204,7 +1206,7 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -1403,7 +1405,7 @@ fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         match_tags,
         action: RuleAction::Route(ProviderRef::new("tenant-hsm")),
     }];
-    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -1476,7 +1478,7 @@ fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         match_tags,
         action: RuleAction::Delegate(allowed),
     }];
-    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -1683,14 +1685,15 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -1704,7 +1707,7 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -1798,14 +1801,15 @@ async fn scope_owner_unset_passes_without_check() {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -1819,7 +1823,7 @@ async fn scope_owner_unset_passes_without_check() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -1988,14 +1992,15 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -2009,7 +2014,7 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -2054,14 +2059,15 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -2075,7 +2081,7 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -2497,14 +2503,15 @@ async fn scope_audit_success_on_unscoped_connection() {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -2518,7 +2525,7 @@ async fn scope_audit_success_on_unscoped_connection() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -2642,7 +2649,7 @@ fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -2835,7 +2842,7 @@ fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
         match_tags,
         action: RuleAction::Route(ProviderRef::new("tenant-hsm")),
     }];
-    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default"));
+    let provider_router = ProviderRouter::with_rules(rules, ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -2880,7 +2887,7 @@ fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<Capturing
         DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -2939,14 +2946,15 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -2960,7 +2968,7 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,
@@ -3409,7 +3417,7 @@ fn build_rejecting_authn_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(RejectingAuthenticator),
     ]));
@@ -3445,7 +3453,7 @@ fn build_invalid_cred_authn_state() -> Arc<ServiceState> {
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(InvalidCredentialAuthenticator),
     ]));
@@ -3716,7 +3724,7 @@ async fn grpc_authn_reject_no_credential() {
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(RejectingAuthenticator),
     ]));
@@ -3824,7 +3832,7 @@ async fn mtls_valid_cert_principal_reaches_pdp_audit() {
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::MtlsAuthenticator),
     ]));
@@ -3882,7 +3890,7 @@ async fn mtls_no_cert_rejected() {
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::MtlsAuthenticator),
     ]));
@@ -3958,7 +3966,8 @@ async fn mtls_untrusted_ca_tls_rejected() {
     let provider_router = keyrack_service::routing::ProviderRouter::new(
         vec![],
         keyrack_core::key::ProviderRef::new("default"),
-    );
+    )
+    .unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(keyrack_core::authn::MtlsAuthenticator),
     ]));
@@ -4078,7 +4087,8 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
             ProviderRef::new("acme-hsm"),
         )],
         ProviderRef::new("default"),
-    );
+    )
+    .unwrap();
     let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit: Arc<dyn keyrack_core::audit::AuditSink> = Arc::new(CapturingSink::new());
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
@@ -4158,7 +4168,8 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
             ProviderRef::new("default"),
         )],
         ProviderRef::new("default"),
-    );
+    )
+    .unwrap();
     let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit: Arc<dyn keyrack_core::audit::AuditSink> = Arc::new(CapturingSink::new());
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
@@ -4380,7 +4391,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
     );
 
     // No routing rules → backward-compat mode: backend_id free select.
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
 
     let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let audit = Arc::new(CapturingSink::new());
@@ -4414,10 +4425,10 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         .generate_key(&keyrack_core::key::KeySpec::Aes256)
         .await
         .unwrap();
-    let (lid, attrs) = keyrack_service::domain::generate_key_lid();
+    let (lid, attrs) = keyrack_service::domain::generate_key_lid().unwrap();
     let record = keyrack_core::key::KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 0,
         current_key_version: 1,
@@ -4431,7 +4442,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -4617,7 +4628,7 @@ async fn trusted_mtls_peer_denied_on_tenant_scoped_connection() {
         DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
@@ -4708,7 +4719,7 @@ async fn trusted_mtls_peer_passes_platform_scoped_connection() {
         DynamicProviderRegistry::new(entries, ProviderRef::new("default")).expect("valid registry"),
     );
 
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let pdp: Arc<dyn PolicyDecisionPoint> = Arc::new(AlwaysAllow);
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
@@ -5928,7 +5939,7 @@ async fn grpc_list_keys_requires_auth() {
     let state = Arc::new(ServiceState {
         storage,
         providers,
-        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         pdp: Arc::new(AlwaysAllow),
         audit: Arc::new(CapturingSink::new()),
         authn,
@@ -5965,7 +5976,7 @@ async fn grpc_list_aliases_requires_auth() {
     let state = Arc::new(ServiceState {
         storage,
         providers,
-        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         pdp: Arc::new(AlwaysAllow),
         audit: Arc::new(CapturingSink::new()),
         authn,
@@ -6002,7 +6013,7 @@ async fn grpc_generate_random_requires_auth() {
     let state = Arc::new(ServiceState {
         storage,
         providers,
-        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")),
+        provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         pdp: Arc::new(AlwaysAllow),
         audit: Arc::new(CapturingSink::new()),
         authn,
@@ -6099,7 +6110,7 @@ fn build_state_for_principal(
         provider,
         ProviderClass::InMemory,
     ));
-    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default"));
+    let provider_router = ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap();
     let authn = Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
         Box::new(FixedPrincipalAuthenticator {
             id: principal_id.to_string(),
@@ -6174,14 +6185,15 @@ async fn grpc_list_keys_legacy_unowned_key_visible_to_all() {
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .unwrap();
     let legacy_lid = keyrack_core::lid::Lid::derive(
-        keyrack_core::canon::CanonicalizationVersion::V1,
+        keyrack_core::canon::CanonicalizationVersion::V2,
         &canonical,
     );
     let legacy = keyrack_core::key::KeyRecord {
         lid: legacy_lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
@@ -6195,7 +6207,7 @@ async fn grpc_list_keys_legacy_unowned_key_visible_to_all() {
         first_exported_at: None,
         was_compromised: false,
         owner_principal_id: None,
-        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs),
+        identity_tags: keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: keyrack_core::tags::UserTags::new(),
         created_at: now,
         updated_at: now,

@@ -33,7 +33,7 @@ pub struct MigrateArgs {
 pub enum MigrateCommand {
     /// Generate a migration plan for canonicalization version upgrade.
     Plan {
-        /// Source canonicalization version (e.g. v1).
+        /// Source canonicalization version (must be supported by this binary).
         #[arg(long)]
         from_canonicalization: String,
 
@@ -208,7 +208,7 @@ async fn plan_migration(
 
     for record in &all_keys {
         if record.canonicalization_version == from_version {
-            let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version);
+            let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version)?;
             entries.push(MigrationEntry {
                 old_lid: record.lid.to_string(),
                 new_lid: Some(new_lid.to_string()),
@@ -256,14 +256,58 @@ async fn plan_migration(
     Ok(())
 }
 
+/// Validate the entire plan before opening storage, even entries execution would
+/// otherwise skip. A checkpoint is not authority to accept an obsolete format.
+fn validate_migration_plan(
+    plan: &MigrationPlan,
+) -> anyhow::Result<(
+    keyrack_core::canon::CanonicalizationVersion,
+    keyrack_core::canon::CanonicalizationVersion,
+)> {
+    let parse = |version: u32| {
+        migration::parse_canon_version(&version.to_string()).map_err(anyhow::Error::msg)
+    };
+    let from = parse(plan.from_canonicalization)?;
+    let to = parse(plan.to_canonicalization)?;
+    for (index, entry) in plan.entries.iter().enumerate() {
+        let entry_from = parse(entry.from_version)?;
+        let entry_to = parse(entry.to_version)?;
+        if entry_to != to
+            || (entry_from != from && !(entry.action == MigrationAction::Skip && entry_from == to))
+        {
+            anyhow::bail!("entry {index} canonicalization versions disagree with the plan");
+        }
+    }
+    // Only V2 is supported today, so no canonicalization migration can run.
+    // Keep apply/rollback consistent with the planner instead of treating a
+    // hand-authored same-version plan as an implicit migration/recovery API.
+    if from == to {
+        anyhow::bail!("source and target canonicalization versions are the same");
+    }
+    Ok((from, to))
+}
+
+/// Deserialization rejects unsupported stored versions; additionally require the
+/// supported record version to match the plan before modifying it or its alias.
+async fn migration_source_record(
+    db: &impl StorageBackend,
+    old_lid: &keyrack_core::lid::Lid,
+    expected: keyrack_core::canon::CanonicalizationVersion,
+) -> anyhow::Result<KeyRecord> {
+    let record = db.get_key(old_lid).await?;
+    if record.canonicalization_version != expected {
+        anyhow::bail!("source record {old_lid} canonicalization version disagrees with the plan");
+    }
+    Ok(record)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn apply_migration(plan_file: &std::path::Path, storage_path: &str) -> anyhow::Result<()> {
     let plan_json = std::fs::read_to_string(plan_file)
         .map_err(|e| anyhow::anyhow!("cannot read plan file: {e}"))?;
     let mut plan: MigrationPlan = serde_json::from_str(&plan_json)?;
 
-    let to_version = migration::parse_canon_version(&format!("v{}", plan.to_canonicalization))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (from_version, to_version) = validate_migration_plan(&plan)?;
 
     let db = open_storage(storage_path)?;
 
@@ -282,7 +326,7 @@ async fn apply_migration(plan_file: &std::path::Path, storage_path: &str) -> any
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid LID '{}': {e}", entry.old_lid))?;
 
-        let record = match db.get_key(&old_lid).await {
+        let record = match migration_source_record(&db, &old_lid, from_version).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(lid = %entry.old_lid, error = %e, "key not found");
@@ -291,7 +335,7 @@ async fn apply_migration(plan_file: &std::path::Path, storage_path: &str) -> any
             }
         };
 
-        let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version);
+        let new_lid = migration::rederive_lid(&record.lid, &record.identity_tags, to_version)?;
         let new_lid_str = new_lid.to_string();
 
         let mut updated = record.clone();
@@ -334,6 +378,7 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
         .map_err(|e| anyhow::anyhow!("cannot read plan file: {e}"))?;
     let plan: MigrationPlan = serde_json::from_str(&plan_json)?;
 
+    let (from_version, to_version) = validate_migration_plan(&plan)?;
     let db = open_storage(storage_path)?;
 
     let mut rolled_back = 0usize;
@@ -347,15 +392,11 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
             continue;
         }
 
-        let alias_name = format!("migration:{}", entry.old_lid);
-        match db.delete_alias(&alias_name).await {
-            Ok(()) => {
-                tracing::info!(alias = %alias_name, "removed migration alias");
-            }
-            Err(e) => {
-                tracing::warn!(alias = %alias_name, error = %e, "failed to remove alias");
-            }
-        }
+        let old_lid = entry
+            .old_lid
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid source LID '{}': {e}", entry.old_lid))?;
+        migration_source_record(&db, &old_lid, from_version).await?;
 
         if let Some(new_lid_str) = &entry.new_lid {
             let new_lid: keyrack_core::lid::Lid = match new_lid_str.parse() {
@@ -369,6 +410,9 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
 
             match db.get_key(&new_lid).await {
                 Ok(record) => {
+                    if record.canonicalization_version != to_version {
+                        anyhow::bail!("migrated record {new_lid} canonicalization version disagrees with the plan");
+                    }
                     let mut destroyed = record.clone();
                     destroyed.state = KeyState::Destroyed;
                     destroyed.occ_version += 1;
@@ -380,8 +424,20 @@ async fn rollback_migration(plan_file: &std::path::Path, storage_path: &str) -> 
                     tracing::info!(lid = %new_lid_str, "marked migrated key copy as destroyed");
                 }
                 Err(e) => {
-                    tracing::warn!(lid = %new_lid_str, error = %e, "migrated key not found, may have been cleaned up already");
+                    // An unreadable legacy/corrupt destination must not be
+                    // mistaken for an already-cleaned-up record.
+                    return Err(e.into());
                 }
+            }
+        }
+
+        let alias_name = format!("migration:{}", entry.old_lid);
+        match db.delete_alias(&alias_name).await {
+            Ok(()) => {
+                tracing::info!(alias = %alias_name, "removed migration alias");
+            }
+            Err(e) => {
+                tracing::warn!(alias = %alias_name, error = %e, "failed to remove alias");
             }
         }
 
@@ -679,4 +735,138 @@ async fn rollback_rule_change(
 
     eprintln!("rule-change rollback: {rolled_back} reverted, {skipped} skipped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "keyrack-migration-version-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn plan(from: u32, to: u32, entries: Vec<MigrationEntry>) -> MigrationPlan {
+        MigrationPlan {
+            from_canonicalization: from,
+            to_canonicalization: to,
+            entries,
+            created_at: "2026-09-07T00:00:00Z".into(),
+        }
+    }
+
+    fn entry(from: u32, to: u32, action: MigrationAction, applied: bool) -> MigrationEntry {
+        MigrationEntry {
+            old_lid: keyrack_core::lid::Lid::from_bytes([0x41; 32]).to_string(),
+            new_lid: Some(keyrack_core::lid::Lid::from_bytes([0x42; 32]).to_string()),
+            from_version: from,
+            to_version: to,
+            action,
+            applied,
+        }
+    }
+
+    fn invalid_plans() -> Vec<(MigrationPlan, &'static str)> {
+        let mut cases = vec![
+            (plan(1, 2, vec![]), "unknown canonicalization version: 1"),
+            (plan(2, 1, vec![]), "unknown canonicalization version: 1"),
+            (plan(2, 2, vec![]), "versions are the same"),
+        ];
+        for action in [MigrationAction::RederiveLid, MigrationAction::Skip] {
+            for applied in [false, true] {
+                cases.push((
+                    plan(1, 2, vec![entry(1, 2, action, applied)]),
+                    "unknown canonicalization version: 1",
+                ));
+                // Hide obsolete versions in a plan with supported headers.
+                // Skipped and already-applied checkpoints still need validation.
+                cases.push((
+                    plan(2, 2, vec![entry(1, 2, action, applied)]),
+                    "unknown canonicalization version: 1",
+                ));
+                cases.push((
+                    plan(2, 2, vec![entry(2, 1, action, applied)]),
+                    "unknown canonicalization version: 1",
+                ));
+                cases.push((
+                    plan(2, 2, vec![entry(2, 2, action, applied)]),
+                    "versions are the same",
+                ));
+            }
+        }
+        cases
+    }
+
+    #[tokio::test]
+    async fn invalid_migration_versions_never_open_storage_or_rewrite_plans() {
+        for (plan, expected_error) in invalid_plans() {
+            for rollback in [false, true] {
+                let scratch = Scratch::new();
+                let plan_path = scratch.0.join("plan.json");
+                let database_path = scratch.0.join("must-not-exist.sqlite");
+                let original = serde_json::to_string(&plan).unwrap();
+                std::fs::write(&plan_path, &original).unwrap();
+                let storage = database_path.to_str().unwrap();
+                let result = if rollback {
+                    rollback_migration(&plan_path, storage).await
+                } else {
+                    apply_migration(&plan_path, storage).await
+                };
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected_error), "{error}");
+                assert!(!database_path.exists(), "validation opened SQLite");
+                assert_eq!(std::fs::read_to_string(&plan_path).unwrap(), original);
+                assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_legacy_rollback_preserves_existing_alias_and_database_bytes() {
+        for (from, entry_from) in [(1, 1), (2, 1), (2, 2)] {
+            let scratch = Scratch::new();
+            let plan_path = scratch.0.join("plan.json");
+            let database_path = scratch.0.join("existing.sqlite");
+            let migration_entry = entry(entry_from, 2, MigrationAction::RederiveLid, true);
+            let alias_name = format!("migration:{}", migration_entry.old_lid);
+            let target = migration_entry.new_lid.as_ref().unwrap().parse().unwrap();
+            let original_plan =
+                serde_json::to_string(&plan(from, 2, vec![migration_entry])).unwrap();
+            std::fs::write(&plan_path, &original_plan).unwrap();
+            let db = open_storage(database_path.to_str().unwrap()).unwrap();
+            db.create_alias(&keyrack_core::storage::AliasRecord {
+                alias_name: alias_name.clone(),
+                target_lid: target,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            drop(db);
+            let original_database = std::fs::read(&database_path).unwrap();
+
+            assert!(
+                rollback_migration(&plan_path, database_path.to_str().unwrap())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&database_path).unwrap(), original_database);
+            assert_eq!(std::fs::read_to_string(&plan_path).unwrap(), original_plan);
+            let db = open_storage(database_path.to_str().unwrap()).unwrap();
+            assert_eq!(db.resolve_alias(&alias_name).await.unwrap(), target);
+        }
+    }
 }

@@ -276,7 +276,9 @@ pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status 
         | KeyRackError::ImmutableTag { .. }
         | KeyRackError::DepthLimitExceeded { .. }
         | KeyRackError::CycleDetected { .. } => tonic::Status::failed_precondition(msg),
-        KeyRackError::EncryptionContextMismatch => tonic::Status::invalid_argument(msg),
+        KeyRackError::EncryptionContextMismatch | KeyRackError::InvalidIdentity(_) => {
+            tonic::Status::invalid_argument(msg)
+        }
         KeyRackError::AuthorizationDenied { .. } => tonic::Status::permission_denied(msg),
         KeyRackError::ProviderUnavailable(_) => tonic::Status::unavailable(msg),
         KeyRackError::CascadeDisableFailed { .. }

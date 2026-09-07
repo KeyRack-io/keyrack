@@ -627,5 +627,38 @@ mod tests {
         assert!(store.get_key(&record.lid).await.unwrap().was_compromised);
     }
 
+    #[tokio::test]
+    async fn legacy_identity_version_is_rejected_without_relabeling_or_writing() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let record = test_key_record(KeyState::Enabled);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["canonicalization_version"] = serde_json::json!("V1");
+        let original = value.to_string();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO keys (lid, record_json, occ_version) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![record.lid.to_string(), original, 1_i64],
+                )
+                .map_err(|e| map_sql(&e))?;
+                Ok(())
+            })
+            .unwrap();
+        let error = store.get_key(&record.lid).await.unwrap_err();
+        assert!(error.to_string().contains("unknown variant `V1`"));
+        assert!(store.get_key_for_use(&record.lid).await.is_err());
+        let unchanged: String = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT record_json FROM keys WHERE lid = ?1",
+                    [record.lid.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        assert_eq!(unchanged, original);
+    }
+
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }
