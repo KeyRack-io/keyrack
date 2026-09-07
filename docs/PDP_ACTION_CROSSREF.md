@@ -17,6 +17,33 @@ v1.0 §7.1.
 | `Sign` | `kms:Sign` | Yes |
 | `Verify` | `kms:Verify` | Yes |
 
+### ReEncrypt authorizes two keys
+
+Both gRPC and REST require a separate `kms:ReEncrypt` permit for the source key
+and for the destination key, before entering the crypto operation. A grant on
+only one key is insufficient, including when the other key belongs to another
+tenant. Policy authors must explicitly grant every permitted destination. This
+keeps re-encryption-only delegation distinct from permission to retrieve plaintext
+with `kms:Decrypt`; it does not require standalone `kms:Encrypt` rights either.
+
+Each leg has a fresh PDP `request_id`, including same-key re-encryption. The outer
+operation ID remains the audit correlation ID and is carried in PDP context as
+`operation_request_id`; `re_encrypt_role` is `source` or `destination`, and
+`source_key_id` / `destination_key_id` bind the pair. Both responses must satisfy
+the normal correlation/version/obligation contract. Denial, indeterminacy or PDP
+failure on either leg prevents provider execution. Destination refusal produces
+an `AuthorizationDenied` event naming that key, in addition to the overall denied
+source operation; successful re-encryption emits one operation-success event.
+Transport/protocol failures are recorded as `Error`, not policy denials, with
+`failure_phase=authorization` and an `authorization_status` in audit metadata.
+
+The bundled Cedar engine currently evaluates action and resource identity but
+does not populate its context/entities from the request attributes. Exact-resource
+grants work; the new context fields do not make role- or tenant-attribute policies
+work there. Provider scope and lifecycle checks remain separate, and source scope
+is checked against the ciphertext's historical version, not the current primary.
+Internal domain functions still require their caller's authorization/audit envelope.
+
 ## Key lifecycle
 
 | gRPC RPC | Action string | In contract §7.1? |

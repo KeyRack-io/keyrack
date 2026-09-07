@@ -6,6 +6,14 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
+  source-key permit alone no longer permits re-encryption into an unauthorized
+  destination. Policies must grant `kms:ReEncrypt` on each key; standalone
+  `Decrypt`/`Encrypt` grants are not required. The two PDP requests have distinct
+  IDs and independently validated responses, with the outer request ID retained
+  for audit correlation. Destination denial names the destination in the audit
+  log and prevents all provider calls. Source provider-scope checks now use the
+  ciphertext's historical key version rather than the current primary binding.
 - **PDP responses are now checked against the request they answer.** Both PDP
   clients returned any response that parsed, without confirming its
   `request_id` echoed the request's, so a well-formed decision belonging to a

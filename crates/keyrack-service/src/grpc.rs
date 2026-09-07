@@ -343,7 +343,7 @@ impl KeyService for KeyServiceImpl {
                     .map(keyrack_core::encryption_context::EncryptionContext::hash)
             };
 
-            let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id);
+            let mut op_ctx = OpContext::re_encrypt(principal, &src_key_id, &req.destination_key_id);
             op_ctx.encryption_context_hash = dst_ec_hash;
             op_ctx.request_id = request_id;
 
@@ -380,10 +380,14 @@ impl KeyService for KeyServiceImpl {
                     )));
                 }
 
+                let (header, ciphertext) =
+                    keyrack_core::header::CiphertextHeader::unwrap_payload(&req.ciphertext_blob)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
                 crate::domain::enforce_scope_for_key_op(
                     &state,
                     &src_record,
-                    None,
+                    Some(header.key_version),
                     principal_scope.as_deref(),
                     &principal_id,
                     &keyrack_core::audit::AuditAction::ReEncrypt,
@@ -403,10 +407,6 @@ impl KeyService for KeyServiceImpl {
 
                 let src_ec = build_encryption_context(&req.source_encryption_context);
                 let dst_ec = build_encryption_context(&req.destination_encryption_context);
-
-                let (header, ciphertext) =
-                    keyrack_core::header::CiphertextHeader::unwrap_payload(&req.ciphertext_blob)
-                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
                 let src_version = src_record
                     .key_versions

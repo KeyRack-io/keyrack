@@ -1516,10 +1516,13 @@ pub mod crypto {
             )));
         }
 
+        let (header, ciphertext) = CiphertextHeader::unwrap_payload(&input.ciphertext_blob)
+            .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
+
         super::enforce_scope_for_key_op(
             state,
             &src_record,
-            None,
+            Some(header.key_version),
             input.principal_scope.as_deref(),
             &input.principal_id,
             &keyrack_core::audit::AuditAction::ReEncrypt,
@@ -1534,9 +1537,6 @@ pub mod crypto {
             &keyrack_core::audit::AuditAction::ReEncrypt,
         )
         .await?;
-
-        let (header, ciphertext) = CiphertextHeader::unwrap_payload(&input.ciphertext_blob)
-            .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
 
         let src_version = src_record
             .key_versions

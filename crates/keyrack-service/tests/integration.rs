@@ -40,6 +40,9 @@ use tonic::Request;
 
 use base64::Engine as _;
 
+#[path = "integration/reencrypt_authorization.rs"]
+mod reencrypt_authorization;
+
 /// Audit sink that captures events for test assertions.
 struct CapturingSink {
     events: Mutex<Vec<AuditEvent>>,
