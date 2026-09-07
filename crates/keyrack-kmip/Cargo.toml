@@ -24,6 +24,9 @@ rustls-pki-types = "1"
 [dev-dependencies]
 keyrack-test-support = { workspace = true }
 serde_json = { workspace = true }
+# tests/neutral_server.rs installs a rustls provider, which the host binary
+# normally does at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [lints]
 workspace = true
