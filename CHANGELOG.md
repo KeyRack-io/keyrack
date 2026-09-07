@@ -22,6 +22,34 @@ All notable changes to KeyRack will be documented in this file.
   and is called by both transports, because the gap was present in *both* the
   HTTP and gRPC clients and a per-transport check is how they drifted in the
   first place.
+- **BREAKING (PDP behaviour): a `Permit` carrying an obligation is now
+  denied.** Obligations are conditions the enforcement point must discharge
+  before acting on a permit, and no obligation handlers are implemented, so
+  the permit was previously honoured as though it carried no condition at all
+  — granting more than the policy author wrote. Such a decision is now denied,
+  with the refusal attributed to `policy_id: "keyrack:pep"` so it is
+  distinguishable in the audit trail from a policy denial. There is
+  deliberately no list of "understood" obligations to opt out with, because
+  such a list would assert handling that does not exist. Obligations on a
+  non-`Permit` decision are unaffected: the operation is refused regardless.
+- **Removed: `AuthzResponse::rate_limit_class()`.** The accessor was public
+  with no callers in the workspace, and its doc comment told the reader the
+  class "is expressed as an obligation" — describing a capability that was
+  never implemented, which is exactly what a shipped artifact must not do.
+  Under the rule above it would also have been unreachable, since a `Permit`
+  carrying that obligation is now denied before any caller could read it.
+  **Rate limiting is not implemented and this does not change that**: nothing
+  in KeyRack enforced a rate limit before this release or after it. Planned
+  single-node enforcement will make the obligation dischargeable, at which
+  point a `Permit` carrying it can be honoured rather than denied;
+  cluster-wide enforcement is a commercial extension.
+- **Added: optional `pdp_api_version` on the authorization response** (proto
+  field 6 on `PdpAuthorizeResponse`). A PDP may state the schema version of
+  its response. Absent is accepted, so PDPs predating the field are unaffected
+  and proto3's inability to distinguish absent from empty is not a problem; a
+  version other than `1.0` is refused, because the remaining fields cannot be
+  read with confidence under an unknown schema. Refused as a protocol failure
+  rather than a denial, for the same reason as an uncorrelated response.
 - **BREAKING (PDP implementers, gRPC only): a PDP must echo `request_id`.**
   HTTP PDPs already had to, since the field is required to deserialize. A gRPC
   PDP that never set it was previously accepted, because proto3 transmits `""`
