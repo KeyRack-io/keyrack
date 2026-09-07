@@ -66,6 +66,12 @@ struct KeyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     backend_id: Option<String>,
     description: String,
+    /// Whether key material may leave the provider boundary.
+    ///
+    /// gRPC `DescribeKey` has always carried this; REST omitted it, so an
+    /// exportable and a non-exportable key were indistinguishable over REST
+    /// even though exportability is a custody-critical property.
+    exportable: bool,
     user_tags: keyrack_core::tags::UserTags,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -89,6 +95,10 @@ impl From<&KeyRecord> for KeyResponse {
             provider_ref: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
             backend_id: r.provider_ref.as_ref().map(|p| p.as_str().to_string()),
             description: r.description.clone(),
+            exportable: matches!(
+                r.exportability,
+                keyrack_core::key::Exportability::Exportable
+            ),
             user_tags: r.user_tags.clone(),
             created_at: r.created_at,
             updated_at: r.updated_at,
