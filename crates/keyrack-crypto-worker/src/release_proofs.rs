@@ -39,17 +39,24 @@ fn worker_fence_release_interleavings() {
             }
             2 => {
                 let previous = phase;
-                let success: bool = kani::any();
+                let outcome: u8 = kani::any::<u8>() % 3;
                 let _ = policy.release::<()>(&mut phase, w, now, || {
                     assert!(!fenced);
                     assert_eq!(previous, Phase::Pending);
-                    if success {
-                        commits += 1;
+                    match outcome {
+                        0 => Ok(false),
+                        1 => {
+                            commits += 1;
+                            Ok(true)
+                        }
+                        _ => Err(()),
                     }
-                    Ok(success)
                 });
-                if previous == Phase::Committed {
-                    assert_eq!(phase, Phase::Committed);
+                if previous != Phase::Pending {
+                    assert_eq!(phase, previous);
+                }
+                if previous == Phase::Pending && policy.allows(w, now) && outcome == 2 {
+                    assert_eq!(phase, Phase::Indeterminate);
                 }
                 assert!(commits <= 1);
             }

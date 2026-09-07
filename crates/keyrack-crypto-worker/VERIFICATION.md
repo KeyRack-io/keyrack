@@ -20,8 +20,10 @@ kani crates/keyrack-crypto-worker/src/release_state.rs --harness worker_invalid_
 ```
 
 The first explores eight arbitrary serialized transitions and symbolic write
-success/retry outcomes: accepted fence/stop prevents later commits, each permit
-commits at most once, and committed output never becomes suppressed. The second
+success/retry/error outcomes: accepted fence/stop prevents later commits, each
+permit commits at most once, and every terminal phase remains unchanged. A capsule
+callback error produces indeterminate state and cannot later become suppressed or
+committed. The second
 checks retry admission with arbitrary 64-bit generation/deadline values and
 incarnation match results. The third checks that rejected fencing preserves state.
 The runner executes every entry of `verification/kani-harnesses.json`; the ordinary

@@ -21,6 +21,8 @@ pub(crate) enum Phase {
     Pending,
     Committed,
     Suppressed,
+    // A failed callback may have exposed capsule bytes. Never relabel it.
+    Indeterminate,
 }
 impl Policy {
     pub fn allows(&self, w: Window, now: u64) -> bool {
@@ -67,7 +69,7 @@ impl Policy {
                 Ok(true) => *phase = Phase::Committed,
                 Ok(false) => {} // Retry must pass allows() again.
                 Err(error) => {
-                    *phase = Phase::Suppressed;
+                    *phase = Phase::Indeterminate;
                     return Err(error);
                 }
             }

@@ -296,7 +296,7 @@ fn fence_cancels_every_precommit_staging_position() {
 }
 
 #[test]
-fn identical_empty_fence_state_can_follow_commit_or_expiry_suppression() {
+fn retained_outcomes_distinguish_commit_from_expiry_with_empty_queues() {
     let history = |commit: bool| {
         let (time, d, p) = fixture();
         let parts = p.encoded.len().div_ceil(256);
@@ -335,17 +335,24 @@ fn identical_empty_fence_state_can_follow_commit_or_expiry_suppression() {
         d.fence(|| Ok(())).unwrap();
         let s = d.state.lock().unwrap();
         (
-            before,
             (
-                s.worker.clone(),
-                s.policy,
-                s.next,
-                s.permits.len(),
-                s.queue.len(),
+                before,
+                (
+                    s.worker.clone(),
+                    s.policy,
+                    s.next,
+                    s.permits.len(),
+                    s.queue.len(),
+                ),
             ),
+            s.outcomes[&1].phase,
         )
     };
-    assert_eq!(history(true), history(false));
+    let committed = history(true);
+    let suppressed = history(false);
+    assert_eq!(committed.0, suppressed.0); // Queue/permit state still cannot tell.
+    assert_eq!(committed.1, Release::Committed);
+    assert_eq!(suppressed.1, Release::Suppressed);
 }
 
 #[test]
@@ -370,6 +377,9 @@ fn mixed_committed_and_cancelled_response_history_is_reachable() {
     assert_eq!(released, vec![1]);
     assert!(cancelled(&sink, 2));
     assert!(!cancelled(&sink, 1));
+    d.stop();
+    assert_eq!(phase(&d, 1), Release::Committed);
+    assert_eq!(phase(&d, 2), Release::Suppressed);
     assert!(sink
         .records
         .iter()
@@ -396,11 +406,21 @@ fn injected_short_capsule_write_is_not_non_disclosure_evidence() {
         w.step(&d, &mut staged).unwrap();
     }
     let mut short = ShortWrite(Vec::new());
-    assert!(matches!(w.step(&d, &mut short), Err(Error::Material)));
+    // Call the gate directly so the outer Writer error handler cannot mask a
+    // missing latch inside the release critical section.
+    assert!(matches!(d.release(1, &mut short), Err(Error::Material)));
     assert!(d.state.lock().unwrap().permits.is_empty());
-    // The writer loop calls stop() only after step() returns its error. In this
-    // interval fence() itself has no retained transport-fault classification.
-    d.fence(|| Ok(())).unwrap();
+    assert_eq!(phase(&d, 1), Release::Indeterminate);
+    assert!(d.state.lock().unwrap().faulted);
+    assert!(d.stopped()); // Latch is set before release returns, without writer cleanup.
+    let mut purged = false;
+    assert!(d
+        .fence(|| {
+            purged = true;
+            Ok(())
+        })
+        .is_err());
+    assert!(purged); // Containment still applies; no successful observation.
     let capsule: Value = serde_json::from_slice(&short.0).unwrap();
     let key = Zeroizing::new(STANDARD.decode(capsule["key"].as_str().unwrap()).unwrap());
     let ciphertext = staged
@@ -418,7 +438,13 @@ fn injected_short_capsule_write_is_not_non_disclosure_evidence() {
             .unwrap(),
     );
     assert!(serde_json::from_slice::<Value>(&plaintext).unwrap()["output"].is_string());
+    d.expire();
     d.stop();
+    assert_eq!(phase(&d, 1), Release::Indeterminate);
+    let before = staged.records.len();
+    run(&mut w, &d, &mut staged);
+    assert_eq!(staged.records.len(), before); // No false cancellation notice.
+    assert!(d.release(1, &mut staged).is_err());
     assert!(d.stopped());
 }
 
@@ -445,4 +471,201 @@ fn empty_queue_and_permits_can_hide_writer_held_cancellation() {
     run(&mut w, &d, &mut sink);
     no_release(&d, &sink);
     assert!(cancelled(&sink, 1));
+}
+
+fn phase(d: &Delivery<Arc<Time>>, id: u64) -> Release {
+    d.state.lock().unwrap().outcomes[&id].phase
+}
+
+#[test]
+fn full_history_rejects_admission_without_evicting_terminal_provenance() {
+    let (_, d, sample) = fixture();
+    let mut w = Writer::new();
+    let mut sink = Capture::default();
+    for sequence in 1..=OUTCOMES as u64 {
+        let mut authority = sample.authority.clone();
+        authority.sequence = sequence;
+        d.enqueue(Prepared::new(authority, &json!({"output":"small"})).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            w.step(&d, &mut sink).unwrap();
+        }
+        assert_eq!(sink.records.last().unwrap()["event"], "release");
+        sink.records.clear();
+    }
+    assert!(matches!(d.enqueue(sample), Err(Error::Limit)));
+    d.fence(|| Ok(())).unwrap();
+    d.stop();
+    let s = d.state.lock().unwrap();
+    assert!(s.permits.is_empty());
+    assert!(s.queue.is_empty());
+    assert_eq!(s.outcomes.len(), OUTCOMES);
+    for (id, outcome) in &s.outcomes {
+        assert_eq!(*id, outcome.authority.sequence);
+        assert_eq!(outcome.authority.worker, "instance");
+        assert_eq!(outcome.authority.generation, 1);
+        assert_eq!(outcome.authority.grant_sha256, [9; 32]);
+        assert_eq!(outcome.phase, Release::Committed);
+    }
+}
+
+#[test]
+fn shutdown_retains_uncommitted_outcomes_and_unknown_ids_never_suppress() {
+    let (_, d, p) = fixture();
+    d.enqueue(p).unwrap();
+    d.stop();
+    assert_eq!(phase(&d, 1), Release::Suppressed);
+    let mut sink = Capture::default();
+    assert!(matches!(d.release(1, &mut sink), Ok(Release::Suppressed)));
+    assert!(d.release(999, &mut sink).is_err());
+    assert!(d.active(999).is_err());
+    assert!(sink.records.is_empty());
+}
+
+#[test]
+fn capsule_errors_are_sticky_and_preserve_other_delivery_outcomes() {
+    struct Fault(u8);
+    impl Sink for Fault {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match self.0 {
+                0 => Ok(0),
+                1 => Ok(bytes.len() - 1),
+                2 => Ok(bytes.len() + 1),
+                _ => Err(io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+    }
+    for mode in 0..4 {
+        let (_, d, first) = fixture();
+        d.enqueue(first).unwrap();
+        let mut w = Writer::new();
+        let mut sink = Capture::default();
+        run(&mut w, &d, &mut sink);
+        for sequence in 2..=3 {
+            let (_, _, mut p) = fixture();
+            p.authority.sequence = sequence;
+            d.enqueue(p).unwrap();
+        }
+        while !w.current.as_ref().is_some_and(|j| j.records.is_empty()) {
+            w.step(&d, &mut sink).unwrap();
+        }
+        assert!(w.step(&d, &mut Fault(mode)).is_err());
+        for _ in 0..2 {
+            d.expire();
+            assert!(d.fence(|| Ok(())).is_err());
+            d.stop();
+            assert_eq!(phase(&d, 1), Release::Committed);
+            assert_eq!(phase(&d, 2), Release::Indeterminate);
+            assert_eq!(phase(&d, 3), Release::Suppressed);
+        }
+        let count = sink.records.len();
+        assert!(matches!(d.release(1, &mut sink), Ok(Release::Committed)));
+        assert!(d.release(2, &mut sink).is_err());
+        assert!(matches!(d.release(3, &mut sink), Ok(Release::Suppressed)));
+        run(&mut w, &d, &mut sink);
+        assert_eq!(sink.records.len(), count);
+    }
+}
+
+#[test]
+fn staging_fault_records_cancellation_and_prevents_later_observation() {
+    struct Broken;
+    impl Sink for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let (_, d, p) = fixture();
+    d.enqueue(p).unwrap();
+    assert!(Writer::new().step(&d, &mut Broken).is_err());
+    assert_eq!(phase(&d, 1), Release::Suppressed); // Capsule never attempted.
+    assert!(d.fence(|| Ok(())).is_err());
+    assert!(d.stopped());
+}
+
+#[test]
+fn pending_capsule_fault_excludes_a_concurrent_successful_fence() {
+    struct PausedFault {
+        entered: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    }
+    impl Sink for PausedFault {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.entered.wait();
+            self.resume.wait();
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let (_, d, p) = fixture();
+    let parts = p.encoded.len().div_ceil(256);
+    let d = Arc::new(d);
+    d.enqueue(p).unwrap();
+    let mut w = Writer::new();
+    let mut sink = Capture::default();
+    for _ in 0..parts {
+        w.step(&d, &mut sink).unwrap();
+    }
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let worker = d.clone();
+    let mut fault = PausedFault {
+        entered: entered.clone(),
+        resume: resume.clone(),
+    };
+    let writer = std::thread::spawn(move || w.step(&worker, &mut fault));
+    entered.wait();
+    assert!(matches!(
+        d.state.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    let worker = d.clone();
+    let fence = std::thread::spawn(move || {
+        let mut purged = false;
+        let result = worker.fence(|| {
+            purged = true;
+            Ok(())
+        });
+        (result, purged)
+    });
+    resume.wait();
+    assert!(writer.join().unwrap().is_err());
+    let (result, purged) = fence.join().unwrap();
+    assert!(result.is_err());
+    assert!(purged);
+    assert_eq!(phase(&d, 1), Release::Indeterminate);
+}
+
+#[test]
+fn fence_during_staging_fault_only_establishes_key_cancellation() {
+    struct StagingFault {
+        entered: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    }
+    impl Sink for StagingFault {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.entered.wait();
+            self.resume.wait();
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let (_, d, p) = fixture();
+    let d = Arc::new(d);
+    d.enqueue(p).unwrap();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let worker = d.clone();
+    let mut fault = StagingFault {
+        entered: entered.clone(),
+        resume: resume.clone(),
+    };
+    let writer = std::thread::spawn(move || Writer::new().step(&worker, &mut fault));
+    entered.wait();
+    // Staging has no capsule bytes and runs outside the gate. The fence can
+    // cancel its key now, without asserting success of this in-flight syscall.
+    d.fence(|| Ok(())).unwrap();
+    assert_eq!(phase(&d, 1), Release::Suppressed);
+    resume.wait();
+    assert!(writer.join().unwrap().is_err());
+    assert!(d.fence(|| Ok(())).is_err());
+    assert_eq!(phase(&d, 1), Release::Suppressed);
 }

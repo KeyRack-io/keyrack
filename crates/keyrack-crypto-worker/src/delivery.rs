@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,6 +19,9 @@ use zeroize::Zeroizing;
 const ATOMIC: usize = 512;
 const QUEUED: usize = 4;
 const RESULTS: usize = 3;
+// Incarnation-local evidence is never evicted. A full ledger rejects admission;
+// restart requires a fresh incarnation/grants and does not prove prior outcomes.
+const OUTCOMES: usize = 4096;
 
 #[derive(Clone)]
 pub(crate) struct Authority {
@@ -39,9 +42,11 @@ struct Capsule<'a> {
     grant_sha256: String,
     key: &'a str,
 }
-struct Permit {
-    phase: Release,
+struct Outcome {
     authority: Authority,
+    phase: Release,
+}
+struct Permit {
     key: Zeroizing<[u8; 32]>,
 }
 pub(crate) struct Prepared {
@@ -78,7 +83,35 @@ struct State {
     policy: Policy,
     next: u64,
     permits: HashMap<u64, Permit>,
+    outcomes: BTreeMap<u64, Outcome>,
+    faulted: bool,
     queue: VecDeque<Job>,
+}
+impl State {
+    fn suppress(&mut self, id: u64) {
+        if let Some(outcome) = self.outcomes.get_mut(&id) {
+            if outcome.phase == Release::Pending {
+                outcome.phase = Release::Suppressed;
+            }
+        }
+        // A terminal outcome contains metadata only, never a transport key.
+        self.permits.remove(&id);
+    }
+    fn suppress_pending(&mut self) {
+        for (id, _) in self.permits.drain() {
+            if let Some(outcome) = self.outcomes.get_mut(&id) {
+                if outcome.phase == Release::Pending {
+                    outcome.phase = Release::Suppressed;
+                }
+            }
+        }
+    }
+    fn fail_transport(&mut self) {
+        self.faulted = true;
+        self.policy.stop();
+        self.suppress_pending();
+        self.queue.clear();
+    }
 }
 pub(crate) struct Delivery<C> {
     state: Mutex<State>,
@@ -110,6 +143,8 @@ impl<C: Clock> Delivery<C> {
                 policy: Policy::default(),
                 next: 0,
                 permits: HashMap::new(),
+                outcomes: BTreeMap::new(),
+                faulted: false,
                 queue: VecDeque::new(),
             }),
         }
@@ -132,7 +167,7 @@ impl<C: Clock> Delivery<C> {
         if !self.allowed(&s, &prepared.authority) {
             return Err(Error::Expired);
         }
-        if s.queue.len() >= QUEUED || s.permits.len() >= RESULTS {
+        if s.queue.len() >= QUEUED || s.permits.len() >= RESULTS || s.outcomes.len() >= OUTCOMES {
             return Err(Error::Limit);
         }
         s.next = s.next.checked_add(1).ok_or(Error::Limit)?;
@@ -142,14 +177,14 @@ impl<C: Clock> Delivery<C> {
         if !s.policy.admit(window, self.clock.millis()) {
             return Err(Error::Expired);
         }
-        s.permits.insert(
+        s.outcomes.insert(
             id,
-            Permit {
+            Outcome {
                 phase: Release::Pending,
                 authority: prepared.authority,
-                key: prepared.key,
             },
         );
+        s.permits.insert(id, Permit { key: prepared.key });
         s.queue.push_back(Job {
             id: Some(id),
             records,
@@ -177,14 +212,24 @@ impl<C: Clock> Delivery<C> {
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
         let observation = apply()?;
         s.policy.fence(true);
-        s.permits.clear();
+        s.suppress_pending();
+        // Apply valid authority revocation and purge even on a failed transport,
+        // but never turn uncertain disclosure into a successful observation.
+        if s.faulted {
+            return Err(Error::Material);
+        }
         Ok(observation)
     }
     pub fn stop(&self) {
         if let Ok(mut s) = self.state.lock() {
             s.policy.stop();
-            s.permits.clear();
+            s.suppress_pending();
             s.queue.clear();
+        }
+    }
+    fn fail_transport(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.fail_transport();
         }
     }
     pub fn stopped(&self) -> bool {
@@ -194,35 +239,48 @@ impl<C: Clock> Delivery<C> {
         let mut s = self.state.lock().unwrap();
         let expired: Vec<_> = s
             .permits
-            .iter()
-            .filter(|(_, p)| !self.allowed(&s, &p.authority))
-            .map(|(id, _)| *id)
+            .keys()
+            .filter(|id| !self.allowed(&s, &s.outcomes[id].authority))
+            .copied()
             .collect();
         for id in expired {
-            s.permits.remove(&id);
+            s.suppress(id);
         }
     }
-    fn active(&self, id: u64) -> bool {
-        let mut s = self.state.lock().unwrap();
-        let active = s
-            .permits
-            .get(&id)
-            .is_some_and(|p| self.allowed(&s, &p.authority));
-        if !active {
-            s.permits.remove(&id);
+    fn active(&self, id: u64) -> Result<bool, Error> {
+        let mut s = self.state.lock().map_err(|_| Error::Material)?;
+        let outcome = s.outcomes.get(&id).ok_or(Error::Material)?;
+        match outcome.phase {
+            Release::Pending => {
+                if !s.permits.contains_key(&id) {
+                    return Err(Error::Material);
+                }
+                if self.allowed(&s, &outcome.authority) {
+                    Ok(true)
+                } else {
+                    s.suppress(id);
+                    Ok(false)
+                }
+            }
+            Release::Suppressed => Ok(false),
+            // Absence of a permit is never itself evidence of suppression.
+            Release::Committed | Release::Indeterminate => Err(Error::Material),
         }
-        active
     }
     fn release(&self, id: u64, sink: &mut impl Sink) -> Result<Release, Error> {
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
-        let Some(p) = s.permits.get(&id) else {
-            return Ok(Release::Suppressed);
-        };
-        if !self.allowed(&s, &p.authority) {
-            s.permits.remove(&id);
+        let outcome = s.outcomes.get(&id).ok_or(Error::Material)?;
+        match outcome.phase {
+            Release::Committed | Release::Suppressed => return Ok(outcome.phase),
+            Release::Indeterminate => return Err(Error::Material),
+            Release::Pending => {}
+        }
+        if !self.allowed(&s, &outcome.authority) {
+            s.suppress(id);
             return Ok(Release::Suppressed);
         }
-        let a = &p.authority;
+        let a = &outcome.authority;
+        let p = s.permits.get(&id).ok_or(Error::Material)?;
         let encoded_key = Zeroizing::new(STANDARD.encode(p.key.as_ref()));
         let capsule = record(&Capsule {
             event: "release",
@@ -232,18 +290,32 @@ impl<C: Clock> Delivery<C> {
             sequence: a.sequence,
             grant_sha256: STANDARD.encode(a.grant_sha256),
             key: encoded_key.as_str(),
-        })?;
-        // Final admission and the atomic syscall remain under this same mutex.
+        });
+        let capsule = match capsule {
+            Ok(capsule) => capsule,
+            Err(error) => {
+                // No syscall attempted: cancellation is known, transport failed.
+                s.fail_transport();
+                return Err(error);
+            }
+        };
+        // Final admission, syscall, terminal evidence and fault latch all share
+        // the fence mutex. No fence can observe an unrecorded capsule result.
         let window = Self::window(&s, a);
         let State {
-            policy, permits, ..
+            policy, outcomes, ..
         } = &mut *s;
-        let permit = permits.get_mut(&id).ok_or(Error::Material)?;
-        let phase = policy.release(&mut permit.phase, window, self.clock.millis(), || {
+        let outcome = outcomes.get_mut(&id).ok_or(Error::Material)?;
+        let phase = policy.release(&mut outcome.phase, window, self.clock.millis(), || {
             atomic(sink, &capsule)
         });
         if !matches!(phase, Ok(Release::Pending)) {
-            permits.remove(&id);
+            s.permits.remove(&id);
+        }
+        if phase.is_err() {
+            // The kernel retained Indeterminate, not Suppressed. All other
+            // uncommitted keys can still be cancelled; prior commits survive.
+            s.fail_transport();
         }
         phase
     }
@@ -278,6 +350,18 @@ impl Writer {
         delivery: &Delivery<C>,
         sink: &mut impl Sink,
     ) -> Result<(), Error> {
+        let result = self.step_inner(delivery, sink);
+        if result.is_err() {
+            delivery.fail_transport();
+            self.current = None;
+        }
+        result
+    }
+    fn step_inner<C: Clock>(
+        &mut self,
+        delivery: &Delivery<C>,
+        sink: &mut impl Sink,
+    ) -> Result<(), Error> {
         delivery.expire();
         if delivery.stopped() {
             self.current = None;
@@ -289,15 +373,17 @@ impl Writer {
         let Some(job) = self.current.as_mut() else {
             return Ok(());
         };
-        if let Some(id) = job.id.filter(|id| !delivery.active(*id)) {
-            job.id = None;
-            job.records = chunks(
-                None,
-                &STANDARD.encode(
-                    serde_json::to_vec(&json!({"error":"output suppressed", "delivery":id}))
-                        .map_err(|_| Error::Material)?,
-                ),
-            )?;
+        if let Some(id) = job.id {
+            if !delivery.active(id)? {
+                job.id = None;
+                job.records = chunks(
+                    None,
+                    &STANDARD.encode(
+                        serde_json::to_vec(&json!({"error":"output suppressed", "delivery":id}))
+                            .map_err(|_| Error::Material)?,
+                    ),
+                )?;
+            }
         }
         if let Some(bytes) = job.records.front() {
             if atomic(sink, bytes)? {
@@ -307,6 +393,7 @@ impl Writer {
             match delivery.release(id, sink)? {
                 Release::Committed => self.current = None,
                 Release::Pending => {}
+                Release::Indeterminate => return Err(Error::Material),
                 Release::Suppressed => {
                     job.id = None;
                     job.records = chunks(
