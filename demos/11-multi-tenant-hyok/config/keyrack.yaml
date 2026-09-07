@@ -21,6 +21,8 @@ provider_routing:
   - match: {}
     action: delegate_any
 
+# Demo only: authorization is disabled outright. `always_allow` must be stated
+# explicitly — omitting `pdp:` is a startup error, not a silent allow.
 pdp:
   type: always_allow
 

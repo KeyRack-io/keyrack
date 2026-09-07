@@ -87,6 +87,9 @@ provider:
                         # for multi-tenant HYOK / multiple backends, use a
                         # `providers:` list + `provider_routing` (see OPERATOR.md)
 
+# Mandatory: there is no default PDP. Omitting this block is a startup error
+# rather than a silent allow. `always_allow` disables authorization and must be
+# opted into explicitly.
 pdp:
   type: http
   endpoint: "http://localhost:8181/v1/authorize"
@@ -94,6 +97,8 @@ pdp:
 
 audit:
   type: stdout           # or: file, nats
+# Audit events are always BLAKE3 hash-chained (tamper evidence). Signing adds
+# Ed25519 authenticity and requires a persistent key.
 sign_audit_events: true
 audit_signing_key_path: "/var/lib/keyrack/audit-signing-key"
 

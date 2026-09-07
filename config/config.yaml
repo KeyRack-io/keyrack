@@ -4,6 +4,8 @@ storage:
   type: memory
 provider:
   type: software
+# Demo only: authorization is disabled outright. `always_allow` must be stated
+# explicitly — omitting `pdp:` is a startup error, not a silent allow.
 pdp:
   type: always_allow
 audit:
@@ -18,9 +20,17 @@ authn:
 #   ttl_secs: 300
 #   max_capacity: 10000
 
-# Persistent audit signing key (32-byte Ed25519 seed file).
-# If omitted, an ephemeral key is generated each startup.
+# Audit tamper evidence is always on: every event carries a BLAKE3
+# `previous_hash` link, verifiable with `keyrack audit verify <log>` and no key.
+#
+# Ed25519 signing adds authenticity on top and is opt-in. Enabling it requires a
+# persistent key, otherwise signatures written before a restart can never be
+# verified again:
+# sign_audit_events: true
 # audit_signing_key_path: "/etc/keyrack/keys/audit-signing.key"
+#
+# Development shortcut — accept a per-startup key instead of a persistent one:
+# audit_signing_key_ephemeral: true
 
 # JWT authentication with issuer/audience validation:
 # authn:

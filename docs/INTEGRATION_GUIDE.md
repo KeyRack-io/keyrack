@@ -139,13 +139,17 @@ KeyRack delegates every authorization decision to an external Policy Decision Po
 
 ### PDP Configuration
 
+`pdp:` is mandatory. There is no default and omitting it is a hard startup
+error, so a deployment cannot end up with authorization silently disabled.
+
 ```yaml
 pdp:
   type: http
   url: http://cedar-pdp:8180/v1/is_authorized
 ```
 
-For dev/test only:
+For dev/test only — disables authorization entirely and logs a `WARN` at every
+startup:
 
 ```yaml
 pdp:
@@ -191,18 +195,28 @@ audit: { type: file, path: /var/log/keyrack/audit.jsonl }
 audit: { type: nats, url: nats://nats:4222 }
 ```
 
-### Signed Audit Events
+### Tamper Evidence and Signed Audit Events
 
-Enable tamper-evident logging with Ed25519-signed, BLAKE3-chained events:
+BLAKE3 hash chaining is **always on**: every event carries a `previous_hash`
+link regardless of configuration, so interior tampering and deletion are
+detectable with no key at all:
+
+```bash
+keyrack audit verify /var/log/keyrack/audit.jsonl
+```
+
+Ed25519 signing adds authenticity — proof of *who* wrote the log — and is
+opt-in:
 
 ```yaml
 sign_audit_events: true
 audit_signing_key_path: /var/lib/keyrack/audit-signing-key
 ```
 
-Without `audit_signing_key_path`, a fresh Ed25519 key is generated each startup
-(the verifying key is logged at boot). With the path set, the same key persists
-across restarts, enabling continuous hash-chain verification.
+`audit_signing_key_path` is required when signing is enabled: a per-startup key
+would make every signature written before the last restart unverifiable, so the
+service refuses to start without either a key path or an explicit
+`audit_signing_key_ephemeral: true` (development only).
 
 ### Event Schema (v1)
 
@@ -270,9 +284,12 @@ TTL means faster convergence at the cost of more backend lookups.
 
 - [ ] TLS enabled (`tls:` with server cert + CA for mTLS)
 - [ ] AuthN configured (not `insecure` or `bootstrap_token` alone)
-- [ ] PDP configured (not `always_allow`)
+- [ ] PDP configured (not `always_allow`; the startup log must not carry the
+      `always_allow` warning)
 - [ ] Audit sink set to NATS or file (not stdout)
-- [ ] `sign_audit_events: true` with `audit_signing_key_path` set
+- [ ] `sign_audit_events: true` with `audit_signing_key_path` set (and
+      `audit_signing_key_ephemeral` **not** set)
+- [ ] Audit chain head anchored externally if tail-truncation must be detectable
 - [ ] Cache enabled with TTL matched to your lockout SLA
 - [ ] NATS configured for lifecycle events (`nats_notify:`)
 - [ ] `KMS_BOOTSTRAP_TOKEN` rotated or removed after initial setup

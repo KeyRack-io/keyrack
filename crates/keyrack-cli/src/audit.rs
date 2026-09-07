@@ -32,30 +32,32 @@ pub struct AuditArgs {
 
 #[derive(Subcommand)]
 pub enum AuditCommand {
-    /// Verify a JSONL audit log's Ed25519 signatures and BLAKE3 hash chain.
+    /// Verify a JSONL audit log's BLAKE3 hash chain and, with `--key`, its
+    /// Ed25519 signatures.
     ///
-    /// Each event is checked for a valid signature against the provided key and
-    /// for correct linkage in the BLAKE3 hash chain.  Exits 0 only if every
-    /// event passes both checks.
+    /// The hash chain is always checked: `KeyRack` maintains it whether or not
+    /// signing is enabled, and it needs no key, so tamper evidence is
+    /// verifiable from the log alone. Pass `--key` to additionally verify
+    /// authenticity. Exits 0 only if every event passes every check performed.
     Verify {
         /// Path to the JSONL audit log file.
         log_file: PathBuf,
 
         /// Path to the Ed25519 signing key file (exactly 32 raw bytes, same
         /// format the service writes when `audit_signing_key_path` is set).
+        /// Omit to check the hash chain only.
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
     },
 }
 
 pub fn run(args: AuditArgs) -> anyhow::Result<()> {
     match args.command {
-        AuditCommand::Verify { log_file, key } => verify(&log_file, &key),
+        AuditCommand::Verify { log_file, key } => verify(&log_file, key.as_deref()),
     }
 }
 
-fn verify(log_file: &std::path::Path, key_path: &std::path::Path) -> anyhow::Result<()> {
-    // ── Load the signing key (32-byte raw seed) ────────────────────────
+fn load_verifying_key(key_path: &std::path::Path) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
     let key_bytes = std::fs::read(key_path)
         .map_err(|e| anyhow::anyhow!("cannot read key file {}: {e}", key_path.display()))?;
 
@@ -67,8 +69,14 @@ fn verify(log_file: &std::path::Path, key_path: &std::path::Path) -> anyhow::Res
 
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&key_bytes);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let verifying_key = signing_key.verifying_key();
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+}
+
+fn verify(log_file: &std::path::Path, key_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    // ── Load the signing key, when one was supplied ────────────────────
+    // Without a key the chain is still fully checkable: KeyRack chains every
+    // event regardless of whether signing is enabled.
+    let verifying_key = key_path.map(load_verifying_key).transpose()?;
 
     // ── Read and verify JSONL ──────────────────────────────────────────
     let file = std::fs::File::open(log_file)
@@ -77,9 +85,11 @@ fn verify(log_file: &std::path::Path, key_path: &std::path::Path) -> anyhow::Res
 
     let mut total: u64 = 0;
     let mut failures: u64 = 0;
-    // Hash chain: first event's previous_hash must be 64 hex zeros;
-    // each subsequent event's previous_hash == hex(blake3(prev_sig_hex_bytes)).
-    let mut expected_prev_hash = "0".repeat(64);
+    // Hash chain: the first event's previous_hash must be the genesis hash;
+    // each subsequent event's previous_hash must equal the preceding event's
+    // chain link (blake3 over its signature hex when signed, over its
+    // canonical JSON when not).
+    let mut expected_prev_hash = keyrack_core::audit::CHAIN_GENESIS_HASH.to_string();
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| anyhow::anyhow!("I/O error reading log: {e}"))?;
@@ -99,7 +109,9 @@ fn verify(log_file: &std::path::Path, key_path: &std::path::Path) -> anyhow::Res
             }
         };
 
-        let sig_ok = keyrack_core::audit::AuditSigner::verify_event(&event, &verifying_key);
+        let sig_ok = verifying_key.as_ref().map_or(true, |vk| {
+            keyrack_core::audit::AuditSigner::verify_event(&event, vk)
+        });
 
         let chain_ok = event
             .previous_hash
@@ -121,27 +133,25 @@ fn verify(log_file: &std::path::Path, key_path: &std::path::Path) -> anyhow::Res
             }
         }
 
-        // Advance the expected hash for the next event using whatever
-        // signature the current event records (even if invalid).
-        if let Some(sig_hex) = &event.signature {
-            expected_prev_hash = hex_encode(blake3::hash(sig_hex.as_bytes()).as_bytes());
-        }
+        // Advance the expected hash using whatever the current event records,
+        // even if it failed, so a single bad event does not cascade into a
+        // reported break on every event after it.
+        expected_prev_hash = keyrack_core::audit::chain_link(&event);
     }
 
-    println!("\n{}/{total} events OK", total - failures);
+    let checked = if verifying_key.is_some() {
+        "hash chain + Ed25519 signatures"
+    } else {
+        "hash chain only (no --key given; tamper evidence, not authenticity)"
+    };
+    println!(
+        "\n{}/{total} events OK — checked {checked}",
+        total - failures
+    );
 
     if failures > 0 {
         anyhow::bail!("{failures} event(s) failed verification");
     }
 
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }

@@ -54,13 +54,23 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub provider_routing: Vec<ProviderRoutingRule>,
 
-    #[serde(default)]
-    pub pdp: PdpConfig,
+    /// Authorization decision point. **Mandatory — there is no default.**
+    ///
+    /// A missing `pdp:` block used to fall back to `always_allow`, which
+    /// silently disabled authorization. It is now a hard startup error; see
+    /// [`ServiceConfig::resolved_pdp`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdp: Option<PdpConfig>,
 
     #[serde(default)]
     pub audit: AuditConfig,
 
-    /// Enable Ed25519 signing of audit events for tamper evidence.
+    /// Enable Ed25519 signing of audit events, which adds *authenticity* on
+    /// top of the BLAKE3 hash chain.
+    ///
+    /// The hash chain itself is always maintained and does not depend on this
+    /// flag: chaining gives tamper evidence, signing gives authenticity, and
+    /// they are separately available.
     #[serde(default)]
     pub sign_audit_events: bool,
 
@@ -89,10 +99,21 @@ pub struct ServiceConfig {
     pub cache: Option<CacheConfig>,
 
     /// Path to persistent Ed25519 signing key for audit events.
-    /// If not set, an ephemeral key is generated each startup.
-    /// Format: 32 raw bytes (the Ed25519 secret seed).
+    /// Format: 32 raw bytes (the Ed25519 secret seed). Created on first start
+    /// if the file does not exist.
+    ///
+    /// Required whenever `sign_audit_events` is true, unless
+    /// `audit_signing_key_ephemeral` is explicitly set.
     #[serde(default)]
     pub audit_signing_key_path: Option<String>,
+
+    /// Accept a per-startup audit signing key instead of a persistent one.
+    ///
+    /// Development-only. An ephemeral key means every signature written before
+    /// the last restart becomes unverifiable, so signing no longer provides
+    /// the authenticity it advertises. Opting in must be deliberate.
+    #[serde(default)]
+    pub audit_signing_key_ephemeral: bool,
 }
 
 /// A named provider entry in the `providers` list.
@@ -171,7 +192,9 @@ impl Default for ServiceConfig {
             providers: Vec::new(),
             default_provider: None,
             provider_routing: Vec::new(),
-            pdp: PdpConfig::default(),
+            // No default PDP: an operator must state the authorization
+            // decision explicitly, including when they want none.
+            pdp: None,
             audit: AuditConfig::default(),
             sign_audit_events: false,
             authn: AuthnConfig::default(),
@@ -182,11 +205,69 @@ impl Default for ServiceConfig {
             grpc_keepalive: None,
             cache: None,
             audit_signing_key_path: None,
+            audit_signing_key_ephemeral: false,
         }
     }
 }
 
+/// Startup error for a config with no `pdp:` block.
+pub const PDP_REQUIRED_ERROR: &str = "config error: `pdp:` is required and has no default. \
+     KeyRack will not start without an explicit authorization decision. Set \
+     `pdp: {type: cedar|http|grpc, endpoint: ...}` for a real policy decision point, \
+     `pdp: {type: always_deny}` to deny every request, or `pdp: {type: always_allow}` \
+     to disable authorization entirely (development only).";
+
+/// Startup error for signing enabled with no persistent key and no opt-in.
+pub const AUDIT_SIGNING_KEY_REQUIRED_ERROR: &str =
+    "config error: `sign_audit_events: true` requires `audit_signing_key_path` so that \
+     signatures stay verifiable across restarts. Set `audit_signing_key_path: <file>` \
+     (created on first start), or set `audit_signing_key_ephemeral: true` to accept a \
+     per-startup key that leaves every signature written before the last restart \
+     unverifiable (development only). The BLAKE3 hash chain is maintained either way.";
+
 impl ServiceConfig {
+    /// Check every fail-closed startup invariant that can be decided from the
+    /// config alone.
+    ///
+    /// Called before anything binds a socket or opens a backend so that a
+    /// misconfigured deployment refuses to serve rather than serving wrongly.
+    ///
+    /// # Errors
+    /// Returns a human-actionable message for the first violated invariant.
+    pub fn validate(&self) -> Result<(), String> {
+        self.resolved_pdp()?;
+        self.validate_audit_signing()?;
+        Ok(())
+    }
+
+    /// The configured PDP, or an error when `pdp:` was omitted.
+    ///
+    /// # Errors
+    /// Returns [`PDP_REQUIRED_ERROR`] when no `pdp:` block is present.
+    pub fn resolved_pdp(&self) -> Result<&PdpConfig, String> {
+        self.pdp.as_ref().ok_or_else(|| PDP_REQUIRED_ERROR.into())
+    }
+
+    /// Reject audit signing that cannot survive a restart unless the operator
+    /// opted into an ephemeral key.
+    ///
+    /// # Errors
+    /// Returns [`AUDIT_SIGNING_KEY_REQUIRED_ERROR`] when signing is enabled
+    /// with neither a key path nor the ephemeral opt-in.
+    pub fn validate_audit_signing(&self) -> Result<(), String> {
+        if !self.sign_audit_events {
+            return Ok(());
+        }
+        let has_key_path = self
+            .audit_signing_key_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if has_key_path || self.audit_signing_key_ephemeral {
+            return Ok(());
+        }
+        Err(AUDIT_SIGNING_KEY_REQUIRED_ERROR.into())
+    }
+
     /// Resolve the canonical list of named providers and the default name.
     ///
     /// - If `providers` is empty: synthesises one `NamedProvider` named
@@ -299,10 +380,15 @@ pub enum ProviderConfig {
     },
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Authorization decision point.
+///
+/// Deliberately **not** `Default`: there is no safe implicit choice, so the
+/// variant is always spelled out in config. `AlwaysAllow` disables
+/// authorization and the service logs a prominent warning when it is selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PdpConfig {
-    #[default]
+    /// No authorization at all — every request is permitted. Development only.
     AlwaysAllow,
     AlwaysDeny,
     Http {
@@ -602,7 +688,7 @@ mod tests {
             providers: Vec::new(),
             default_provider: None,
             provider_routing: Vec::new(),
-            pdp: PdpConfig::AlwaysAllow,
+            pdp: Some(PdpConfig::AlwaysAllow),
             audit: AuditConfig::Stdout,
             sign_audit_events: false,
             authn: AuthnConfig::Insecure,
@@ -613,10 +699,81 @@ mod tests {
             grpc_keepalive: None,
             cache: None,
             audit_signing_key_path: None,
+            audit_signing_key_ephemeral: false,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();
         assert_eq!(parsed.grpc_addr, "0.0.0.0:50051");
+        assert!(matches!(parsed.resolved_pdp(), Ok(PdpConfig::AlwaysAllow)));
+    }
+
+    #[test]
+    fn omitting_the_pdp_block_is_rejected() {
+        let yaml = "storage:\n  type: memory\nprovider:\n  type: software\n";
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+
+        assert!(config.pdp.is_none(), "there must be no implicit PDP");
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("`pdp:` is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn built_in_defaults_do_not_grant_an_implicit_pdp() {
+        // `keyrack-service` falls back to `ServiceConfig::default()` when no
+        // KEYRACK_CONFIG is set; that path must fail closed too.
+        let err = ServiceConfig::default().validate().unwrap_err();
+        assert!(
+            err.contains("`pdp:` is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_always_allow_is_accepted() {
+        let yaml = "pdp:\n  type: always_allow\n";
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+
+        config.validate().unwrap();
+        assert!(matches!(config.resolved_pdp(), Ok(PdpConfig::AlwaysAllow)));
+    }
+
+    #[test]
+    fn signing_without_a_persistent_key_is_rejected() {
+        let yaml = "pdp:\n  type: always_allow\nsign_audit_events: true\n";
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("audit_signing_key_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn signing_accepts_a_key_path_or_an_explicit_ephemeral_opt_in() {
+        let persistent = ServiceConfig::from_yaml(
+            "pdp:\n  type: always_allow\nsign_audit_events: true\naudit_signing_key_path: /data/k\n",
+        )
+        .unwrap();
+        persistent.validate().unwrap();
+
+        let ephemeral = ServiceConfig::from_yaml(
+            "pdp:\n  type: always_allow\nsign_audit_events: true\naudit_signing_key_ephemeral: true\n",
+        )
+        .unwrap();
+        ephemeral.validate().unwrap();
+    }
+
+    #[test]
+    fn unsigned_audit_config_is_valid_and_still_chains() {
+        // Chaining is unconditional, so an unsigned config needs no signing
+        // key and must not be rejected.
+        let config = ServiceConfig::from_yaml("pdp:\n  type: always_deny\n").unwrap();
+        assert!(!config.sign_audit_events);
+        config.validate().unwrap();
     }
 
     #[test]

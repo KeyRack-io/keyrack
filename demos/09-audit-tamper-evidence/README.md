@@ -6,12 +6,21 @@ tampering (line deletion / reordering that breaks the chain).
 
 ## How it works
 
-Every audit event written by KeyRack (when `sign_audit_events: true`) is:
+Chaining and signing are separate properties. **Chaining is unconditional** —
+every KeyRack deployment gets it, with no key and no configuration — and gives
+tamper evidence. **Signing is opt-in** via `sign_audit_events: true` and gives
+authenticity. This demo enables both so it can show what each one catches.
 
-1. **Signed** with Ed25519 over the canonical JSON of the event (with
-   the `signature` field nulled before signing).
-2. **Chained** via BLAKE3: `event.previous_hash = hex(blake3(prev_event.signature_hex_bytes))`.
-   The first event's `previous_hash` is 64 hex zeros.
+Every audit event is:
+
+1. **Chained** via BLAKE3: `event.previous_hash = hex(blake3(link(prev_event)))`,
+   where `link` is the previous event's signature hex when it is signed and its
+   canonical JSON when it is not. Either preimage appears verbatim in the log,
+   so the chain is checkable from the log alone. The first event's
+   `previous_hash` is 64 hex zeros.
+2. **Signed**, when signing is enabled, with Ed25519 over the canonical JSON of
+   the event (with the `signature` field nulled before signing). The signed
+   bytes include `previous_hash`, so the signature also attests to the link.
 
 ```
 Event 1: previous_hash="000...0"  signature=Ed25519(event1_content)
@@ -21,11 +30,21 @@ Event 3: previous_hash=blake3(event2.signature)  signature=Ed25519(event3_conten
 
 ### What each tamper breaks
 
-| Tamper | Detected by |
-|--------|-------------|
-| Modify any field value | Ed25519 signature check (signature no longer matches content) |
-| Delete or reorder a line | BLAKE3 hash chain (subsequent `previous_hash` no longer matches) |
-| Inject a new line | BLAKE3 hash chain (injected event's `previous_hash` is wrong) |
+| Tamper | Detected by | Needs a key? |
+|--------|-------------|--------------|
+| Modify any field value | Ed25519 signature check (signature no longer matches content) | Yes |
+| Delete or reorder a line | BLAKE3 hash chain (subsequent `previous_hash` no longer matches) | No |
+| Inject a new line | BLAKE3 hash chain (injected event's `previous_hash` is wrong) | No |
+
+Two limits, stated plainly:
+
+- **Tail-truncation** (dropping the newest N events) breaks nothing internal to
+  the log. Detecting it requires an external anchor, e.g. periodically
+  recording the current head hash somewhere else.
+- **A chain alone does not prove authorship.** An attacker with write access to
+  the whole file can rewrite every event and recompute every link. Signing is
+  what makes that infeasible, which is why an audit-grade deployment sets
+  `sign_audit_events: true` with a persistent key.
 
 ## Quick start
 
@@ -40,16 +59,21 @@ docker compose down -v
 
 | Check | Expected result |
 |-------|----------------|
-| `keyrack audit verify` on the clean log | Exit 0, all events OK |
+| `keyrack audit verify --key` on the clean log | Exit 0, all events OK |
 | Falsify outcome (`"result":"success"` → `"denied"`) in event 1 | Exit 1, "invalid signature" |
 | Delete event 2, recheck | Exit 1, "hash chain break" |
+| `keyrack audit verify` on the clean log, **no key** | Exit 0, "hash chain only" |
+| `keyrack audit verify` on the deletion-tampered log, **no key** | Exit 1, "hash chain break" |
+
+The last two are what an unsigned deployment gets. They run in CI, so the claim
+"tamper evidence without a signing key" is asserted rather than asserted-about.
 
 ## CLI: keyrack audit verify
 
 The verifier is a subcommand of the `keyrack` CLI built in this repo:
 
 ```bash
-# Verify a log file against its signing key
+# Verify the hash chain and the signatures
 keyrack audit verify /data/audit.log --key /data/audit-signing.key
 
 # Output:
@@ -57,7 +81,15 @@ keyrack audit verify /data/audit.log --key /data/audit-signing.key
 # event 2: OK
 # event 3: OK
 #
-# 3/3 events OK
+# 3/3 events OK — checked hash chain + Ed25519 signatures
+```
+
+Omit `--key` to check only the hash chain. That is the mode an unsigned
+deployment uses, and it still detects deletion, reordering, and injection:
+
+```bash
+keyrack audit verify /data/audit.log
+# 3/3 events OK — checked hash chain only (no --key given; tamper evidence, not authenticity)
 ```
 
 ### Signing key format
