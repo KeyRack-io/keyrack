@@ -47,6 +47,12 @@ pub(crate) trait Clock {
     fn millis(&self) -> u64;
 }
 
+impl<T: Clock> Clock for std::sync::Arc<T> {
+    fn millis(&self) -> u64 {
+        (**self).millis()
+    }
+}
+
 pub(crate) struct MonotonicClock(Instant);
 impl MonotonicClock {
     pub(crate) fn new() -> Self {
@@ -387,6 +393,39 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             return Err(Error::Expired);
         }
         Ok(output.to_vec())
+    }
+
+    pub(crate) fn execute_for_delivery(
+        &mut self,
+        signed: &Signed,
+        principal: &str,
+        context: &WrappingContext,
+        operation: Operation,
+        input: &[u8],
+    ) -> Result<(crate::delivery::Authority, Zeroizing<Vec<u8>>), Error> {
+        let output = Zeroizing::new(self.execute(signed, principal, context, operation, input)?);
+        let AuthorityMessage::Grant(g) = self.verify(signed)? else {
+            return Err(Error::Authority);
+        };
+        let resident = self
+            .resident
+            .get(&context_digest(context)?)
+            .ok_or(Error::Expired)?;
+        Ok((
+            crate::delivery::Authority {
+                worker: g.worker,
+                generation: g.generation,
+                sequence: g.sequence,
+                grant_sha256: digest(signed.body.as_bytes()),
+                not_before: g.not_before_ms,
+                expires: g
+                    .expires_ms
+                    .min(g.ancestor_expires_ms)
+                    .min(g.residency_until_ms)
+                    .min(resident.until),
+            },
+            output,
+        ))
     }
 
     fn remove(&mut self, binding: [u8; 32]) -> Option<ResidencyCleanup> {

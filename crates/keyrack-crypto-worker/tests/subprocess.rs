@@ -22,6 +22,49 @@ use std::{
 };
 use uuid::Uuid;
 
+fn response(output: &mut impl BufRead, transcript: &mut String) -> Value {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    let mut control = String::new();
+    let mut staged = std::collections::HashMap::<u64, String>::new();
+    loop {
+        let mut line = String::new();
+        assert!(
+            output.read_line(&mut line).unwrap() > 0,
+            "worker output ended"
+        );
+        transcript.push_str(&line);
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        match frame["event"].as_str().unwrap() {
+            "control" => {
+                control.push_str(frame["data"].as_str().unwrap());
+                if frame["last"] == true {
+                    return serde_json::from_slice(&STANDARD.decode(control).unwrap()).unwrap();
+                }
+            }
+            "staged" => staged
+                .entry(frame["id"].as_u64().unwrap())
+                .or_default()
+                .push_str(frame["data"].as_str().unwrap()),
+            "release" => {
+                let key = zeroize::Zeroizing::new(
+                    STANDARD.decode(frame["key"].as_str().unwrap()).unwrap(),
+                );
+                let ciphertext = STANDARD
+                    .decode(staged.remove(&frame["id"].as_u64().unwrap()).unwrap())
+                    .unwrap();
+                let plain = zeroize::Zeroizing::new(
+                    Aes256Gcm::new_from_slice(&key)
+                        .unwrap()
+                        .decrypt(&Nonce::from([0; 12]), ciphertext.as_slice())
+                        .unwrap(),
+                );
+                return serde_json::from_slice(&plain).unwrap();
+            }
+            _ => panic!("unknown private transport record"),
+        }
+    }
+}
+
 struct Harness {
     child: Child,
     input: Option<ChildStdin>,
@@ -85,8 +128,7 @@ impl Harness {
         let input = child.stdin.take().unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
-        output.read_line(&mut line).unwrap();
-        let hello: Value = serde_json::from_str(&line).expect("worker must reach ready state");
+        let hello = response(&mut output, &mut line);
         assert_ne!(
             hello["pid"].as_u64().unwrap(),
             u64::from(std::process::id())
@@ -252,10 +294,7 @@ impl Harness {
         )
         .unwrap();
         self.input.as_mut().unwrap().flush().unwrap();
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        self.transcript.push_str(&line);
-        serde_json::from_str(&line).unwrap()
+        response(&mut self.output, &mut self.transcript)
     }
 
     fn finish(&mut self) {
@@ -454,5 +493,71 @@ fn native_startup_reaches_authority_wait_without_contacting_vault() {
     );
     assert!(worker.send(&json!({"command": "generate", "grant": STANDARD.encode(b"invalid canonical authority")})).get("error").is_some());
     assert!(!worker.transcript.contains("inert-startup-test-credential"));
+    worker.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn process_fence_cancels_staged_output_before_key_release() {
+    let mut worker = Harness::new(false);
+    // Begin a maximum-size response on a real pipe; fence after receiving its
+    // first encrypted fragment. Deterministic unit injection forces backpressure.
+    let request = worker.request(1, "encrypt", &vec![42; 16_384], 30_000);
+    writeln!(worker.input.as_mut().unwrap(), "{request}").unwrap();
+    let mut first = String::new();
+    worker.output.read_line(&mut first).unwrap();
+    let frame: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(frame["event"], "staged");
+    let cancelled_id = frame["id"].clone();
+    // Fence arrives after writing has begun, before the full staged result is
+    // drained. Unit Sink injection separately forces EAGAIN at each boundary.
+    let signed = worker.signed(&json!({"kind":"fence", "body": {
+        "worker":worker.hello["worker"], "security_domain":"development-only",
+        "generation":2, "expires_ms":30_000
+    }}));
+    writeln!(
+        worker.input.as_mut().unwrap(),
+        "{}",
+        json!({"command":"fence","signed":signed})
+    )
+    .unwrap();
+    let mut captured = first;
+    let cancelled = response(&mut worker.output, &mut captured);
+    assert_eq!(cancelled["error"], "output suppressed");
+    assert_eq!(cancelled["delivery"], cancelled_id);
+    let observed = response(&mut worker.output, &mut captured);
+    assert_eq!(observed["local_fence"]["event"], "worker_locally_fenced");
+    for line in captured.lines() {
+        let record: Value = serde_json::from_str(line).unwrap();
+        assert!(!(record["event"] == "release" && record["id"] == cancelled_id));
+    }
+    let denied = worker.request(2, "encrypt", b"after fence", 30_000);
+    assert_eq!(worker.send(&denied)["error"], "replayed or fenced request");
+    worker.finish();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_pipe_expiry_returns_terminal_cancellation_without_release() {
+    let mut worker = Harness::new(false);
+    assert_eq!(
+        rustix::pipe::fcntl_setpipe_size(worker.output.get_ref(), 4096).unwrap(),
+        4096
+    );
+    let request = worker.request(1, "encrypt", &vec![42; 16_384], 1500);
+    writeln!(worker.input.as_mut().unwrap(), "{request}").unwrap();
+    let mut first = String::new();
+    worker.output.read_line(&mut first).unwrap();
+    let frame: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(frame["event"], "staged");
+    // An actual 4 KiB pipe cannot contain the full maximum response. No draining
+    // occurs until well beyond the signed deadline; this is OS backpressure.
+    std::thread::sleep(std::time::Duration::from_millis(1700));
+    let result = response(&mut worker.output, &mut first);
+    assert_eq!(result["error"], "output suppressed");
+    assert_eq!(result["delivery"], frame["id"]);
+    assert!(!first
+        .lines()
+        .any(|l| serde_json::from_str::<Value>(l).unwrap()["event"] == "release"));
     worker.finish();
 }
