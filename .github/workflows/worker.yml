@@ -1,10 +1,8 @@
 name: Worker security
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main, "feat/**", "fix/**", "handback/**"]
+# Required-context candidates must report for every target branch and change.
+# merge_group also reports when a repository owner enables a merge queue.
+on: [push, pull_request, merge_group]
 
 permissions:
   contents: read

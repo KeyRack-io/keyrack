@@ -255,3 +255,194 @@ fn successful_commit_after_admission_is_never_relabelled_suppressed() {
     assert!(d.state.lock().unwrap().permits.is_empty());
     d.fence(|| Ok(())).unwrap(); // The prior commit is irrevocable, not suppressed.
 }
+
+// These tests enumerate transport facts, not canonical receipt dispositions.
+fn cancelled(sink: &Capture, id: u64) -> bool {
+    sink.records
+        .iter()
+        .filter(|r| r["event"] == "control")
+        .any(|r| {
+            let bytes = STANDARD.decode(r["data"].as_str().unwrap()).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            value["error"] == "output suppressed" && value["delivery"] == id
+        })
+}
+
+#[test]
+fn fence_cancels_every_precommit_staging_position() {
+    let (_, _, sample) = fixture();
+    let parts = sample.encoded.len().div_ceil(256);
+    for staged in 0..=parts {
+        let (_, d, p) = fixture();
+        d.enqueue(p).unwrap();
+        let mut w = Writer::new();
+        let mut sink = Capture::default();
+        for _ in 0..staged {
+            w.step(&d, &mut sink).unwrap();
+        }
+        assert_eq!(sink.records.len(), staged);
+        d.fence(|| Ok(())).unwrap();
+        run(&mut w, &d, &mut sink);
+        no_release(&d, &sink);
+        assert!(cancelled(&sink, 1));
+        assert_eq!(
+            sink.records
+                .iter()
+                .filter(|r| r["event"] == "staged")
+                .count(),
+            staged
+        );
+    }
+}
+
+#[test]
+fn identical_empty_fence_state_can_follow_commit_or_expiry_suppression() {
+    let history = |commit: bool| {
+        let (time, d, p) = fixture();
+        let parts = p.encoded.len().div_ceil(256);
+        d.enqueue(p).unwrap();
+        let mut w = Writer::new();
+        let mut sink = Capture::default();
+        for _ in 0..parts {
+            w.step(&d, &mut sink).unwrap();
+        }
+        if commit {
+            w.step(&d, &mut sink).unwrap();
+        }
+        time.0.store(100, Ordering::SeqCst);
+        run(&mut w, &d, &mut sink);
+        assert!(w.current.is_none());
+        assert_eq!(
+            sink.records
+                .iter()
+                .filter(|r| r["event"] == "release")
+                .count(),
+            usize::from(commit)
+        );
+        assert_eq!(cancelled(&sink, 1), !commit);
+        let before = {
+            let s = d.state.lock().unwrap();
+            assert!(s.permits.is_empty());
+            assert!(s.queue.is_empty());
+            (
+                s.worker.clone(),
+                s.policy,
+                s.next,
+                s.permits.len(),
+                s.queue.len(),
+            )
+        };
+        d.fence(|| Ok(())).unwrap();
+        let s = d.state.lock().unwrap();
+        (
+            before,
+            (
+                s.worker.clone(),
+                s.policy,
+                s.next,
+                s.permits.len(),
+                s.queue.len(),
+            ),
+        )
+    };
+    assert_eq!(history(true), history(false));
+}
+
+#[test]
+fn mixed_committed_and_cancelled_response_history_is_reachable() {
+    let (_, d, first) = fixture();
+    d.enqueue(first).unwrap();
+    let mut w = Writer::new();
+    let mut sink = Capture::default();
+    run(&mut w, &d, &mut sink); // Delivery 1 irrevocably committed.
+    let (_, _, mut second) = fixture();
+    second.authority.sequence = 2;
+    d.enqueue(second).unwrap();
+    w.step(&d, &mut sink).unwrap(); // Delivery 2 only partly staged.
+    d.fence(|| Ok(())).unwrap();
+    run(&mut w, &d, &mut sink);
+    let released: Vec<_> = sink
+        .records
+        .iter()
+        .filter(|r| r["event"] == "release")
+        .map(|r| r["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(released, vec![1]);
+    assert!(cancelled(&sink, 2));
+    assert!(!cancelled(&sink, 1));
+    assert!(sink
+        .records
+        .iter()
+        .any(|r| r["event"] == "staged" && r["id"] == 2));
+}
+
+#[test]
+fn injected_short_capsule_write_is_not_non_disclosure_evidence() {
+    struct ShortWrite(Vec<u8>);
+    impl Sink for ShortWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            // This violates the verified FIFO contract. Omit only the newline:
+            // a malicious receiver still has the entire JSON key capsule.
+            self.0.extend_from_slice(&bytes[..bytes.len() - 1]);
+            Ok(bytes.len() - 1)
+        }
+    }
+    let (_, d, p) = fixture();
+    let parts = p.encoded.len().div_ceil(256);
+    d.enqueue(p).unwrap();
+    let mut w = Writer::new();
+    let mut staged = Capture::default();
+    for _ in 0..parts {
+        w.step(&d, &mut staged).unwrap();
+    }
+    let mut short = ShortWrite(Vec::new());
+    assert!(matches!(w.step(&d, &mut short), Err(Error::Material)));
+    assert!(d.state.lock().unwrap().permits.is_empty());
+    // The writer loop calls stop() only after step() returns its error. In this
+    // interval fence() itself has no retained transport-fault classification.
+    d.fence(|| Ok(())).unwrap();
+    let capsule: Value = serde_json::from_slice(&short.0).unwrap();
+    let key = Zeroizing::new(STANDARD.decode(capsule["key"].as_str().unwrap()).unwrap());
+    let ciphertext = staged
+        .records
+        .iter()
+        .map(|r| r["data"].as_str().unwrap())
+        .collect::<String>();
+    let plaintext = Zeroizing::new(
+        Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .decrypt(
+                &Nonce::from([0; 12]),
+                STANDARD.decode(ciphertext).unwrap().as_slice(),
+            )
+            .unwrap(),
+    );
+    assert!(serde_json::from_slice::<Value>(&plaintext).unwrap()["output"].is_string());
+    d.stop();
+    assert!(d.stopped());
+}
+
+#[test]
+fn empty_queue_and_permits_can_hide_writer_held_cancellation() {
+    let (time, d, p) = fixture();
+    let parts = p.encoded.len().div_ceil(256);
+    d.enqueue(p).unwrap();
+    let mut w = Writer::new();
+    let mut sink = Capture::default();
+    for _ in 0..parts {
+        w.step(&d, &mut sink).unwrap();
+    }
+    time.0.store(100, Ordering::SeqCst);
+    d.expire();
+    {
+        let s = d.state.lock().unwrap();
+        assert!(s.queue.is_empty());
+        assert!(s.permits.is_empty());
+    }
+    assert!(w.current.is_some());
+    assert!(!cancelled(&sink, 1)); // Cancellation is still unresolved to the reader.
+    d.fence(|| Ok(())).unwrap();
+    run(&mut w, &d, &mut sink);
+    no_release(&d, &sink);
+    assert!(cancelled(&sink, 1));
+}

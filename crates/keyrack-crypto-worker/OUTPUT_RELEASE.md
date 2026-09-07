@@ -2,6 +2,9 @@
 
 This is the unpublished harness transport, not a shared IPC revision or a
 canonical `RevocationResult`. The worker does not emit `OutputsSuppressed`.
+[The delivery-state enumeration](REVOCATION_DELIVERY_STATES.md) distinguishes
+normal terminal outcomes, information currently lost by the fence path, and
+transport faults which cannot support a successful canonical disposition.
 
 ## Release point and exact claim
 

@@ -15,8 +15,9 @@ script runs the worker suite and then `worker-supervisor-isolation.py`.
 
 The job fails on unsupported platforms, missing sudo/systemd/user tools, failed
 identity evidence, missing completion evidence, or a NOT RUN message. Fixture
-success is reported only after cleanup. Repository protection must separately
-require this stable check; the workflow does not change branch protection.
+success is reported only after cleanup. The workflow has no path or branch filters: it reports on all push, pull-request
+and merge-group events. Repository protection must separately require this stable
+check; the workflow does not change branch protection.
 
 Ordinary Vault-provider contributions default to isolation mode `off` and print
 **NOT RUN** for the supervisor rather than implying isolation passed. Explicit
