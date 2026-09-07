@@ -223,6 +223,14 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
         KeyRackError::AuthorizationDenied { .. } => (StatusCode::FORBIDDEN, "AuthorizationDenied"),
         KeyRackError::DepthLimitExceeded { .. } => (StatusCode::BAD_REQUEST, "DepthLimitExceeded"),
         KeyRackError::CycleDetected { .. } => (StatusCode::BAD_REQUEST, "CycleDetected"),
+        // An unreachable backend is a retryable condition, and saying so is
+        // what lets a caller come back after custody is restored. The gRPC
+        // surface and `DomainError::to_rest_error` both report this as
+        // unavailable; only this mapper fell through to 500, telling REST
+        // callers the opposite of what the same failure told gRPC callers.
+        KeyRackError::ProviderUnavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
+        }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     };
     ops::rest_error(code, kind, &err.to_string())
