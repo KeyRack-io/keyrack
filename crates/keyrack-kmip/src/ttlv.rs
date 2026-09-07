@@ -107,18 +107,38 @@ pub mod tag {
     pub const SIGNATURE_DATA: u32 = 0x0042_00C3;
     // 0x4200C4 is Data Length and 0x4200C5 is Random IV; MAC Data is 0x4200C6.
     pub const MAC_DATA: u32 = 0x0042_00C6;
+    /// GCM authentication tag, returned by Encrypt and required by Decrypt.
+    pub const AUTHENTICATED_ENCRYPTION_TAG: u32 = 0x0042_00FF;
+    /// Additional authenticated data: covered by the tag, not encrypted.
+    pub const AUTHENTICATED_ENCRYPTION_ADDITIONAL_DATA: u32 = 0x0042_00FE;
+    /// Number of bytes requested from the server's RNG. Distinct from `DATA`,
+    /// which carries payload bytes.
+    pub const DATA_LENGTH: u32 = 0x0042_00C4;
+    /// Requested authentication tag length, in bytes, carried inside
+    /// `CryptographicParameters`. A server may refuse an authenticated mode
+    /// without it.
+    pub const TAG_LENGTH: u32 = 0x0042_00CE;
+    pub const REVOCATION_REASON: u32 = 0x0042_0081;
+    pub const REVOCATION_REASON_CODE: u32 = 0x0042_0082;
 }
 
 /// KMIP operation enum values.
 pub mod operation {
     pub const CREATE: u32 = 0x01;
     pub const GET: u32 = 0x0A;
+    /// Moves a newly created object from Pre-Active to Active. KMIP forbids
+    /// cryptographic use of a Pre-Active object, so Create alone yields a key
+    /// that exists and cannot be used.
+    pub const ACTIVATE: u32 = 0x12;
+    /// Moves an Active object to Deactivated. KMIP forbids destroying an
+    /// Active object, so Destroy alone fails on a key that was activated.
+    pub const REVOKE: u32 = 0x13;
     pub const DESTROY: u32 = 0x14;
     pub const ENCRYPT: u32 = 0x1F;
     pub const DECRYPT: u32 = 0x20;
     pub const SIGN: u32 = 0x21;
     pub const SIGNATURE_VERIFY: u32 = 0x22;
-    pub const RNG_RETRIEVE: u32 = 0x2C;
+    pub const RNG_RETRIEVE: u32 = 0x25;
 }
 
 /// KMIP result status values.
@@ -128,23 +148,39 @@ pub mod result_status {
 }
 
 /// KMIP object type values.
+///
+/// `0x01` is Certificate, not `SymmetricKey` — see the note on
+/// `crypto_algorithm` about how these values are checked.
 pub mod object_type {
-    pub const SYMMETRIC_KEY: u32 = 0x01;
+    pub const SYMMETRIC_KEY: u32 = 0x02;
     pub const PUBLIC_KEY: u32 = 0x03;
     pub const PRIVATE_KEY: u32 = 0x04;
 }
 
 /// KMIP cryptographic algorithm values.
+///
+/// These, and every other constant in this module, are checked against a
+/// third-party implementation of the same specification by
+/// `conformance/kmip-provider/check-constants.py`. A value that is wrong but
+/// self-consistent is invisible to a test that encodes and decodes with the
+/// same table, which is how four of them were wrong at once: each named a
+/// different algorithm or object that the specification does define, so the
+/// requests were well-formed and meant something else.
 pub mod crypto_algorithm {
     pub const AES: u32 = 0x03;
     pub const RSA: u32 = 0x04;
     pub const ECDSA: u32 = 0x06;
-    pub const ED25519: u32 = 0x1B;
+    pub const ED25519: u32 = 0x37;
 }
 
 /// KMIP block cipher mode values.
 pub mod block_cipher_mode {
-    pub const GCM: u32 = 0x0E;
+    pub const GCM: u32 = 0x09;
+}
+
+/// KMIP revocation reason codes.
+pub mod revocation_reason {
+    pub const CESSATION_OF_OPERATION: u32 = 0x06;
 }
 
 /// A decoded TTLV item.
