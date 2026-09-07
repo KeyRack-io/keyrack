@@ -33,6 +33,21 @@
 //!
 //! The NATS sink is out-of-crate because `keyrack-core` must not
 //! depend on a NATS client. The trait allows any sink implementation.
+//!
+//! # Tamper evidence and authenticity are separate properties
+//!
+//! Two independent decorators provide them:
+//!
+//! - [`ChainingAuditSink`] links events into a BLAKE3 hash chain
+//!   ([`AuditChain`]). This is **tamper evidence**: any edit to an earlier
+//!   event breaks every subsequent link, and the breakage is detectable from
+//!   the log alone, with no key.
+//! - [`SigningAuditSink`] does the same chaining *and* signs each event with
+//!   Ed25519. This adds **authenticity**: the log was written by the holder of
+//!   the signing key, so it cannot be silently rewritten end to end.
+//!
+//! Chaining is unconditional in the service; signing is opt-in. Never make
+//! the chain conditional on signing — a chain-only log is still evidence.
 
 use crate::lid::Lid;
 use async_trait::async_trait;
@@ -499,24 +514,105 @@ impl AuditSink for FileSink {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Audit event signer (tamper-evidence via Ed25519 + hash chain)
+// Hash chain (tamper evidence, independent of signing)
+// ────────────────────────────────────────────────────────────────────
+
+/// The `previous_hash` carried by the first event of a chain: 64 hex zeros.
+pub const CHAIN_GENESIS_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The `previous_hash` that the event following `event` must carry.
+///
+/// The link commits to the event's terminal representation: its Ed25519
+/// signature hex when the event is signed, and its canonical JSON otherwise.
+/// Either way the preimage contains the event's own `previous_hash`, so every
+/// link binds the entire prefix of the log transitively — editing an earlier
+/// event breaks all later links.
+///
+/// Both preimages appear verbatim in the written log line, so a verifier can
+/// re-derive the chain from the log alone, with no key and no signing
+/// configured. That is what makes chain-only tamper evidence usable.
+#[must_use]
+pub fn chain_link(event: &AuditEvent) -> String {
+    let preimage = match &event.signature {
+        Some(sig_hex) => sig_hex.clone(),
+        None => serde_json::to_string(event).expect("AuditEvent serialization should not fail"),
+    };
+    hex_encode(blake3::hash(preimage.as_bytes()).as_bytes())
+}
+
+/// Append-only BLAKE3 hash chain over audit events.
+///
+/// Chaining costs one hash per event and needs no key material, so it is
+/// always on in the service. [`AuditSigner`] composes a chain rather than
+/// owning a bespoke one, which keeps signed and unsigned logs on the same
+/// linkage rule.
+pub struct AuditChain {
+    head: Mutex<String>,
+}
+
+impl Default for AuditChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuditChain {
+    /// Start a fresh chain at [`CHAIN_GENESIS_HASH`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            head: Mutex::new(CHAIN_GENESIS_HASH.to_string()),
+        }
+    }
+
+    /// The current head — the `previous_hash` the next event will carry.
+    #[must_use]
+    pub fn head(&self) -> String {
+        self.head.lock().unwrap().clone()
+    }
+
+    /// Link `event` into the chain, leaving it unsigned.
+    pub fn append(&self, event: &mut AuditEvent) {
+        self.link(event, |_| {});
+    }
+
+    /// Stamp `previous_hash`, let `seal` finalize the event (e.g. sign it),
+    /// then advance the head.
+    ///
+    /// `seal` runs while the head lock is held so that concurrent emitters
+    /// cannot interleave and produce two events claiming the same predecessor.
+    fn link<F>(&self, event: &mut AuditEvent, seal: F)
+    where
+        F: FnOnce(&mut AuditEvent),
+    {
+        let mut head = self.head.lock().unwrap();
+        event.previous_hash = Some(head.clone());
+        event.signature = None;
+        seal(event);
+        *head = chain_link(event);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Audit event signer (authenticity via Ed25519, on top of the chain)
 // ────────────────────────────────────────────────────────────────────
 
 /// Signs audit events with Ed25519 and maintains a BLAKE3 hash chain
 /// linking consecutive events for tamper evidence.
 pub struct AuditSigner {
     signing_key: ed25519_dalek::SigningKey,
-    previous_hash: Mutex<String>,
+    chain: AuditChain,
 }
 
 impl AuditSigner {
     /// Create a signer from an existing Ed25519 signing key.
-    /// The hash chain starts with a zero hash (64 hex zeros).
+    /// The hash chain starts at [`CHAIN_GENESIS_HASH`].
     #[must_use]
     pub fn new(signing_key: ed25519_dalek::SigningKey) -> Self {
         Self {
             signing_key,
-            previous_hash: Mutex::new("0".repeat(64)),
+            chain: AuditChain::new(),
         }
     }
 
@@ -531,20 +627,18 @@ impl AuditSigner {
     /// computes the Ed25519 signature over the canonical JSON (with signature
     /// fields excluded), then updates the chain hash.
     pub fn sign_event(&self, event: &mut AuditEvent) {
-        let mut prev_hash = self.previous_hash.lock().unwrap();
-        event.previous_hash = Some(prev_hash.clone());
-        event.signature = None;
+        self.chain.link(event, |e| {
+            let canonical =
+                serde_json::to_string(e).expect("AuditEvent serialization should not fail");
+            let sig = self.signing_key.sign(canonical.as_bytes());
+            e.signature = Some(hex_encode(sig.to_bytes().as_slice()));
+        });
+    }
 
-        let canonical =
-            serde_json::to_string(event).expect("AuditEvent serialization should not fail");
-
-        let sig = self.signing_key.sign(canonical.as_bytes());
-        let sig_hex = hex_encode(sig.to_bytes().as_slice());
-
-        event.signature = Some(sig_hex.clone());
-
-        let new_hash = blake3::hash(sig_hex.as_bytes());
-        *prev_hash = hex_encode(new_hash.as_bytes());
+    /// The current chain head — the `previous_hash` the next event will carry.
+    #[must_use]
+    pub fn chain_head(&self) -> String {
+        self.chain.head()
     }
 
     /// Returns the public verifying key for external consumers to verify events.
@@ -582,10 +676,57 @@ impl AuditSigner {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Chaining audit sink (decorator)
+// ────────────────────────────────────────────────────────────────────
+
+/// A decorator sink that links every event into a BLAKE3 hash chain before
+/// forwarding it to the inner sink.
+///
+/// Use this when signing is not configured: it still yields a tamper-evident
+/// log that `keyrack-cli audit verify` can check without any key. Use
+/// [`SigningAuditSink`] instead when authenticity is also required — it
+/// chains *and* signs, so the two are never stacked.
+pub struct ChainingAuditSink {
+    inner: Box<dyn AuditSink>,
+    chain: AuditChain,
+}
+
+impl ChainingAuditSink {
+    #[must_use]
+    pub fn new(inner: Box<dyn AuditSink>) -> Self {
+        Self {
+            inner,
+            chain: AuditChain::new(),
+        }
+    }
+
+    /// The current chain head — the `previous_hash` the next event will carry.
+    #[must_use]
+    pub fn chain_head(&self) -> String {
+        self.chain.head()
+    }
+}
+
+#[async_trait]
+impl AuditSink for ChainingAuditSink {
+    async fn emit(&self, event: &AuditEvent) -> crate::error::Result<()> {
+        let mut chained_event = event.clone();
+        self.chain.append(&mut chained_event);
+        self.inner.emit(&chained_event).await
+    }
+
+    async fn flush(&self) -> crate::error::Result<()> {
+        self.inner.flush().await
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Signing audit sink (decorator)
 // ────────────────────────────────────────────────────────────────────
 
-/// A decorator sink that signs every event before forwarding to the inner sink.
+/// A decorator sink that chains and signs every event before forwarding it to
+/// the inner sink. Signing implies chaining; do not wrap this in a
+/// [`ChainingAuditSink`].
 pub struct SigningAuditSink {
     inner: Box<dyn AuditSink>,
     signer: AuditSigner,
@@ -1058,6 +1199,114 @@ mod tests {
         );
 
         assert!(!AuditSigner::verify_event(&event, &vk));
+    }
+
+    fn sample_event(resource: &str) -> AuditEvent {
+        AuditEvent::new(
+            EventType::CryptoOperation,
+            AuditAction::Encrypt,
+            AuditPrincipal {
+                id: "u:chain".into(),
+                principal_type: "User".into(),
+            },
+            AuditResource {
+                id: resource.into(),
+                resource_type: "Key".into(),
+            },
+            AuditResult::Success,
+        )
+    }
+
+    #[test]
+    fn chain_stamps_genesis_then_links_without_signing() {
+        let chain = AuditChain::new();
+        assert_eq!(chain.head(), CHAIN_GENESIS_HASH);
+
+        let mut e1 = sample_event("k1");
+        chain.append(&mut e1);
+
+        assert_eq!(e1.previous_hash.as_deref(), Some(CHAIN_GENESIS_HASH));
+        assert!(
+            e1.signature.is_none(),
+            "chaining must not fabricate a signature"
+        );
+
+        let mut e2 = sample_event("k2");
+        chain.append(&mut e2);
+
+        assert_eq!(e2.previous_hash.as_deref(), Some(chain_link(&e1).as_str()));
+        assert_eq!(chain.head(), chain_link(&e2));
+    }
+
+    #[test]
+    fn unsigned_chain_link_is_derivable_from_the_written_log_line() {
+        // The link preimage for an unsigned event is exactly the JSON a sink
+        // writes, so a verifier needs nothing but the log itself.
+        let chain = AuditChain::new();
+        let mut event = sample_event("k_log");
+        chain.append(&mut event);
+
+        let written_line = String::from_utf8(event.to_json_bytes().unwrap()).unwrap();
+        let expected = hex_encode(blake3::hash(written_line.as_bytes()).as_bytes());
+
+        assert_eq!(chain_link(&event), expected);
+    }
+
+    #[test]
+    fn editing_a_chained_event_breaks_the_next_link() {
+        let chain = AuditChain::new();
+        let mut e1 = sample_event("k1");
+        chain.append(&mut e1);
+        let mut e2 = sample_event("k2");
+        chain.append(&mut e2);
+
+        let recorded_link = e2.previous_hash.clone().unwrap();
+        e1.resource.id = "k_evil".into();
+
+        assert_ne!(
+            chain_link(&e1),
+            recorded_link,
+            "a tampered predecessor must no longer hash to the recorded link"
+        );
+    }
+
+    #[test]
+    fn signed_events_chain_over_the_signature_hex() {
+        // Regression guard: the signed chain rule must stay byte-identical, so
+        // logs written before chaining was decoupled still verify.
+        let signer = AuditSigner::generate();
+        let mut event = sample_event("k_signed");
+        signer.sign_event(&mut event);
+
+        let sig_hex = event.signature.clone().unwrap();
+        let expected = hex_encode(blake3::hash(sig_hex.as_bytes()).as_bytes());
+
+        assert_eq!(chain_link(&event), expected);
+        assert_eq!(signer.chain_head(), expected);
+    }
+
+    #[tokio::test]
+    async fn chaining_sink_chains_unsigned_events() {
+        let (inner, events) = CollectorSink::new();
+        let sink = ChainingAuditSink::new(Box::new(inner));
+
+        sink.emit(&sample_event("k1")).await.unwrap();
+        sink.emit(&sample_event("k2")).await.unwrap();
+
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured.iter().all(|e| e.signature.is_none()),
+            "the chaining sink must not sign"
+        );
+        assert_eq!(
+            captured[0].previous_hash.as_deref(),
+            Some(CHAIN_GENESIS_HASH)
+        );
+        assert_eq!(
+            captured[1].previous_hash.as_deref(),
+            Some(chain_link(&captured[0]).as_str())
+        );
     }
 
     #[tokio::test]
