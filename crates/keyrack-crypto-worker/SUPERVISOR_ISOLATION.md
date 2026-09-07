@@ -7,8 +7,12 @@ used only by the pre-existing A2 Vault service fixture, not as the identity boun
 A local macOS run cannot establish this acceptance result.
 
 `prepare-worker-vault-fixture.py` invokes `worker-supervisor-isolation.py` after the
-normal worker contribution succeeds on Linux. The existing A2 job already invokes
-that contribution. Linux execution is mandatory: missing sudo, systemd, user tools,
+normal worker contribution succeeds on Linux. In the A2 PR merge ref, `.github/workflows/ci.yml` job
+`vault-provider` (display name **Vault provider export tests**) invokes
+`test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh
+--from-vault-provider-fixture`, which calls the preparation script and then the
+supervisor. The supervisor fixture is exercised inside that job; it has no separate
+CI check name. Linux execution is mandatory: missing sudo, systemd, user tools,
 identity evidence or permissions fails the lane. No new workflow, Vault service,
 ignored live-test name or alternative maintained stack is added.
 
@@ -31,7 +35,9 @@ explicitly clean environment. It refuses real/effective/saved UID 0, the wrong U
 the worker UID, effective capabilities and inherited credential variables. It
 first reads a public control file successfully, then actually calls `open` for
 reading on the worker token path. Only `EACCES` is accepted: successful open,
-`ENOENT`, another error or inability to read the positive control fails.
+`ENOENT`, another error or inability to read the positive control fails. Expected
+check failures print their static description to stderr; unexpected exceptions
+retain a generic diagnostic so paths and credential data cannot enter the log.
 
 The controller performs three phases:
 
