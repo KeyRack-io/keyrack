@@ -101,6 +101,23 @@ pub fn error_response(error_type: &str, message: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reencrypt_permission_names_are_not_api_operations() {
+        assert!(matches!(
+            super::parse_action("TrentService.ReEncrypt"),
+            Ok(super::KmsAction::ReEncrypt)
+        ));
+        for name in [
+            "ReEncryptFrom",
+            "ReEncryptTo",
+            "kms:ReEncryptFrom",
+            "kms:ReEncryptTo",
+            "ReEncrypt*",
+        ] {
+            assert!(super::parse_action(&format!("TrentService.{name}")).is_err());
+        }
+    }
+
     use super::*;
 
     #[test]

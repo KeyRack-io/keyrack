@@ -330,3 +330,49 @@ impl std::fmt::Debug for GrpcPdpClient {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod directional_wire_tests {
+    use super::*;
+    use keyrack_core::audit::AuditAction;
+    use keyrack_core::pdp::{Principal, RequestContext, Resource, PDP_API_VERSION};
+    use prost::Message;
+
+    #[test]
+    fn json_and_protobuf_keep_the_exact_directional_permission() {
+        for (action, name, key) in [
+            (
+                AuditAction::ReEncryptFrom,
+                "kms:ReEncryptFrom",
+                "source-key",
+            ),
+            (
+                AuditAction::ReEncryptTo,
+                "kms:ReEncryptTo",
+                "destination-key",
+            ),
+        ] {
+            let request = AuthzRequest {
+                pdp_api_version: PDP_API_VERSION.into(),
+                request_id: format!("request-{name}"),
+                action,
+                principal: Principal::system(),
+                resource: Resource {
+                    id: key.into(),
+                    resource_type: "Key".into(),
+                    attributes: BTreeMap::new(),
+                },
+                context: RequestContext::default(),
+            };
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(json["action"], name);
+            assert_eq!(json["resource"]["id"], key);
+            assert_eq!(json["request_id"], request.request_id);
+            let encoded = authz_to_proto(&request).encode_to_vec();
+            let decoded = proto::PdpAuthorizeRequest::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.action, name);
+            assert_eq!(decoded.resource.unwrap().id, key);
+            assert_eq!(decoded.request_id, request.request_id);
+        }
+    }
+}

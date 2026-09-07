@@ -34,6 +34,8 @@ const PLAINTEXT: &[u8] = b"independent two-key authorization";
 #[derive(Clone, Copy, Debug)]
 enum PdpMode {
     PermitBoth,
+    FromOnly,
+    ToOnly,
     SourceForbid,
     DestinationForbid,
     DestinationIndeterminate,
@@ -42,6 +44,13 @@ enum PdpMode {
     DestinationReplaySource,
     DestinationObligation,
     DestinationWrongVersion,
+}
+
+fn is_reencrypt(action: &AuditAction) -> bool {
+    matches!(
+        action,
+        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo
+    )
 }
 
 /// Deliberately returns raw responses: the service executor, not an HTTP PDP
@@ -73,19 +82,24 @@ impl PolicyDecisionPoint for ReEncryptPdp {
     async fn evaluate(&self, request: &AuthzRequest) -> keyrack_core::error::Result<AuthzResponse> {
         let (leg, first_id) = {
             let mut requests = self.requests.lock().unwrap();
-            let prior_legs = requests
-                .iter()
-                .filter(|r| r.action == AuditAction::ReEncrypt)
-                .count();
+            let prior_legs = requests.iter().filter(|r| is_reencrypt(&r.action)).count();
             let first_id = requests
                 .iter()
-                .find(|r| r.action == AuditAction::ReEncrypt)
+                .find(|r| is_reencrypt(&r.action))
                 .map(|r| r.request_id.clone());
             requests.push(request.clone());
             (prior_legs % 2, first_id)
         };
         let mut response = AlwaysAllow.evaluate(request).await?;
-        if request.action != AuditAction::ReEncrypt {
+        if !is_reencrypt(&request.action) {
+            return Ok(response);
+        }
+        // Match actual actions, not leg order or context: a one-direction grant
+        // must never acquire its converse, even when both resources are identical.
+        if (matches!(self.mode, PdpMode::FromOnly) && request.action != AuditAction::ReEncryptFrom)
+            || (matches!(self.mode, PdpMode::ToOnly) && request.action != AuditAction::ReEncryptTo)
+        {
+            response.decision = Decision::Forbid;
             return Ok(response);
         }
         match (self.mode, leg) {
@@ -287,7 +301,7 @@ impl Fixture {
             .audit
             .events()
             .into_iter()
-            .filter(|event| event.action == AuditAction::ReEncrypt)
+            .filter(|event| is_reencrypt(&event.action))
             .collect();
         let resources: Vec<_> = events
             .iter()
@@ -299,7 +313,15 @@ impl Fixture {
             vec![self.source.as_str()]
         };
         assert_eq!(resources, expected);
-        for event in events {
+        for (index, event) in events.into_iter().enumerate() {
+            assert_eq!(
+                event.action,
+                if destination_failed && index == 0 {
+                    AuditAction::ReEncryptTo
+                } else {
+                    AuditAction::ReEncryptFrom
+                }
+            );
             if denied {
                 assert_eq!(event.event_type, EventType::AuthorizationDenied);
                 assert_eq!(event.result, AuditResult::Denied);
@@ -325,7 +347,14 @@ fn assert_requests(requests: &[AuthzRequest], source: &str, destination: &str) {
         } else {
             ("destination", destination)
         };
-        assert_eq!(request.action, AuditAction::ReEncrypt);
+        assert_eq!(
+            request.action,
+            if index % 2 == 0 {
+                AuditAction::ReEncryptFrom
+            } else {
+                AuditAction::ReEncryptTo
+            }
+        );
         assert_eq!(request.resource.id, resource);
         assert_eq!(request.resource.resource_type, "Key");
         assert_ne!(request.request_id, OUTER_REQUEST_ID);
@@ -340,6 +369,25 @@ fn assert_requests(requests: &[AuthzRequest], source: &str, destination: &str) {
                 Some(&AttributeValue::String(value.into())),
                 "missing or incorrect {name} on {role} decision"
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_one_direction_grant_cannot_authorize_the_other_leg_even_on_the_same_key() {
+    for wire in [Wire::Grpc, Wire::Rest] {
+        for same_key in [false, true] {
+            for mode in [PdpMode::FromOnly, PdpMode::ToOnly] {
+                let fixture = Fixture::new(mode, same_key).await;
+                let before = fixture.provider.calls();
+                fixture.run(wire).await.unwrap_err().assert_forbidden();
+                assert_eq!(fixture.provider.calls(), before);
+                let requests = fixture.pdp.requests();
+                let destination_failed = matches!(mode, PdpMode::FromOnly);
+                assert_eq!(requests.len(), if destination_failed { 2 } else { 1 });
+                assert_requests(&requests, &fixture.source, &fixture.destination);
+                fixture.assert_failed_audit(destination_failed, true);
+            }
         }
     }
 }
@@ -385,10 +433,11 @@ async fn both_permits_roundtrip_with_independent_ids_even_when_caller_reuses_req
             .audit
             .events()
             .into_iter()
-            .filter(|event| event.action == AuditAction::ReEncrypt)
+            .filter(|event| is_reencrypt(&event.action))
             .collect();
         assert_eq!(events.len(), 2);
         for event in events {
+            assert_eq!(event.action, AuditAction::ReEncryptFrom);
             assert_eq!(event.result, AuditResult::Success);
             assert_eq!(event.resource.id, fixture.source);
             assert_eq!(event.request_id.as_deref(), Some(OUTER_REQUEST_ID));
@@ -470,39 +519,50 @@ async fn denied_destination_precedes_storage_lookup_and_ciphertext_parsing() {
 #[tokio::test]
 async fn generic_single_key_reencrypt_context_cannot_enter_either_executor_closure() {
     let fixture = Fixture::new(PdpMode::PermitBoth, false).await;
-    let executed = Arc::new(AtomicBool::new(false));
-    let observed = executed.clone();
-    let result = ops::execute(
-        &fixture.state,
-        OpContext::key(AuditAction::ReEncrypt, Principal::system(), &fixture.source),
-        move |_| async move {
-            observed.store(true, Ordering::SeqCst);
-            Ok(())
-        },
-    )
-    .await;
-    assert!(result.is_err());
-    assert!(!executed.load(Ordering::SeqCst));
-    let observed = executed.clone();
-    let result = ops::execute_rest(
-        &fixture.state,
-        OpContext::key(AuditAction::ReEncrypt, Principal::system(), &fixture.source),
-        move |_| async move {
-            observed.store(true, Ordering::SeqCst);
-            Ok(())
-        },
-    )
-    .await;
-    assert!(result.is_err());
-    assert!(!executed.load(Ordering::SeqCst));
-    assert!(fixture.pdp.requests().is_empty());
+    for action in [AuditAction::ReEncryptFrom, AuditAction::ReEncryptTo] {
+        let executed = Arc::new(AtomicBool::new(false));
+        let observed = executed.clone();
+        let result = ops::execute(
+            &fixture.state,
+            OpContext::key(action.clone(), Principal::system(), &fixture.source),
+            move |_| async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!executed.load(Ordering::SeqCst));
+        let observed = executed.clone();
+        let result = ops::execute_rest(
+            &fixture.state,
+            OpContext::key(action, Principal::system(), &fixture.source),
+            move |_| async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!executed.load(Ordering::SeqCst));
+        assert!(fixture.pdp.requests().is_empty());
+    }
 }
 
 #[tokio::test]
 async fn single_resource_attribute_helper_cannot_authorize_reencrypt() {
     let fixture = Fixture::new(PdpMode::PermitBoth, false).await;
     for ctx in [
-        OpContext::key(AuditAction::ReEncrypt, Principal::system(), &fixture.source),
+        OpContext::key(
+            AuditAction::ReEncryptFrom,
+            Principal::system(),
+            &fixture.source,
+        ),
+        OpContext::key(
+            AuditAction::ReEncryptTo,
+            Principal::system(),
+            &fixture.source,
+        ),
         OpContext::re_encrypt(Principal::system(), &fixture.source, &fixture.destination),
     ] {
         assert!(

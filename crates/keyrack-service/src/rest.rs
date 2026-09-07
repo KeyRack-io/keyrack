@@ -1704,7 +1704,7 @@ async fn re_encrypt(
             Some(header.key_version),
             principal_scope.as_deref(),
             &principal_id,
-            &keyrack_core::audit::AuditAction::ReEncrypt,
+            &keyrack_core::audit::AuditAction::ReEncryptFrom,
         )
         .await
         .map_err(|e| e.to_rest_error())?;
@@ -1714,7 +1714,7 @@ async fn re_encrypt(
             None,
             principal_scope.as_deref(),
             &principal_id,
-            &keyrack_core::audit::AuditAction::ReEncrypt,
+            &keyrack_core::audit::AuditAction::ReEncryptTo,
         )
         .await
         .map_err(|e| e.to_rest_error())?;
