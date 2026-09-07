@@ -198,15 +198,23 @@ audit: { type: nats, url: nats://nats:4222 }
 ### Tamper Evidence and Signed Audit Events
 
 BLAKE3 hash chaining is **always on**: every event carries a `previous_hash`
-link regardless of configuration, so interior tampering and deletion are
-detectable with no key at all:
+link regardless of configuration, so in-place tampering and interior deletion
+are detectable with no key at all:
 
 ```bash
 keyrack audit verify /var/log/keyrack/audit.jsonl
 ```
 
-Ed25519 signing adds authenticity — proof of *who* wrote the log — and is
-opt-in:
+Know what the keyless check does not cover. Repairing the chain after an edit
+only requires recomputing every link from that point forward, so an attacker
+with write access to the whole log defeats it; and tail-truncation breaks no
+link at all, so it needs an external anchor such as recording the head hash
+elsewhere. See
+[OPERATOR.md](OPERATOR.md#audit-tamper-evidence-and-authenticity) for the full
+treatment.
+
+Ed25519 signing closes the first of those — it adds authorship, proof of *who*
+wrote the log, which a chain alone cannot give — and is opt-in:
 
 ```yaml
 sign_audit_events: true

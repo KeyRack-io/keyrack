@@ -479,14 +479,19 @@ chain is re-derivable from the log alone:
 keyrack audit verify /var/log/keyrack/audit.jsonl
 ```
 
-Interior tampering and deletion break every link after the edit and are
-detected with no key and no configuration. Tail-truncation (dropping the latest
-N events) is **not** detectable from the log alone — that needs an external
-anchor, such as periodically recording the current head hash elsewhere.
+An in-place edit or an interior deletion breaks every link after it and is
+detected with no key and no configuration. There are two bounds on that, and
+they are closed by different things:
 
-An unsigned chain does not establish *who* wrote the log: an attacker with
-write access to the whole file can recompute it end to end. That is what
-signing adds.
+1. **Full-log rewrite.** Repairing the chain after an edit only means
+   recomputing every link from that point forward, which anyone with write
+   access to the whole log can do. So an unsigned chain does not establish
+   *who* wrote the log. Signing closes this: the attacker would also need the
+   signing key.
+2. **Tail-truncation.** Dropping the latest N events breaks no link at all, so
+   it is not detectable from the log alone — and **signing does not help
+   either**. This one needs an external anchor, such as periodically recording
+   the current head hash elsewhere.
 
 **Ed25519 signing (authenticity) is opt-in.**
 

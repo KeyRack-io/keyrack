@@ -136,11 +136,17 @@ cargo build --release -p keyrack-cli
 ./target/release/keyrack audit verify audit.jsonl
 ```
 
-No key is needed: the chain is maintained unconditionally, so any edit to an
-earlier event is detectable from the log alone. Adding `sign_audit_events: true`
-plus an `audit_signing_key_path` layers Ed25519 authenticity on top, which
-`keyrack audit verify --key <keyfile>` then also checks. Chaining gives tamper
-evidence; signing gives authenticity.
+No key is needed: the chain is maintained unconditionally, so an edit made in
+place to an earlier event is detectable from the log alone. Two bounds on that
+— repairing the chain after an edit means recomputing every link from that
+point forward, which anyone with write access to the whole log can do, and
+tail-truncation (dropping the newest events) breaks nothing internal to the
+log. Adding
+`sign_audit_events: true` plus an `audit_signing_key_path` layers Ed25519
+authorship on top, which `keyrack audit verify --key <keyfile>` then also
+checks, and closes the first bound; the second needs an external anchor. See
+[docs/OPERATOR.md](docs/OPERATOR.md) for both. Chaining gives tamper evidence;
+signing gives authorship.
 
 ---
 

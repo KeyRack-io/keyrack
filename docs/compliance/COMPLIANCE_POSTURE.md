@@ -131,12 +131,12 @@ A `--features fips` build flag that replaces BLAKE3 with SHA-256 or SHA3-256 is 
 | AWS KMS compatibility shim | No | `commercial:keyrack-aws-kms-shim` |
 | Management UI | No | `commercial:keyrack-ui` |
 | Compliance templates and reporting | No | `commercial:compliance` |
-| Tamper-evident audit trail (BLAKE3 hash chain) | Yes — unconditional, no key or configuration required | Yes |
+| Tamper-evident audit trail (BLAKE3 hash chain) | Yes — unconditional, no key or configuration required; detects in-place edits, not full-log rewrite or truncation | Yes |
 | Authenticated audit trail (Ed25519 signatures) | Yes — opt-in via `sign_audit_events` + a persistent key | Yes (commercial receipt chain) |
 
 ### What this means for compliance
 
-- **SOC 2 / HIPAA**: FOSS provides the technical controls. Every deployment gets a BLAKE3-chained audit trail whether or not signing is configured, so interior tampering and deletion are always detectable; `sign_audit_events: true` with a persistent signing key adds Ed25519 authenticity on top, which is what an auditor asking "prove KeyRack wrote this" needs. Commercial adds compliance documentation templates and the commercial receipt chain. An FOSS deployment can pass a SOC 2 audit with `sign_audit_events: true` and a persistent signing key.
+- **SOC 2 / HIPAA**: FOSS provides the technical controls. Every deployment gets a BLAKE3-chained audit trail whether or not signing is configured, so in-place tampering and interior deletion are detectable with no key. State the bounds when presenting this to an auditor: the chain does not establish *authorship*, because anyone able to rewrite the whole log can recompute every link from the edit point forward, and it does not detect tail-truncation, which needs an external anchor. `sign_audit_events: true` with a persistent signing key adds Ed25519 authorship on top and is what an auditor asking "prove KeyRack wrote this" needs — treat it as required, not optional, for a SOC 2 deployment. Commercial adds compliance documentation templates and the commercial receipt chain.
 - **PCI-DSS**: FOSS provides key lifecycle and HSM integration. Commercial adds compliance templates and potentially the HA deployment required for availability. Split knowledge / dual control is an HSM operational concern regardless.
 - **FIPS 140-3**: Same story for both — depends on the HSM certificate. The BLAKE3 internal usage affects both.
 - **GDPR**: FOSS crypto-shredding is the strongest feature. Commercial adds a key destruction certificate and DPIA template.
