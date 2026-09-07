@@ -22,9 +22,44 @@ All notable changes to KeyRack will be documented in this file.
   asserts what only a live server can settle — including that it binds the
   encryption context rather than accepting the field and ignoring it. Pointing
   the harness at another server is how to qualify that server.
+- **`conformance/pkcs11-custody/`: custody loss and restoration, proven against
+  the real binary.** The harness runs `keyrack-service` against two SoftHSM
+  tokens on one library, takes one away, gives it back, and asserts service
+  returns in the same process. It is a binary-level proof because the defect it
+  guards lived in state that only exists in a long-running process, which is
+  the class that passes in-process tests and fails in deployment. The second
+  token is held under continuous load for the whole window, which is how the
+  crash described below was found.
 
 ### Fixed
 
+- **A PKCS#11 token that came back stayed dead until KeyRack was restarted.**
+  When a token became unreachable under a running process — an HSM restart, a
+  re-attached partition, a token volume that went away — the module was left
+  holding an unusable view of it, and that view did not clear when the token
+  returned. Every later call kept failing, including on a brand-new session,
+  so restoring custody restored nothing and the only remedy was restarting the
+  process. Sessions were never the problem: KeyRack already opens a fresh one
+  per operation, and re-resolving the slot did not help either. The module
+  itself has to be reinitialized, so KeyRack now does that on the first
+  request that fails against a token and retries that request. Recovery is
+  bounded: at most one reinitialization per library every two seconds, and it
+  is **abandoned** rather than forced if calls already inside the library do
+  not drain within five seconds — finalizing a library under an active call
+  terminates the process rather than returning an error. Providers sharing the
+  library keep serving throughout; `conformance/pkcs11-custody/` holds one
+  under continuous load across the whole recovery to prove it.
+- **REST reported an unreachable backend as an internal error.** `map_core_err`
+  had no arm for `ProviderUnavailable`, so REST answered 500 where gRPC
+  answered `UNAVAILABLE` for the identical failure. This is the difference
+  between a client that retries and one that gives up, and after the fix above
+  a retry is what restores service — so the wrong status actively prolonged the
+  outage. REST now answers 503 `ProviderUnavailable`, matching gRPC.
+- **A wedged PKCS#11 module reported a permanent fault.** `CKR_GENERAL_ERROR`
+  was classified as a provider defect rather than a connectivity failure, which
+  is both wrong and, again, the difference between a caller retrying and not.
+  It now reads as unavailable, alongside the device and session errors already
+  classified that way.
 - **Compromised keys now deny decrypt by default, including ReEncrypt sources.**
   Persisted compromise history prevents deletion cancellation or rotation from
   restoring decrypt or raw export. Security-sensitive reads bypass metadata
