@@ -434,12 +434,57 @@ pub struct RequestContext {
 pub struct AuthzResponse {
     pub request_id: String,
     pub decision: Decision,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<PolicyReason>,
+    pub obligations: Vec<Obligation>,
     pub policy_version: Option<String>,
+    pub pdp_api_version: Option<String>,
 }
 
 pub enum Decision { Permit, Forbid, Indeterminate }
 ```
+
+### 8.1.1 What a response must satisfy to be enforced
+
+Three conditions are checked where the response crosses the trust boundary,
+identically on the HTTP and gRPC transports.
+
+**1. Correlation — required.** A PDP **must** echo the request's `request_id`.
+A response whose id does not match the request it was sent is refused and the
+operation fails. This is a hard requirement, not a convention: a decision only
+describes the request it was computed for, so applying one that arrived out of
+band — substituted in transit, or misrouted by a shared proxy or a
+connection-pooling bug — authorizes an operation nobody evaluated. gRPC PDPs
+must set the field explicitly, because proto3 sends `""` rather than an absent
+value when it is unset, which is indistinguishable from a well-formed response
+until the id is checked.
+
+**2. Schema version — optional, but must be readable if stated.** A response
+may state `pdp_api_version`. Absent is accepted, since PDPs predating the
+field are well-formed. A stated version other than the current
+`PDP_API_VERSION` is refused, because the remaining fields cannot be read with
+confidence under a schema this build does not know.
+
+**3. Obligations — a `Permit` carrying one is denied.** Obligations are
+conditions the enforcement point must discharge before acting on a `Permit`.
+No obligation handlers are implemented, so a conditional `Permit` cannot be
+honoured and is denied instead. Ignoring the condition would convert a
+conditional permit into an unconditional one, granting more than the policy
+author wrote. There is deliberately no list of "understood" obligations to
+opt out with: such a list would assert handling that does not exist.
+Obligations attached to a non-`Permit` decision are left alone, since the
+operation is refused regardless and nothing is granted on an undischarged
+condition.
+
+Conditions 1 and 2 are protocol failures: the operation fails with an error,
+and nothing is recorded as a policy decision, because no policy decided
+anything. Condition 3 is a decision KeyRack understands but cannot honour
+safely, so it denies and attributes the refusal to `policy_id: "keyrack:pep"`,
+leaving the PDP's own reasons in place so an audit reader can tell an
+enforcement refusal from a policy denial.
+
+A PDP that needs an obligation honoured should not return `Permit` until the
+mechanism that discharges it exists here; a `Permit` nobody can satisfy is not
+a weaker permit, it is a denial with extra steps.
 
 ### 8.2 System principal
 
@@ -452,7 +497,10 @@ honour it via their own policies.
 - `AlwaysAllow` — always returns `Permit`.
 - `AlwaysDeny` — always returns `Forbid`.
 
-Both are feature-gated for test use only.
+Both are selectable in config as `pdp: { type: always_allow | always_deny }`
+and are not feature-gated. `always_allow` disables authorization entirely and
+must be chosen explicitly — there is no default `pdp:` — and the service logs
+a prominent warning at every startup when it is in use.
 
 ### 8.4 Trait
 

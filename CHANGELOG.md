@@ -6,6 +6,57 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **PDP responses are now checked against the request they answer.** Both PDP
+  clients returned any response that parsed, without confirming its
+  `request_id` echoed the request's, so a well-formed decision belonging to a
+  *different* authorization request was applied to the operation in hand.
+  Calibrated honestly: this is a correlation gap, not a fail-open one. The
+  non-success status path already returned `Decision::Forbid` and the
+  parse-error path already returned `Err`, so neither failure mode admitted
+  anything; the exploit shape is response substitution or a confused proxy —
+  a shared forward proxy, or a connection-pooling bug that crosses two
+  in-flight authorizations — rather than an unauthenticated allow. It also
+  required a PDP endpoint reachable and trusted enough to answer at all.
+  Uncorrelated responses now fail the operation instead of authorizing it.
+  Validation lives on `AuthzResponse::require_correlated` in `keyrack-core`
+  and is called by both transports, because the gap was present in *both* the
+  HTTP and gRPC clients and a per-transport check is how they drifted in the
+  first place.
+- **BREAKING (PDP behaviour): a `Permit` carrying an obligation is now
+  denied.** Obligations are conditions the enforcement point must discharge
+  before acting on a permit, and no obligation handlers are implemented, so
+  the permit was previously honoured as though it carried no condition at all
+  — granting more than the policy author wrote. Such a decision is now denied,
+  with the refusal attributed to `policy_id: "keyrack:pep"` so it is
+  distinguishable in the audit trail from a policy denial. There is
+  deliberately no list of "understood" obligations to opt out with, because
+  such a list would assert handling that does not exist. Obligations on a
+  non-`Permit` decision are unaffected: the operation is refused regardless.
+- **Removed: `AuthzResponse::rate_limit_class()`.** The accessor was public
+  with no callers in the workspace, and its doc comment told the reader the
+  class "is expressed as an obligation" — describing a capability that was
+  never implemented, which is exactly what a shipped artifact must not do.
+  Under the rule above it would also have been unreachable, since a `Permit`
+  carrying that obligation is now denied before any caller could read it.
+  **Rate limiting is not implemented and this does not change that**: nothing
+  in KeyRack enforced a rate limit before this release or after it. Planned
+  single-node enforcement will make the obligation dischargeable, at which
+  point a `Permit` carrying it can be honoured rather than denied;
+  cluster-wide enforcement is a commercial extension.
+- **Added: optional `pdp_api_version` on the authorization response** (proto
+  field 6 on `PdpAuthorizeResponse`). A PDP may state the schema version of
+  its response. Absent is accepted, so PDPs predating the field are unaffected
+  and proto3's inability to distinguish absent from empty is not a problem; a
+  version other than `1.0` is refused, because the remaining fields cannot be
+  read with confidence under an unknown schema. Refused as a protocol failure
+  rather than a denial, for the same reason as an uncorrelated response.
+- **BREAKING (PDP implementers, gRPC only): a PDP must echo `request_id`.**
+  HTTP PDPs already had to, since the field is required to deserialize. A gRPC
+  PDP that never set it was previously accepted, because proto3 transmits `""`
+  rather than an absent value, and is now refused with a message naming that
+  specific cause. The bundled Cedar PDP and the `always_allow` / `always_deny`
+  fixtures echo the id by construction and are unaffected.
+
 - **Docs: the audit-detection claim control now matches the claim rather than
   one phrasing of it.** The first version of
   `keyless_audit_claims_state_their_bounds` triggered only on wording that
