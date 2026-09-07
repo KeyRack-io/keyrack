@@ -42,6 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = load_config()?;
 
+    // Fail closed before anything binds a socket or opens a backend: a config
+    // that cannot state its authorization decision must not serve at all.
+    config
+        .validate()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install Prometheus metrics recorder");
@@ -406,8 +412,13 @@ fn provider_class_str(class: keyrack_core::key::ProviderClass) -> &'static str {
     }
 }
 
-/// Build the audit sink (stdout/file/NATS), optionally wrapped in an Ed25519
-/// signing sink for tamper-evident hash chaining.
+/// Build the audit sink (stdout/file/NATS) with a BLAKE3 hash chain always
+/// maintained, and Ed25519 signatures on top when signing is enabled.
+///
+/// Chaining is unconditional on purpose. It needs no key material and gives
+/// tamper evidence; signing gives authenticity. Coupling the chain to signing
+/// would leave the default deployment with a `previous_hash` field that is
+/// never populated.
 async fn build_audit_sink(
     config: &ServiceConfig,
 ) -> Result<Arc<dyn keyrack_core::audit::AuditSink>, Box<dyn std::error::Error>> {
@@ -426,9 +437,18 @@ async fn build_audit_sink(
     };
 
     if !config.sign_audit_events {
-        return Ok(Arc::from(base_sink));
+        tracing::info!(
+            "audit events are BLAKE3 hash-chained (tamper-evident) but NOT signed; \
+             set sign_audit_events: true to add Ed25519 authenticity. Verify with \
+             `keyrack-cli audit verify <log>`"
+        );
+        return Ok(Arc::new(keyrack_core::audit::ChainingAuditSink::new(
+            base_sink,
+        )));
     }
 
+    // `ServiceConfig::validate` has already rejected signing with neither a
+    // key path nor the ephemeral opt-in.
     let signer = if let Some(path) = &config.audit_signing_key_path {
         let key_path = std::path::Path::new(path);
         let signing_key = if key_path.exists() {
@@ -460,7 +480,12 @@ async fn build_audit_sink(
         };
         keyrack_core::audit::AuditSigner::new(signing_key)
     } else {
-        tracing::info!("using ephemeral audit signing key (will not persist across restarts)");
+        tracing::warn!(
+            "SECURITY: audit_signing_key_ephemeral is set — the audit signing key is \
+             regenerated on every startup, so every signature written before this restart \
+             is permanently unverifiable. Set audit_signing_key_path for any deployment \
+             whose audit trail has to be provable."
+        );
         keyrack_core::audit::AuditSigner::generate()
     };
     let vk = signer.verifying_key();
@@ -606,9 +631,24 @@ async fn build_state(
 
     let provider_router = ProviderRouter::with_rules(routing_rules, default_ref);
 
-    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = match &config.pdp {
-        PdpConfig::AlwaysAllow => Arc::new(keyrack_core::pdp::AlwaysAllow),
-        PdpConfig::AlwaysDeny => Arc::new(keyrack_core::pdp::AlwaysDeny),
+    let pdp_config = config
+        .resolved_pdp()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let pdp: Arc<dyn keyrack_core::pdp::PolicyDecisionPoint> = match pdp_config {
+        PdpConfig::AlwaysAllow => {
+            tracing::warn!(
+                "SECURITY: pdp type is `always_allow` — authorization is DISABLED and every \
+                 request is permitted regardless of principal, action, or resource. This is a \
+                 development-only setting; configure a `cedar`, `http`, or `grpc` PDP for any \
+                 deployment holding real keys."
+            );
+            Arc::new(keyrack_core::pdp::AlwaysAllow)
+        }
+        PdpConfig::AlwaysDeny => {
+            tracing::info!("pdp type is `always_deny` — every request will be denied");
+            Arc::new(keyrack_core::pdp::AlwaysDeny)
+        }
         PdpConfig::Http {
             endpoint,
             timeout_ms,

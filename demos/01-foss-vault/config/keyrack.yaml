@@ -9,13 +9,19 @@ provider:
   vault_addr: http://vault:8200
   vault_token: demo-root-token
 
+# Demo only: authorization is disabled outright. `always_allow` must be stated
+# explicitly — omitting `pdp:` is a startup error, not a silent allow.
 pdp:
   type: always_allow
 
 audit:
   type: stdout
 
+# Audit events are BLAKE3 hash-chained regardless of this flag. Signing adds
+# Ed25519 authenticity on top; the ephemeral opt-in is what makes it legal to
+# run without a persistent key, and is a demo-only choice.
 sign_audit_events: true
+audit_signing_key_ephemeral: true
 
 authn:
   type: insecure
