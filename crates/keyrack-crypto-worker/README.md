@@ -96,10 +96,9 @@ four original provider tests and exposes a post-test command hook using the same
 `demos/01-foss-vault` fixture. This crate supplies that hook's worker consumer,
 **not a second maintained CI stack**.
 
-The worker contribution is present through A2 merge `bfa0060` (formerly
-`f4d7bfc`), but the workflow at the worker base `4e639ad` still invokes only the
-provider script with no hook arguments. The latest fetched A2 target `27b5923` contains that correction at
-`c730a3a` and the PR-trigger fix `be72c05`. The invocation is:
+The A2 workflow invokes the worker contribution through the provider script's
+post-test hook. The worker branch carries that integration along with the
+separately named isolation job. The hook invocation is:
 
 ```sh
 bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
@@ -161,9 +160,8 @@ the deleted parent. That test does not claim immediate deletion detection.
 The A2 lane retains its **four original ignored Vault-provider tests**. The worker
 script additionally guards discovery of its own four ignored live tests, so a
 renamed, removed, or un-ignored test fails before running the suite. Local hook
-passes do not establish CI acceptance. The hook is absent from this branch base
-but restored on the A2 integration target at `c730a3a`. Actual CI run evidence for each worker revision and required
-branch-protection contexts remain separate acceptance obligations. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
+passes do not establish CI acceptance. Actual CI run evidence for each worker
+revision and required branch-protection contexts remain separate acceptance obligations. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
 for its trigger and gating scope.
 
 The **Worker credential isolation** check now runs the same fixture through

@@ -26,8 +26,8 @@ checks retry admission with arbitrary 64-bit generation/deadline values and
 incarnation match results. The third checks that rejected fencing preserves state.
 The runner executes every entry of `verification/kani-harnesses.json`; the ordinary
 `documented_kani_harnesses_exist` test checks the registry against proof annotations
-and these documented commands. A contribution patch extends the core documentation
-control to this worker registry; that shared-control integration remains A2-owned.
+and these documented commands. The existing core `documented_kani_harnesses_exist` control also validates this
+worker registry, proof annotations and documented invocations.
 
 The proofs assume the caller computes incarnation equality correctly, verifies
 fence authenticity correctly, holds the mutex across the callback, and uses the
