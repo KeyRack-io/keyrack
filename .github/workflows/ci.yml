@@ -79,6 +79,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run the two persistent-compromise regressions (no zero-test pass)
         shell: bash
         run: |
