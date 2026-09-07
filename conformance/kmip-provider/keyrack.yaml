@@ -1,0 +1,33 @@
+# Service configuration for the KMIP provider proof.
+#
+# The `provider:` block is copied from the KMIP section of docs/OPERATOR.md
+# with only the host and the certificate paths changed, so that a reader
+# following the documentation gets a service that boots. That is the point of
+# the exercise: the documented configuration was accepted by the parser and
+# then rejected at startup.
+#
+# Everything else is the minimum needed to exercise the provider, and is not
+# a production posture: storage is in memory, there is no authentication, and
+# authorization is disabled. A real KMIP deployment would carry none of these.
+
+storage:
+  type: memory
+
+provider:
+  type: kmip
+  host: "127.0.0.1"
+  port: 5696
+  client_cert: "CERT_DIR/client.crt"
+  client_key: "CERT_DIR/client.key"
+  ca_cert: "CERT_DIR/ca.crt"
+
+authn:
+  type: insecure
+
+# Local proof only: disables authorization entirely, and the service logs a
+# prominent warning while it is set.
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout

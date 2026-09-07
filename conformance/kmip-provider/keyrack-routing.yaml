@@ -1,0 +1,36 @@
+# The second documented way to reach a KMIP backend: an entry in the
+# `providers:` list with tag-based routing, rather than the single `provider:`
+# block. Both go through the same construction path, and neither was reachable
+# before, so both are exercised.
+#
+# Shape copied from the multi-provider section of docs/OPERATOR.md.
+
+storage:
+  type: memory
+
+providers:
+  - name: shared-soft
+    type: software
+  - name: tenant-acme
+    type: kmip
+    host: "127.0.0.1"
+    port: 5696
+    client_cert: "CERT_DIR/client.crt"
+    client_key: "CERT_DIR/client.key"
+    ca_cert: "CERT_DIR/ca.crt"
+
+default_provider: shared-soft
+
+provider_routing:
+  - match:
+      tenant: acme
+    provider: tenant-acme
+
+authn:
+  type: insecure
+
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout
