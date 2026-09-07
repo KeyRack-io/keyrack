@@ -212,12 +212,13 @@ call can delay the poll (local Vault requests have a two-second timeout). Usage
 limits are per residency, not a durable lifetime nonce budget; admission/eviction
 and multi-worker accounting need the production profile's reviewed limits.
 
-The core checks authority before returning, but its output writer receives plain
-JSON without deadline/generation metadata. A queued or writer-held result can
-outlive that check. FIFO orders earlier outputs before a fence observation; it
-does not provide deadline-aware transport cancellation or concurrent interruption
-of a provider call. The worker must resolve release-time enforcement with the A3
-transport before activation; this is not covered by the current in-flight tests.
+[Output release and cancellation](OUTPUT_RELEASE.md) now carry authority and
+incarnation through encrypted staging and an atomic, nonblocking key-capsule
+commit serialized with fencing. Cancelled responses have terminal status; queued
+keys expire even behind blocked control output. The document defines admission,
+irrevocable release and fence observation precisely, including OS preemption and
+receiver-read limitations. This remains a private transport and creates no
+canonical `OutputsSuppressed` claim.
 
 Owned raw buffers and AES schedules enable available zeroization features.
 Compiler/OS copies, HTTP header buffers, swap/crash dumps, and all GCM-derived

@@ -3,6 +3,7 @@
 //! Private line-based development harness. Not a cross-track IPC contract.
 mod core;
 mod credential;
+mod delivery;
 mod fixture;
 mod source;
 
@@ -16,8 +17,8 @@ use keyrack_core::{material::ParentWrappedMaterial, wrapping::WrappingIdentifier
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    io::{self, BufRead, Write},
-    sync::mpsc,
+    io::{self, BufRead},
+    sync::{mpsc, Arc},
     time::Duration,
 };
 
@@ -38,13 +39,19 @@ enum Request {
     },
 }
 
-fn write(value: &serde_json::Value) -> Result<(), Error> {
-    let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, value).map_err(|_| Error::Material)?;
-    stdout.write_all(b"\n").map_err(|_| Error::Material)?;
-    stdout.flush().map_err(|_| Error::Material)
+// Drop stops and joins the writer before the worker's owned state disappears.
+struct Stop<C: core::Clock> {
+    delivery: Arc<delivery::Delivery<C>>,
+    writer: Option<std::thread::JoinHandle<()>>,
 }
-
+impl<C: core::Clock> Drop for Stop<C> {
+    fn drop(&mut self) {
+        self.delivery.stop();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+    }
+}
 fn run() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 || args[1] != "--provisional-harness" {
@@ -86,11 +93,12 @@ fn run() -> Result<(), Error> {
     } else {
         Source::Local(LocalFixture::new(&context)?)
     };
+    let clock = Arc::new(MonotonicClock::new());
     let mut worker = Worker::new(
         verifier,
         context.security_domain.as_str().to_owned(),
         source,
-        MonotonicClock::new(),
+        clock.clone(),
         Limits {
             resident_keys: 8,
             residence_ms: 60_000,
@@ -105,17 +113,13 @@ fn run() -> Result<(), Error> {
         .map_err(|_| Error::Context)?;
         worker.reserve_creation(plan, fixture::custody_context(&context))?;
     }
-    // Output backpressure must never hold custody or block expiry/fencing. The
-    // writer owns only operation results; saturation terminates and drops keys.
-    let (out_tx, out_rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        while let Ok(value) = out_rx.recv() {
-            if write(&value).is_err() {
-                break;
-            }
-        }
-    });
-    let emit = |value| out_tx.try_send(value).map_err(|_| Error::Limit);
+    let delivery = Arc::new(delivery::Delivery::new(worker.instance.clone(), clock));
+    let writer = delivery::spawn(delivery.clone())?;
+    let _stop = Stop {
+        delivery: delivery.clone(),
+        writer: Some(writer),
+    };
+    let emit = |value| delivery.control(&value);
     emit(
         json!({"event": "provisional_ready", "worker": worker.instance,
         "context_sha256": core::context_digest(&context)?, "pid": std::process::id(),
@@ -145,6 +149,9 @@ fn run() -> Result<(), Error> {
     });
     loop {
         worker.expire();
+        if delivery.stopped() {
+            return Err(Error::Material);
+        }
         let frame = match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(result) => result?,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -154,11 +161,19 @@ fn run() -> Result<(), Error> {
             Ok(Request::Generate { grant }) => STANDARD.decode(grant)
                 .map_err(|_| Error::Authority)
                 .and_then(|bytes| worker.generate(&bytes))
-                .and_then(|evidence| Ok(json!({
+                .and_then(|evidence| {
+                    let grant = &evidence.grant.claims;
+                    let authority = delivery::Authority {
+                        worker: worker.instance.clone(), generation: grant.authority.generation.get(),
+                        sequence: grant.sequence.get(), grant_sha256: core::digest(&evidence.grant.canonical_bytes().map_err(|_| Error::Authority)?),
+                        not_before: grant.validity.not_before, expires: grant.validity.not_after.min(grant.ancestor_not_after),
+                    };
+                    delivery.enqueue(delivery::Prepared::new(authority, &json!({
                     "creation": STANDARD.encode(evidence.result.canonical_bytes().map_err(|_| Error::Material)?),
                     "authority": STANDARD.encode(evidence.grant.canonical_bytes().map_err(|_| Error::Material)?),
                     "material": STANDARD.encode(evidence.material.canonical_bytes().map_err(|_| Error::Material)?),
-                }))),
+                }))?)
+                }),
             Ok(Request::Execute {
                 signed,
                 principal,
@@ -167,14 +182,16 @@ fn run() -> Result<(), Error> {
             }) => STANDARD
                 .decode(input)
                 .map_err(|_| Error::Context)
-                .and_then(|input| worker.execute(&signed, &principal, &context, operation, &input))
-                .map(|output| json!({"output": STANDARD.encode(output)})),
-            Ok(Request::Fence { signed }) => worker
-                .fence(&signed)
-                .map(|observation| json!({"local_fence": observation})),
+                .and_then(|input| worker.execute_for_delivery(&signed, &principal, &context, operation, &input))
+                .and_then(|(authority, output)| delivery.enqueue(delivery::Prepared::new(authority, &json!({"output": STANDARD.encode(output.as_slice())}))?)),
+            Ok(Request::Fence { signed }) => delivery
+                .fence(|| worker.fence(&signed))
+                .and_then(|observation| emit(json!({"local_fence": observation}))),
             Err(_) => Err(Error::Context),
         };
-        emit(result.unwrap_or_else(|error| json!({"error": error.to_string()})))?;
+        if let Err(error) = result {
+            emit(json!({"error": error.to_string()}))?;
+        }
     }
 }
 
