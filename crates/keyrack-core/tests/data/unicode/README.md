@@ -31,8 +31,14 @@ A single boolean rule is not a complete observation: unrelated maps can both
 fail, and `$`-prefixed patterns denote variables. Rules receive the original raw
 maps, so the test cannot mask a missing normalization boundary. Other generated
 tests exercise arbitrary-rule forward congruence, Unicode-equivalent spellings,
-different and independent maps, and duplicate normalized keys. These are bounded
-generated tests, not a proof of injectivity over unbounded inputs.
+different and independent maps, and duplicate normalized keys. Equivalent-map
+generation samples all 16,776 distinct nonidentity NFC pairs extracted from every
+reference row's five column relations, with arbitrary common Unicode prefixes
+and suffixes and either pair orientation. This exercises composition across the
+boundaries of the sampled reference strings; distinct raw spellings remain
+available for duplicate-key rejection. The generated tests are bounded samples,
+not a proof of injectivity over unbounded inputs or an exhaustive enumeration of
+all combinations from the reference corpus.
 
 All fixtures are public test data. Software AEAD tests establish identity/AAD
 semantics only; they do not qualify provider-native wrapping or key custody.

@@ -13,6 +13,7 @@ use keyrack_core::tags::IdentityTags;
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 type Flat = BTreeMap<String, String>;
 const REFERENCE: &str = include_str!("data/unicode/NormalizationTest-17.0.0.txt");
@@ -248,16 +249,47 @@ fn flat_map() -> BoxedStrategy<Flat> {
         .boxed()
 }
 
-fn equivalent_spellings() -> impl Strategy<Value = (&'static str, &'static str)> {
-    prop::sample::select(vec![
-        ("é", "e\u{301}"),
-        ("Å", "A\u{30a}"),
-        ("Å", "\u{212b}"),
-        ("각", "\u{1100}\u{1161}\u{11a8}"),
-        ("\u{1e0c}\u{307}", "D\u{307}\u{323}"),
-        ("\u{0308}\u{0301}", "\u{0344}"),
-        ("\u{1d157}\u{1d165}", "\u{1d15e}"),
-    ])
+fn reference_equivalent_pairs() -> &'static [(String, String)] {
+    static PAIRS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    PAIRS.get_or_init(|| {
+        let mut pairs = BTreeSet::new();
+        for line in REFERENCE.lines() {
+            let data = line.split('#').next().unwrap().trim();
+            if data.is_empty() || data.starts_with('@') {
+                continue;
+            }
+            let columns: Vec<_> = data.split(';').take(5).map(reference_string).collect();
+            for (i, raw) in columns.iter().enumerate() {
+                let expected = &columns[if i < 3 { 1 } else { 3 }];
+                if raw != expected {
+                    pairs.insert((raw.clone(), expected.clone()));
+                }
+            }
+        }
+        // All distinct nonidentity NFC relations from the full pinned corpus,
+        // not a handpicked list of scripts or old regression examples.
+        assert_eq!(pairs.len(), 16_776);
+        pairs.into_iter().collect()
+    })
+}
+
+fn equivalent_spellings() -> impl Strategy<Value = (String, String)> {
+    let pairs = reference_equivalent_pairs();
+    (0..pairs.len(), rich_string(), rich_string(), any::<bool>()).prop_map(
+        move |(index, prefix, suffix, reverse)| {
+            let (a, b) = &pairs[index];
+            // Canonical equivalence is closed under common concatenation.
+            // Arbitrary surrounding text exercises composition/reordering at
+            // both boundaries while distinct raw spellings stay distinct.
+            let a = format!("{prefix}{a}{suffix}");
+            let b = format!("{prefix}{b}{suffix}");
+            if reverse {
+                (b, a)
+            } else {
+                (a, b)
+            }
+        },
+    )
 }
 
 fn equivalent_maps() -> impl Strategy<Value = (Flat, Flat)> {
