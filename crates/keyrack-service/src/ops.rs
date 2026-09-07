@@ -78,6 +78,9 @@ pub struct OpContext {
     pub encryption_context_hash: Option<[u8; 32]>,
     /// Propagated x-request-id for end-to-end correlation across services.
     pub request_id: String,
+    // A second key is mandatory for ReEncrypt. Keep the binding private so a
+    // generic single-resource context cannot accidentally authorize the pair.
+    re_encrypt_destination: Option<String>,
 }
 
 impl OpContext {
@@ -89,7 +92,16 @@ impl OpContext {
             resource_type: "Key".into(),
             encryption_context_hash: None,
             request_id: new_request_id(),
+            re_encrypt_destination: None,
         }
+    }
+
+    /// Requires `kms:ReEncryptFrom` on the source and `kms:ReEncryptTo` on the destination;
+    /// it does not imply permission to retrieve plaintext through `Decrypt`.
+    pub fn re_encrypt(principal: Principal, source: &str, destination: &str) -> Self {
+        let mut ctx = Self::key(AuditAction::ReEncryptFrom, principal, source);
+        ctx.re_encrypt_destination = Some(destination.to_owned());
+        ctx
     }
 
     pub fn alias(action: AuditAction, principal: Principal, alias_name: &str) -> Self {
@@ -100,6 +112,7 @@ impl OpContext {
             resource_type: "Alias".into(),
             encryption_context_hash: None,
             request_id: new_request_id(),
+            re_encrypt_destination: None,
         }
     }
 
@@ -116,6 +129,7 @@ impl OpContext {
             resource_type: resource_type.to_owned(),
             encryption_context_hash: None,
             request_id: new_request_id(),
+            re_encrypt_destination: None,
         }
     }
 
@@ -127,6 +141,7 @@ impl OpContext {
             resource_type: resource_type.to_owned(),
             encryption_context_hash: None,
             request_id: new_request_id(),
+            re_encrypt_destination: None,
         }
     }
 }
@@ -157,14 +172,8 @@ where
     tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize(state, &ctx).await {
-        emit_audit(
-            state,
-            &ctx,
-            AuditResult::Denied,
-            Some(keyrack_core::audit::EventType::AuthorizationDenied),
-        )
-        .await;
-        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
+        emit_authorization_failure(state, &ctx, denied.code()).await;
+        record_authorization_failure(&ctx, denied.code(), start);
         return Err(denied);
     }
 
@@ -175,7 +184,7 @@ where
     } else {
         (AuditResult::Error, "error")
     };
-    emit_audit(state, &ctx, audit_result, None).await;
+    emit_audit(state, &ctx, audit_result, None, None).await;
     crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result
@@ -186,6 +195,7 @@ async fn emit_audit(
     ctx: &OpContext,
     result: AuditResult,
     event_type_override: Option<keyrack_core::audit::EventType>,
+    authorization_status: Option<tonic::Code>,
 ) {
     let event_type = event_type_override.unwrap_or_else(|| event_type_for_action(&ctx.action));
     let mut event = AuditEvent::new(
@@ -202,6 +212,11 @@ async fn emit_audit(
         result,
     )
     .with_request_id(ctx.request_id.clone());
+
+    if let Some(code) = authorization_status {
+        event.add_metadata("failure_phase", "authorization");
+        event.add_metadata("authorization_status", format!("{code:?}"));
+    }
 
     let tenant = ctx
         .principal
@@ -235,8 +250,29 @@ async fn emit_audit(
 
 #[allow(clippy::result_large_err)]
 async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), tonic::Status> {
-    let pdp_start = Instant::now();
+    for (index, request) in authorization_requests(ctx)?.iter().enumerate() {
+        if let Err(error) = authorize_request(state, request).await {
+            if index == 1 {
+                // The executor also records the overall source operation as
+                // denied. Name the refused destination explicitly, without
+                // inventing a successful standalone Encrypt operation.
+                let mut denied = OpContext::key(
+                    AuditAction::ReEncryptTo,
+                    ctx.principal.clone(),
+                    &request.resource.id,
+                );
+                denied.request_id.clone_from(&ctx.request_id);
+                denied.encryption_context_hash = ctx.encryption_context_hash;
+                emit_authorization_failure(state, &denied, error.code()).await;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
 
+#[allow(clippy::result_large_err)]
+fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::Status> {
     let request = AuthzRequest {
         pdp_api_version: PDP_API_VERSION.into(),
         request_id: ctx.request_id.clone(),
@@ -249,12 +285,71 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
         },
         context: RequestContext::default(),
     };
-
-    let response = state.pdp.evaluate(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "PDP evaluation failed");
-        crate::metrics::record_pdp(pdp_start.elapsed(), false);
-        tonic::Status::internal("authorization service unavailable")
+    if ctx.action != AuditAction::ReEncryptFrom {
+        if ctx.re_encrypt_destination.is_some() || ctx.action == AuditAction::ReEncryptTo {
+            return Err(tonic::Status::internal(
+                "invalid two-key authorization context",
+            ));
+        }
+        return Ok(vec![request]);
+    }
+    let destination = ctx.re_encrypt_destination.as_deref().ok_or_else(|| {
+        tonic::Status::internal("ReEncrypt requires a bound destination authorization")
     })?;
+    Ok([
+        (
+            "source",
+            ctx.resource_id.as_str(),
+            AuditAction::ReEncryptFrom,
+        ),
+        ("destination", destination, AuditAction::ReEncryptTo),
+    ]
+    .into_iter()
+    .map(|(role, key_id, action)| {
+        let mut leg = request.clone();
+        leg.action = action;
+        // These are different PDP questions, even for a same-key rewrap.
+        // Reusing the operation ID would accept a source response for the
+        // destination. Keep the outer ID solely as correlation context.
+        leg.request_id = new_request_id();
+        key_id.clone_into(&mut leg.resource.id);
+        for (name, value) in [
+            ("operation_request_id", ctx.request_id.as_str()),
+            ("re_encrypt_role", role),
+            ("source_key_id", ctx.resource_id.as_str()),
+            ("destination_key_id", destination),
+        ] {
+            leg.context.entries.insert(
+                name.into(),
+                keyrack_core::pdp::AttributeValue::String(value.into()),
+            );
+        }
+        leg
+    })
+    .collect())
+}
+
+#[allow(clippy::result_large_err)]
+async fn authorize_request(
+    state: &Arc<ServiceState>,
+    request: &AuthzRequest,
+) -> Result<(), tonic::Status> {
+    let pdp_start = Instant::now();
+    let response = state
+        .pdp
+        .evaluate(request)
+        .await
+        .and_then(|response| {
+            // Enforce the response contract for injected/in-process PDPs too, not
+            // only the HTTP/gRPC adapters. This operation must not accept a source
+            // Permit substituted as its independently requested destination Permit.
+            response.into_enforceable(request)
+        })
+        .map_err(|e| {
+            tracing::error!(error = %e, "PDP evaluation failed");
+            crate::metrics::record_pdp(pdp_start.elapsed(), false);
+            tonic::Status::internal("authorization service unavailable")
+        })?;
 
     match response.decision {
         Decision::Permit => {
@@ -298,14 +393,13 @@ where
     tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize_rest(state, &ctx).await {
-        emit_audit(
-            state,
-            &ctx,
-            AuditResult::Denied,
-            Some(keyrack_core::audit::EventType::AuthorizationDenied),
-        )
-        .await;
-        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
+        let code = if denied.0 == axum::http::StatusCode::FORBIDDEN {
+            tonic::Code::PermissionDenied
+        } else {
+            tonic::Code::Internal
+        };
+        emit_authorization_failure(state, &ctx, code).await;
+        record_authorization_failure(&ctx, code, start);
         return Err(denied);
     }
 
@@ -316,7 +410,7 @@ where
     } else {
         (AuditResult::Error, "error")
     };
-    emit_audit(state, &ctx, audit_result, None).await;
+    emit_audit(state, &ctx, audit_result, None, None).await;
     crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result
@@ -326,56 +420,21 @@ async fn authorize_rest(
     state: &Arc<ServiceState>,
     ctx: &OpContext,
 ) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
-    let pdp_start = Instant::now();
-
-    let request = AuthzRequest {
-        pdp_api_version: PDP_API_VERSION.into(),
-        request_id: ctx.request_id.clone(),
-        action: ctx.action.clone(),
-        principal: ctx.principal.clone(),
-        resource: Resource {
-            id: ctx.resource_id.clone(),
-            resource_type: ctx.resource_type.clone(),
-            attributes: std::collections::BTreeMap::default(),
-        },
-        context: RequestContext::default(),
-    };
-
-    let response = state.pdp.evaluate(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "PDP evaluation failed");
-        crate::metrics::record_pdp(pdp_start.elapsed(), false);
-        rest_error(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "PdpUnavailable",
-            "authorization service unavailable",
-        )
-    })?;
-
-    match response.decision {
-        Decision::Permit => {
-            crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            Ok(())
-        }
-        Decision::Forbid | Decision::Indeterminate => {
-            crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons: String = response
-                .reasons
-                .iter()
-                .map(|r| {
-                    r.human_message
-                        .as_deref()
-                        .or(r.reason_code.as_deref())
-                        .unwrap_or(&r.policy_id)
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(rest_error(
+    authorize(state, ctx).await.map_err(|error| {
+        if error.code() == tonic::Code::PermissionDenied {
+            rest_error(
                 axum::http::StatusCode::FORBIDDEN,
                 "AuthorizationDenied",
-                &format!("authorization denied: {reasons}"),
-            ))
+                error.message(),
+            )
+        } else {
+            rest_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "PdpUnavailable",
+                error.message(),
+            )
         }
-    }
+    })
 }
 
 pub fn rest_error(
@@ -421,7 +480,8 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::GenerateRandom
         | AuditAction::GenerateDataKey
         | AuditAction::GenerateDataKeyWithoutPlaintext
-        | AuditAction::ReEncrypt => EventType::CryptoOperation,
+        | AuditAction::ReEncryptFrom
+        | AuditAction::ReEncryptTo => EventType::CryptoOperation,
 
         AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => {
             EventType::TagMutation
@@ -479,8 +539,17 @@ pub async fn authorize_with_resource_attrs(
     ctx: &OpContext,
     resource_attrs: BTreeMap<String, keyrack_core::pdp::AttributeValue>,
 ) -> Result<(), tonic::Status> {
-    let pdp_start = Instant::now();
-
+    // This helper authorizes one resource. ReEncrypt must go through the
+    // two-key executor; neither a generic nor bound context can bypass it here.
+    if matches!(
+        ctx.action,
+        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo
+    ) || ctx.re_encrypt_destination.is_some()
+    {
+        return Err(tonic::Status::internal(
+            "ReEncrypt requires the two-key executor",
+        ));
+    }
     let request = AuthzRequest {
         pdp_api_version: PDP_API_VERSION.into(),
         request_id: ctx.request_id.clone(),
@@ -493,48 +562,35 @@ pub async fn authorize_with_resource_attrs(
         },
         context: RequestContext::default(),
     };
-
-    let response = state.pdp.evaluate(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "PDP evaluation failed");
-        crate::metrics::record_pdp(pdp_start.elapsed(), false);
-        tonic::Status::internal("authorization service unavailable")
-    })?;
-
-    match response.decision {
-        Decision::Permit => {
-            crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            Ok(())
-        }
-        Decision::Forbid | Decision::Indeterminate => {
-            crate::metrics::record_pdp(pdp_start.elapsed(), true);
-            let reasons: String = response
-                .reasons
-                .iter()
-                .map(|r| {
-                    r.human_message
-                        .as_deref()
-                        .or(r.reason_code.as_deref())
-                        .unwrap_or(&r.policy_id)
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(tonic::Status::permission_denied(format!(
-                "authorization denied: {reasons}"
-            )))
-        }
-    }
+    authorize_request(state, &request).await
 }
 
 /// Emit an authorization-denied audit event (used by double-gate flows where
 /// a secondary authorization check happens inside an already-authorized operation).
 pub async fn emit_audit_denied(state: &Arc<ServiceState>, ctx: &OpContext) {
-    emit_audit(
-        state,
-        ctx,
-        AuditResult::Denied,
-        Some(keyrack_core::audit::EventType::AuthorizationDenied),
-    )
-    .await;
+    emit_authorization_failure(state, ctx, tonic::Code::PermissionDenied).await;
+}
+
+fn record_authorization_failure(ctx: &OpContext, code: tonic::Code, start: Instant) {
+    let outcome = if code == tonic::Code::PermissionDenied {
+        "denied"
+    } else {
+        "error"
+    };
+    crate::metrics::record_op(&ctx.action.to_string(), outcome, start.elapsed());
+}
+
+async fn emit_authorization_failure(state: &Arc<ServiceState>, ctx: &OpContext, code: tonic::Code) {
+    let (result, kind) = if code == tonic::Code::PermissionDenied {
+        (
+            AuditResult::Denied,
+            Some(keyrack_core::audit::EventType::AuthorizationDenied),
+        )
+    } else {
+        // An unavailable PDP or invalid response is not a policy decision.
+        (AuditResult::Error, None)
+    };
+    emit_audit(state, ctx, result, kind, Some(code)).await;
 }
 
 /// PDP + audit envelope with resource-attribute enrichment. Used by
@@ -554,14 +610,8 @@ where
     tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
 
     if let Err(denied) = authorize_with_resource_attrs(state, &ctx, resource_attrs).await {
-        emit_audit(
-            state,
-            &ctx,
-            AuditResult::Denied,
-            Some(keyrack_core::audit::EventType::AuthorizationDenied),
-        )
-        .await;
-        crate::metrics::record_op(&ctx.action.to_string(), "denied", start.elapsed());
+        emit_authorization_failure(state, &ctx, denied.code()).await;
+        record_authorization_failure(&ctx, denied.code(), start);
         return Err(denied);
     }
 
@@ -572,7 +622,7 @@ where
     } else {
         (AuditResult::Error, "error")
     };
-    emit_audit(state, &ctx, audit_result, None).await;
+    emit_audit(state, &ctx, audit_result, None, None).await;
     crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result

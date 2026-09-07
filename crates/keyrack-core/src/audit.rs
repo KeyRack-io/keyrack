@@ -72,8 +72,10 @@ pub enum AuditAction {
     GenerateDataKey,
     #[serde(rename = "kms:GenerateDataKeyWithoutPlaintext")]
     GenerateDataKeyWithoutPlaintext,
-    #[serde(rename = "kms:ReEncrypt")]
-    ReEncrypt,
+    #[serde(rename = "kms:ReEncryptFrom")]
+    ReEncryptFrom,
+    #[serde(rename = "kms:ReEncryptTo")]
+    ReEncryptTo,
     #[serde(rename = "kms:Sign")]
     Sign,
     #[serde(rename = "kms:Verify")]
@@ -1017,13 +1019,37 @@ mod tests {
     }
 
     #[test]
+    fn reencrypt_permissions_are_directional_without_a_legacy_alias() {
+        for (action, name) in [
+            (AuditAction::ReEncryptFrom, "kms:ReEncryptFrom"),
+            (AuditAction::ReEncryptTo, "kms:ReEncryptTo"),
+        ] {
+            assert_eq!(action.to_string(), name);
+            assert_eq!(serde_json::to_value(&action).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<AuditAction>(serde_json::json!(name)).unwrap(),
+                action
+            );
+        }
+        for invalid in [
+            "kms:ReEncrypt",
+            "kms:ReEncrypt*",
+            "ReEncryptFrom",
+            "ReEncryptTo",
+        ] {
+            assert!(serde_json::from_value::<AuditAction>(serde_json::json!(invalid)).is_err());
+        }
+    }
+
+    #[test]
     fn all_actions_serialize_with_kms_prefix() {
         let actions = vec![
             AuditAction::Encrypt,
             AuditAction::Decrypt,
             AuditAction::GenerateDataKey,
             AuditAction::GenerateDataKeyWithoutPlaintext,
-            AuditAction::ReEncrypt,
+            AuditAction::ReEncryptFrom,
+            AuditAction::ReEncryptTo,
             AuditAction::Sign,
             AuditAction::Verify,
             AuditAction::GenerateRandom,

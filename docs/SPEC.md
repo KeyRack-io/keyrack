@@ -226,7 +226,7 @@ All actions are prefixed `kms:` and match the `AuditAction` enum:
 
 | Category | Actions |
 |---|---|
-| Crypto | `Encrypt`, `Decrypt`, `GenerateDataKey`, `GenerateDataKeyWithoutPlaintext`, `ReEncrypt`, `Sign`, `Verify`, `GenerateRandom` |
+| Crypto | `Encrypt`, `Decrypt`, `GenerateDataKey`, `GenerateDataKeyWithoutPlaintext`, `ReEncryptFrom`, `ReEncryptTo`, `Sign`, `Verify`, `GenerateRandom` |
 | Lifecycle | `CreateKey`, `EnableKey`, `DisableKey`, `ScheduleKeyDeletion`, `CancelKeyDeletion`, `RotateKey` |
 | Metadata | `DescribeKey`, `UpdateKey` |
 | Tags | `TagResource`, `UntagResource` |
@@ -234,6 +234,11 @@ All actions are prefixed `kms:` and match the `AuditAction` enum:
 | HSM | `CreateHsmConnection`, `DeleteHsmConnection` |
 | Rotation jobs | `AcknowledgeRotationJob`, `CompleteRotationJob`, `FailRotationJob` |
 | Cascade | `CascadeDisable` |
+
+The `ReEncrypt` API requires From on the source and To on the destination, even
+for same-key requests. There is no aggregate `kms:ReEncrypt` permission alias.
+See [PDP action cross-reference](PDP_ACTION_CROSSREF.md#reencrypt-authorizes-two-keys)
+for authorization and audit semantics.
 
 ### 5.3 Sinks
 

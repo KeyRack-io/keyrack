@@ -10,12 +10,54 @@ v1.0 §7.1.
 |----------|---------------|-------------------|
 | `Encrypt` | `kms:Encrypt` | Yes |
 | `Decrypt` | `kms:Decrypt` | Yes |
-| `ReEncrypt` | `kms:ReEncrypt` | Yes |
+| `ReEncrypt` (source) | `kms:ReEncryptFrom` | Directional correction; see below |
+| `ReEncrypt` (destination) | `kms:ReEncryptTo` | Directional correction; see below |
 | `GenerateDataKey` | `kms:GenerateDataKey` | Yes |
 | `GenerateDataKeyWithoutPlaintext` | `kms:GenerateDataKeyWithoutPlaintext` | Yes |
 | `GenerateRandom` | `kms:GenerateRandom` | Yes |
 | `Sign` | `kms:Sign` | Yes |
 | `Verify` | `kms:Verify` | Yes |
+
+### ReEncrypt authorizes two keys
+
+Both gRPC and REST require `kms:ReEncryptFrom` on the source key and
+`kms:ReEncryptTo` on the destination key, before entering the crypto operation. A grant on
+only one key is insufficient, including when the other key belongs to another
+tenant. Policy authors must explicitly grant every permitted destination. This
+keeps re-encryption-only delegation distinct from permission to retrieve plaintext
+with `kms:Decrypt`; it does not require standalone `kms:Encrypt` rights either.
+
+`ReEncrypt` is the API operation, not an IAM permission. AWS documents the two
+directional permissions separately in its [ReEncrypt API reference](https://docs.aws.amazon.com/kms/latest/APIReference/API_ReEncrypt.html)
+and [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_kms.html)
+(verified 2026-09-07). KeyRack removes the old `kms:ReEncrypt` action without an
+alias: an old aggregate grant must not silently acquire both directions. AWS's
+`kms:ReEncrypt*` policy wildcard is not a literal KeyRack action or an implicit
+Cedar wildcard expansion. Exact-action policies and custom Cedar schemas must
+name the two permissions explicitly; granting From on a key does not grant To.
+Even same-key requests require both permissions. The API operation name remains
+`ReEncrypt`; permission names are not callable API operations.
+
+Each leg has a fresh PDP `request_id`, including same-key re-encryption. The outer
+operation ID remains the audit correlation ID and is carried in PDP context as
+`operation_request_id`; `re_encrypt_role` is `source` or `destination`, and
+`source_key_id` / `destination_key_id` bind the pair. Both responses must satisfy
+the normal correlation/version/obligation contract. Denial, indeterminacy or PDP
+failure on either leg prevents provider execution. Destination refusal produces
+an `AuthorizationDenied` event naming that key, in addition to the overall denied
+source operation; successful re-encryption emits one `kms:ReEncryptFrom`
+operation-success event against the source. Destination authorization failures
+use `kms:ReEncryptTo`. The source event describes the whole two-key operation,
+not a separately callable source-only operation.
+Transport/protocol failures are recorded as `Error`, not policy denials, with
+`failure_phase=authorization` and an `authorization_status` in audit metadata.
+
+The bundled Cedar engine currently evaluates action and resource identity but
+does not populate its context/entities from the request attributes. Exact-resource
+grants work; the new context fields do not make role- or tenant-attribute policies
+work there. Provider scope and lifecycle checks remain separate, and source scope
+is checked against the ciphertext's historical version, not the current primary.
+Internal domain functions still require their caller's authorization/audit envelope.
 
 ## Key lifecycle
 

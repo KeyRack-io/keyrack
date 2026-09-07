@@ -52,7 +52,7 @@ fn reencrypt_input(source: &str, destination: &str, blob: &[u8]) -> crypto::ReEn
         destination_encryption_context: None,
         principal_scope: None,
         principal_id: Principal::system().id,
-        audit_context: context(source, AuditAction::ReEncrypt),
+        audit_context: context(source, AuditAction::ReEncryptFrom),
     }
 }
 
@@ -197,7 +197,7 @@ async fn dormant_domain_legacy_uses_emit_correlated_structured_markers() {
     );
     for (event, (action, request_id)) in marked.iter().zip([
         (AuditAction::Decrypt, decrypt_request_id),
-        (AuditAction::ReEncrypt, reencrypt_request_id),
+        (AuditAction::ReEncryptFrom, reencrypt_request_id),
     ]) {
         assert_eq!(event.action, action);
         assert_eq!(event.request_id.as_deref(), Some(request_id.as_str()));
