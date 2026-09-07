@@ -115,6 +115,7 @@ impl PolicyDecisionPoint for HttpPdpClient {
                 }],
                 obligations: vec![],
                 policy_version: None,
+                pdp_api_version: None,
             });
         }
 
@@ -127,16 +128,16 @@ impl PolicyDecisionPoint for HttpPdpClient {
             KeyRackError::Other(format!("PDP response parse error: {e}"))
         })?;
 
-        parsed.require_correlated(request).inspect_err(|_| {
+        let response_request_id = parsed.request_id.clone();
+        parsed.into_enforceable(request).inspect_err(|error| {
             tracing::error!(
                 pdp_endpoint = %self.endpoint,
                 request_id = %request.request_id,
-                response_request_id = %parsed.request_id,
-                "PDP response does not correlate with the request; refusing it"
+                response_request_id = %response_request_id,
+                error = %error,
+                "refusing PDP response: it is not one this service can act on"
             );
-        })?;
-
-        Ok(parsed)
+        })
     }
 }
 

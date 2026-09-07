@@ -270,6 +270,13 @@ fn response_from_proto(response: proto::PdpAuthorizeResponse) -> AuthzResponse {
         } else {
             Some(response.policy_version)
         },
+        // proto3 cannot distinguish absent from empty, so an unset version
+        // maps to `None` and is accepted; see `into_enforceable`.
+        pdp_api_version: if response.pdp_api_version.is_empty() {
+            None
+        } else {
+            Some(response.pdp_api_version)
+        },
     }
 }
 
@@ -301,17 +308,17 @@ impl PolicyDecisionPoint for GrpcPdpClient {
             .into_inner();
 
         let converted = response_from_proto(response);
+        let response_request_id = converted.request_id.clone();
 
-        converted.require_correlated(request).inspect_err(|_| {
+        converted.into_enforceable(request).inspect_err(|error| {
             tracing::error!(
                 pdp_endpoint = %self.endpoint,
                 request_id = %request.request_id,
-                response_request_id = %converted.request_id,
-                "PDP response does not correlate with the request; refusing it"
+                response_request_id = %response_request_id,
+                error = %error,
+                "refusing PDP response: it is not one this service can act on"
             );
-        })?;
-
-        Ok(converted)
+        })
     }
 }
 

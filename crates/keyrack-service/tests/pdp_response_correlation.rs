@@ -154,11 +154,13 @@ async fn http_pdp_accepts_a_correlated_permit() {
 // gRPC
 // ---------------------------------------------------------------------------
 
-/// Answers every `Authorize` with a Permit carrying `reply_id`, regardless of
-/// what was asked.
-#[derive(Clone)]
+/// Answers every `Authorize` with a Permit built from these fields, regardless
+/// of what was asked.
+#[derive(Clone, Default)]
 struct FixedIdPdp {
     reply_id: String,
+    api_version: String,
+    obligation_ids: Vec<String>,
 }
 
 #[tonic::async_trait]
@@ -171,8 +173,16 @@ impl proto::pdp_service_server::PdpService for FixedIdPdp {
             request_id: self.reply_id.clone(),
             decision: proto::PdpDecision::Permit as i32,
             reasons: vec![],
-            obligations: vec![],
+            obligations: self
+                .obligation_ids
+                .iter()
+                .map(|id| proto::PdpObligation {
+                    obligation_id: id.clone(),
+                    parameters: std::collections::HashMap::new(),
+                })
+                .collect(),
             policy_version: String::new(),
+            pdp_api_version: self.api_version.clone(),
         }))
     }
 
@@ -192,11 +202,16 @@ impl proto::pdp_service_server::PdpService for FixedIdPdp {
 }
 
 async fn spawn_grpc_pdp(reply_id: &str) -> SocketAddr {
+    spawn_grpc_pdp_with(FixedIdPdp {
+        reply_id: reply_id.to_string(),
+        ..FixedIdPdp::default()
+    })
+    .await
+}
+
+async fn spawn_grpc_pdp_with(svc: FixedIdPdp) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let svc = FixedIdPdp {
-        reply_id: reply_id.to_string(),
-    };
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
@@ -258,4 +273,139 @@ async fn grpc_pdp_accepts_a_correlated_permit() {
         .await
         .expect("a correlated Permit must still be accepted");
     assert_eq!(resp.decision, Decision::Permit);
+}
+
+// ---------------------------------------------------------------------------
+// Obligations: a permit conditional on something nothing discharges
+// ---------------------------------------------------------------------------
+
+/// Ignoring an obligation turns a conditional permit into an unconditional
+/// one, granting more than the policy author wrote. Nothing here implements
+/// any obligation handler, so the decision is denied rather than honoured.
+///
+/// This denies rather than erroring: the PDP behaved correctly and its
+/// decision parsed, so a protocol error would misdescribe what happened.
+#[tokio::test]
+async fn http_pdp_denies_a_permit_carrying_an_obligation() {
+    let body = serde_json::json!({
+        "request_id": "req-MINE",
+        "decision": "Permit",
+        "obligations": [{ "obligation_id": "rate_limit_class",
+                          "parameters": { "class": "burst" } }],
+    });
+    let addr = spawn_http_pdp(body).await;
+    let client = HttpPdpClient::new(
+        format!("http://{addr}/authorize"),
+        TIMEOUT,
+        None,
+        None,
+        None,
+    )
+    .expect("client");
+
+    let resp = client
+        .evaluate(&request_with_id("req-MINE"))
+        .await
+        .expect("an obligation is a policy condition, not a protocol failure");
+
+    assert_eq!(
+        resp.decision,
+        Decision::Forbid,
+        "a conditional permit must not be honoured as an unconditional one"
+    );
+    assert!(
+        resp.reasons.iter().any(|r| r.policy_id == "keyrack:pep"),
+        "the refusal must be attributed to the enforcement point rather than the policy, \
+         so an audit reader can tell who denied: {:?}",
+        resp.reasons
+    );
+}
+
+#[tokio::test]
+async fn grpc_pdp_denies_a_permit_carrying_an_obligation() {
+    let addr = spawn_grpc_pdp_with(FixedIdPdp {
+        reply_id: "req-MINE".into(),
+        obligation_ids: vec!["rate_limit_class".into()],
+        ..FixedIdPdp::default()
+    })
+    .await;
+    let client =
+        GrpcPdpClient::new(format!("http://{addr}"), TIMEOUT, None, None, None).expect("client");
+
+    let resp = client
+        .evaluate(&request_with_id("req-MINE"))
+        .await
+        .expect("an obligation is a policy condition, not a protocol failure");
+    assert_eq!(resp.decision, Decision::Forbid);
+    assert!(resp.reasons.iter().any(|r| r.policy_id == "keyrack:pep"));
+}
+
+// ---------------------------------------------------------------------------
+// Schema version
+// ---------------------------------------------------------------------------
+
+/// A response that states a version this build cannot read must not have its
+/// remaining fields trusted. Refused as a protocol failure, matching the
+/// correlation case: no policy decision can be attributed to it.
+#[tokio::test]
+async fn grpc_pdp_refuses_an_unreadable_schema_version() {
+    let addr = spawn_grpc_pdp_with(FixedIdPdp {
+        reply_id: "req-MINE".into(),
+        api_version: "2.0".into(),
+        ..FixedIdPdp::default()
+    })
+    .await;
+    let client =
+        GrpcPdpClient::new(format!("http://{addr}"), TIMEOUT, None, None, None).expect("client");
+
+    let err = client
+        .evaluate(&request_with_id("req-MINE"))
+        .await
+        .expect_err("a Permit under an unreadable schema version must not be applied");
+    assert!(
+        err.to_string().contains("PDP protocol violation"),
+        "got: {err}"
+    );
+}
+
+/// proto3 sends `""` for an unset field, and PDPs written before the field
+/// existed do not set it, so absent must stay acceptable.
+#[tokio::test]
+async fn grpc_pdp_accepts_a_response_that_states_no_schema_version() {
+    let addr = spawn_grpc_pdp("req-MINE").await;
+    let client =
+        GrpcPdpClient::new(format!("http://{addr}"), TIMEOUT, None, None, None).expect("client");
+
+    let resp = client
+        .evaluate(&request_with_id("req-MINE"))
+        .await
+        .expect("a PDP predating the field is well-formed");
+    assert_eq!(resp.decision, Decision::Permit);
+}
+
+#[tokio::test]
+async fn http_pdp_refuses_an_unreadable_schema_version() {
+    let body = serde_json::json!({
+        "request_id": "req-MINE",
+        "decision": "Permit",
+        "pdp_api_version": "2.0",
+    });
+    let addr = spawn_http_pdp(body).await;
+    let client = HttpPdpClient::new(
+        format!("http://{addr}/authorize"),
+        TIMEOUT,
+        None,
+        None,
+        None,
+    )
+    .expect("client");
+
+    let err = client
+        .evaluate(&request_with_id("req-MINE"))
+        .await
+        .expect_err("a Permit under an unreadable schema version must not be applied");
+    assert!(
+        err.to_string().contains("PDP protocol violation"),
+        "got: {err}"
+    );
 }

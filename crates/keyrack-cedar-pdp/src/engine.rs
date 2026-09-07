@@ -103,6 +103,7 @@ impl CedarEngine {
             .collect();
 
         Ok(AuthzResponse {
+            pdp_api_version: Some(keyrack_core::pdp::PDP_API_VERSION.into()),
             request_id: req.request_id.clone(),
             decision,
             reasons,

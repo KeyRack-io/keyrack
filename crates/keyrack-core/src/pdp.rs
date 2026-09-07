@@ -138,71 +138,122 @@ pub struct Obligation {
 }
 
 /// Authorization response from the PDP.
-///
-/// `rate_limit_class` is expressed as an obligation
-/// (`obligation_id = "rate_limit_class"`), not a top-level field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzResponse {
     pub request_id: String,
     pub decision: Decision,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<PolicyReason>,
+    /// Conditions the enforcement point must discharge before acting on a
+    /// `Permit`. Core implements no obligation handlers, so a `Permit`
+    /// carrying any of these is refused — see [`AuthzResponse::into_enforceable`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub obligations: Vec<Obligation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_version: Option<String>,
+    /// Schema version of this response, when the PDP states one. Absent is
+    /// accepted; a stated version that is not [`PDP_API_VERSION`] is refused,
+    /// because the fields cannot be read with confidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdp_api_version: Option<String>,
 }
 
+/// Reason source for a refusal decided by the enforcement point rather than
+/// by policy, so an audit reader can tell the two apart.
+const PEP_POLICY_ID: &str = "keyrack:pep";
+
 impl AuthzResponse {
-    /// Confirm this response answers `request`.
+    /// Reduce this response to what the enforcement point can actually act on,
+    /// or refuse it.
     ///
-    /// A decision is only meaningful for the request it was computed for, so a
-    /// response whose `request_id` does not echo the one sent is refused
-    /// rather than acted on. Without this, a response substituted in transit
-    /// or misrouted by a shared proxy or a connection-pooling bug is accepted
-    /// as if it described the operation actually being authorized.
+    /// Three conditions, applied at the point the response crosses the trust
+    /// boundary. Both the HTTP and gRPC clients call this one function, so the
+    /// two transports cannot drift apart in what they accept — the correlation
+    /// gap this replaced was present in both, and a per-transport check is how
+    /// they got there.
     ///
-    /// Both the HTTP and gRPC clients call this at the point the response
-    /// crosses the trust boundary. It lives here, on the response type, so the
-    /// two transports cannot drift apart in what they consider correlated —
-    /// the gap being closed was present in both.
+    /// 1. **Correlation.** A decision is only meaningful for the request it was
+    ///    computed for, so a response whose `request_id` does not echo the one
+    ///    sent is refused. Without this, a response substituted in transit or
+    ///    misrouted by a shared proxy or a connection-pooling bug is acted on
+    ///    as though it described the operation being authorized.
+    /// 2. **Schema version.** A stated `pdp_api_version` other than
+    ///    [`PDP_API_VERSION`] is refused, because the remaining fields cannot
+    ///    be read with confidence. An absent version is accepted: the field is
+    ///    an addition, and PDPs that predate it are well-formed.
+    /// 3. **Obligations.** No obligation handlers are implemented, so a
+    ///    `Permit` carrying one cannot be discharged and is downgraded to
+    ///    `Forbid`. An obligation is a *condition* on a permit; ignoring it
+    ///    turns a conditional permit into an unconditional one, which grants
+    ///    more than the policy author wrote.
     ///
-    /// The bundled PDP implementations (`AlwaysAllow`, `AlwaysDeny`, the Cedar
-    /// engine) echo the id by construction and are unaffected.
-    pub fn require_correlated(&self, request: &AuthzRequest) -> crate::error::Result<()> {
-        if self.request_id == request.request_id {
-            return Ok(());
+    /// The first two are protocol failures and return `Err` — no policy
+    /// decided anything, so nothing should be recorded as though it had. The
+    /// third is a decision this crate understands but cannot honour safely, so
+    /// it denies and says who denied it via [`PEP_POLICY_ID`], leaving the
+    /// PDP's own reasons in place.
+    ///
+    /// Obligations on a non-`Permit` decision are left alone: the operation is
+    /// refused regardless, so there is no condition to discharge and nothing
+    /// is granted on an undischarged one.
+    ///
+    /// The bundled implementations (`AlwaysAllow`, `AlwaysDeny`, the Cedar
+    /// engine) echo the id and emit no obligations, so they pass unchanged.
+    pub fn into_enforceable(mut self, request: &AuthzRequest) -> crate::error::Result<Self> {
+        if self.request_id != request.request_id {
+            // Called out separately because it is the shape a gRPC PDP that
+            // never sets the field produces: proto3 yields "" rather than an
+            // absent value, so the response still looks well-formed.
+            let detail = if self.request_id.is_empty() {
+                "response carries no request_id (a gRPC PDP must echo the field; \
+                 proto3 leaves it empty when unset)"
+                    .to_string()
+            } else {
+                format!(
+                    "response request_id {:?} does not match request {:?}",
+                    self.request_id, request.request_id
+                )
+            };
+            return Err(crate::error::KeyRackError::Other(format!(
+                "PDP protocol violation: {detail}"
+            )));
         }
 
-        // Called out separately because it is the shape a gRPC PDP that never
-        // sets the field produces: proto3 yields "" rather than an absent
-        // value, so the response looks well-formed.
-        let detail = if self.request_id.is_empty() {
-            "response carries no request_id (a gRPC PDP must echo the field; \
-             proto3 leaves it empty when unset)"
-                .to_string()
-        } else {
-            format!(
-                "response request_id {:?} does not match request {:?}",
-                self.request_id, request.request_id
-            )
-        };
+        if let Some(version) = self.pdp_api_version.as_deref() {
+            if version != PDP_API_VERSION {
+                return Err(crate::error::KeyRackError::Other(format!(
+                    "PDP protocol violation: response states pdp_api_version {version:?}, \
+                     which this build cannot read (expected {PDP_API_VERSION:?})"
+                )));
+            }
+        }
 
-        Err(crate::error::KeyRackError::Other(format!(
-            "PDP protocol violation: {detail}"
-        )))
-    }
+        if self.decision.is_permit() && !self.obligations.is_empty() {
+            let ids: Vec<&str> = self
+                .obligations
+                .iter()
+                .map(|o| o.obligation_id.as_str())
+                .collect();
+            let ids = ids.join(", ");
 
-    /// Extract `rate_limit_class` from the obligations array, if present.
-    pub fn rate_limit_class(&self) -> Option<&str> {
-        self.obligations
-            .iter()
-            .find(|o| o.obligation_id == "rate_limit_class")
-            .and_then(|o| o.parameters.get("class"))
-            .and_then(|v| match v {
-                AttributeValue::String(s) => Some(s.as_str()),
-                _ => None,
-            })
+            tracing::warn!(
+                request_id = %self.request_id,
+                obligations = %ids,
+                "PDP permitted subject to obligations that cannot be discharged; denying"
+            );
+
+            self.decision = Decision::Forbid;
+            self.reasons.push(PolicyReason {
+                policy_id: PEP_POLICY_ID.into(),
+                reason_code: Some("obligation_not_dischargeable".into()),
+                human_message: Some(format!(
+                    "permit was conditional on obligations with no handler ({ids}); \
+                     denied rather than granted unconditionally"
+                )),
+            });
+        }
+
+        Ok(self)
     }
 }
 
@@ -243,6 +294,7 @@ impl PolicyDecisionPoint for AlwaysAllow {
             reasons: vec![],
             obligations: vec![],
             policy_version: None,
+            pdp_api_version: Some(PDP_API_VERSION.into()),
         })
     }
 }
@@ -263,6 +315,7 @@ impl PolicyDecisionPoint for AlwaysDeny {
             }],
             obligations: vec![],
             policy_version: None,
+            pdp_api_version: Some(PDP_API_VERSION.into()),
         })
     }
 }
@@ -339,20 +392,28 @@ mod tests {
             reasons: vec![],
             obligations: vec![],
             policy_version: None,
+            pdp_api_version: None,
+        }
+    }
+
+    fn obligation(id: &str) -> Obligation {
+        Obligation {
+            obligation_id: id.into(),
+            parameters: BTreeMap::new(),
         }
     }
 
     #[test]
     fn correlated_response_is_accepted() {
         let req = make_test_request(AuditAction::Decrypt);
-        assert!(response_with_id("req-001").require_correlated(&req).is_ok());
+        assert!(response_with_id("req-001").into_enforceable(&req).is_ok());
     }
 
     #[test]
     fn response_for_another_request_is_refused() {
         let req = make_test_request(AuditAction::Decrypt);
         let err = response_with_id("req-999")
-            .require_correlated(&req)
+            .into_enforceable(&req)
             .expect_err("a Permit for a different request must not be applied to this one");
         let msg = err.to_string();
         assert!(msg.contains("PDP protocol violation"), "got: {msg}");
@@ -366,7 +427,7 @@ mod tests {
     fn response_without_a_request_id_is_refused() {
         let req = make_test_request(AuditAction::Decrypt);
         let err = response_with_id("")
-            .require_correlated(&req)
+            .into_enforceable(&req)
             .expect_err("an empty request_id does not correlate");
         assert!(
             err.to_string().contains("carries no request_id"),
@@ -375,15 +436,101 @@ mod tests {
     }
 
     #[test]
-    fn bundled_pdps_correlate_by_construction() {
-        // The fixtures and the Cedar engine echo the id, so the check is not
-        // load-bearing for them — worth asserting so a refactor that breaks
-        // the echo is caught here rather than in a deployment.
+    fn absent_schema_version_is_accepted() {
+        // The field is an addition; PDPs predating it are well-formed.
+        let req = make_test_request(AuditAction::Decrypt);
+        let mut resp = response_with_id("req-001");
+        resp.pdp_api_version = None;
+        assert!(resp.into_enforceable(&req).is_ok());
+    }
+
+    #[test]
+    fn unreadable_schema_version_is_refused() {
+        let req = make_test_request(AuditAction::Decrypt);
+        let mut resp = response_with_id("req-001");
+        resp.pdp_api_version = Some("2.0".into());
+        let err = resp
+            .into_enforceable(&req)
+            .expect_err("a version this build cannot read must not be parsed as though it could");
+        let msg = err.to_string();
+        assert!(msg.contains("PDP protocol violation"), "got: {msg}");
+        assert!(msg.contains("2.0") && msg.contains("1.0"), "got: {msg}");
+    }
+
+    #[test]
+    fn permit_with_an_obligation_is_denied_not_granted() {
+        let req = make_test_request(AuditAction::Decrypt);
+        let mut resp = response_with_id("req-001");
+        resp.obligations = vec![obligation("rate_limit_class")];
+
+        let enforced = resp
+            .into_enforceable(&req)
+            .expect("an obligation is a policy condition, not a protocol failure");
+
+        assert_eq!(
+            enforced.decision,
+            Decision::Forbid,
+            "a permit conditional on something nothing discharges must not be honoured \
+             as an unconditional permit"
+        );
+        let pep = enforced
+            .reasons
+            .iter()
+            .find(|r| r.policy_id == PEP_POLICY_ID)
+            .expect("the refusal must name the enforcement point, not the policy");
+        assert_eq!(
+            pep.reason_code.as_deref(),
+            Some("obligation_not_dischargeable")
+        );
+        assert!(
+            pep.human_message
+                .as_deref()
+                .is_some_and(|m| m.contains("rate_limit_class")),
+            "the unhandled obligation should be named: {:?}",
+            pep.human_message
+        );
+    }
+
+    #[test]
+    fn obligations_on_a_denial_are_left_alone() {
+        // Nothing is granted, so there is no condition to discharge; the
+        // decision and the PDP's own reasons pass through untouched.
+        let req = make_test_request(AuditAction::Decrypt);
+        let mut resp = response_with_id("req-001");
+        resp.decision = Decision::Forbid;
+        resp.obligations = vec![obligation("log_denial")];
+
+        let enforced = resp.into_enforceable(&req).expect("still a valid response");
+        assert_eq!(enforced.decision, Decision::Forbid);
+        assert!(
+            enforced.reasons.is_empty(),
+            "no PEP reason should be synthesised for an already-denied request"
+        );
+    }
+
+    #[test]
+    fn bundled_pdps_pass_unchanged() {
+        // The fixtures and the Cedar engine echo the id and emit no
+        // obligations, so none of the three rules is load-bearing for them.
+        // Asserted here so a refactor that breaks the echo, or starts emitting
+        // an obligation, is caught in this crate rather than in a deployment.
         let req = make_test_request(AuditAction::CreateKey);
-        let permit = tokio_test_block(AlwaysAllow.evaluate(&req));
-        let deny = tokio_test_block(AlwaysDeny.evaluate(&req));
-        assert!(permit.unwrap().require_correlated(&req).is_ok());
-        assert!(deny.unwrap().require_correlated(&req).is_ok());
+        let permit = tokio_test_block(AlwaysAllow.evaluate(&req)).expect("permit");
+        let deny = tokio_test_block(AlwaysDeny.evaluate(&req)).expect("deny");
+
+        assert_eq!(
+            permit
+                .into_enforceable(&req)
+                .expect("fixture must pass")
+                .decision,
+            Decision::Permit
+        );
+        assert_eq!(
+            deny.into_enforceable(&req)
+                .expect("fixture must pass")
+                .decision,
+            Decision::Forbid
+        );
     }
 
     fn tokio_test_block<F: std::future::Future>(fut: F) -> F::Output {

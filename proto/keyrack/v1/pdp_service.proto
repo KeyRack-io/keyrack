@@ -107,6 +107,11 @@ message PdpAuthorizeResponse {
   repeated PdpPolicyReason reasons = 3;
   repeated PdpObligation obligations = 4;
   string policy_version = 5;
+  // Schema version of this response. Optional: empty is accepted, since PDPs
+  // predating the field are well-formed. A value other than the request's
+  // pdp_api_version is refused, because the fields above cannot then be read
+  // with confidence. request_id must always be echoed.
+  string pdp_api_version = 6;
 }
 
 message PdpBatchAuthorizeResponse {
