@@ -90,5 +90,8 @@ incarnation for the same unresolved storage attempt. Production must obtain a
 current, durable reservation and reconcile lost responses before issuing another
 generation authorization. Durable owner currentness, restart reuse prevention,
 publication and qualification are **UNMET**, not implied by typed evidence.
-Distinct-UID deployment credential isolation and A2-owned CI hook wiring also remain
-UNMET. The earlier credential file ownership/mode enforcement remains intact.
+Distinct-UID deployment credential isolation remains UNMET and is explicitly
+intended for deployment ownership, pending named-owner acceptance and evidence.
+A2 wired the existing CI hook at `f4d7bfc`; CI run evidence and required lane gating
+remain separate obligations. The credential file ownership/mode enforcement
+remains intact.
