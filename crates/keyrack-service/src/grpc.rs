@@ -123,11 +123,11 @@ impl KeyService for KeyServiceImpl {
             ops::execute(&self.state, op_ctx, |state| async move {
                 let record = state
                     .storage
-                    .get_key(&parse_lid(&key_id)?)
+                    .get_key_for_use(&parse_lid(&key_id)?)
                     .await
                     .map_err(convert::error_to_status)?;
 
-                if !record.state.permits_encrypt() {
+                if !record.permits_encrypt() {
                     return Err(Status::failed_precondition(format!(
                         "key {key_id} is in state {} — encrypt not permitted",
                         record.state
@@ -228,20 +228,17 @@ impl KeyService for KeyServiceImpl {
             let mut op_ctx = OpContext::key(AuditAction::Decrypt, principal, &key_id);
             op_ctx.encryption_context_hash = ec_hash;
             op_ctx.request_id = request_id;
+            let legacy_audit_context = op_ctx.clone();
 
             ops::execute(&self.state, op_ctx, |state| async move {
                 let record = state
                     .storage
-                    .get_key(&parse_lid(&key_id)?)
+                    .get_key_for_use(&parse_lid(&key_id)?)
                     .await
                     .map_err(convert::error_to_status)?;
 
-                if !record.state.permits_decrypt() {
-                    return Err(Status::failed_precondition(format!(
-                        "key {key_id} is in state {} — decrypt not permitted",
-                        record.state
-                    )));
-                }
+                let decrypt_permission = crate::compromise::check_decrypt(&state, &record)
+                    .map_err(|e| e.to_grpc_status())?;
 
                 let (header, ciphertext) =
                     keyrack_core::header::CiphertextHeader::unwrap_payload(&req.ciphertext_blob)
@@ -287,6 +284,9 @@ impl KeyService for KeyServiceImpl {
 
                 let aad = header.build_aad(&ec_aad);
 
+                decrypt_permission
+                    .record_use(&state, &record, &legacy_audit_context)
+                    .await;
                 let plaintext = dec_entry
                     .provider
                     .decrypt(&version_record.key_handle, ciphertext, &aad)
@@ -336,6 +336,7 @@ impl KeyService for KeyServiceImpl {
             let mut op_ctx = OpContext::key(AuditAction::ReEncrypt, principal, &src_key_id);
             op_ctx.encryption_context_hash = dst_ec_hash;
             op_ctx.request_id = request_id;
+            let legacy_audit_context = op_ctx.clone();
 
             ops::execute(&self.state, op_ctx, |state| async move {
                 let src_lid = parse_lid(&req.source_key_id)?;
@@ -343,12 +344,12 @@ impl KeyService for KeyServiceImpl {
 
                 let src_record = state
                     .storage
-                    .get_key(&src_lid)
+                    .get_key_for_use(&src_lid)
                     .await
                     .map_err(convert::error_to_status)?;
                 let dst_record = state
                     .storage
-                    .get_key(&dst_lid)
+                    .get_key_for_use(&dst_lid)
                     .await
                     .map_err(convert::error_to_status)?;
 
@@ -357,13 +358,9 @@ impl KeyService for KeyServiceImpl {
                 // own direction would get if called on its own. Checking one
                 // predicate for both would let a caller reach either operation
                 // through the pair that it could not reach directly.
-                if !src_record.state.permits_decrypt() {
-                    return Err(Status::failed_precondition(format!(
-                        "key {} is in state {} — decrypt not permitted",
-                        req.source_key_id, src_record.state
-                    )));
-                }
-                if !dst_record.state.permits_encrypt() {
+                let decrypt_permission = crate::compromise::check_decrypt(&state, &src_record)
+                    .map_err(|e| e.to_grpc_status())?;
+                if !dst_record.permits_encrypt() {
                     return Err(Status::failed_precondition(format!(
                         "key {} is in state {} — encrypt not permitted",
                         req.destination_key_id, dst_record.state
@@ -442,6 +439,9 @@ impl KeyService for KeyServiceImpl {
                     .unwrap_or_default();
                 let dst_aad = new_header.build_aad(&dst_ec_aad);
 
+                decrypt_permission
+                    .record_use(&state, &src_record, &legacy_audit_context)
+                    .await;
                 let output =
                     if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
                         src_re_entry
@@ -517,11 +517,11 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
 
-                if !record.state.permits_encrypt() {
+                if !record.permits_encrypt() {
                     return Err(Status::failed_precondition("key not in Enabled state"));
                 }
 
@@ -619,10 +619,10 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
-                if !record.state.permits_encrypt() {
+                if !record.permits_encrypt() {
                     return Err(Status::failed_precondition("key not in Enabled state"));
                 }
                 let primary = record
@@ -744,7 +744,7 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
                 crate::domain::enforce_state_for_key_op(
@@ -839,7 +839,7 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
                 crate::domain::enforce_state_for_key_op(
@@ -934,7 +934,7 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
                 crate::domain::enforce_state_for_key_op(
@@ -1011,7 +1011,7 @@ impl KeyService for KeyServiceImpl {
                 let lid = parse_lid(&key_id)?;
                 let record = state
                     .storage
-                    .get_key(&lid)
+                    .get_key_for_use(&lid)
                     .await
                     .map_err(convert::error_to_status)?;
                 crate::domain::enforce_state_for_key_op(
@@ -1185,6 +1185,7 @@ impl KeyService for KeyServiceImpl {
                         keyrack_core::key::Exportability::NonExportable
                     },
                     first_exported_at: None,
+                    was_compromised: false,
                     owner_principal_id: Some(principal_id.clone()),
                     identity_tags,
                     user_tags: keyrack_core::tags::UserTags::new(),
@@ -1383,7 +1384,7 @@ impl KeyService for KeyServiceImpl {
             let lid = parse_lid(&key_id)?;
             let mut record = state
                 .storage
-                .get_key(&lid)
+                .get_key_for_use(&lid)
                 .await
                 .map_err(convert::error_to_status)?;
             let old_state = record.state.to_string();
@@ -1448,7 +1449,7 @@ impl KeyService for KeyServiceImpl {
             let lid = parse_lid(&key_id)?;
             let mut record = state
                 .storage
-                .get_key(&lid)
+                .get_key_for_use(&lid)
                 .await
                 .map_err(convert::error_to_status)?;
             let days = if req.grace_period_days == 0 {
@@ -1492,7 +1493,7 @@ impl KeyService for KeyServiceImpl {
             let lid = parse_lid(&key_id)?;
             let mut record = state
                 .storage
-                .get_key(&lid)
+                .get_key_for_use(&lid)
                 .await
                 .map_err(convert::error_to_status)?;
             if record.state != keyrack_core::key::KeyState::PendingDeletion {
@@ -1531,7 +1532,7 @@ impl KeyService for KeyServiceImpl {
             let lid = parse_lid(&key_id)?;
             let mut record = state
                 .storage
-                .get_key(&lid)
+                .get_key_for_use(&lid)
                 .await
                 .map_err(convert::error_to_status)?;
             let old_state = record.state.to_string();
@@ -2619,7 +2620,7 @@ impl KeyService for KeyServiceImpl {
         let record = self
             .state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(convert::error_to_status)?;
 
@@ -2633,7 +2634,7 @@ impl KeyService for KeyServiceImpl {
         // handed out either. Without this, `PendingDeletion` and `Destroyed`
         // keys still served plaintext material over KMIP `Get`, making export
         // more permissive than decrypt.
-        if !record.state.permits_export() {
+        if !record.permits_export() {
             return Err(Status::failed_precondition(format!(
                 "key {key_id} is in state {} — key-material export not permitted",
                 record.state
@@ -2645,6 +2646,20 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
 
         ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
+            // Authorization may have awaited a remote PDP across a compromise.
+            // Export must not use that earlier snapshot after permission returns.
+            let record = state
+                .storage
+                .get_key_for_use(&lid)
+                .await
+                .map_err(convert::error_to_status)?;
+            if record.exportability != keyrack_core::key::Exportability::Exportable
+                || !record.permits_export()
+            {
+                return Err(Status::failed_precondition(
+                    "key-material export no longer permitted",
+                ));
+            }
             let version_number = if req.key_version == 0 {
                 record.current_key_version
             } else {
@@ -2931,6 +2946,7 @@ impl KeyService for KeyServiceImpl {
                     keyrack_core::key::Exportability::NonExportable
                 },
                 first_exported_at: None,
+                was_compromised: false,
                 owner_principal_id: Some(principal_id.clone()),
                 identity_tags,
                 user_tags: keyrack_core::tags::UserTags::new(),

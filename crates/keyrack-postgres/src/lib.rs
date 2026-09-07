@@ -109,7 +109,9 @@ fn state_str(state: RotationJobState) -> Result<String> {
 impl StorageBackend for PostgresStorage {
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         let lid_str = record.lid.to_string();
-        let json = serde_json::to_value(record)
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        let json = serde_json::to_value(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let occ = record.occ_version as i64;
 
@@ -150,12 +152,29 @@ impl StorageBackend for PostgresStorage {
                 "occ_version must be > 0 for updates".into(),
             ));
         }
+        let current = self.get_key(&record.lid).await?;
+        if current.occ_version != record.occ_version - 1 {
+            return Err(KeyRackError::OptimisticConcurrencyConflict {
+                lid: record.lid,
+                expected: record.occ_version - 1,
+                actual: current.occ_version,
+            });
+        }
+        if current.has_compromise_history() && !record.has_compromise_history() {
+            return Err(KeyRackError::Other(
+                "cannot clear a key's compromise history".into(),
+            ));
+        }
         let lid_str = record.lid.to_string();
-        let json = serde_json::to_value(record)
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        let json = serde_json::to_value(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
         let new_occ = record.occ_version as i64;
         let expected_occ = (record.occ_version - 1) as i64;
 
+        // The OCC predicate also rejects changes made after the history check,
+        // so a concurrent compromise cannot be overwritten.
         let result = sqlx::query(
             "UPDATE kr_keys SET record_json = $1, occ_version = $2 WHERE lid = $3 AND occ_version = $4",
         )

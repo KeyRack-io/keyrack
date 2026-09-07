@@ -189,6 +189,10 @@ Storage tracks this relationship. The service provides two query APIs:
 
 ### Decrypt (version resolution from ciphertext)
 
+The lifecycle read is authoritative (`get_key_for_use`), not a cached permission.
+Compromised keys deny by default; see the [dangerous legacy opt-in](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in)
+for the separately audited exception.
+
 ```
   Client                    Service                   Storage          Provider
     │                          │                         │                │
@@ -204,8 +208,8 @@ Storage tracks this relationship. The service provides two query APIs:
     │                          │         KeyRecord       │                │
     │                          │◀────────────────────────│                │
     │                          │                         │                │
-    │                          │  check state.permits_decrypt()           │
-    │                          │  (Enabled, Disabled, or Compromised)     │
+    │                          │  check record.permits_decrypt()          │
+    │                          │  Enabled/Disabled, no compromise history │
     │                          │                         │                │
     │                          │  find version matching  │                │
     │                          │  header.key_version     │                │

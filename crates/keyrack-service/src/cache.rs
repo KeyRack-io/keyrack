@@ -21,9 +21,9 @@
 //! Caching layer for `StorageBackend`.
 //!
 //! Wraps any storage backend with a moka-based async cache for `get_key`
-//! operations. The cache is automatically invalidated on mutations
-//! (`create_key`, `update_key`) and can be externally invalidated via
-//! NATS events for multi-replica deployments.
+//! metadata queries. Local mutations replace entries. External invalidation
+//! hooks exist, but this service does not wire a cross-replica subscriber.
+//! Security-sensitive use bypasses cached snapshots via `get_key_for_use`.
 
 use keyrack_core::error::Result;
 use keyrack_core::hsm::HsmConnection;
@@ -38,11 +38,10 @@ use std::time::Duration;
 /// A caching wrapper around any `StorageBackend`.
 ///
 /// Caches `get_key` results by LID with a configurable TTL and max capacity.
-/// Writes always go through to the underlying backend and evict the cache entry.
+/// Writes always go through to the underlying backend and replace the local entry.
 ///
-/// For HYOK deployments, the cache TTL functions as a security property:
-/// after a tenant disconnects their HSM, cached key records will expire
-/// within at most one TTL window, providing a bounded lockout guarantee.
+/// TTL bounds metadata caching, not authorization or operation completion.
+/// Crypto/lifecycle checks must use the authoritative `get_key_for_use` path.
 pub struct CachingStorage {
     inner: Arc<dyn StorageBackend>,
     key_cache: Cache<Lid, KeyRecord>,
@@ -52,8 +51,7 @@ impl CachingStorage {
     /// Create a new caching storage wrapper.
     ///
     /// - `max_capacity`: Maximum number of key records to cache.
-    /// - `ttl`: Time-to-live for cached entries. Also serves as the
-    ///   upper bound on time-to-lockout for HYOK disconnect scenarios.
+    /// - `ttl`: Time-to-live for cached metadata entries, not a use lease.
     pub fn new(inner: Arc<dyn StorageBackend>, max_capacity: u64, ttl: Duration) -> Self {
         let key_cache = Cache::builder()
             .max_capacity(max_capacity)
@@ -64,7 +62,7 @@ impl CachingStorage {
 
     /// Explicitly invalidate a key from the cache.
     ///
-    /// Used by NATS invalidation subscriber for cross-replica consistency.
+    /// Hook available to an integrator's cross-replica invalidation subscriber.
     pub async fn invalidate(&self, lid: &Lid) {
         self.key_cache.invalidate(lid).await;
     }
@@ -97,6 +95,13 @@ impl StorageBackend for CachingStorage {
         let record = self.inner.get_key(lid).await?;
         self.key_cache.insert(*lid, record.clone()).await;
         Ok(record)
+    }
+
+    async fn get_key_for_use(&self, lid: &Lid) -> Result<KeyRecord> {
+        // Metadata TTL is not lifecycle authorization. A different replica or
+        // an in-flight cache fill can leave an old Enabled record here after
+        // compromise has committed. Read through every cache layer for use.
+        self.inner.get_key_for_use(lid).await
     }
 
     async fn update_key(&self, record: &KeyRecord) -> Result<()> {
