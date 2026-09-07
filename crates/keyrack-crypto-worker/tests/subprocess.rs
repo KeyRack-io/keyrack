@@ -89,7 +89,10 @@ impl Harness {
         let reservation = json!({"operation": Uuid::new_v4(), "attempt": Uuid::new_v4(),
             "owner": {"instance": Uuid::new_v4(), "generation": 7},
             "envelope_ref": "fixture-subprocess-envelope", "principal": "alice"});
-        let mut command = Command::new(env!("CARGO_BIN_EXE_keyrack-worker-provisional"));
+        // Override is trusted test-supervisor input, never worker IPC.
+        let executable = std::env::var_os("KEYRACK_WORKER_FIXTURE_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_keyrack-worker-provisional").into());
+        let mut command = Command::new(executable);
         command
             .arg("--provisional-harness")
             .arg(STANDARD.encode(key.verifying_key().as_bytes()))
@@ -133,6 +136,39 @@ impl Harness {
             hello["pid"].as_u64().unwrap(),
             u64::from(std::process::id())
         );
+        #[cfg(target_os = "linux")]
+        if let Ok(report) = std::env::var("KEYRACK_WORKER_ISOLATION_REPORT") {
+            let expected: u32 = std::env::var("KEYRACK_WORKER_EXPECTED_UID")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let uid = rustix::process::geteuid().as_raw();
+            assert_ne!(uid, 0, "root execution is not isolation evidence");
+            assert_eq!(uid, expected);
+            assert_eq!(rustix::process::getuid().as_raw(), expected);
+            assert_eq!(hello["pid"].as_u64().unwrap(), u64::from(child.id()));
+            let status = std::fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+            let uids: Vec<u32> = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .unwrap()
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            assert!(uids.iter().all(|value| *value == expected));
+            let capabilities = status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .unwrap()
+                .trim();
+            assert_eq!(u64::from_str_radix(capabilities, 16).unwrap(), 0);
+            std::fs::write(
+                report,
+                json!({"uid":uid,"child_uid":uids[1],"pid":child.id(),"worker":hello["worker"]})
+                    .to_string(),
+            )
+            .unwrap();
+        }
         Self {
             child,
             input: Some(input),
