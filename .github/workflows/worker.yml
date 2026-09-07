@@ -34,9 +34,11 @@ jobs:
       - run: echo "$RUNNER_TEMP/worker-tools/bin" >> "$GITHUB_PATH"
       - run: cargo kani setup
       - run: python3 scripts/test-worker-kani.py
-      - uses: dtolnay/rust-toolchain@nightly-2025-11-21
+      - run: rustup toolchain install nightly-2025-11-21 --profile minimal
       - run: cargo install --locked --version 0.13.1 cargo-fuzz --root "$RUNNER_TEMP/worker-tools"
       - run: bash scripts/test-worker-fuzz.sh
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2025-11-21
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
