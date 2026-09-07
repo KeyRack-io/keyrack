@@ -166,6 +166,15 @@ but restored on the A2 integration target at `c730a3a`. Actual CI run evidence f
 branch-protection contexts remain separate acceptance obligations. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
 for its trigger and gating scope.
 
+The **Worker credential isolation** check now runs the same fixture through
+`scripts/test-worker-isolation.sh` in `.github/workflows/worker.yml`, with mandatory
+execution and skip/completion guards. The ordinary provider contribution reports
+supervisor NOT RUN; its passing status is not the isolation check. Repository
+owners separately configure whether the stable isolation check is required.
+
+[Worker verification](VERIFICATION.md) describes the runtime Kani transition
+proofs, generated cache sequences and the actual IPC decoder fuzz target.
+
 ## Limits and integration gates
 
 **Distinct-UID fixture acceptance demonstrated on Linux.** The

@@ -74,12 +74,7 @@ pub(crate) trait MaterialSource {
     fn open(&mut self, context: &WrappingContext) -> Result<Secret, Error>;
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Operation {
-    Encrypt,
-    Decrypt,
-}
+pub(crate) use crate::ipc::{Operation, Signed};
 
 /// Private test-authority body, not a neutral authority contract. All deadlines
 /// are offsets from this worker's monotonic boot, never caller-controlled clocks.
@@ -113,14 +108,6 @@ pub(crate) struct Fence {
 pub(crate) enum AuthorityMessage {
     Grant(Grant),
     Fence(Fence),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Signed {
-    // Signature covers exact bytes, prefixed with a harness-only domain.
-    pub(crate) body: String,
-    pub(crate) signature: Vec<u8>,
 }
 
 pub(crate) const SIGNING_DOMAIN: &[u8] = b"KeyRack:UNAPPROVED-worker-harness-authority\0";

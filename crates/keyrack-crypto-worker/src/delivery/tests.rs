@@ -144,7 +144,7 @@ fn retry_revalidates_deadline_and_incarnation_and_generation() {
     no_release(&d, &sink);
     for (worker, generation) in [("other", 1), ("instance", 2)] {
         let (_, d, mut p) = fixture();
-        d.state.lock().unwrap().generation = Some(1);
+        d.state.lock().unwrap().policy.generation = Some(1);
         p.authority.worker = worker.into();
         p.authority.generation = generation;
         assert!(d.enqueue(p).is_err());

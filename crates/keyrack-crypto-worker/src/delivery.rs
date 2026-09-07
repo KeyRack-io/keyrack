@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Private cancellable response transport. No canonical revocation receipt.
 use crate::core::{Clock, Error};
+use crate::release_state::{Phase as Release, Policy, Window};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::{rngs::OsRng, RngCore};
@@ -39,6 +40,7 @@ struct Capsule<'a> {
     key: &'a str,
 }
 struct Permit {
+    phase: Release,
     authority: Authority,
     key: Zeroizing<[u8; 32]>,
 }
@@ -73,9 +75,7 @@ struct Job {
 }
 struct State {
     worker: String,
-    generation: Option<u64>,
-    fenced: bool,
-    stopped: bool,
+    policy: Policy,
     next: u64,
     permits: HashMap<u64, Permit>,
     queue: VecDeque<Job>,
@@ -107,24 +107,25 @@ impl<C: Clock> Delivery<C> {
             clock,
             state: Mutex::new(State {
                 worker,
-                generation: None,
-                fenced: false,
-                stopped: false,
+                policy: Policy::default(),
                 next: 0,
                 permits: HashMap::new(),
                 queue: VecDeque::new(),
             }),
         }
     }
+    fn window(state: &State, a: &Authority) -> Window {
+        Window {
+            incarnation_matches: a.worker == state.worker,
+            generation: a.generation,
+            not_before: a.not_before,
+            expires: a.expires,
+        }
+    }
     fn allowed(&self, state: &State, a: &Authority) -> bool {
-        let now = self.clock.millis();
-        !state.stopped
-            && !state.fenced
-            && a.worker == state.worker
-            && a.generation != 0
-            && state.generation.map_or(true, |g| g == a.generation)
-            && now >= a.not_before
-            && now < a.expires
+        state
+            .policy
+            .allows(Self::window(state, a), self.clock.millis())
     }
     pub fn enqueue(&self, prepared: Prepared) -> Result<(), Error> {
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
@@ -137,10 +138,14 @@ impl<C: Clock> Delivery<C> {
         s.next = s.next.checked_add(1).ok_or(Error::Limit)?;
         let id = s.next;
         let records = chunks(Some(id), &prepared.encoded)?;
-        s.generation = Some(prepared.authority.generation);
+        let window = Self::window(&s, &prepared.authority);
+        if !s.policy.admit(window, self.clock.millis()) {
+            return Err(Error::Expired);
+        }
         s.permits.insert(
             id,
             Permit {
+                phase: Release::Pending,
                 authority: prepared.authority,
                 key: prepared.key,
             },
@@ -157,7 +162,7 @@ impl<C: Clock> Delivery<C> {
             return Err(Error::Limit);
         }
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
-        if s.stopped || s.queue.len() >= QUEUED {
+        if s.policy.stopped() || s.queue.len() >= QUEUED {
             return Err(Error::Limit);
         }
         s.queue.push_back(Job {
@@ -171,19 +176,19 @@ impl<C: Clock> Delivery<C> {
     pub fn fence<T>(&self, apply: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
         let observation = apply()?;
-        s.fenced = true;
+        s.policy.fence(true);
         s.permits.clear();
         Ok(observation)
     }
     pub fn stop(&self) {
         if let Ok(mut s) = self.state.lock() {
-            s.stopped = true;
+            s.policy.stop();
             s.permits.clear();
             s.queue.clear();
         }
     }
     pub fn stopped(&self) -> bool {
-        self.state.lock().map_or(true, |s| s.stopped)
+        self.state.lock().map_or(true, |s| s.policy.stopped())
     }
     fn expire(&self) {
         let mut s = self.state.lock().unwrap();
@@ -228,24 +233,20 @@ impl<C: Clock> Delivery<C> {
             grant_sha256: STANDARD.encode(a.grant_sha256),
             key: encoded_key.as_str(),
         })?;
-        // Final authorization check immediately before the nonblocking syscall.
-        // No fence can linearize between this check and that syscall's result.
-        if !self.allowed(&s, &p.authority) {
-            s.permits.remove(&id);
-            return Ok(Release::Suppressed);
+        // Final admission and the atomic syscall remain under this same mutex.
+        let window = Self::window(&s, a);
+        let State {
+            policy, permits, ..
+        } = &mut *s;
+        let permit = permits.get_mut(&id).ok_or(Error::Material)?;
+        let phase = policy.release(&mut permit.phase, window, self.clock.millis(), || {
+            atomic(sink, &capsule)
+        });
+        if !matches!(phase, Ok(Release::Pending)) {
+            permits.remove(&id);
         }
-        if atomic(sink, &capsule)? {
-            s.permits.remove(&id);
-            Ok(Release::Committed)
-        } else {
-            Ok(Release::Pending)
-        }
+        phase
     }
-}
-enum Release {
-    Pending,
-    Committed,
-    Suppressed,
 }
 pub(crate) trait Sink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;

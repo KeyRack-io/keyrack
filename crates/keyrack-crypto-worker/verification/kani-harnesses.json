@@ -1,0 +1,9 @@
+{
+  "source": "src/release_state.rs",
+  "proofs": "src/release_proofs.rs",
+  "harnesses": [
+    "worker_fence_release_interleavings",
+    "worker_release_checks_every_retry",
+    "worker_invalid_fence_preserves_admission"
+  ]
+}

@@ -2726,6 +2726,7 @@ dependencies = [
  "hkdf",
  "keyrack-core",
  "polyval",
+ "proptest",
  "rand 0.8.6",
  "reqwest",
  "rustix",
