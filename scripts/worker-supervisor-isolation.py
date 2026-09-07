@@ -151,7 +151,6 @@ def main():
 
         if unit_installed:
             cleanup_command("systemctl", "stop", unit)
-            cleanup_command("systemctl", "reset-failed", unit)
             try:
                 state = run("systemctl", "show", unit, "--property=ActiveState", "--value", capture_output=True, text=True)
                 if state.stdout.strip() != "inactive":
@@ -164,6 +163,12 @@ def main():
             failures.append("unit-file-removal")
         if unit_installed:
             cleanup_command("systemctl", "daemon-reload")
+            try:
+                load = run("systemctl", "show", unit, "--property=LoadState", "--value", capture_output=True, text=True)
+                if load.stdout.strip() != "not-found":
+                    failures.append("unit-still-loaded")
+            except (OSError, subprocess.SubprocessError):
+                failures.append("unit-unload-check")
         for name in reversed(created):
             cleanup_command("userdel", name)
             try:
