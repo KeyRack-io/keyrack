@@ -75,3 +75,12 @@ Before a deployment makes the same claim, preserve the demonstrated identity,
 supervisor, credential-path and clean-environment controls in that deployment.
 This fixture does not approve the production custody profile, pin a provider,
 replace the external authority, or change required repository checks.
+
+
+The corrected fixture passed on Ubuntu 24.04 in [CI run 34103419226](https://github.com/KeyRack-io/keyrack/actions/runs/34103419226/job/101682857423),
+commit `049c5b8ec0ea621d74c2504c4538fa2137609522`: worker UID 999, coordinator real/
+effective/saved UID 997, zero effective capabilities, three native-Vault executions
+and six EACCES probes. Unit/users/files cleanup passed before the final success
+message. The first run had passed the probes but failed a redundant systemd cleanup
+command; it was not recorded as acceptance. The corrected run verifies unit removal
+and `LoadState=not-found` explicitly.

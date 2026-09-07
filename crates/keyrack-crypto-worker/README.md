@@ -168,27 +168,21 @@ for its trigger and gating scope.
 
 ## Limits and integration gates
 
-**UNMET deployment acceptance gate — coordinator/worker credential isolation.**
-The startup ownership/mode checks are enforced; they do not establish distinct
-coordinator and worker identities. A same-UID coordinator or privileged launcher
-can still read an owner-only file. The development subprocess tests run under one
-UID and prove channel non-leakage and unsafe-file refusal, not deployment isolation.
+**Distinct-UID fixture acceptance demonstrated on Linux.** The
+[two-user supervisor fixture](SUPERVISOR_ISOLATION.md) passed in the existing Vault
+lane at `049c5b8`: three native worker executions under a dedicated non-root user,
+and six actual coordinator-user token-open attempts returning `EACCES`, before and
+after startup, restart and credential replacement/revocation. It verifies real UID
+and capability state, uses a clean coordinator environment and requires cleanup.
+Root performs provisioning only; denial probes and worker tests execute non-root.
+The ordinary same-UID subprocess suite alone still proves no deployment isolation.
 
-A deployment must run the worker under a dedicated OS identity distinct from the
-coordinator, provision its credential through a trusted supervisor the coordinator
-cannot control, and protect the credential file and parent directories. It must
-deny coordinator access through ACLs, shared mounts, process inspection, privilege
-escalation and equivalent Vault credentials; the authority verification key and
-worker configuration also belong to that trusted supervisor. Demonstrate denial
-from the actual coordinator identity before claiming credential isolation. This
-crate does not enforce or attest those deployment controls. Host-root remains
-trusted under the process profile.
-
-The worker track intends to hand implementation and demonstration of these OS
-controls to deployment. A named receiving owner must explicitly accept the handoff;
-that assignment and deployment evidence are still pending. The worker retains the
-loader/refusal tests and keeps this gate visible as **UNMET** until the deployed
-coordinator is demonstrably denied worker-equivalent access.
+The token loader independently enforces owner-only regular-file checks. A deployment
+must preserve the tested separate identities, trusted supervisor, protected token
+path and clean credential environment, and exclude equivalent credential access.
+The fixture establishes its stated file-read acceptance property; it does not
+attest arbitrary deployments, process-memory access controls or host-root exclusion.
+Profile approval, durable storage and external authority remain separate integrations.
 
 The shared canonical custody frame is adopted for native creation and Vault parent
 operations. The [Vault construction investigation](VAULT_PROFILE_QUALIFICATION.md)
