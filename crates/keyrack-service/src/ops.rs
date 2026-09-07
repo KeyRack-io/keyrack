@@ -95,10 +95,10 @@ impl OpContext {
         }
     }
 
-    /// Re-encryption-only delegation requires `kms:ReEncrypt` on BOTH keys;
+    /// Requires `kms:ReEncryptFrom` on the source and `kms:ReEncryptTo` on the destination;
     /// it does not imply permission to retrieve plaintext through `Decrypt`.
     pub fn re_encrypt(principal: Principal, source: &str, destination: &str) -> Self {
-        let mut ctx = Self::key(AuditAction::ReEncrypt, principal, source);
+        let mut ctx = Self::key(AuditAction::ReEncryptFrom, principal, source);
         ctx.re_encrypt_destination = Some(destination.to_owned());
         ctx
     }
@@ -256,7 +256,7 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
                 // denied. Name the refused destination explicitly, without
                 // inventing a successful standalone Encrypt operation.
                 let mut denied = OpContext::key(
-                    AuditAction::ReEncrypt,
+                    AuditAction::ReEncryptTo,
                     ctx.principal.clone(),
                     &request.resource.id,
                 );
@@ -284,8 +284,8 @@ fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::S
         },
         context: RequestContext::default(),
     };
-    if ctx.action != AuditAction::ReEncrypt {
-        if ctx.re_encrypt_destination.is_some() {
+    if ctx.action != AuditAction::ReEncryptFrom {
+        if ctx.re_encrypt_destination.is_some() || ctx.action == AuditAction::ReEncryptTo {
             return Err(tonic::Status::internal(
                 "invalid two-key authorization context",
             ));
@@ -296,12 +296,17 @@ fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::S
         tonic::Status::internal("ReEncrypt requires a bound destination authorization")
     })?;
     Ok([
-        ("source", ctx.resource_id.as_str()),
-        ("destination", destination),
+        (
+            "source",
+            ctx.resource_id.as_str(),
+            AuditAction::ReEncryptFrom,
+        ),
+        ("destination", destination, AuditAction::ReEncryptTo),
     ]
     .into_iter()
-    .map(|(role, key_id)| {
+    .map(|(role, key_id, action)| {
         let mut leg = request.clone();
+        leg.action = action;
         // These are different PDP questions, even for a same-key rewrap.
         // Reusing the operation ID would accept a source response for the
         // destination. Keep the outer ID solely as correlation context.
@@ -474,7 +479,8 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::GenerateRandom
         | AuditAction::GenerateDataKey
         | AuditAction::GenerateDataKeyWithoutPlaintext
-        | AuditAction::ReEncrypt => EventType::CryptoOperation,
+        | AuditAction::ReEncryptFrom
+        | AuditAction::ReEncryptTo => EventType::CryptoOperation,
 
         AuditAction::TagResource | AuditAction::UntagResource | AuditAction::ListResourceTags => {
             EventType::TagMutation
@@ -534,7 +540,11 @@ pub async fn authorize_with_resource_attrs(
 ) -> Result<(), tonic::Status> {
     // This helper authorizes one resource. ReEncrypt must go through the
     // two-key executor; neither a generic nor bound context can bypass it here.
-    if ctx.action == AuditAction::ReEncrypt || ctx.re_encrypt_destination.is_some() {
+    if matches!(
+        ctx.action,
+        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo
+    ) || ctx.re_encrypt_destination.is_some()
+    {
         return Err(tonic::Status::internal(
             "ReEncrypt requires the two-key executor",
         ));
