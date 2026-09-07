@@ -2723,6 +2723,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "ghash",
+ "hkdf",
  "keyrack-core",
  "polyval",
  "rand 0.8.6",
@@ -2733,6 +2734,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "uuid",
  "zeroize",
 ]
 

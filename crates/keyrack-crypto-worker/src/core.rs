@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub(crate) mod creation;
+
 pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -43,6 +45,12 @@ pub(crate) enum Error {
 
 pub(crate) trait Clock {
     fn millis(&self) -> u64;
+}
+
+impl<T: Clock> Clock for std::sync::Arc<T> {
+    fn millis(&self) -> u64 {
+        (**self).millis()
+    }
 }
 
 pub(crate) struct MonotonicClock(Instant);
@@ -190,6 +198,7 @@ pub(crate) struct Worker<S, C> {
     sequence: u64,
     next_lease: u64,
     resident: HashMap<[u8; 32], Resident>,
+    creation: Option<creation::Reservation>,
 }
 
 impl<S: MaterialSource, C: Clock> Worker<S, C> {
@@ -223,6 +232,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             sequence: 0,
             next_lease: 0,
             resident: HashMap::new(),
+            creation: None,
         })
     }
 
@@ -289,6 +299,9 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             return Err(Error::Authority);
         }
         self.check_time(&grant)?;
+        if !self.creation_allows_use() {
+            return Err(Error::Material);
+        }
         if self.fenced
             || grant.generation == 0
             || grant.sequence <= self.sequence
@@ -380,6 +393,39 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             return Err(Error::Expired);
         }
         Ok(output.to_vec())
+    }
+
+    pub(crate) fn execute_for_delivery(
+        &mut self,
+        signed: &Signed,
+        principal: &str,
+        context: &WrappingContext,
+        operation: Operation,
+        input: &[u8],
+    ) -> Result<(crate::delivery::Authority, Zeroizing<Vec<u8>>), Error> {
+        let output = Zeroizing::new(self.execute(signed, principal, context, operation, input)?);
+        let AuthorityMessage::Grant(g) = self.verify(signed)? else {
+            return Err(Error::Authority);
+        };
+        let resident = self
+            .resident
+            .get(&context_digest(context)?)
+            .ok_or(Error::Expired)?;
+        Ok((
+            crate::delivery::Authority {
+                worker: g.worker,
+                generation: g.generation,
+                sequence: g.sequence,
+                grant_sha256: digest(signed.body.as_bytes()),
+                not_before: g.not_before_ms,
+                expires: g
+                    .expires_ms
+                    .min(g.ancestor_expires_ms)
+                    .min(g.residency_until_ms)
+                    .min(resident.until),
+            },
+            output,
+        ))
     }
 
     fn remove(&mut self, binding: [u8; 32]) -> Option<ResidencyCleanup> {

@@ -3,6 +3,8 @@
 use super::*;
 use crate::fixture::context;
 
+mod qualification;
+
 #[test]
 fn authenticated_local_fixture_rejects_each_semantic_context_change() {
     let original = context();
@@ -42,9 +44,11 @@ fn real_vault_native_wrapped_only_authenticates_every_v1_context_byte() {
     let parent =
         std::env::var("KEYRACK_WORKER_VAULT_PARENT").expect("derived fixture parent required");
     let context = context();
-    let mut source = VaultFixture::new(&address, token, parent, &context).unwrap();
-    let canonical = context.canonical_bytes().unwrap();
-    assert_eq!(source.generation.context_sha256, digest(&canonical));
+    let mut source = VaultFixture::new(&address, token, parent).unwrap();
+    source = crate::core::creation::tests::generated_source(source);
+    let canonical = crate::fixture::custody_context(&context)
+        .canonical_bytes()
+        .unwrap();
     let first = source.open(&context).unwrap();
     assert_eq!(first.0.len(), 32);
     for index in 0..canonical.len() {
@@ -56,8 +60,10 @@ fn real_vault_native_wrapped_only_authenticates_every_v1_context_byte() {
         );
     }
     let again = source.open(&context).unwrap();
-    assert!(first.0.as_slice() == again.0.as_slice());
+    // Keep secret values out of assertion failure output.
+    assert!(first.0.as_slice().eq(again.0.as_slice()));
     // Never format either value in assertion diagnostics.
+    qualification::verify_pinned_vault_binding(&source, &canonical);
 }
 
 #[test]
@@ -132,7 +138,7 @@ fn real_vault_parent_loss_respects_separate_authority_and_residency_bounds() {
         .unwrap();
     assert!(response.status().is_success());
     let context = context();
-    let source = VaultFixture::new(&address, worker_token, name.clone(), &context).unwrap();
+    let source = VaultFixture::new(&address, worker_token, name.clone()).unwrap();
     let clock = Rc::new(Cell::new(0));
     let signer = SigningKey::generate(&mut OsRng);
     let mut worker = Worker::new(
@@ -148,7 +154,8 @@ fn real_vault_parent_loss_respects_separate_authority_and_residency_bounds() {
         },
     )
     .unwrap();
-    let authorize = |instance: &str, sequence, expiry| {
+    crate::core::creation::tests::authorize(&mut worker, &signer);
+    let authorize = |instance: &str, sequence: u64, expiry| {
         let body = serde_json::to_string(&AuthorityMessage::Grant(Grant {
             worker: instance.into(),
             principal: "alice".into(),
@@ -156,7 +163,7 @@ fn real_vault_parent_loss_respects_separate_authority_and_residency_bounds() {
             operation: Operation::Encrypt,
             input_sha256: digest(b"data"),
             generation: 1,
-            sequence,
+            sequence: sequence + 1,
             not_before_ms: 0,
             expires_ms: expiry,
             ancestor_expires_ms: expiry,
@@ -205,4 +212,94 @@ fn real_vault_parent_loss_respects_separate_authority_and_residency_bounds() {
         worker.execute(&grant, "alice", &context, Operation::Encrypt, b"data"),
         Err(Error::Material)
     );
+}
+
+#[test]
+fn native_adapter_rejects_malformed_or_plaintext_replies_without_evidence() {
+    use crate::core::creation::tests::{grant, plan, sign};
+    use crate::core::{Limits, MonotonicClock, Worker};
+    use ed25519_dalek::SigningKey;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        time::Instant,
+    };
+
+    // Explicit protocol-negative unit fixture. Live acceptance still requires
+    // Vault and has no substitution path to this server.
+    for bad in [
+        json!({"ciphertext": "vault:v1:"}),
+        json!({"ciphertext": "vault:v1:!!!"}),
+        json!({"ciphertext": format!("vault:v1:{}", STANDARD.encode([0; 59]))}),
+        json!({"ciphertext": format!("vault:v2:{}", STANDARD.encode([0; 60]))}),
+        json!({"ciphertext": "x".repeat(4097)}),
+        json!({"ciphertext": format!("vault:v1:{}", STANDARD.encode([0; 60])), "plaintext": "must-not-be-observed"}),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let context = crate::fixture::custody_context(&context());
+        let canonical = context.canonical_bytes().unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, data) in [json!({"derived": true, "convergent_encryption": false, "type": "aes256-gcm96", "exportable": false, "allow_plaintext_backup": false}), bad].into_iter().enumerate() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "native request missing");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new(); reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(if index == 0 { "GET /v1/transit/keys/" } else { "POST /v1/transit/datakey/wrapped/" }));
+                let mut length = 0;
+                loop {
+                    line.clear(); reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = value.trim().parse().unwrap(); }
+                }
+                let mut body = vec![0; length]; reader.read_exact(&mut body).unwrap();
+                if index == 1 {
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(STANDARD.decode(body["context"].as_str().unwrap()).unwrap(), canonical);
+                    assert_eq!(body["bits"], 256);
+                    assert_eq!(body["key_version"], 1);
+                }
+                let body = json!({"data": data}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let source = VaultFixture::new(
+            &address,
+            Zeroizing::new("unit-fixture-only".into()),
+            "worker-fixture-unit".into(),
+        )
+        .unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let mut worker = Worker::new(
+            key.verifying_key(),
+            "development-only".into(),
+            source,
+            MonotonicClock::new(),
+            Limits {
+                resident_keys: 1,
+                residence_ms: 1_000,
+                uses_per_residency: 3,
+                authority_horizon_ms: 10_000,
+            },
+        )
+        .unwrap();
+        worker.reserve_creation(plan(), context).unwrap();
+        assert!(worker.generate(&sign(grant(&worker), &key)).is_err());
+        let mut retry = grant(&worker);
+        retry.sequence = std::num::NonZeroU64::new(2).unwrap();
+        assert!(worker.generate(&sign(retry, &key)).is_err());
+        assert!(!worker.creation_allows_use());
+        server.join().unwrap();
+    }
 }

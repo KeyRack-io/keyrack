@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Fixed development context. Never advertised as a production A3 capability.
 use keyrack_core::{
+    custody::{CustodyContext, CustodyProfile, ExecutionBoundary},
     key::{KeySpec, ProviderRef},
     lid::Lid,
     wrapping::{
@@ -9,6 +10,16 @@ use keyrack_core::{
         WrappingIdentifier, WrappingKeyPurpose,
     },
 };
+
+pub(crate) fn custody_context(wrapping: &WrappingContext) -> CustodyContext {
+    CustodyContext {
+        wrapping: wrapping.clone(),
+        profile: CustodyProfile {
+            boundary: ExecutionBoundary::TrustedHostWorkerMemory,
+            id: WrappingIdentifier::new("UNQUALIFIED-vault-derived-worker-fixture-v1").unwrap(),
+        },
+    }
+}
 
 pub(crate) fn context() -> WrappingContext {
     WrappingContext {
