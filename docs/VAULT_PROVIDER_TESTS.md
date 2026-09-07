@@ -34,7 +34,8 @@ run but do not gate merges: neither is a required branch-protection context on
 `main`. The owner plans to add both after integration. Workflow presence alone
 does not make a job a merge gate; re-check the required-context list before
 reporting otherwise. The workflow triggers on pushes to `main` and PRs targeting
-`main`, not every feature-branch push.
+`main`, `feat/**`, `fix/**` or `handback/**`, not every feature-branch push. Existing
+PRs still need a qualifying event; branch eligibility alone is not a completed run.
 
 Additional integration assertions can share this fixture:
 
