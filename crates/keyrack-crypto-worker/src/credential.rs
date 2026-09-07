@@ -62,7 +62,8 @@ mod tests {
         fs::write(file.path(), "fixture-token").unwrap();
         for mode in [0o600, 0o400] {
             fs::set_permissions(file.path(), fs::Permissions::from_mode(mode)).unwrap();
-            assert!(load(file.path()).unwrap().as_str() == "fixture-token");
+            // Keep failure output redacted; assert_eq! would print the credential.
+            assert!(load(file.path()).unwrap().as_str().eq("fixture-token"));
         }
         // Uses real private-file metadata and a different expected worker UID;
         // no root/chown fixture is needed to exercise the ownership refusal.

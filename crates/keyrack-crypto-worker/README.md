@@ -6,8 +6,8 @@ contract. No service depends on it. Start requires the explicit
 `--provisional-harness` flag and a base64 Ed25519 verification key supplied by a
 trusted launcher. The test authority holds the signing key outside the worker.
 
-The implementation consumes `keyrack_core::custody` from `a74f884` for native
-creation, and retains V1 `WrappingContext` and `ParentWrappedMaterial` accessors
+The implementation consumes `keyrack_core::custody` from `0476087` (the rebased
+successor of `a74f884`) for native creation, and retains V1 `WrappingContext` and `ParentWrappedMaterial` accessors
 for the provisional encrypt/decrypt adapter. It changes none of these shared types. Its private
 fixture descriptor is only checked structurally; no worker lifecycle is inferred
 from it. There is no public library, persisted worker envelope, hierarchy database,
@@ -55,12 +55,13 @@ distribution or attestation**. No other receipt family is migrated in this slice
 - Independently verified, domain-separated signed test grants binding principal,
   complete context digest, operation, input digest, worker incarnation,
   generation, sequence and monotonic boot-relative deadlines.
-- Authority checked before materialization, on warm cache hits and before result
-  release. Replays consume a bounded sequence high-water mark; ambiguous failed
-  attempts cannot be replayed. Every restart generates a new random incarnation.
+- Authority checked before materialization, on warm cache hits and before the core
+  returns an operation result. Replays consume a bounded sequence high-water mark;
+  ambiguous failed attempts cannot be replayed. Every restart generates a new random incarnation.
 - Bounded secret residency, non-renewing cache deadlines, operation counts,
   zeroizing owned secret buffers and expiry cleanup even with idle input.
-- Serialized local fencing drains/suppresses work before its local observation;
+- Serialized local fencing follows completed core work and purges before its
+  local observation;
   signed wrong-domain, stale or wrong-incarnation fences fail. Fencing is terminal
   for the incarnation: this slice invents no reinstatement protocol.
 - Separate local residency-cleanup and authority-fence observations. Neither is
@@ -95,8 +96,10 @@ four original provider tests and exposes a post-test command hook using the same
 `demos/01-foss-vault` fixture. This crate supplies that hook's worker consumer,
 **not a second maintained CI stack**.
 
-A2 adopted the worker hook in `f4d7bfc`; the existing job now invokes both suites
-with this run step:
+The worker contribution is present through A2 merge `bfa0060` (formerly
+`f4d7bfc`), but the workflow at the worker base `4e639ad` still invokes only the
+provider script with no hook arguments. The latest fetched A2 target `27b5923` contains that correction at
+`c730a3a` and the PR-trigger fix `be72c05`. The invocation is:
 
 ```sh
 bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
@@ -124,7 +127,7 @@ Its test launcher needs these environment variables:
 | `KEYRACK_WORKER_VAULT_PARENT` | Dedicated `worker-fixture-*` parent, version 1, derived non-convergent `aes256-gcm96`, non-exportable, plaintext backup disabled |
 | `KEYRACK_WORKER_VAULT_TOKEN_FILE` | File containing worker token, read on `transit/keys/worker-fixture-*`, update on `transit/datakey/wrapped/worker-fixture-*` and `transit/decrypt/worker-fixture-*` |
 | `KEYRACK_WORKER_VAULT_COORDINATOR_TOKEN_FILE` | Valid token with self-lookup allowed and parent-decrypt denied |
-| `KEYRACK_WORKER_VAULT_ADMIN_TOKEN_FILE` | Test-parent create/configure/delete permission for the parent-loss control |
+| `KEYRACK_WORKER_VAULT_ADMIN_TOKEN_FILE` | Disposable test-admin permissions for parent-loss and qualification controls: create/read/configure/delete/rotate parents, native generation/decrypt/encrypt, and export of a separate exportable control parent |
 
 Only the worker token file/address/parent are passed into the subprocess; the
 admin and coordinator tokens stay with the test launcher. On Unix the worker
@@ -142,8 +145,9 @@ decrypt. It verifies parent settings, bounds responses and rejects unexpected
 generation plaintext or malformed/wrong-version ciphertext. The exact profile is
 `UNQUALIFIED-vault-derived-worker-fixture-v1`; it enables no production capability.
 This uses Vault's native derivation; `context` is not the
-same parameter as `associated_data`. See the
-[native Vault API](https://developer.hashicorp.com/vault/api-docs/secret/transit#generate-data-key).
+same parameter as `associated_data`. The [version-scoped qualification report](VAULT_PROFILE_QUALIFICATION.md) establishes the exact HKDF/AES-GCM construction,
+endpoint AAD behavior and remaining production-profile gates. The test requires
+Vault 1.17.6; the existing Compose minor tag is not an immutable image pin.
 
 Live tests require the actual fixture and fail if absent; they do not fall back
 to mocks. They verify every-byte custody-frame perturbation rejection (the historical
@@ -157,9 +161,9 @@ the deleted parent. That test does not claim immediate deletion detection.
 The A2 lane retains its **four original ignored Vault-provider tests**. The worker
 script additionally guards discovery of its own four ignored live tests, so a
 renamed, removed, or un-ignored test fails before running the suite. Local hook
-passes do not establish CI acceptance. The hook is wired by A2 at `f4d7bfc`; CI
-run evidence for this revision and required branch-protection contexts remain
-separate from that wiring. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
+passes do not establish CI acceptance. The hook is absent from this branch base
+but restored on the A2 integration target at `c730a3a`. Actual CI run evidence for each worker revision and required
+branch-protection contexts remain separate acceptance obligations. See [the A2 lane status](../../docs/VAULT_PROVIDER_TESTS.md)
 for its trigger and gating scope.
 
 ## Limits and integration gates
@@ -187,10 +191,12 @@ loader/refusal tests and keeps this gate visible as **UNMET** until the deployed
 coordinator is demonstrably denied worker-equivalent access.
 
 The shared canonical custody frame is adopted for native creation and Vault parent
-operations. **Vault derived-parent construction is UNQUALIFIED**, as required by
-`docs/CUSTODY_CONTRACT.md`; codec conformance and perturbation tests do not qualify
-that construction. A2 owns review of the proposed transcript/profile and eventual
-storage acceptance. Encrypt/decrypt test grants, application-data AAD, local lease
+operations. The [Vault construction investigation](VAULT_PROFILE_QUALIFICATION.md)
+is verified for the recorded 1.17.6 build and fresh-parent conditions, using source
+inspection, independent decryption and live controls. **Production profile approval
+remains UNMET**; the contract codec itself does not qualify a provider. A2 owns
+review of these findings, the proposed transcript/profile and eventual storage
+acceptance. Encrypt/decrypt test grants, application-data AAD, local lease
 cleanup and local fencing still use their explicitly provisional adapters; this
 is not a completed shared IPC/authority migration. Native creation does not publish
 anything into the hierarchy or bypass `VerifiedA2Closure` requirements.
@@ -206,13 +212,20 @@ call can delay the poll (local Vault requests have a two-second timeout). Usage
 limits are per residency, not a durable lifetime nonce budget; admission/eviction
 and multi-worker accounting need the production profile's reviewed limits.
 
+The core checks authority before returning, but its output writer receives plain
+JSON without deadline/generation metadata. A queued or writer-held result can
+outlive that check. FIFO orders earlier outputs before a fence observation; it
+does not provide deadline-aware transport cancellation or concurrent interruption
+of a provider call. The worker must resolve release-time enforcement with the A3
+transport before activation; this is not covered by the current in-flight tests.
+
 Owned raw buffers and AES schedules enable available zeroization features.
 Compiler/OS copies, HTTP header buffers, swap/crash dumps, and all GCM-derived
 state are not proved erased. In particular, the pinned POLYVAL ARM PMULL backend
 does not implement zeroizing Drop. This prototype makes no full-memory erasure,
 host-root exclusion, hardware-custody, or child-HYOK claim.
 
-The original branch base is `27e0f51`; `a74f884` and its A2-owned prerequisites
-were merged without modifying their contract, storage, or workflow files. This
-ancestry still lacks PKCS#11 concurrency fix `f63b347` present on
-public main `e54c14d`. This slice does not exercise concurrent PKCS#11 login.
+The original branch base was `27e0f51`. After the A2 rebase recovery, this branch
+is based on `4e639ad` and **includes** PKCS#11 concurrency fix `f63b347`. The worker
+replays landed at `9e69991` and `bb1497e`; the original V1 material/wrapping files
+remain unchanged. This slice does not exercise concurrent PKCS#11 login.

@@ -3,6 +3,8 @@
 use super::*;
 use crate::fixture::context;
 
+mod qualification;
+
 #[test]
 fn authenticated_local_fixture_rejects_each_semantic_context_change() {
     let original = context();
@@ -58,8 +60,10 @@ fn real_vault_native_wrapped_only_authenticates_every_v1_context_byte() {
         );
     }
     let again = source.open(&context).unwrap();
-    assert!(first.0.as_slice() == again.0.as_slice());
+    // Keep secret values out of assertion failure output.
+    assert!(first.0.as_slice().eq(again.0.as_slice()));
     // Never format either value in assertion diagnostics.
+    qualification::verify_pinned_vault_binding(&source, &canonical);
 }
 
 #[test]

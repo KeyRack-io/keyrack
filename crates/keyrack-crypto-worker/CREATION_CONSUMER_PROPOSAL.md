@@ -45,10 +45,12 @@ The legacy wrapping encoder is unchanged. This cannot read old V1-only envelopes
 as though they had the new profile; no persistence migration is attempted.
 
 This adopts the shared representation, **not a qualification of native Vault
-context derivation**. Independent A2/A3 acceptance must establish that construction,
-parent resolution, settings, versions and full semantic authentication before any
-production profile is enabled. The fixture's configured Vault parent is not a
-production resolver for its synthetic versioned parent identity.
+context derivation**. The [version-scoped investigation](VAULT_PROFILE_QUALIFICATION.md)
+now establishes the construction for fresh parents on the recorded Vault 1.17.6
+artifact. A2/A3 acceptance of those findings, parent resolution, settings, versions and complete
+semantic authentication remains required before any production profile is enabled.
+The fixture's configured Vault parent is not a production resolver for its synthetic
+versioned parent identity.
 
 ## Creation evidence and authority provenance
 
@@ -89,9 +91,11 @@ because its incarnation differs, but an external authority could still sign a ne
 incarnation for the same unresolved storage attempt. Production must obtain a
 current, durable reservation and reconcile lost responses before issuing another
 generation authorization. Durable owner currentness, restart reuse prevention,
-publication and qualification are **UNMET**, not implied by typed evidence.
+publication and production profile approval are **UNMET**, not implied by typed evidence.
 Distinct-UID deployment credential isolation remains UNMET and is explicitly
 intended for deployment ownership, pending named-owner acceptance and evidence.
-A2 wired the existing CI hook at `f4d7bfc`; CI run evidence and required lane gating
-remain separate obligations. The credential file ownership/mode enforcement
-remains intact.
+A2 merge `bfa0060` carries the hook contribution, but the workflow at base
+`4e639ad` does not invoke it. A2 corrected the invocation at `c730a3a`, present
+on the fetched target `27b5923`. Actual CI run evidence for each worker revision
+and required lane gating remain separate obligations. The credential file
+ownership/mode enforcement remains intact.
