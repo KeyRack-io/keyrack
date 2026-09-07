@@ -71,11 +71,11 @@ Three deployment patterns:
 
 Every KeyRack operation emits an audit event containing:
 
-- Ed25519 signature over the event payload (opt-in; ephemeral key by default unless a persistent signing key path is configured)
+- Ed25519 signature over the event payload (opt-in; enabling it requires a persistent `audit_signing_key_path`, or an explicit `audit_signing_key_ephemeral: true` for throwaway development keys)
 - BLAKE3 hash-chain linking each event to its predecessor
 - Full operation metadata (principal, action, key ID, timestamp)
 
-The chain provides strong interior tamper-evidence: any modification or interior deletion of events is detectable by replaying the hash chain. Tail-truncation (dropping the latest N events) is not detectable without an external anchor such as a signed checkpoint or independent witness. Events are delivered via NATS for real-time consumption.
+The chain provides interior tamper-evidence: an in-place modification or interior deletion of events is detectable by replaying the hash chain, with no key. There are two bounds on that. Repairing the chain after an edit only means recomputing every link from that point forward, so an attacker able to rewrite the whole log defeats the keyless check — that is the gap Ed25519 signing closes, and why an audit-grade deployment enables it. And tail-truncation (dropping the latest N events) is not detectable without an external anchor such as a signed checkpoint or independent witness; signing does not address that one either. Events are delivered via NATS for real-time consumption.
 
 ### Lockout behavior
 

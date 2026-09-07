@@ -154,7 +154,7 @@ For a KMS, the Security and Confidentiality criteria are primary. Auditors expec
 | Gap | Severity | Notes |
 |---|---|---|
 | No built-in key management policy documentation generator | Low | SOC 2 requires documented policies; KeyRack provides the technical controls but policy documents are an organizational concern |
-| Audit log tamper-evidence | Low | FOSS ships Ed25519+BLAKE3 signed/chained audit events (opt-in; ephemeral key by default). Interior tamper-evidence is strong; tail-truncation detection requires an external anchor. |
+| Audit log tamper-evidence | Low | BLAKE3 chaining is unconditional, so an in-place edit or interior deletion is detectable with no key. Ed25519 signing is opt-in and requires a persistent signing key path. Without signing, an attacker able to rewrite the whole log can recompute every link and defeat the keyless check; tail-truncation needs an external anchor regardless. |
 | Continuous monitoring / alerting | Low | KeyRack emits metrics and events, but SOC 2 Type II requires evidence of monitoring over time. This is an operational concern. |
 
 #### What would be needed to close them?

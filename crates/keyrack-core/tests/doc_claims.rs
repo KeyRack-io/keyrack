@@ -105,7 +105,14 @@ fn documented_kani_harnesses_are_actually_proofs() {
     }
 }
 
-/// Phrases that assert audit tampering is detectable without a verifying key.
+/// Phrases that assert audit tampering is detectable from the log itself.
+///
+/// The first group names the absence of a key. The second does not: a doc can
+/// make exactly the same claim without ever mentioning keys, which is how
+/// `docs/WHY_KEYRACK.md` ("is detectable by replaying the hash chain") went
+/// unnoticed by the first version of this control. Keying the trigger on the
+/// phrasing one author happened to use reproduces the very failure the control
+/// exists to catch, so the claim is matched, not the wording.
 const KEYLESS_CLAIM_PHRASES: &[&str] = &[
     "with no key",
     "no key at all",
@@ -113,13 +120,23 @@ const KEYLESS_CLAIM_PHRASES: &[&str] = &[
     "no key or configuration",
     "from the log alone",
     "without a key",
+    "is detectable",
+    "are detectable",
+    "always detectable",
+    "detectable by",
 ];
 
-/// A doc claiming keyless detection must also say what it does not cover: the
-/// chain can be recomputed from the edit point forward by anyone who can
-/// rewrite the whole log, and tail-truncation breaks no link at all.
-const REWRITE_BOUND_MARKER: &str = "recomput";
-const TRUNCATION_BOUND_MARKER: &str = "truncat";
+/// A doc claiming detection must also say what it does not cover: the chain can
+/// be recomputed from the edit point forward by anyone who can rewrite the
+/// whole log, and tail-truncation breaks no link at all.
+const REWRITE_BOUND_MARKERS: &[&str] = &["recomput", "rewrit", "authorship"];
+const TRUNCATION_BOUND_MARKERS: &[&str] = &["truncat"];
+
+/// Truncation has to be discussed *as a bound*, which means naming the only
+/// thing that addresses it. Without this, an unrelated mention satisfies the
+/// marker spuriously — `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` discusses TLV
+/// "truncation attacks" in its LID section, nowhere near an audit claim.
+const TRUNCATION_REMEDY_MARKERS: &[&str] = &["anchor", "witness", "checkpoint"];
 
 /// `CHANGELOG.md` is an append-only historical record — past entries are not
 /// rewritten when wording elsewhere improves — and its statement is about the
@@ -144,15 +161,59 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// True if `text` claims keyless detection. "without a key **path**" and
-/// "without a key **file**" are configuration statements, not claims.
-fn makes_keyless_claim(text: &str) -> Option<&'static str> {
-    KEYLESS_CLAIM_PHRASES.iter().copied().find(|phrase| {
-        text.match_indices(phrase).any(|(at, _)| {
-            let rest = text[at + phrase.len()..].trim_start();
-            !rest.starts_with("path") && !rest.starts_with("file")
+/// Heading level of an ATX heading line, ignoring lines inside code fences —
+/// a shell comment such as `# development only` is not a section heading.
+fn heading_levels(lines: &[&str]) -> Vec<Option<usize>> {
+    let mut fenced = false;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                fenced = !fenced;
+                return None;
+            }
+            if fenced {
+                return None;
+            }
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            ((1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ')).then_some(hashes)
         })
-    })
+        .collect()
+}
+
+/// The innermost section containing `line`: from the nearest preceding heading
+/// to the next heading of the same or higher level. Bounds stated in a
+/// different section of a long document do not qualify the claim, which is the
+/// looseness a whole-file substring check has.
+fn enclosing_section(lines: &[&str], levels: &[Option<usize>], line: usize) -> String {
+    let start = (0..=line).rev().find(|i| levels[*i].is_some());
+    let (start, level) = match start {
+        Some(i) => (i, levels[i].expect("heading")),
+        None => (0, usize::MAX), // preamble before the first heading
+    };
+    let end = ((start + 1)..lines.len())
+        .find(|i| levels[*i].is_some_and(|l| l <= level))
+        .unwrap_or(lines.len());
+    lines[start..end].join("\n")
+}
+
+/// Claim occurrences as `(line index, phrase)`. "without a key **path**" and
+/// "without a key **file**" are configuration statements, not claims.
+fn keyless_claims(lines: &[&str]) -> Vec<(usize, &'static str)> {
+    let mut found = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        for phrase in KEYLESS_CLAIM_PHRASES {
+            if line.match_indices(phrase).any(|(at, _)| {
+                let rest = line[at + phrase.len()..].trim_start();
+                !rest.starts_with("path") && !rest.starts_with("file")
+            }) {
+                found.push((idx, *phrase));
+                break;
+            }
+        }
+    }
+    found
 }
 
 /// Guards against the failure mode this test was written for: the bounds on
@@ -181,32 +242,39 @@ fn keyless_audit_claims_state_their_bounds() {
         }
 
         let lower = read(&path).to_lowercase();
-        let Some(phrase) = makes_keyless_claim(&lower) else {
-            continue;
-        };
-        scanned += 1;
+        let lines: Vec<&str> = lower.lines().collect();
+        let levels = heading_levels(&lines);
 
-        let mut missing = Vec::new();
-        if !lower.contains(REWRITE_BOUND_MARKER) {
-            missing.push("full-log rewrite");
-        }
-        if !lower.contains(TRUNCATION_BOUND_MARKER) {
-            missing.push("tail-truncation");
-        }
+        for (line, phrase) in keyless_claims(&lines) {
+            scanned += 1;
+            let section = enclosing_section(&lines, &levels, line);
+            let has = |markers: &[&str]| markers.iter().any(|m| section.contains(m));
 
-        if !missing.is_empty() {
-            violations.push(format!(
-                "  {} — claims detection without a key (\"{phrase}\"), missing the {} bound(s)",
-                rel.display(),
-                missing.join(" and ")
-            ));
+            let mut missing = Vec::new();
+            if !has(REWRITE_BOUND_MARKERS) {
+                missing.push("full-log rewrite");
+            }
+            if !(has(TRUNCATION_BOUND_MARKERS) && has(TRUNCATION_REMEDY_MARKERS)) {
+                missing.push("tail-truncation");
+            }
+
+            if !missing.is_empty() {
+                violations.push(format!(
+                    "  {}:{} — claims detection from the log (\"{phrase}\"), and its section \
+                     does not state the {} bound(s)",
+                    rel.display(),
+                    line + 1,
+                    missing.join(" and ")
+                ));
+            }
         }
     }
 
     assert!(
         violations.is_empty(),
-        "the keyless audit-verification claim is stated without its bounds in {} \
-         doc(s). That claim is only true within them; state them or drop the claim.\n{}\n\n\
+        "the audit-detection claim is stated without its bounds in {} place(s). \
+         That claim is only true within them; state them in the same section as the \
+         claim, or drop the claim.\n{}\n\n\
          Missing bounds are:\n\
          \x20 - full-log rewrite: repairing the chain only means recomputing every link \
          from the edit point forward, so a chain does not establish authorship. Signing \
@@ -217,9 +285,13 @@ fn keyless_audit_claims_state_their_bounds() {
         violations.join("\n")
     );
 
+    // Without this the control passes vacuously the moment the claim is
+    // reworded past the trigger list, which is exactly how the first version
+    // of it missed docs/WHY_KEYRACK.md.
     assert!(
-        scanned >= 4,
-        "expected the keyless audit claim in at least 4 docs, found {scanned} — if the \
-         claim was reworded, update KEYLESS_CLAIM_PHRASES so this stays a control"
+        scanned >= 8,
+        "expected the audit-detection claim in at least 8 places, found {scanned} — if it \
+         was reworded, update KEYLESS_CLAIM_PHRASES so this stays a control rather than \
+         lowering this floor"
     );
 }

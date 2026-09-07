@@ -6,6 +6,33 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **Docs: the audit-detection claim control now matches the claim rather than
+  one phrasing of it.** The first version of
+  `keyless_audit_claims_state_their_bounds` triggered only on wording that
+  mentions the absence of a key, so it missed `docs/WHY_KEYRACK.md`, which
+  asserts detection without mentioning keys at all ("is detectable by
+  replaying the hash chain") and stated only one of the two bounds. That file
+  is now correct and the trigger matches assertions of detectability. Two
+  further tightenings: the bounds must appear in the same section as the
+  claim, not anywhere in the file, and a mention of truncation only counts as
+  the truncation bound when the section also names the remedy — otherwise
+  unrelated prose satisfies it, as the TLV "truncation attacks" discussion in
+  `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` would have.
+
+- **Docs: three docs still said an ephemeral audit signing key is the
+  default.** Making `audit_signing_key_ephemeral` an explicit opt-in left
+  `README.md`, `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` and
+  `docs/WHY_KEYRACK.md` describing the behaviour it replaced — signing now
+  requires a persistent `audit_signing_key_path`, and a throwaway key must be
+  asked for. No behaviour change. A claim about a configuration default is
+  mechanically checkable, so a new control,
+  `documented_config_defaults_match_config_rs` in
+  `crates/keyrack-service/tests/doc_config_claims.rs`, parses
+  `ServiceConfig::default()` and fails when prose asserts a default that
+  contradicts it. Flipping a default in `config.rs` changes what the control
+  demands of the docs, rather than leaving the expectation hard-coded in a
+  test.
+
 - **Docs: the keyless audit-verification claim now states its bounds
   everywhere it is made.** Making chaining unconditional was correct, but the
   documentation of it landed unevenly: `docs/OPERATOR.md` and the
