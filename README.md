@@ -14,7 +14,7 @@ provider holds key bytes in process memory (dev/test only).
 - **Policy-driven** — external authorization via any PDP (Cedar, OPA). Every operation is authorized and audited.
 - **Hierarchical keys** — KEK-wrapping hierarchy with namespace-scoped rules and cascade disable.
 - **HYOK (Hold Your Own Key)** — tenants plug in their own HSM; disconnect immediately fails crypto operations on that backend. Cross-node cache staleness in the commercial HA tier is bounded by a configurable TTL.
-- **Cryptographic audit** — Ed25519-signed events with BLAKE3 hash chain, delivered over NATS. Provides strong interior tamper-evidence; tail-truncation detection requires an external anchor; signing is opt-in and ephemeral by default.
+- **Cryptographic audit** — BLAKE3 hash-chained events delivered over NATS, chained whether or not signing is enabled, so an in-place edit or interior deletion is detectable with no key. Two bounds: an attacker who can rewrite the whole log can recompute every link, which is what opt-in Ed25519 signing closes (it requires a persistent signing key), and tail-truncation needs an external anchor.
 
 ## Quickstart
 

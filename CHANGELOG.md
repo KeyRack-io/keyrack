@@ -6,6 +6,20 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **Docs: three docs still said an ephemeral audit signing key is the
+  default.** Making `audit_signing_key_ephemeral` an explicit opt-in left
+  `README.md`, `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` and
+  `docs/WHY_KEYRACK.md` describing the behaviour it replaced — signing now
+  requires a persistent `audit_signing_key_path`, and a throwaway key must be
+  asked for. No behaviour change. A claim about a configuration default is
+  mechanically checkable, so a new control,
+  `documented_config_defaults_match_config_rs` in
+  `crates/keyrack-service/tests/doc_config_claims.rs`, parses
+  `ServiceConfig::default()` and fails when prose asserts a default that
+  contradicts it. Flipping a default in `config.rs` changes what the control
+  demands of the docs, rather than leaving the expectation hard-coded in a
+  test.
+
 - **Docs: the keyless audit-verification claim now states its bounds
   everywhere it is made.** Making chaining unconditional was correct, but the
   documentation of it landed unevenly: `docs/OPERATOR.md` and the

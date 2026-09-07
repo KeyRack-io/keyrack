@@ -71,7 +71,7 @@ Three deployment patterns:
 
 Every KeyRack operation emits an audit event containing:
 
-- Ed25519 signature over the event payload (opt-in; ephemeral key by default unless a persistent signing key path is configured)
+- Ed25519 signature over the event payload (opt-in; enabling it requires a persistent `audit_signing_key_path`, or an explicit `audit_signing_key_ephemeral: true` for throwaway development keys)
 - BLAKE3 hash-chain linking each event to its predecessor
 - Full operation metadata (principal, action, key ID, timestamp)
 
