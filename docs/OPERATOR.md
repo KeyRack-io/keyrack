@@ -149,6 +149,39 @@ provider:
   ca_cert: "/etc/keyrack/tls/kmip-ca.pem"   # optional
 ```
 
+What your server has to provide for this to work:
+
+- **KMIP 1.4.** That is the version KeyRack announces and encodes. A
+  server that only speaks 2.x will reject the connection.
+- **An AEAD TLS cipher suite.** KeyRack's TLS implementation offers only
+  AEAD suites (AES-GCM and ChaCha20-Poly1305), so a server restricted to
+  CBC suites shares no cipher with it and the handshake fails. If your
+  server's AEAD suites are ECDHE-ECDSA, it needs an ECDSA certificate.
+- **Mutual TLS.** The client certificate is the only authentication
+  mechanism; there is no username or password field.
+- **`Create`, `Activate`, `Encrypt`, `Decrypt`, `Revoke`, `Destroy`.** Keys
+  are activated on creation, and revoked before destruction, because KMIP
+  forbids using a Pre-Active object and forbids destroying an Active one.
+- **`AuthenticatedEncryptionAdditionalData` that is actually bound.**
+  KeyRack sends the encryption context in this field and relies on the
+  server covering it with the authentication tag. A server that accepts
+  the field and ignores it produces ciphertexts that decrypt under any
+  context, which KeyRack cannot detect on its own.
+
+Not supported over KMIP:
+
+- **`generate-random`.** The request is built, but it has never been
+  exercised against a real server, because the server this backend is
+  proven against does not implement `RNGRetrieve`. Treat it as untested
+  rather than working.
+- **Signing keys.** Only AES-256 has been proven end to end. The other key
+  specs the provider advertises are unexercised.
+
+`conformance/kmip-provider/run-proof.sh` runs the whole lifecycle against a
+third-party KMIP server. Pointing it at your own server is the way to find
+out whether the requirements above hold there — in particular the AAD
+binding, which is asserted rather than assumed.
+
 ### In-memory (test fixtures)
 
 ```yaml

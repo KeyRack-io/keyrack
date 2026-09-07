@@ -380,8 +380,29 @@ async fn build_provider(
                 keyrack_core::key::ProviderClass::Pkcs11,
             )
         }
-        ProviderConfig::Kmip { .. } => {
-            return Err("KMIP provider not yet implemented".into());
+        ProviderConfig::Kmip {
+            host,
+            port,
+            client_cert,
+            client_key,
+            ca_cert,
+        } => {
+            let kmip_config = keyrack_kmip::KmipProviderConfig {
+                endpoint: format!("kmip://{host}:{port}"),
+                client_cert_path: Some(client_cert.clone()),
+                client_key_path: Some(client_key.clone()),
+                ca_cert_path: ca_cert.clone(),
+                timeout_secs: 30,
+                // Mutual TLS is the authentication mechanism; the config
+                // exposes no username or password, so a KMIP deployment that
+                // authenticates by credential is not supported here yet.
+                username: None,
+                password: None,
+            };
+            (
+                Arc::new(keyrack_kmip::KmipProvider::new(kmip_config)),
+                keyrack_core::key::ProviderClass::Kmip,
+            )
         }
         ProviderConfig::VaultTransit {
             vault_addr,

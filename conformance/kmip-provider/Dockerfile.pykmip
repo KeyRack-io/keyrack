@@ -1,0 +1,17 @@
+# Neutral KMIP server for proving the KeyRack KMIP provider.
+#
+# PyKMIP is a third-party implementation, deliberately: validating our client
+# against our own keyrack-kmip-server would only prove the two agree, which is
+# exactly how a shared misreading of the spec survives.
+#
+# Python is pinned to 3.11 because PyKMIP 0.10.0 is its latest release (2020)
+# and its server calls ssl.wrap_socket, which was removed in Python 3.12. Note
+# that PyKMIP's *client* still runs on 3.12 — only the server side is pinned
+# back, so this does not contradict harnesses that drive PyKMIP as a client.
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir "PyKMIP==0.10.0"
+
+# 5696 is the port the KMIP specification recommends.
+EXPOSE 5696
+ENTRYPOINT ["pykmip-server", "-f", "/etc/pykmip/pykmip-server.conf", "-l", "/tmp/pykmip.log"]
