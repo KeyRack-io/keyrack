@@ -5,7 +5,8 @@
 
 No server/container/workflow is created here. The caller is the optional command
 hook in test-vault-provider.sh. This trusted test launcher intentionally has admin
-access; it is not evidence of distinct-UID coordinator isolation.
+access. Linux runs additionally invoke the real-user supervisor fixture; ordinary
+same-UID assertions alone are not evidence of deployment isolation.
 """
 import json
 import os
@@ -100,6 +101,34 @@ def main():
             print("Running worker assertions inside the existing Vault provider fixture", flush=True)
             result = subprocess.run(["bash", str(Path(__file__).with_name(
                 "test-worker-vault-contribution.sh"))], env=env, check=False).returncode
+            if result == 0 and sys.platform == "linux":
+                # Reuse this live Vault; real host users/systemd provide the
+                # isolation boundary. Linux failure is fatal, never a skip.
+                rotated = request("auth/token/create", {"policies": [worker_policy],
+                                  "no_default_policy": True, "ttl": "20m"})["auth"]["client_token"]
+                tokens.append(rotated)
+                artifacts = subprocess.run(["cargo", "test", "--locked", "-p", "keyrack-crypto-worker",
+                    "--test", "subprocess", "--no-run", "--message-format=json"],
+                    env=env, check=True, text=True, stdout=subprocess.PIPE)
+                binaries = {}
+                for line in artifacts.stdout.splitlines():
+                    item = json.loads(line)
+                    if item.get("reason") == "compiler-artifact" and item.get("executable"):
+                        binaries[item["target"]["name"]] = item["executable"]
+                config = {
+                    "worker_binary": binaries["keyrack-worker-provisional"],
+                    "test_binary": binaries["subprocess"], "address": address, "parent": parent,
+                    "initial_token": env["KEYRACK_WORKER_VAULT_TOKEN_FILE"],
+                    "rotated_token": token_file("rotated-worker.token", rotated),
+                    "admin_token": env["KEYRACK_WORKER_VAULT_ADMIN_TOKEN_FILE"],
+                }
+                config_path = root / "supervisor-config.json"
+                config_path.write_text(json.dumps(config))
+                result = subprocess.run(["sudo", "-n", "/usr/bin/python3", str(Path(__file__).with_name(
+                    "worker-supervisor-isolation.py")), str(config_path)], check=False,
+                    env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin", "LANG":"C.UTF-8"}).returncode
+            elif result == 0:
+                print("Distinct-UID supervisor acceptance NOT RUN: requires a Linux host with systemd and two real OS users", flush=True)
         finally:
             # Revoke only this run's tokens/policies/parent. A2 owns container
             # teardown, including any failed parent-loss test's temporary key.
