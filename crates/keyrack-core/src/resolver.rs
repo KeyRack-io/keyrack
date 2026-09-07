@@ -57,7 +57,7 @@ impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
         }
     }
 }
@@ -79,7 +79,7 @@ pub fn resolve_chain(
 ) -> Result<Vec<Lid>> {
     let mut chain = Vec::new();
     let mut visited = HashSet::new();
-    let mut current_attrs = attrs.clone();
+    let mut current_attrs = crate::attr::normalize_flat(attrs)?;
     let mut depth = 0u32;
 
     loop {
@@ -89,7 +89,7 @@ pub fn resolve_chain(
             });
         }
 
-        let lid = lid_from_flat_attrs(&current_attrs, config.canonicalization_version);
+        let lid = lid_from_flat_attrs(&current_attrs, config.canonicalization_version)?;
 
         if !visited.insert(lid) {
             return Err(KeyRackError::CycleDetected { lid });
@@ -129,13 +129,16 @@ pub fn resolve_chain(
 }
 
 /// Helper: compute a LID from flat string attributes.
-fn lid_from_flat_attrs(attrs: &BTreeMap<String, String>, version: CanonicalizationVersion) -> Lid {
+fn lid_from_flat_attrs(
+    attrs: &BTreeMap<String, String>,
+    version: CanonicalizationVersion,
+) -> Result<Lid> {
     let mut attr_set = AttributeSet::new();
     for (k, v) in attrs {
         attr_set.insert(k, AttributeValue::String(v.clone()));
     }
-    let form = canonicalize(version, &attr_set);
-    Lid::derive(version, &form)
+    let form = canonicalize(version, &attr_set)?;
+    Ok(Lid::derive(version, &form))
 }
 
 #[cfg(test)]
@@ -167,7 +170,8 @@ mod tests {
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         reg.register(Namespace {
             name: "acme-app".into(),
@@ -193,7 +197,8 @@ mod tests {
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         reg
     }
@@ -265,7 +270,8 @@ mod tests {
             attachment: None,
             max_depth: 3,
             routing_rules: rules,
-        });
+        })
+        .unwrap();
 
         let config = ResolverConfig {
             max_depth: 3,
@@ -301,7 +307,8 @@ mod tests {
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         let config = ResolverConfig::default();
         let attrs = BTreeMap::from([("kind".into(), "a".into())]);

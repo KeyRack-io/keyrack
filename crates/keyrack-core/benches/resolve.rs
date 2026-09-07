@@ -56,7 +56,8 @@ fn build_registry() -> RuleRegistry {
                 key_spec: None,
             },
         ],
-    });
+    })
+    .unwrap();
 
     reg.register(Namespace {
         name: "app".into(),
@@ -82,7 +83,8 @@ fn build_registry() -> RuleRegistry {
                 key_spec: None,
             },
         ],
-    });
+    })
+    .unwrap();
 
     reg
 }
@@ -113,7 +115,8 @@ fn bench_canonicalize(c: &mut Criterion) {
 
     c.bench_function("canonicalize V1 (4 attrs)", |b| {
         b.iter(|| {
-            let form = canonicalize(black_box(CanonicalizationVersion::V1), black_box(&attrs));
+            let form =
+                canonicalize(black_box(CanonicalizationVersion::V2), black_box(&attrs)).unwrap();
             black_box(form);
         });
     });
@@ -123,11 +126,11 @@ fn bench_lid_derive(c: &mut Criterion) {
     let mut attrs = AttributeSet::new();
     attrs.insert("kind", AttributeValue::String("dek".into()));
     attrs.insert("user", AttributeValue::String("alice".into()));
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
 
     c.bench_function("lid_derive (BLAKE3)", |b| {
         b.iter(|| {
-            let lid = Lid::derive(black_box(CanonicalizationVersion::V1), black_box(&form));
+            let lid = Lid::derive(black_box(CanonicalizationVersion::V2), black_box(&form));
             black_box(lid);
         });
     });

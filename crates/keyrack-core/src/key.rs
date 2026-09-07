@@ -770,12 +770,12 @@ pub(crate) mod tests {
 
         let mut attrs = AttributeSet::new();
         attrs.insert("tenant", AttributeValue::String("test".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
         KeyRecord {
             lid,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,
@@ -789,7 +789,7 @@ pub(crate) mod tests {
             exportability: Exportability::default(),
             first_exported_at: None,
             owner_principal_id: None,
-            identity_tags: IdentityTags::from_attribute_set(&attrs),
+            identity_tags: IdentityTags::from_attribute_set(&attrs).unwrap(),
             user_tags: UserTags::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -826,24 +826,24 @@ pub(crate) mod tests {
             AttributeValue::String("deterministic-id-for-test".into()),
         );
 
-        let canonical = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &canonical);
+        let canonical = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &canonical);
 
         // Deterministic: same attributes → same LID.
         let lid2 = Lid::derive(
-            CanonicalizationVersion::V1,
-            &canonicalize(CanonicalizationVersion::V1, &attrs),
+            CanonicalizationVersion::V2,
+            &canonicalize(CanonicalizationVersion::V2, &attrs).unwrap(),
         );
         assert_eq!(lid, lid2, "LID derivation must be deterministic");
 
         // Two KeyRecords with the SAME identity attributes but DIFFERENT
         // provider_ref values get identical LIDs (provider_ref is a side
         // property, not part of identity_tags or the canonical form).
-        let identity_tags = IdentityTags::from_attribute_set(&attrs);
+        let identity_tags = IdentityTags::from_attribute_set(&attrs).unwrap();
 
         let record_software = KeyRecord {
             lid,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,
@@ -905,8 +905,9 @@ pub(crate) mod tests {
             "provider_ref",
             AttributeValue::String("hsm-tenant-a".into()),
         );
-        let contaminated_canonical = canonicalize(CanonicalizationVersion::V1, &attrs_contaminated);
-        let lid_contaminated = Lid::derive(CanonicalizationVersion::V1, &contaminated_canonical);
+        let contaminated_canonical =
+            canonicalize(CanonicalizationVersion::V2, &attrs_contaminated).unwrap();
+        let lid_contaminated = Lid::derive(CanonicalizationVersion::V2, &contaminated_canonical);
         assert_ne!(
             lid, lid_contaminated,
             "Including provider_ref in the attribute set WOULD change the LID — \
@@ -943,13 +944,13 @@ pub(crate) mod tests {
             AttributeValue::String("export-lid-test".into()),
         );
 
-        let canonical = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &canonical);
-        let identity_tags = IdentityTags::from_attribute_set(&attrs);
+        let canonical = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &canonical);
+        let identity_tags = IdentityTags::from_attribute_set(&attrs).unwrap();
 
         let record_non_exportable = KeyRecord {
             lid,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,

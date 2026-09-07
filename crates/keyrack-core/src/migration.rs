@@ -66,10 +66,10 @@ pub struct MigrationState {
     pub failed: Vec<(String, String)>,
 }
 
-/// Parse a version string like "v1" into a `CanonicalizationVersion`.
+/// Parse the sole supported version. Legacy versions are rejected.
 pub fn parse_canon_version(s: &str) -> Result<CanonicalizationVersion, String> {
     match s.to_lowercase().trim_start_matches('v') {
-        "1" => Ok(CanonicalizationVersion::V1),
+        "2" => Ok(CanonicalizationVersion::V2),
         other => Err(format!("unknown canonicalization version: {other}")),
     }
 }
@@ -84,12 +84,12 @@ pub fn rederive_lid(
     old_lid: &Lid,
     identity_tags: &crate::tags::IdentityTags,
     target_version: CanonicalizationVersion,
-) -> Lid {
+) -> crate::error::Result<Lid> {
     let mut attr_set = crate::attr::AttributeSet::new();
     for (k, v) in identity_tags.as_map() {
         attr_set.insert(k, crate::attr::AttributeValue::String(v.clone()));
     }
-    let form = crate::canon::canonicalize(target_version, &attr_set);
+    let form = crate::canon::canonicalize(target_version, &attr_set)?;
     let new_lid = Lid::derive(target_version, &form);
 
     tracing::debug!(
@@ -99,7 +99,7 @@ pub fn rederive_lid(
         target_version,
     );
 
-    new_lid
+    Ok(new_lid)
 }
 
 #[cfg(test)]
@@ -108,9 +108,10 @@ mod tests {
 
     #[test]
     fn parse_version_strings() {
-        assert!(parse_canon_version("v1").is_ok());
-        assert!(parse_canon_version("V1").is_ok());
-        assert!(parse_canon_version("1").is_ok());
+        assert!(parse_canon_version("v2").is_ok());
+        assert!(parse_canon_version("V2").is_ok());
+        assert!(parse_canon_version("2").is_ok());
+        assert!(parse_canon_version("v1").is_err());
         assert!(parse_canon_version("v99").is_err());
     }
 

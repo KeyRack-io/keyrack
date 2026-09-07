@@ -273,7 +273,9 @@ fn build_ec(
 async fn create_key(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(crate::identity_input::IdentityRequest(body)): Json<
+        crate::identity_input::IdentityRequest,
+    >,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
@@ -330,8 +332,8 @@ async fn create_key(
             if !namespace.is_empty() {
                 caller_attrs.insert("namespace".to_string(), namespace);
             }
-            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
-            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+            let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(&caller_attrs).map_err(|e| e.to_rest_error())?;
+            let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).map_err(|e| crate::domain::DomainError::InvalidArgument(e.to_string()).to_rest_error())?;
 
             // Resolve the binding (tag routing + explicit selectors) once.
             let hsm_connection_id = body
@@ -396,7 +398,7 @@ async fn create_key(
 
             let record = keyrack_core::key::KeyRecord {
                 lid,
-                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+                canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
                 parent_lid,
                 occ_version: 1,
                 current_key_version: 1,
@@ -742,7 +744,9 @@ async fn rotate_key(
 async fn import_key(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(crate::identity_input::IdentityRequest(body)): Json<
+        crate::identity_input::IdentityRequest,
+    >,
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
@@ -822,8 +826,12 @@ async fn import_key(
         if !namespace.is_empty() {
             caller_attrs.insert("namespace".to_string(), namespace);
         }
-        let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(caller_attrs);
-        let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+        let (lid, attrs) = crate::domain::generate_key_lid_from_attrs(&caller_attrs)
+            .map_err(|e| e.to_rest_error())?;
+        let identity_tags =
+            keyrack_core::tags::IdentityTags::from_attribute_set(&attrs).map_err(|e| {
+                crate::domain::DomainError::InvalidArgument(e.to_string()).to_rest_error()
+            })?;
 
         let hsm_connection_id = body
             .get("hsm_connection_id")
@@ -888,7 +896,7 @@ async fn import_key(
 
         let record = keyrack_core::key::KeyRecord {
             lid,
-            canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+            canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,
@@ -2066,7 +2074,9 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 async fn explain_routing(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(crate::identity_input::IdentityRequest(body)): Json<
+        crate::identity_input::IdentityRequest,
+    >,
 ) -> Result<impl IntoResponse, RestError> {
     let _principal = ops::extract_principal_rest(&state, &headers).await?;
 
@@ -2090,7 +2100,8 @@ async fn explain_routing(
         caller_attrs.insert("namespace".to_string(), namespace);
     }
 
-    let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs);
+    let identity_tags = keyrack_core::tags::IdentityTags::from_map(caller_attrs)
+        .map_err(|e| crate::domain::DomainError::InvalidArgument(e.to_string()).to_rest_error())?;
 
     let hsm_connection_id = body
         .get("hsm_connection_id")

@@ -222,18 +222,19 @@ impl WasmKeyRack {
     /// round-trip.
     #[wasm_bindgen(js_name = "computeLid")]
     pub fn compute_lid(&self, attrs_json: &str) -> Result<String, JsError> {
-        let attrs: std::collections::BTreeMap<String, String> = serde_json::from_str(attrs_json)
+        let tags: keyrack_core::tags::IdentityTags = serde_json::from_str(attrs_json)
             .map_err(|e| JsError::new(&format!("invalid JSON: {e}")))?;
         let mut attr_set = keyrack_core::attr::AttributeSet::new();
-        for (k, v) in &attrs {
+        for (k, v) in tags.as_map() {
             attr_set.insert(k, keyrack_core::attr::AttributeValue::String(v.clone()));
         }
         let form = keyrack_core::canon::canonicalize(
-            keyrack_core::canon::CanonicalizationVersion::V1,
+            keyrack_core::canon::CanonicalizationVersion::V2,
             &attr_set,
-        );
+        )
+        .map_err(|e| JsError::new(&e.to_string()))?;
         let lid =
-            keyrack_core::lid::Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &form);
+            keyrack_core::lid::Lid::derive(keyrack_core::canon::CanonicalizationVersion::V2, &form);
         Ok(lid.to_string())
     }
 }

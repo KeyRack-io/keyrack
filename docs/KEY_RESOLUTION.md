@@ -369,7 +369,7 @@ the correct provider based on the record's `provider_class`.
 The LID is deterministic for a given set of attributes:
 
 ```
-attributes → canonicalize(V1, attrs) → CanonicalForm (bytes)
+attributes → canonicalize(V2, attrs) → CanonicalForm (bytes)
                                             │
                         ┌───────────────────┘
                         ▼
@@ -381,7 +381,10 @@ attributes → canonicalize(V1, attrs) → CanonicalForm (bytes)
 
 In the current `CreateKey` flow, the attributes contain a random UUID
 (`_keyrack_key_id`), making each LID unique. The canonicalization version
-is `V1` and is stored on the record to support future migration.
+is `V2` and is stored on the record. V1 records are rejected; this baseline
+is not an in-place upgrade for a V1 database. Stored-LID lookups and
+attribute-based recomputation are distinct paths; see
+[Canonical identity](CANONICAL_IDENTITY.md).
 
 ---
 

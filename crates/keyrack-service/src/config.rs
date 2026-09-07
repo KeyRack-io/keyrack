@@ -159,7 +159,11 @@ pub struct NamedProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRoutingRule {
     /// Identity-tag predicate. All entries must match (AND logic).
-    #[serde(rename = "match", default)]
+    #[serde(
+        rename = "match",
+        default,
+        deserialize_with = "keyrack_core::attr::deserialize_flat"
+    )]
     pub match_tags: std::collections::BTreeMap<String, String>,
     /// For `route` rules: name of the provider to pin to.
     /// For `delegate` and `delegate_any` rules: unused (ignored if present).

@@ -21,9 +21,8 @@
 //! Attribute canonicalization.
 //!
 //! Produces a deterministic byte sequence from an [`AttributeSet`] under a
-//! specific canonicalization version. The byte format is versioned so future
-//! changes trigger the alias-based migration in `MIGRATION.md` rather than
-//! silently invalidating existing LIDs.
+//! specific canonicalization version. V2 is the sole supported identity format.
+//! Legacy version tags are rejected, never interpreted with new semantics.
 
 use crate::attr::{AttributeSet, AttributeValue};
 use unicode_normalization::UnicodeNormalization;
@@ -32,7 +31,24 @@ use unicode_normalization::UnicodeNormalization;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u32)]
 pub enum CanonicalizationVersion {
-    V1 = 1,
+    V2 = 2,
+}
+
+/// Invalid or ambiguous identity input. Never replace an error with empty input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalizationError {
+    #[error("duplicate normalized attribute name: {0}")]
+    DuplicateName(String),
+    #[error("attribute encoding exceeds its size or depth limit")]
+    LimitExceeded,
+    #[error("identity rules require string attributes; non-string value at {0}")]
+    NonStringIdentity(String),
+}
+
+/// NFC for identity strings. The dependency and Unicode conformance data are pinned.
+#[must_use]
+pub fn normalize_text(value: &str) -> String {
+    value.nfc().collect()
 }
 
 impl CanonicalizationVersion {
@@ -61,13 +77,17 @@ const TAG_LIST_OF_STRING: u8 = 0x04;
 const TAG_RECORD: u8 = 0x05;
 
 /// Canonicalize an attribute set under the given version.
-pub fn canonicalize(version: CanonicalizationVersion, attrs: &AttributeSet) -> CanonicalForm {
-    match version {
-        CanonicalizationVersion::V1 => canonicalize_v1(attrs),
-    }
+pub fn canonicalize(
+    _version: CanonicalizationVersion,
+    attrs: &AttributeSet,
+) -> Result<CanonicalForm, CanonicalizationError> {
+    let normalized = crate::attr::normalize_attributes(attrs)?;
+    let mut buf = Vec::new();
+    encode_map(&mut buf, &normalized.0);
+    Ok(CanonicalForm(buf))
 }
 
-/// V1 canonicalization.
+/// V2 canonicalization.
 ///
 /// Encoding: for each entry in the `BTreeMap` (which iterates in sorted key
 /// order):
@@ -85,12 +105,6 @@ pub fn canonicalize(version: CanonicalizationVersion, attrs: &AttributeSet) -> C
 ///   + NFC UTF-8 bytes). No per-element tag — the list is homogeneous.
 /// - Record: recursive — canonicalize the inner `BTreeMap` as a nested
 ///   attribute set (same key+value encoding, sorted).
-fn canonicalize_v1(attrs: &AttributeSet) -> CanonicalForm {
-    let mut buf = Vec::new();
-    encode_map(&mut buf, &attrs.0);
-    CanonicalForm(buf)
-}
-
 fn encode_map(buf: &mut Vec<u8>, map: &std::collections::BTreeMap<String, AttributeValue>) {
     for (key, value) in map {
         encode_string_raw(buf, key);
@@ -155,7 +169,7 @@ mod tests {
     #[test]
     fn empty_attribute_set_produces_empty_bytes() {
         let attrs = AttributeSet::new();
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert!(form.bytes().is_empty());
     }
 
@@ -165,8 +179,8 @@ mod tests {
         attrs.insert("tenant", AttributeValue::String("acme".into()));
         attrs.insert("priority", AttributeValue::I64(42));
 
-        let a = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let b = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let a = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let b = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert_eq!(a, b);
     }
 
@@ -181,8 +195,8 @@ mod tests {
         b.insert("z", AttributeValue::Bool(true));
 
         assert_eq!(
-            canonicalize(CanonicalizationVersion::V1, &a),
-            canonicalize(CanonicalizationVersion::V1, &b),
+            canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
+            canonicalize(CanonicalizationVersion::V2, &b).unwrap(),
         );
     }
 
@@ -196,8 +210,8 @@ mod tests {
         b.insert("name", AttributeValue::String("e\u{0301}".into()));
 
         assert_eq!(
-            canonicalize(CanonicalizationVersion::V1, &a),
-            canonicalize(CanonicalizationVersion::V1, &b),
+            canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
+            canonicalize(CanonicalizationVersion::V2, &b).unwrap(),
         );
     }
 
@@ -210,8 +224,8 @@ mod tests {
         b.insert("x", AttributeValue::I64(2));
 
         assert_ne!(
-            canonicalize(CanonicalizationVersion::V1, &a),
-            canonicalize(CanonicalizationVersion::V1, &b),
+            canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
+            canonicalize(CanonicalizationVersion::V2, &b).unwrap(),
         );
     }
 
@@ -224,8 +238,8 @@ mod tests {
         b.insert("x", AttributeValue::String("1".into()));
 
         assert_ne!(
-            canonicalize(CanonicalizationVersion::V1, &a),
-            canonicalize(CanonicalizationVersion::V1, &b),
+            canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
+            canonicalize(CanonicalizationVersion::V2, &b).unwrap(),
         );
     }
 
@@ -237,10 +251,10 @@ mod tests {
         let mut attrs = AttributeSet::new();
         attrs.insert("outer", AttributeValue::Record(inner));
 
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert!(!form.bytes().is_empty());
 
-        let again = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let again = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert_eq!(form, again);
     }
 
@@ -252,10 +266,10 @@ mod tests {
             AttributeValue::ListOfString(vec!["a".into(), "b".into(), "c".into()]),
         );
 
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert!(!form.bytes().is_empty());
 
-        let again = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let again = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         assert_eq!(form, again);
     }
 
@@ -264,8 +278,8 @@ mod tests {
         for &val in &[i64::MIN, -1, 0, 1, i64::MAX] {
             let mut attrs = AttributeSet::new();
             attrs.insert("n", AttributeValue::I64(val));
-            let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-            let again = canonicalize(CanonicalizationVersion::V1, &attrs);
+            let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+            let again = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
             assert_eq!(form, again);
         }
     }
@@ -279,13 +293,13 @@ mod tests {
         b.insert("flag", AttributeValue::Bool(false));
 
         assert_ne!(
-            canonicalize(CanonicalizationVersion::V1, &a),
-            canonicalize(CanonicalizationVersion::V1, &b),
+            canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
+            canonicalize(CanonicalizationVersion::V2, &b).unwrap(),
         );
     }
 
     #[test]
     fn version_le_bytes() {
-        assert_eq!(CanonicalizationVersion::V1.as_le_bytes(), [1, 0, 0, 0]);
+        assert_eq!(CanonicalizationVersion::V2.as_le_bytes(), [2, 0, 0, 0]);
     }
 }

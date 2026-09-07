@@ -10,8 +10,9 @@ fuzz_target!(|data: &[u8]| {
             for (k, v) in &map {
                 attrs.insert(k.as_str(), AttributeValue::String(v.clone()));
             }
-            let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-            let _ = keyrack_core::lid::Lid::derive(CanonicalizationVersion::V1, &form);
+            if let Ok(form) = canonicalize(CanonicalizationVersion::V2, &attrs) {
+                let _ = keyrack_core::lid::Lid::derive(CanonicalizationVersion::V2, &form);
+            }
         }
     }
 });

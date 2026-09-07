@@ -17,7 +17,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-unicode-normalization = "0.1"
+unicode-normalization = "=0.1.25"
 zeroize = { version = "1", features = ["derive"] }
 
 # YAML parsing for rule/namespace config
