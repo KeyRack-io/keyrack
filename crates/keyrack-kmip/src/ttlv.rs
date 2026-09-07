@@ -79,9 +79,13 @@ pub mod tag {
     pub const BATCH_COUNT: u32 = 0x0042_000D;
     pub const BATCH_ITEM: u32 = 0x0042_000F;
     pub const OPERATION: u32 = 0x0042_005C;
+    // KMIP assigns tags in alphabetical order of item name, so Result Message,
+    // Result Reason and Result Status are consecutive and precede Revocation
+    // Message (0x420080) and Revocation Reason (0x420081). Reason and Message
+    // previously held those two Revocation values.
+    pub const RESULT_MESSAGE: u32 = 0x0042_007D;
+    pub const RESULT_REASON: u32 = 0x0042_007E;
     pub const RESULT_STATUS: u32 = 0x0042_007F;
-    pub const RESULT_REASON: u32 = 0x0042_0080;
-    pub const RESULT_MESSAGE: u32 = 0x0042_0081;
     pub const REQUEST_PAYLOAD: u32 = 0x0042_0079;
     pub const RESPONSE_PAYLOAD: u32 = 0x0042_007C;
     pub const UNIQUE_ID: u32 = 0x0042_0094;
@@ -101,7 +105,8 @@ pub mod tag {
     pub const HASHING_ALGORITHM: u32 = 0x0042_0038;
     pub const DIGITAL_SIGNATURE_ALGORITHM: u32 = 0x0042_00AE;
     pub const SIGNATURE_DATA: u32 = 0x0042_00C3;
-    pub const MAC_DATA: u32 = 0x0042_00C4;
+    // 0x4200C4 is Data Length and 0x4200C5 is Random IV; MAC Data is 0x4200C6.
+    pub const MAC_DATA: u32 = 0x0042_00C6;
 }
 
 /// KMIP operation enum values.

@@ -24,6 +24,27 @@
 //! over TLS using TTLV wire encoding. Connections are established
 //! lazily and held behind a lock for serialized access; connection
 //! pooling is a future enhancement.
+//!
+//! # Additional authenticated data is not supported
+//!
+//! KMIP 2.1 does define the transport for AAD: `Authenticated Encryption
+//! Additional Data` (tag `0x4200FE`) is an optional field of both the Encrypt
+//! and the Decrypt request payload, paired with `Authenticated Encryption Tag`
+//! (`0x4200FF`), which the server returns on Encrypt and which the client must
+//! replay on Decrypt (OASIS KMIP 2.1 §6.1.16, §6.1.17, §7.3, §7.4).
+//!
+//! This client implements neither half of that exchange. It sends no AAD field,
+//! and it neither captures the Authenticated Encryption Tag from an Encrypt
+//! response nor returns it on Decrypt — so even if the AAD were transmitted,
+//! there would be no tag through which the binding could be verified, and
+//! whether a given server honours the field at all is a per-server capability
+//! this client never probes.
+//!
+//! Consequently [`KmipProvider::encrypt`] and [`KmipProvider::decrypt`] **reject
+//! a non-empty `aad`** rather than dropping it. A caller that supplies an
+//! encryption context is asserting a binding that this provider cannot deliver;
+//! failing tells them so, whereas succeeding would not. An empty `aad` asserts
+//! no binding and is still accepted.
 
 use crate::connection::KmipConnection;
 use crate::messages;
@@ -40,7 +61,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 /// Configuration for a KMIP connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deliberately does **not** derive `Debug`: it holds `password` in plain
+/// text, and a derived `Debug` puts that password into any log line or error
+/// that formats the config. `Pkcs11ProviderConfig` omits `Debug` for the same
+/// reason.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KmipProviderConfig {
     /// KMIP server endpoint (e.g. `kmip://hsm.example.com:5696`).
     pub endpoint: String,
@@ -154,6 +180,28 @@ impl KmipProvider {
             }
         })
     }
+
+    /// Fail closed when the caller supplies additional authenticated data.
+    ///
+    /// See the module documentation: this client transmits neither the KMIP
+    /// `Authenticated Encryption Additional Data` field nor the
+    /// `Authenticated Encryption Tag` that would authenticate it, so a
+    /// non-empty `aad` cannot be bound to the ciphertext. Refusing keeps the
+    /// caller's belief and the cryptographic reality in agreement; silently
+    /// discarding it would not. An empty `aad` binds nothing and is accepted.
+    fn reject_unbindable_aad(aad: &[u8], operation: &str) -> Result<()> {
+        if aad.is_empty() {
+            return Ok(());
+        }
+        Err(KeyRackError::Provider(format!(
+            "kmip provider cannot bind additional authenticated data: {operation} was given \
+             {} byte(s) of AAD, but this client does not transmit the KMIP Authenticated \
+             Encryption Additional Data field and cannot verify the Authenticated Encryption \
+             Tag. Refusing rather than discarding the encryption context — use a provider that \
+             supports AAD, or call with an empty AAD if no binding is required.",
+            aad.len()
+        )))
+    }
 }
 
 #[async_trait]
@@ -196,8 +244,10 @@ impl CryptoProvider for KmipProvider {
         &self,
         handle: &KeyHandle,
         plaintext: &[u8],
-        _aad: &[u8],
+        aad: &[u8],
     ) -> Result<EncryptOutput> {
+        Self::reject_unbindable_aad(aad, "encrypt")?;
+
         let request = messages::encrypt_request(
             &handle.key_id,
             plaintext,
@@ -237,8 +287,10 @@ impl CryptoProvider for KmipProvider {
         &self,
         handle: &KeyHandle,
         ciphertext: &[u8],
-        _aad: &[u8],
+        aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
+        Self::reject_unbindable_aad(aad, "decrypt")?;
+
         // For AES-GCM, the first 12 bytes are the IV.
         let (iv, ct) = if matches!(handle.key_spec, KeySpec::Aes256) && ciphertext.len() > 12 {
             (&ciphertext[..12], &ciphertext[12..])
@@ -437,6 +489,89 @@ mod tests {
         assert!(
             !caps.supports_atomic_re_encrypt,
             "supports_atomic_re_encrypt must be false without a re_encrypt override"
+        );
+    }
+
+    fn test_handle() -> KeyHandle {
+        KeyHandle {
+            key_id: "kmip-key-1".into(),
+            key_spec: KeySpec::Aes256,
+        }
+    }
+
+    // ── AAD contract ────────────────────────────────────────────────
+    //
+    // These tests run in-process under `cargo test --workspace`; they need no
+    // KMIP server. `test_config` points at a port nothing is listening on, so
+    // an assertion that the error names the AAD problem — rather than a
+    // connection failure — is itself the proof that the request was refused
+    // before it could reach the wire and lose the caller's context.
+
+    #[test]
+    fn empty_aad_is_accepted_by_the_guard() {
+        assert!(
+            KmipProvider::reject_unbindable_aad(&[], "encrypt").is_ok(),
+            "an empty AAD asserts no binding and must remain usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypt_rejects_non_empty_aad() {
+        let provider = KmipProvider::new(test_config());
+        let err = provider
+            .encrypt(&test_handle(), b"plaintext", b"tenant=acme")
+            .await
+            .expect_err("non-empty AAD must be refused, not silently discarded");
+
+        assert!(
+            matches!(err, KeyRackError::Provider(_)),
+            "expected a provider error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("additional authenticated data") && msg.contains("encrypt"),
+            "error must name the unsupported AAD binding and the operation: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_rejects_non_empty_aad() {
+        let provider = KmipProvider::new(test_config());
+        let err = provider
+            .decrypt(&test_handle(), b"ciphertext", b"tenant=acme")
+            .await
+            .expect_err("non-empty AAD must be refused, not silently discarded");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("additional authenticated data") && msg.contains("decrypt"),
+            "error must name the unsupported AAD binding and the operation: {msg}"
+        );
+    }
+
+    // `re_encrypt` and `generate_data_key` use the trait's default
+    // implementations, which compose `encrypt`/`decrypt` — so they must inherit
+    // the refusal rather than route around it. `re_encrypt` decrypts first, so
+    // the guard is reachable without a server; `generate_data_key` calls
+    // `generate_random` first, so it only fails once the server has been
+    // contacted and is therefore not covered in-process here.
+    #[tokio::test]
+    async fn re_encrypt_inherits_the_aad_refusal() {
+        let provider = KmipProvider::new(test_config());
+        let err = provider
+            .re_encrypt(
+                &test_handle(),
+                b"ciphertext",
+                b"tenant=acme",
+                &test_handle(),
+                b"tenant=acme",
+            )
+            .await
+            .expect_err("re_encrypt must not launder a non-empty AAD");
+
+        assert!(
+            err.to_string().contains("additional authenticated data"),
+            "expected the AAD refusal to propagate, got: {err}"
         );
     }
 

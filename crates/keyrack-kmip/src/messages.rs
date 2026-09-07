@@ -275,6 +275,34 @@ mod tests {
         assert_eq!(major.as_integer(), Some(2));
     }
 
+    /// A server's failure text is only reachable if `RESULT_MESSAGE` names the
+    /// tag the server actually writes. This response is built from the spec
+    /// values rather than from the constants, so it fails if they drift again.
+    #[test]
+    fn result_message_is_read_from_the_tag_servers_write() {
+        const SPEC_RESULT_MESSAGE: u32 = 0x0042_007D;
+        const SPEC_RESULT_STATUS: u32 = 0x0042_007F;
+
+        let response = crate::ttlv::structure(
+            tag::RESPONSE_MESSAGE,
+            vec![crate::ttlv::structure(
+                tag::BATCH_ITEM,
+                vec![
+                    crate::ttlv::enumeration(SPEC_RESULT_STATUS, 1),
+                    crate::ttlv::text_string(SPEC_RESULT_MESSAGE, "key state not permitted"),
+                ],
+            )],
+        );
+
+        let parsed = parse_response(&response).unwrap();
+        assert_eq!(
+            parsed.result_message.as_deref(),
+            Some("key state not permitted"),
+            "the server's failure text must survive parsing; \
+             a wrong RESULT_MESSAGE tag silently degrades every error to \"unknown error\""
+        );
+    }
+
     #[test]
     fn encrypt_request_round_trip() {
         let msg = encrypt_request("key-1", b"plaintext", None, Some(block_cipher_mode::GCM));

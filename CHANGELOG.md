@@ -4,6 +4,63 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **KMIP server error messages are now readable.** Three TTLV tag constants in
+  the KMIP client were wrong. Because KMIP assigns tags in alphabetical order of
+  item name, `RESULT_MESSAGE` and `RESULT_REASON` held the values for
+  *Revocation Reason* (`0x420081`) and *Revocation Message* (`0x420080`) instead
+  of `0x42007D` and `0x42007E`, and `MAC_DATA` held *Data Length* (`0x4200C4`)
+  instead of `0x4200C6`. `RESULT_MESSAGE` was live: `parse_response` looks it up
+  on every response, so a server's failure text was never found and every KMIP
+  error surfaced as `"unknown error"`. Diagnosing a KMIP-backed deployment was
+  effectively impossible. `RESULT_REASON` and `MAC_DATA` had no call sites yet
+  and were latent. The bundled KMIP server had all three correct, so client and
+  server disagreed on the wire.
+- **BREAKING (behaviour): the KMIP provider no longer discards additional
+  authenticated data.** `KmipProvider::encrypt` and `KmipProvider::decrypt`
+  accepted an `aad` argument and never transmitted it, so every caller that
+  supplied an encryption context against a KMIP-backed key believed in a
+  binding that did not exist. KMIP 2.1 does define the transport
+  (`Authenticated Encryption Additional Data`, tag `0x4200FE`, paired with
+  `Authenticated Encryption Tag`, `0x4200FF`), but this client implements
+  neither the AAD field nor the tag exchange that would authenticate it, so
+  the binding cannot be delivered or verified. Both operations now **fail
+  closed** on a non-empty `aad`; an empty `aad` asserts no binding and still
+  succeeds. `re_encrypt` and `generate_data_key` inherit the refusal through
+  the default trait implementations. A deployment that was passing an
+  encryption context to a KMIP-backed key was already not getting one and will
+  now see the operation rejected instead of silently unbound.
+- **BREAKING (behaviour): REST `DisableKey` now cascades to descendants, as
+  gRPC already did.** The gRPC handler walked the key hierarchy and disabled
+  every enabled descendant, emitted a `kms:CascadeDisable` audit record, and
+  published a NATS state-changed event; the REST handler transitioned only the
+  target key and left the entire subtree enabled and usable. The admin CLI
+  speaks gRPC, which is why the gap went unnoticed. Both surfaces now call a
+  single `domain::disable_key`, so they share the traversal, the fail-closed
+  behaviour on a descendant write failure, the audit records, and the NATS
+  events. A deployment that disabled keys over REST should expect descendants
+  that were previously left enabled to be disabled from now on; existing keys
+  are not retroactively re-evaluated.
+- **REST `RotateKey` now queues descendant rotation jobs, as gRPC already
+  did**, via the same single `domain::rotate_key`. A key rotated over REST
+  previously left every dependent bound to the superseded version with no
+  `RotationJob` scheduled to re-key it. REST's error body for rotating a
+  non-`Enabled` key keeps its `409` status but its `error` field changes from
+  `InvalidState` to `FailedPrecondition`, which is the shared mapper's spelling.
+- **Rotation now reports the number of descendant jobs it actually created.**
+  The recursive walk incremented its job counter even when
+  `create_rotation_job` failed, so the log line told operators a job was queued
+  for a dependent that had none. Failures are counted separately and logged at
+  `error` naming the dependents that will not be re-keyed. The rotation itself
+  still succeeds, because the new key version is already committed by that
+  point and failing the call would report a rotation that did happen.
+- **`KmipProviderConfig` no longer derives `Debug`.** It holds `password` in
+  plain text, so any log line or error that formatted the config leaked the
+  KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`
+  entirely. Callers that were formatting the config with `{:?}` will no longer
+  compile.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave

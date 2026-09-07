@@ -7080,3 +7080,276 @@ async fn rest_re_encrypt_refused_when_key_state_forbids_the_direction() {
         "a disabled source still permits decrypt and must not be refused on state"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// DisableKey cascade — gRPC/REST parity
+//
+// gRPC's DisableKey walked the hierarchy and disabled every enabled
+// descendant. REST's transitioned the target key and left the entire subtree
+// enabled and usable, so the cascade the compliance documentation relies on
+// held on one surface and not the other. The admin CLI speaks gRPC, which is
+// why the REST gap stayed invisible. Both surfaces now run the single
+// `domain::disable_key`, so this test fails if either one drifts again.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create a key whose `parent_key_id` is `parent`, and return its key id.
+async fn create_child_key(svc: &keyrack_service::grpc::KeyServiceImpl, parent: &str) -> String {
+    svc.create_key(Request::new(proto::CreateKeyRequest {
+        key_spec: proto::KeySpec::Aes256.into(),
+        description: "cascade descendant".into(),
+        parent_key_id: Some(parent.to_owned()),
+        ..Default::default()
+    }))
+    .await
+    .expect("create child key")
+    .into_inner()
+    .metadata
+    .expect("metadata")
+    .key_id
+}
+
+/// Seed `root -> child -> grandchild`. Two generations, so the test covers the
+/// recursive walk and not merely the direct-children case.
+async fn seed_three_generations(
+    svc: &keyrack_service::grpc::KeyServiceImpl,
+) -> (String, String, String) {
+    let root = create_aes_key(svc).await;
+    let child = create_child_key(svc, &root).await;
+    let grandchild = create_child_key(svc, &child).await;
+    (root, child, grandchild)
+}
+
+#[tokio::test]
+async fn cross_surface_disable_cascade_parity() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    // Two independent three-generation trees, one disabled over each surface.
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+
+    // ── gRPC path ──
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: grpc_root.clone(),
+    }))
+    .await
+    .expect("gRPC disable_key");
+
+    // ── REST path ──
+    let app = keyrack_service::rest::router(state.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{rest_root}/actions-disable"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "REST disable must succeed, got {}",
+        resp.status()
+    );
+
+    // The two subtrees must end up in identical states, generation by
+    // generation. Comparing REST against gRPC rather than against a literal is
+    // the point: it is the divergence that is the defect.
+    for (generation, grpc_id, rest_id) in [
+        ("root", &grpc_root, &rest_root),
+        ("child", &grpc_child, &rest_child),
+        ("grandchild", &grpc_grandchild, &rest_grandchild),
+    ] {
+        let via_grpc = key_state(&state, grpc_id).await;
+        let via_rest = key_state(&state, rest_id).await;
+        assert_eq!(
+            via_grpc,
+            keyrack_core::key::KeyState::Disabled,
+            "gRPC disable must reach the {generation}"
+        );
+        assert_eq!(
+            via_rest, via_grpc,
+            "REST disable must leave the {generation} in the same state as gRPC \
+             (REST used to cascade to nothing)"
+        );
+    }
+
+    // Performing the cascade is not enough — both surfaces must record it, or
+    // the audit trail disagrees with the key states depending on which surface
+    // the operator used.
+    let cascade_events: Vec<_> = audit
+        .events()
+        .into_iter()
+        .filter(|e| e.action == keyrack_core::audit::AuditAction::CascadeDisable)
+        .collect();
+    assert_eq!(
+        cascade_events.len(),
+        2,
+        "each surface must emit exactly one CascadeDisable audit record, got {}",
+        cascade_events.len()
+    );
+    let audited: Vec<_> = cascade_events
+        .iter()
+        .map(|e| e.resource.id.clone())
+        .collect();
+    assert!(
+        audited.contains(&grpc_root) && audited.contains(&rest_root),
+        "both cascade records must name the root they cascaded from: {audited:?}"
+    );
+}
+
+/// A descendant that is not `Enabled` must not fail the cascade, and both
+/// surfaces must treat it the same way.
+///
+/// Note what this pins and what it does not. The shared walk enqueues a
+/// descendant only when it was itself `Enabled` and transitioned, so a
+/// non-`Enabled` child **truncates the walk** and anything below it stays
+/// enabled under a disabled root. That is a real gap, and it is pre-existing
+/// gRPC behaviour, not something REST introduced — this change was scoped to
+/// making the two surfaces agree, so the gap is reported rather than silently
+/// redefined here. This test locks the two surfaces together so that whoever
+/// fixes the truncation fixes it for both at once.
+#[tokio::test]
+async fn cross_surface_disable_cascade_handles_non_enabled_descendants_alike() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    // Two identical trees, each with the middle generation put into a state
+    // that cannot transition to Disabled.
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+    for child in [&grpc_child, &rest_child] {
+        svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            key_id: child.clone(),
+            grace_period_days: 7,
+        }))
+        .await
+        .expect("schedule child deletion");
+    }
+
+    svc.disable_key(Request::new(proto::DisableKeyRequest {
+        key_id: grpc_root.clone(),
+    }))
+    .await
+    .expect("gRPC disable must not fail on a non-Enabled descendant");
+
+    let app = keyrack_service::rest::router(state.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{rest_root}/actions-disable"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "REST disable must not fail on a non-Enabled descendant, got {}",
+        resp.status()
+    );
+
+    for (generation, grpc_id, rest_id) in [
+        ("root", &grpc_root, &rest_root),
+        ("child", &grpc_child, &rest_child),
+        ("grandchild", &grpc_grandchild, &rest_grandchild),
+    ] {
+        assert_eq!(
+            key_state(&state, rest_id).await,
+            key_state(&state, grpc_id).await,
+            "the two surfaces must agree on the {generation} when a descendant \
+             cannot transition"
+        );
+    }
+
+    assert_eq!(
+        key_state(&state, &grpc_child).await,
+        keyrack_core::key::KeyState::PendingDeletion,
+        "a pending-deletion child must be left alone, not forced to Disabled"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RotateKey descendant jobs — gRPC/REST parity
+//
+// gRPC's RotateKey walked the hierarchy and queued a RotationJob per
+// descendant so the rotation worker could re-key them. REST's created none, so
+// a key rotated over REST left every dependent bound to the superseded version
+// with nothing scheduled to fix that. Both surfaces now run the single
+// `domain::rotate_key`.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Rotation jobs recorded against `parent`, by dependent LID.
+async fn rotation_job_dependents(state: &ServiceState, parent: &str) -> Vec<String> {
+    let parent_lid: keyrack_core::lid::Lid = parent.parse().expect("parse lid");
+    let mut dependents: Vec<String> = state
+        .storage
+        .list_rotation_jobs(None)
+        .await
+        .expect("list rotation jobs")
+        .into_iter()
+        .filter(|j| j.parent_lid == parent_lid)
+        .map(|j| j.dependent_lid.to_string())
+        .collect();
+    dependents.sort();
+    dependents
+}
+
+#[tokio::test]
+async fn cross_surface_rotate_descendant_jobs_parity() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let (state, _pdp, _audit) = build_test_state();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+
+    // ── gRPC path ──
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: grpc_root.clone(),
+    }))
+    .await
+    .expect("gRPC rotate_key");
+
+    // ── REST path ──
+    let app = keyrack_service::rest::router(state.clone());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{rest_root}/actions-rotate"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "REST rotate must succeed, got {}",
+        resp.status()
+    );
+
+    let via_grpc = rotation_job_dependents(&state, &grpc_root).await;
+    let via_rest = rotation_job_dependents(&state, &rest_root).await;
+
+    let mut expected_grpc = vec![grpc_child.clone(), grpc_grandchild.clone()];
+    expected_grpc.sort();
+    assert_eq!(
+        via_grpc, expected_grpc,
+        "gRPC rotate must queue a job for every descendant, recursively"
+    );
+
+    let mut expected_rest = vec![rest_child.clone(), rest_grandchild.clone()];
+    expected_rest.sort();
+    assert_eq!(
+        via_rest, expected_rest,
+        "REST rotate must queue the same descendant jobs as gRPC (it used to \
+         queue none)"
+    );
+    assert_eq!(
+        via_rest.len(),
+        via_grpc.len(),
+        "the two surfaces must queue the same number of descendant jobs"
+    );
+}
