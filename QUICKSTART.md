@@ -69,13 +69,31 @@ cargo build --release -p keyrack-service
 
 ### 2. Start the service
 
-With no config file, KeyRack starts with sensible defaults: in-memory
-storage, software crypto provider, no authentication, and `always_allow`
-authorization. No PDP needed.
+KeyRack has no default authorization policy: it refuses to start unless the
+config says what the authorization decision is. That includes saying you want
+none, which is what this quickstart does.
 
 ```bash
-./target/release/keyrack-service
+cat > keyrack.yaml <<'EOF'
+storage:
+  type: memory
+provider:
+  type: software
+authn:
+  type: insecure
+# Local experimentation only: disables authorization entirely. The service logs
+# a prominent warning while this is set. Use a `cedar`, `http`, or `grpc` PDP
+# for anything holding real keys.
+pdp:
+  type: always_allow
+EOF
+
+KEYRACK_CONFIG=keyrack.yaml ./target/release/keyrack-service
 ```
+
+Everything else uses defaults: in-memory storage, the software crypto provider,
+no authentication, and audit events to stdout. Those audit events are BLAKE3
+hash-chained even in this minimal setup — see step 4.
 
 The service listens on:
 - gRPC: `[::1]:50051`
@@ -99,6 +117,30 @@ curl -s "http://localhost:8080/v1/keys/$KEY_ID/actions-decrypt" \
   -X POST -H 'Content-Type: application/json' \
   -d "{\"ciphertext_blob\": \"$CIPHERTEXT\"}" | jq -r '.plaintext' | base64 -d
 ```
+
+### 4. Verify the audit chain
+
+Point the audit sink at a file and every event is linked into a BLAKE3 hash
+chain. Change `audit:` in `keyrack.yaml`:
+
+```yaml
+audit:
+  type: file
+  path: audit.jsonl
+```
+
+Then, after running some operations:
+
+```bash
+cargo build --release -p keyrack-cli
+./target/release/keyrack audit verify audit.jsonl
+```
+
+No key is needed: the chain is maintained unconditionally, so any edit to an
+earlier event is detectable from the log alone. Adding `sign_audit_events: true`
+plus an `audit_signing_key_path` layers Ed25519 authenticity on top, which
+`keyrack audit verify --key <keyfile>` then also checks. Chaining gives tamper
+evidence; signing gives authenticity.
 
 ---
 

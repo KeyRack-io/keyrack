@@ -6,6 +6,54 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **The audit hash chain no longer depends on signing.** `previous_hash` was
+  assigned in exactly one place, `AuditSigner::sign_event`, and
+  `sign_audit_events` defaults to `false`. A default deployment therefore wrote
+  an audit log with no signatures *and* no chain, while the `previous_hash`
+  field stayed in the schema implying tamper evidence that was not being
+  produced. Chaining is now unconditional: it is owned by a new `AuditChain`
+  and applied by a new `ChainingAuditSink` when signing is off, and
+  `AuditSigner` composes the same chain when signing is on. Chaining gives
+  tamper evidence, signing gives authenticity, and the two are now separately
+  available. The signed chain rule is byte-for-byte unchanged — a signed event
+  still links via BLAKE3 over the predecessor's signature hex — so logs written
+  by earlier versions verify exactly as before. An unsigned event links via
+  BLAKE3 over its canonical JSON, which is precisely the bytes the sink wrote,
+  so an unsigned chain is re-derivable from the log with no key.
+- **`keyrack audit verify` no longer requires a signing key.** `--key` is now
+  optional. Without it the command checks the hash chain alone, which is the
+  only mode available to a deployment that has not enabled signing — the same
+  deployments that previously had no chain to check. With `--key` it checks the
+  chain and the Ed25519 signatures, as before. The summary line states which
+  checks ran, so a chain-only pass is not mistakable for an authenticity pass.
+- **BREAKING (config): `sign_audit_events: true` now requires a persistent
+  signing key.** The signing key path defaulted to `None`, and the service then
+  generated a fresh Ed25519 key on every startup, so nothing written before a
+  restart could ever be verified — signing was configured but its stated
+  property did not hold. Enabling signing now requires `audit_signing_key_path`
+  (created on first start if absent). A deployment that genuinely wants a
+  throwaway key must set the new `audit_signing_key_ephemeral: true`, which logs
+  a `WARN` at every startup. Three demos that enabled signing without a key path
+  now set the flag explicitly.
+- **BREAKING (config): omitting the `pdp:` block is now a startup error.**
+  `ServiceConfig::pdp` carried a serde default and `AlwaysAllow` was the
+  `#[default]` variant, so a config with no `pdp:` block silently disabled
+  authorization with no warning. `PdpConfig` no longer implements `Default` and
+  the field is now optional at parse time and mandatory at startup: the service
+  refuses to serve and prints the accepted variants. This also closes the
+  built-in-defaults path used when `KEYRACK_CONFIG` is unset. `always_allow`
+  remains available but must be written out, and now logs a prominent `WARN`
+  naming it on every startup. Scope note: no shipped config omitted `pdp:`, so
+  this was a latent trap rather than a live hole — every demo, docker, and
+  example config already set it explicitly.
+- **`docs/FORMAL_VERIFICATION.md` no longer documents a Kani harness that does
+  not exist.** The doc told readers to run
+  `cargo kani -p keyrack-core --harness audit_event_serialization_no_plaintext_leak`;
+  no such harness exists in `crates/keyrack-core/`. The property is a proptest,
+  and the doc's own limitations section explains why it cannot be a Kani
+  harness. The instruction is corrected to point at the proptest, and
+  `crates/keyrack-core/tests/doc_claims.rs` now asserts that every `--harness`
+  name in the document resolves to a real `#[kani::proof]`.
 - **KMIP server error messages are now readable.** Three TTLV tag constants in
   the KMIP client were wrong. Because KMIP assigns tags in alphabetical order of
   item name, `RESULT_MESSAGE` and `RESULT_REASON` held the values for

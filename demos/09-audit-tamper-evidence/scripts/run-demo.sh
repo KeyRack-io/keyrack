@@ -201,6 +201,48 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
+#  PART 5 — Chain-only verification: no signing key involved
+# ══════════════════════════════════════════════════════════════════════
+#
+# KeyRack maintains the hash chain whether or not signing is enabled, so
+# tamper evidence must be checkable with no key at all. This is the mode every
+# deployment that has not turned on signing depends on.
+
+banner "Part 5: Verify the chain with NO key (expect PASS, then chain FAIL)"
+
+step "Running: keyrack audit verify ${AUDIT_LOG}   (no --key)"
+NOKEY_OUT=$(keyrack audit verify "${AUDIT_LOG}" 2>&1) && NOKEY_RC=0 || NOKEY_RC=$?
+echo "${NOKEY_OUT}"
+if [ "${NOKEY_RC}" -eq 0 ]; then
+  ok "Clean log verified with no key (exit 0)"
+else
+  fail "Chain-only verification FAILED unexpectedly (exit ${NOKEY_RC})"
+  exit 1
+fi
+
+if echo "${NOKEY_OUT}" | grep -q "hash chain only"; then
+  ok "Output states that only the chain was checked (not authenticity)"
+else
+  fail "Output did not distinguish chain-only from signature verification"
+fi
+
+step "Running: keyrack audit verify ${DELETED_LOG}   (no --key)"
+NOKEY_DEL_OUT=$(keyrack audit verify "${DELETED_LOG}" 2>&1) && NOKEY_DEL_RC=0 || NOKEY_DEL_RC=$?
+echo "${NOKEY_DEL_OUT}"
+if [ "${NOKEY_DEL_RC}" -ne 0 ]; then
+  ok "Deletion detected without a key (exit ${NOKEY_DEL_RC})"
+else
+  fail "Deletion was NOT detected without a key — the chain is not doing its job"
+  exit 1
+fi
+
+if echo "${NOKEY_DEL_OUT}" | grep -q "hash chain"; then
+  ok "Keyless output correctly reports 'hash chain break'"
+else
+  fail "Keyless output did not report 'hash chain break'"
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 #  Summary
 # ══════════════════════════════════════════════════════════════════════
 

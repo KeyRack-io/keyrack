@@ -18,8 +18,10 @@ Running KeyRack in production.
 ## Configuration
 
 KeyRack is configured via a YAML file. Point to it with the `KEYRACK_CONFIG`
-environment variable. If unset, the service starts with built-in defaults
-(in-memory storage, software provider, insecure auth — suitable only for dev).
+environment variable. If unset, the service falls back to built-in defaults
+(in-memory storage, software provider, mTLS auth) — but it will not start,
+because there is no default authorization policy and `pdp:` has to be stated
+explicitly. A config file is therefore always required in practice.
 
 ### Minimal configuration
 
@@ -56,7 +58,7 @@ not retained in memory.
 
 | Variable | Description | Default |
 |---|---|---|
-| `KEYRACK_CONFIG` | Path to YAML config file | (built-in defaults) |
+| `KEYRACK_CONFIG` | Path to YAML config file | (built-in defaults, which lack the mandatory `pdp:` and so refuse to start) |
 | `KMS_BOOTSTRAP_TOKEN` | Bootstrap auth token (hashed at startup) | — |
 | `RUST_LOG` | Tracing filter (e.g. `info`, `keyrack_service=debug`) | — |
 
@@ -214,6 +216,13 @@ KeyRack delegates all authorization decisions to an external Policy Decision
 Point. Every operation is checked before execution; the service fails closed
 if the PDP is unreachable.
 
+**`pdp:` is mandatory and has no default.** A config without it is a hard
+startup error — the service refuses to serve rather than fall back to
+permitting everything. The error message lists the accepted variants. This also
+applies to the built-in defaults used when `KEYRACK_CONFIG` is unset, so there
+is no way to reach a running service without having stated the authorization
+decision.
+
 ### HTTP PDP (OPA, Cedar, custom)
 
 ```yaml
@@ -238,6 +247,11 @@ pdp:
 pdp:
   type: always_allow   # or: always_deny
 ```
+
+`always_allow` bypasses authorization for every request. It is accepted only
+when written out like this, and the service logs a `WARN` naming it at every
+startup. Use it for fixtures and local experiments, never for a deployment
+holding real keys.
 
 ### Bundled Cedar PDP
 
@@ -451,29 +465,57 @@ credential swapping on a running listener; perform a rolling restart
 after certificate renewal. The infrastructure is in place for seamless
 reload in a future version.
 
-### Audit event signing
+### Audit tamper evidence and authenticity
 
-Enable Ed25519 tamper-evidence signatures on audit events:
+These are two separate properties, configured separately.
+
+**Hash chaining (tamper evidence) is always on.** Every audit event carries a
+`previous_hash` linking it to its predecessor: BLAKE3 over the preceding
+event's signature hex when signed, and over the preceding event's canonical
+JSON when not. Either preimage is present verbatim in the written log, so the
+chain is re-derivable from the log alone:
+
+```bash
+keyrack audit verify /var/log/keyrack/audit.jsonl
+```
+
+Interior tampering and deletion break every link after the edit and are
+detected with no key and no configuration. Tail-truncation (dropping the latest
+N events) is **not** detectable from the log alone — that needs an external
+anchor, such as periodically recording the current head hash elsewhere.
+
+An unsigned chain does not establish *who* wrote the log: an attacker with
+write access to the whole file can recompute it end to end. That is what
+signing adds.
+
+**Ed25519 signing (authenticity) is opt-in.**
 
 ```yaml
 sign_audit_events: true
-```
-
-On startup the service generates an ephemeral Ed25519 keypair and logs
-the hex-encoded verifying key. Each audit event is signed and includes a
-hash-chain reference to the previous event, ensuring interior tampering
-or deletion is detectable. Tail-truncation (dropping the latest N events)
-is not detectable without an external anchor.
-
-To persist the signing key across restarts (so verifiers can use a stable
-public key), provide a path to a 32-byte Ed25519 seed file:
-
-```yaml
 audit_signing_key_path: "/etc/keyrack/keys/audit-signing.key"
 ```
 
-If not set, an ephemeral key is generated each startup and the verifying
-key is logged at INFO level.
+The key file is 32 raw bytes (an Ed25519 seed), created on first start if it
+does not exist. The hex-encoded verifying key is logged at startup. Verify with:
+
+```bash
+keyrack audit verify /var/log/keyrack/audit.jsonl --key /etc/keyrack/keys/audit-signing.key
+```
+
+`audit_signing_key_path` is **required** whenever `sign_audit_events` is true.
+An ephemeral key would leave every signature written before the last restart
+permanently unverifiable, which is not the property signing advertises, so the
+service refuses to start in that configuration. Development deployments that
+genuinely want a throwaway key must say so:
+
+```yaml
+sign_audit_events: true
+audit_signing_key_ephemeral: true   # development only; logs a WARN each start
+```
+
+Back up the signing key alongside your storage. Losing it does not break the
+chain — tamper evidence survives — but it does make every existing signature
+unverifiable.
 
 ---
 
