@@ -6,6 +6,29 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **PDP responses are now checked against the request they answer.** Both PDP
+  clients returned any response that parsed, without confirming its
+  `request_id` echoed the request's, so a well-formed decision belonging to a
+  *different* authorization request was applied to the operation in hand.
+  Calibrated honestly: this is a correlation gap, not a fail-open one. The
+  non-success status path already returned `Decision::Forbid` and the
+  parse-error path already returned `Err`, so neither failure mode admitted
+  anything; the exploit shape is response substitution or a confused proxy —
+  a shared forward proxy, or a connection-pooling bug that crosses two
+  in-flight authorizations — rather than an unauthenticated allow. It also
+  required a PDP endpoint reachable and trusted enough to answer at all.
+  Uncorrelated responses now fail the operation instead of authorizing it.
+  Validation lives on `AuthzResponse::require_correlated` in `keyrack-core`
+  and is called by both transports, because the gap was present in *both* the
+  HTTP and gRPC clients and a per-transport check is how they drifted in the
+  first place.
+- **BREAKING (PDP implementers, gRPC only): a PDP must echo `request_id`.**
+  HTTP PDPs already had to, since the field is required to deserialize. A gRPC
+  PDP that never set it was previously accepted, because proto3 transmits `""`
+  rather than an absent value, and is now refused with a message naming that
+  specific cause. The bundled Cedar PDP and the `always_allow` / `always_deny`
+  fixtures echo the id by construction and are unaffected.
+
 - **Docs: the audit-detection claim control now matches the claim rather than
   one phrasing of it.** The first version of
   `keyless_audit_claims_state_their_bounds` triggered only on wording that

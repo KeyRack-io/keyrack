@@ -434,12 +434,28 @@ pub struct RequestContext {
 pub struct AuthzResponse {
     pub request_id: String,
     pub decision: Decision,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<PolicyReason>,
+    pub obligations: Vec<Obligation>,
     pub policy_version: Option<String>,
 }
 
 pub enum Decision { Permit, Forbid, Indeterminate }
 ```
+
+### 8.1.1 Response correlation (required)
+
+A PDP **must** echo the request's `request_id` in its response. KeyRack
+refuses any response whose `request_id` does not match the request it was
+sent, on both the HTTP and gRPC transports, and the operation fails rather
+than proceeding on an uncorrelated decision.
+
+This is a hard requirement, not a convention: a decision only describes the
+request it was computed for, so applying one that arrived out of band —
+substituted in transit, or misrouted by a shared proxy or a connection-pooling
+bug — authorizes an operation nobody evaluated. Note that gRPC PDPs must set
+the field explicitly, because proto3 sends `""` rather than an absent value
+when it is left unset, which is indistinguishable from a well-formed response
+until the id is checked.
 
 ### 8.2 System principal
 
@@ -452,7 +468,10 @@ honour it via their own policies.
 - `AlwaysAllow` — always returns `Permit`.
 - `AlwaysDeny` — always returns `Forbid`.
 
-Both are feature-gated for test use only.
+Both are selectable in config as `pdp: { type: always_allow | always_deny }`
+and are not feature-gated. `always_allow` disables authorization entirely and
+must be chosen explicitly — there is no default `pdp:` — and the service logs
+a prominent warning at every startup when it is in use.
 
 ### 8.4 Trait
 

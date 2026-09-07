@@ -300,7 +300,18 @@ impl PolicyDecisionPoint for GrpcPdpClient {
             })?
             .into_inner();
 
-        Ok(response_from_proto(response))
+        let converted = response_from_proto(response);
+
+        converted.require_correlated(request).inspect_err(|_| {
+            tracing::error!(
+                pdp_endpoint = %self.endpoint,
+                request_id = %request.request_id,
+                response_request_id = %converted.request_id,
+                "PDP response does not correlate with the request; refusing it"
+            );
+        })?;
+
+        Ok(converted)
     }
 }
 

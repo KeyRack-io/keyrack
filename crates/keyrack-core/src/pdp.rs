@@ -154,6 +154,45 @@ pub struct AuthzResponse {
 }
 
 impl AuthzResponse {
+    /// Confirm this response answers `request`.
+    ///
+    /// A decision is only meaningful for the request it was computed for, so a
+    /// response whose `request_id` does not echo the one sent is refused
+    /// rather than acted on. Without this, a response substituted in transit
+    /// or misrouted by a shared proxy or a connection-pooling bug is accepted
+    /// as if it described the operation actually being authorized.
+    ///
+    /// Both the HTTP and gRPC clients call this at the point the response
+    /// crosses the trust boundary. It lives here, on the response type, so the
+    /// two transports cannot drift apart in what they consider correlated —
+    /// the gap being closed was present in both.
+    ///
+    /// The bundled PDP implementations (`AlwaysAllow`, `AlwaysDeny`, the Cedar
+    /// engine) echo the id by construction and are unaffected.
+    pub fn require_correlated(&self, request: &AuthzRequest) -> crate::error::Result<()> {
+        if self.request_id == request.request_id {
+            return Ok(());
+        }
+
+        // Called out separately because it is the shape a gRPC PDP that never
+        // sets the field produces: proto3 yields "" rather than an absent
+        // value, so the response looks well-formed.
+        let detail = if self.request_id.is_empty() {
+            "response carries no request_id (a gRPC PDP must echo the field; \
+             proto3 leaves it empty when unset)"
+                .to_string()
+        } else {
+            format!(
+                "response request_id {:?} does not match request {:?}",
+                self.request_id, request.request_id
+            )
+        };
+
+        Err(crate::error::KeyRackError::Other(format!(
+            "PDP protocol violation: {detail}"
+        )))
+    }
+
     /// Extract `rate_limit_class` from the obligations array, if present.
     pub fn rate_limit_class(&self) -> Option<&str> {
         self.obligations
@@ -291,6 +330,67 @@ mod tests {
         let resp = pdp.evaluate(&req).await.unwrap();
         assert_eq!(resp.decision, Decision::Forbid);
         assert!(!resp.reasons.is_empty());
+    }
+
+    fn response_with_id(id: &str) -> AuthzResponse {
+        AuthzResponse {
+            request_id: id.into(),
+            decision: Decision::Permit,
+            reasons: vec![],
+            obligations: vec![],
+            policy_version: None,
+        }
+    }
+
+    #[test]
+    fn correlated_response_is_accepted() {
+        let req = make_test_request(AuditAction::Decrypt);
+        assert!(response_with_id("req-001").require_correlated(&req).is_ok());
+    }
+
+    #[test]
+    fn response_for_another_request_is_refused() {
+        let req = make_test_request(AuditAction::Decrypt);
+        let err = response_with_id("req-999")
+            .require_correlated(&req)
+            .expect_err("a Permit for a different request must not be applied to this one");
+        let msg = err.to_string();
+        assert!(msg.contains("PDP protocol violation"), "got: {msg}");
+        assert!(
+            msg.contains("req-999") && msg.contains("req-001"),
+            "both ids belong in the error so the mismatch is diagnosable: {msg}"
+        );
+    }
+
+    #[test]
+    fn response_without_a_request_id_is_refused() {
+        let req = make_test_request(AuditAction::Decrypt);
+        let err = response_with_id("")
+            .require_correlated(&req)
+            .expect_err("an empty request_id does not correlate");
+        assert!(
+            err.to_string().contains("carries no request_id"),
+            "the proto3 empty-field case gets its own message: {err}"
+        );
+    }
+
+    #[test]
+    fn bundled_pdps_correlate_by_construction() {
+        // The fixtures and the Cedar engine echo the id, so the check is not
+        // load-bearing for them — worth asserting so a refactor that breaks
+        // the echo is caught here rather than in a deployment.
+        let req = make_test_request(AuditAction::CreateKey);
+        let permit = tokio_test_block(AlwaysAllow.evaluate(&req));
+        let deny = tokio_test_block(AlwaysDeny.evaluate(&req));
+        assert!(permit.unwrap().require_correlated(&req).is_ok());
+        assert!(deny.unwrap().require_correlated(&req).is_ok());
+    }
+
+    fn tokio_test_block<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(fut)
     }
 
     #[test]

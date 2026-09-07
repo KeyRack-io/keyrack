@@ -118,14 +118,25 @@ impl PolicyDecisionPoint for HttpPdpClient {
             });
         }
 
-        resp.json::<AuthzResponse>().await.map_err(|e| {
+        let parsed = resp.json::<AuthzResponse>().await.map_err(|e| {
             tracing::error!(
                 pdp_endpoint = %self.endpoint,
                 error = %e,
                 "failed to deserialize PDP response"
             );
             KeyRackError::Other(format!("PDP response parse error: {e}"))
-        })
+        })?;
+
+        parsed.require_correlated(request).inspect_err(|_| {
+            tracing::error!(
+                pdp_endpoint = %self.endpoint,
+                request_id = %request.request_id,
+                response_request_id = %parsed.request_id,
+                "PDP response does not correlate with the request; refusing it"
+            );
+        })?;
+
+        Ok(parsed)
     }
 }
 
