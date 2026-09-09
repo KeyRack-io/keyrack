@@ -1,11 +1,15 @@
 # Private worker output release and cancellation
 
-This is the unpublished harness transport, not a shared IPC revision or a
-canonical `RevocationResult`. The worker does not emit `OutputsSuppressed`.
+This is the unpublished harness transport, not a shared IPC revision. Its release
+gate now supports [authenticated canonical local revocation receipts](REVOCATION_RECEIPTS.md)
+under A2's whole-scope ruling; indeterminate output cannot produce a success receipt.
+[The delivery-state enumeration](REVOCATION_DELIVERY_STATES.md) distinguishes
+retained terminal outcomes, evidence limits, and
+transport faults which cannot support a successful canonical disposition.
 
 ## Release point and exact claim
 
-An operation response has two terminal outcomes: its one-use transport key is
+Under the verified pipe contract, an operation response has two normal terminal outcomes: its one-use transport key is
 committed to the verified pipe, or that key is discarded and the response is
 suppressed. Ciphertext staging is not release of usable output.
 
@@ -36,8 +40,9 @@ kernel enqueue after that deadline. Such a successful write remains committed;
 we do not falsely label it suppressed. Receiver read time is also outside this
 claim. A deterministic test explicitly exercises this case. Any stronger physical
 delivery deadline requires additional OS/transport support and a separately
-reviewed contract; these local outcomes must not be promoted to canonical
-`OutputsSuppressed` or platform-wide completion.
+reviewed contract. The canonical suppression postcondition is scoped to future
+release after the applied fence; it is neither that stronger deadline guarantee
+nor platform-wide completion.
 
 ## Mechanism and bounds
 
@@ -65,12 +70,19 @@ Other platforms and stdout types fail closed. All output comes from this single
 writer. The trusted launcher must not replace or change its descriptors.
 
 At most four jobs queue and three result permits exist, including a writer-held
-result. Plain serialized results are bounded at 65,536 bytes; staging chunks hold
+result. A separate ledger retains authority metadata and terminal phases for at
+most 4,096 admissions per incarnation. Entries contain no output or transport keys
+and are never evicted: when full, new responses are rejected. Restart loses the
+ledger, requires a new incarnation/grants, and proves no prior outcome. Plain serialized results are bounded at 65,536 bytes; staging chunks hold
 256 base64 characters. Existing application/input limits remain. Queue overflow rejects the new response; previously admitted responses remain
 authorized unless even the redacted error cannot queue. I/O failure, failure to
 queue that error and process shutdown discard pending keys and close the stream; EOF
-is terminal cancellation for any result without a capsule. A partial record write
-is a violation of the verified pipe assumption and terminates the process.
+is cancellation only where no capsule bytes could have escaped. A partial record
+write violates the verified pipe assumption and terminates the process. A partial
+capsule can expose its key, so capsule-write faults are retained as indeterminate,
+never inferred suppressed from EOF or an absent permit. The fault latch and capsule
+outcome are set under the release/fence mutex. A valid fence still applies core
+purge on a faulted transport, but returns no successful observation.
 
 The writer checks expiry independently of the current job, including while a
 control response is blocked. Expired keys are discarded without waiting for pipe
@@ -88,7 +100,7 @@ Previously staged output can be cancelled as soon as the fence is validated.
 ## Private records and tests
 
 - `control`: base64 JSON chunks with part/last markers, for public ready metadata,
-  redacted errors, correlated `output suppressed` results and local fence notices.
+  redacted errors, correlated `output suppressed` results and canonical local revocation evidence.
 - `staged`: delivery ID, part/last markers and base64 ciphertext chunks.
 - `release`: delivery ID, worker incarnation, generation, sequence, grant digest
   and one-use key. Only this capsule makes the staged response usable.

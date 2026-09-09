@@ -1,0 +1,23 @@
+[package]
+name = "keyrack-worker-ipc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "ipc_decoder"
+path = "fuzz_targets/ipc_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

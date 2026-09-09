@@ -6,15 +6,25 @@ returning `EACCES` across worker restart and credential rotation. Containers are
 used only by the pre-existing A2 Vault service fixture, not as the identity boundary.
 A local macOS run cannot establish this acceptance result.
 
-`prepare-worker-vault-fixture.py` invokes `worker-supervisor-isolation.py` after the
-normal worker contribution succeeds on Linux. In the A2 PR merge ref, `.github/workflows/ci.yml` job
-`vault-provider` (display name **Vault provider export tests**) invokes
-`test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh
---from-vault-provider-fixture`, which calls the preparation script and then the
-supervisor. The supervisor fixture is exercised inside that job; it has no separate
-CI check name. Linux execution is mandatory: missing sudo, systemd, user tools,
-identity evidence or permissions fails the lane. No new workflow, Vault service,
-ignored live-test name or alternative maintained stack is added.
+The stable **Worker credential isolation** check is job `isolation` in
+`.github/workflows/worker.yml`. It runs `scripts/test-worker-isolation.sh`, which
+requires Linux, sets `KEYRACK_WORKER_ISOLATION=required`, and invokes the existing
+A2 fixture through `test-vault-provider.sh -- bash
+test-worker-vault-contribution.sh --from-vault-provider-fixture`. The preparation
+script runs the worker suite and then `worker-supervisor-isolation.py`.
+
+The job fails on unsupported platforms, missing sudo/systemd/user tools, failed
+identity evidence, missing completion evidence, or a NOT RUN message. Fixture
+success is reported only after cleanup. The workflow has no path or branch filters: it reports on all push, pull-request
+and merge-group events. Repository protection must separately require this stable
+check; the workflow does not change branch protection.
+
+Ordinary Vault-provider contributions default to isolation mode `off` and print
+**NOT RUN** for the supervisor rather than implying isolation passed. Explicit
+`auto` mode supports laptop development (Linux executes, other platforms report
+NOT RUN); `required` mode rejects unsupported platforms. The dedicated check
+always selects `required`. This uses the existing Vault service and original
+provider acceptance tests; it introduces no second maintained Vault stack.
 
 The trusted provisioning controller uses root only for creating/removing the two
 unique accounts, installing a temporary unit, placing credentials and rotating/
@@ -74,7 +84,7 @@ the final host boundary.
 Run through the existing lane on a Linux systemd host:
 
 ```sh
-bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
+bash scripts/test-worker-isolation.sh
 ```
 
 Before a deployment makes the same claim, preserve the demonstrated identity,

@@ -676,3 +676,5 @@ fn slow_open_exceeding_residency_limit_is_denied_even_with_valid_authority() {
     );
     assert!(delayed.resident.is_empty());
 }
+
+mod properties;

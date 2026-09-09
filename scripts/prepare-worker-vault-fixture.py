@@ -5,8 +5,8 @@
 
 No server/container/workflow is created here. The caller is the optional command
 hook in test-vault-provider.sh. This trusted test launcher intentionally has admin
-access. Linux runs additionally invoke the real-user supervisor fixture; ordinary
-same-UID assertions alone are not evidence of deployment isolation.
+access. The dedicated isolation gate requires the real-user supervisor fixture;
+ordinary same-UID assertions alone are not evidence of deployment isolation.
 """
 import json
 import os
@@ -21,7 +21,16 @@ import urllib.request
 import uuid
 
 
+def isolation_requested(mode, platform):
+    if mode not in ("off", "auto", "required"):
+        raise RuntimeError("invalid worker isolation mode")
+    if mode == "required" and platform != "linux":
+        raise RuntimeError("required worker isolation gate needs Linux/systemd; refusing skip")
+    return mode != "off" and platform == "linux"
+
+
 def main():
+    isolation = isolation_requested(os.environ.get("KEYRACK_WORKER_ISOLATION", "off"), sys.platform)
     address = os.environ.get("VAULT_ADDR", "")
     parsed = urllib.parse.urlsplit(address)
     admin = os.environ.get("VAULT_TOKEN", "")
@@ -101,7 +110,7 @@ def main():
             print("Running worker assertions inside the existing Vault provider fixture", flush=True)
             result = subprocess.run(["bash", str(Path(__file__).with_name(
                 "test-worker-vault-contribution.sh"))], env=env, check=False).returncode
-            if result == 0 and sys.platform == "linux":
+            if result == 0 and isolation:
                 # Reuse this live Vault; real host users/systemd provide the
                 # isolation boundary. Linux failure is fatal, never a skip.
                 rotated = request("auth/token/create", {"policies": [worker_policy],
@@ -128,7 +137,7 @@ def main():
                     "worker-supervisor-isolation.py")), str(config_path)], check=False,
                     env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin", "LANG":"C.UTF-8"}).returncode
             elif result == 0:
-                print("Distinct-UID supervisor acceptance NOT RUN: requires a Linux host with systemd and two real OS users", flush=True)
+                print("Distinct-UID supervisor acceptance NOT RUN: use the dedicated required isolation gate on Linux/systemd; ordinary worker tests do not establish isolation", flush=True)
         finally:
             # Revoke only this run's tokens/policies/parent. A2 owns container
             # teardown, including any failed parent-loss test's temporary key.

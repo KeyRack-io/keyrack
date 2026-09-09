@@ -5,39 +5,24 @@ mod core;
 mod credential;
 mod delivery;
 mod fixture;
+mod ipc;
+mod release_state;
 mod source;
 
 use crate::core::creation::CreationPlan;
-use crate::core::{Error, Limits, MonotonicClock, Operation, Signed, Worker};
+use crate::core::{Error, Limits, MonotonicClock, Worker};
+use crate::ipc::{decode, read_frame, Request};
 use crate::source::{LocalFixture, Source, VaultFixture};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 use keyrack_core::custody::Canonical;
 use keyrack_core::{material::ParentWrappedMaterial, wrapping::WrappingIdentifier};
-use serde::Deserialize;
 use serde_json::json;
 use std::{
-    io::{self, BufRead},
+    io,
     sync::{mpsc, Arc},
     time::Duration,
 };
-
-#[derive(Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Generate {
-        grant: String,
-    },
-    Execute {
-        signed: Signed,
-        principal: String,
-        operation: Operation,
-        input: String,
-    },
-    Fence {
-        signed: Signed,
-    },
-}
 
 // Drop stops and joins the writer before the worker's owned state disappears.
 struct Stop<C: core::Clock> {
@@ -125,7 +110,7 @@ fn run() -> Result<(), Error> {
         "context_sha256": core::context_digest(&context)?, "pid": std::process::id(),
         "creation_request": worker.creation_request().map(|r| r.canonical_bytes().map(|b| STANDARD.encode(b))).transpose().map_err(|_| Error::Context)?,
         "custody_context": STANDARD.encode(fixture::custody_context(&context).canonical_bytes().map_err(|_| Error::Context)?),
-        "observation_key": worker.observation_key().map(|k| STANDARD.encode(k.key.as_bytes()))}),
+        "observation_key": STANDARD.encode(worker.observation_key().key.as_bytes())}),
     )?;
     // Bounded queue and bounded frames. Reader owns no credentials or key bytes.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -157,7 +142,7 @@ fn run() -> Result<(), Error> {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         };
-        let result = match serde_json::from_slice::<Request>(&frame) {
+        let result = match decode(&frame) {
             Ok(Request::Generate { grant }) => STANDARD.decode(grant)
                 .map_err(|_| Error::Authority)
                 .and_then(|bytes| worker.generate(&bytes))
@@ -184,39 +169,16 @@ fn run() -> Result<(), Error> {
                 .map_err(|_| Error::Context)
                 .and_then(|input| worker.execute_for_delivery(&signed, &principal, &context, operation, &input))
                 .and_then(|(authority, output)| delivery.enqueue(delivery::Prepared::new(authority, &json!({"output": STANDARD.encode(output.as_slice())}))?)),
-            Ok(Request::Fence { signed }) => delivery
-                .fence(|| worker.fence(&signed))
-                .and_then(|observation| emit(json!({"local_fence": observation}))),
+            Ok(Request::Fence { evidence }) => STANDARD.decode(evidence)
+                .map_err(|_| Error::Authority)
+                .and_then(|bytes| worker.revoke(&bytes, &delivery))
+                .and_then(|observation| emit(json!({"revocation": STANDARD.encode(
+                    observation.canonical_bytes().map_err(|_| Error::Material)?
+                )}))),
             Err(_) => Err(Error::Context),
         };
         if let Err(error) = result {
             emit(json!({"error": error.to_string()}))?;
-        }
-    }
-}
-
-fn read_frame(reader: &mut impl BufRead, output: &mut Vec<u8>) -> Result<(), Error> {
-    loop {
-        let bytes = reader.fill_buf().map_err(|_| Error::Material)?;
-        if bytes.is_empty() {
-            return if output.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::Context)
-            };
-        }
-        let end = bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1);
-        let count = end.unwrap_or(bytes.len());
-        if output.len() + count > 65_536 {
-            return Err(Error::Limit);
-        }
-        output.extend_from_slice(&bytes[..count]);
-        reader.consume(count);
-        if end.is_some() {
-            return Ok(());
         }
     }
 }
@@ -226,16 +188,5 @@ fn main() {
         // Static redacted errors only. Never print request bodies or provider errors.
         eprintln!("{error}");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod frame_tests {
-    use super::*;
-    #[test]
-    fn rejects_oversized_and_truncated_frames() {
-        assert!(read_frame(&mut &vec![b'x'; 65_537][..], &mut Vec::new()).is_err());
-        assert!(read_frame(&mut &b"{}"[..], &mut Vec::new()).is_err());
-        assert!(read_frame(&mut &b"{}\n"[..], &mut Vec::new()).is_ok());
     }
 }

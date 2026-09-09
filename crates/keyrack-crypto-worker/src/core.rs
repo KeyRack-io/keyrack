@@ -1,14 +1,14 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Private custody engine. No public API, persisted format, or integration receipt.
+//! Private custody engine consuming canonical creation and revocation evidence.
 use std::{collections::HashMap, time::Instant};
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use keyrack_core::{
     key::KeySpec,
     material::ParentWrappedMaterial,
@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub(crate) mod creation;
+mod revocation;
 
 pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
@@ -74,12 +75,7 @@ pub(crate) trait MaterialSource {
     fn open(&mut self, context: &WrappingContext) -> Result<Secret, Error>;
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Operation {
-    Encrypt,
-    Decrypt,
-}
+pub(crate) use crate::ipc::{Operation, Signed};
 
 /// Private test-authority body, not a neutral authority contract. All deadlines
 /// are offsets from this worker's monotonic boot, never caller-controlled clocks.
@@ -113,14 +109,6 @@ pub(crate) struct Fence {
 pub(crate) enum AuthorityMessage {
     Grant(Grant),
     Fence(Fence),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Signed {
-    // Signature covers exact bytes, prefixed with a harness-only domain.
-    pub(crate) body: String,
-    pub(crate) signature: Vec<u8>,
 }
 
 pub(crate) const SIGNING_DOMAIN: &[u8] = b"KeyRack:UNAPPROVED-worker-harness-authority\0";
@@ -170,6 +158,7 @@ pub(crate) struct ResidencyCleanup {
     event: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub(crate) struct LocalFenceApplied {
     worker: String,
@@ -190,6 +179,7 @@ pub(crate) struct Worker<S, C> {
     pub(crate) instance: String,
     domain: String,
     verifier: VerifyingKey,
+    observer: SigningKey,
     source: S,
     clock: C,
     limits: Limits,
@@ -224,6 +214,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             instance,
             domain,
             verifier,
+            observer: SigningKey::generate(&mut OsRng),
             source,
             clock,
             limits,
@@ -291,6 +282,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             || grant.context_sha256 != binding
             || grant.operation != operation
             || grant.input_sha256 != digest(input)
+            || context.provider_ref != crate::fixture::context().provider_ref
             || context.security_domain.as_str() != self.domain
             || context.child_spec != KeySpec::Aes256
             || context.key_format != WrappedKeyFormat::RawSecret
@@ -455,6 +447,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn fence(&mut self, signed: &Signed) -> Result<LocalFenceApplied, Error> {
         let AuthorityMessage::Fence(fence) = self.verify(signed)? else {
             return Err(Error::Authority);

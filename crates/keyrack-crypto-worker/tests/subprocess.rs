@@ -9,7 +9,8 @@ use keyrack_core::{
     custody::{
         AuthorityGrant, AuthorityIdentity, AuthorityScope, Canonical, ClockDomain, CreationResult,
         CryptoOperation, CustodyContext, CustodyMaterialDescriptor, Evidence, EvidenceKey,
-        RequestBinding, Validity, WrappingIdentifier,
+        ExecutorIncarnation, InFlightDisposition, RequestBinding, RevocationCommand,
+        RevocationResult, Validity, WrappingIdentifier,
     },
 };
 use rand::rngs::OsRng;
@@ -323,6 +324,79 @@ impl Harness {
         }}));
         json!({"command": "execute", "signed": signed, "principal": "alice", "operation": operation, "input": STANDARD.encode(input)})
     }
+    fn fence_request(&self) -> (RevocationCommand, Value) {
+        let context = CustodyContext::from_canonical_bytes(
+            &STANDARD
+                .decode(self.hello["custody_context"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let executor = ExecutorIncarnation::new(
+            STANDARD
+                .decode(self.hello["worker"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let command = RevocationCommand {
+            fence: Uuid::new_v4(),
+            executor,
+            authority: AuthorityIdentity {
+                issuer: WrappingIdentifier::new("development-authority").unwrap(),
+                scope: AuthorityScope::SecurityDomain {
+                    provider_ref: context.wrapping.provider_ref,
+                    security_domain: context.wrapping.security_domain,
+                },
+                generation: NonZeroU64::new(2).unwrap(),
+            },
+            validity: Validity {
+                clock: ClockDomain::ExecutorMonotonicMilliseconds(executor),
+                not_before: 0,
+                not_after: 30_000,
+            },
+        };
+        let mut evidence = Evidence {
+            issuer: command.authority.issuer.clone(),
+            key_id: WrappingIdentifier::new("development-authority-key").unwrap(),
+            claims: command.clone(),
+            signature: [0; 64],
+        };
+        evidence.signature = self.key.sign(&evidence.signing_bytes().unwrap()).to_bytes();
+        (
+            command,
+            json!({"command":"fence", "evidence": STANDARD.encode(evidence.canonical_bytes().unwrap())}),
+        )
+    }
+    fn verify_fence(&self, output: &Value, command: &RevocationCommand) -> RevocationResult {
+        let key = EvidenceKey {
+            issuer: WrappingIdentifier::new("development-worker-observation").unwrap(),
+            key_id: WrappingIdentifier::new("incarnation-key").unwrap(),
+            // The trusted supervisor binds this child key to this incarnation.
+            key: ed25519_dalek::VerifyingKey::from_bytes(
+                &STANDARD
+                    .decode(self.hello["observation_key"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        let result = Evidence::<RevocationResult>::from_canonical_bytes(
+            &STANDARD
+                .decode(
+                    output["revocation"]
+                        .as_str()
+                        .expect("canonical receipt required"),
+                )
+                .unwrap(),
+        )
+        .unwrap()
+        .authenticate(&key)
+        .unwrap();
+        result.claims().check_command(command).unwrap();
+        result.claims().clone()
+    }
     fn send(&mut self, value: &Value) -> Value {
         writeln!(
             self.input.as_mut().unwrap(),
@@ -380,11 +454,12 @@ fn round_trip(vault: bool) {
     );
     let expired = worker.request(3, "encrypt", b"data", 0);
     assert_eq!(worker.send(&expired)["error"], "expired authority");
-    let signed = worker.signed(&json!({"kind": "fence", "body": {
-        "worker": worker.hello["worker"], "security_domain": "development-only", "generation": 2, "expires_ms": 30_000,
-    }}));
-    let result = worker.send(&json!({"command": "fence", "signed": signed}));
-    assert_eq!(result["local_fence"]["purged"].as_array().unwrap().len(), 1);
+    let (command, request) = worker.fence_request();
+    let result = worker.send(&request);
+    let receipt = worker.verify_fence(&result, &command);
+    assert_eq!(receipt.observed_leases.len(), 1);
+    assert_eq!(receipt.in_flight, InFlightDisposition::Drained);
+    assert!(worker.send(&request).get("error").is_some());
     let request = worker.request(4, "encrypt", b"data", 30_000);
     assert_eq!(worker.send(&request)["error"], "replayed or fenced request");
     assert!(worker
@@ -542,9 +617,13 @@ fn native_startup_reaches_authority_wait_without_contacting_vault() {
 #[test]
 fn process_fence_cancels_staged_output_before_key_release() {
     let mut worker = Harness::new(false);
+    // First commit one response. The later fence covers a mixed history with
+    // one irrevocable prior output and one staged output to suppress.
+    let committed = worker.request(1, "encrypt", b"already released", 30_000);
+    assert!(worker.send(&committed).get("output").is_some());
     // Begin a maximum-size response on a real pipe; fence after receiving its
     // first encrypted fragment. Deterministic unit injection forces backpressure.
-    let request = worker.request(1, "encrypt", &vec![42; 16_384], 30_000);
+    let request = worker.request(2, "encrypt", &vec![42; 16_384], 30_000);
     writeln!(worker.input.as_mut().unwrap(), "{request}").unwrap();
     let mut first = String::new();
     worker.output.read_line(&mut first).unwrap();
@@ -553,22 +632,19 @@ fn process_fence_cancels_staged_output_before_key_release() {
     let cancelled_id = frame["id"].clone();
     // Fence arrives after writing has begun, before the full staged result is
     // drained. Unit Sink injection separately forces EAGAIN at each boundary.
-    let signed = worker.signed(&json!({"kind":"fence", "body": {
-        "worker":worker.hello["worker"], "security_domain":"development-only",
-        "generation":2, "expires_ms":30_000
-    }}));
-    writeln!(
-        worker.input.as_mut().unwrap(),
-        "{}",
-        json!({"command":"fence","signed":signed})
-    )
-    .unwrap();
+    let (command, request) = worker.fence_request();
+    writeln!(worker.input.as_mut().unwrap(), "{request}").unwrap();
     let mut captured = first;
     let cancelled = response(&mut worker.output, &mut captured);
     assert_eq!(cancelled["error"], "output suppressed");
     assert_eq!(cancelled["delivery"], cancelled_id);
     let observed = response(&mut worker.output, &mut captured);
-    assert_eq!(observed["local_fence"]["event"], "worker_locally_fenced");
+    let receipt = worker.verify_fence(&observed, &command);
+    assert_eq!(
+        receipt.in_flight,
+        InFlightDisposition::FurtherReleaseBlocked
+    );
+    assert_eq!(receipt.observed_leases.len(), 1);
     for line in captured.lines() {
         let record: Value = serde_json::from_str(line).unwrap();
         assert!(!(record["event"] == "release" && record["id"] == cancelled_id));
@@ -601,5 +677,33 @@ fn blocked_pipe_expiry_returns_terminal_cancellation_without_release() {
     assert!(!first
         .lines()
         .any(|l| serde_json::from_str::<Value>(l).unwrap()["event"] == "release"));
+    worker.finish();
+}
+
+#[test]
+fn process_rejects_legacy_fence_and_forged_canonical_command() {
+    let mut worker = Harness::new(false);
+    let legacy = worker.signed(&json!({"kind":"fence", "body": {
+        "worker": worker.hello["worker"], "security_domain":"development-only", "generation":2, "expires_ms":30_000
+    }}));
+    assert!(worker
+        .send(&json!({"command":"fence", "signed":legacy}))
+        .get("error")
+        .is_some());
+    let (command, request) = worker.fence_request();
+    let mut forged = request.clone();
+    let mut bytes = STANDARD
+        .decode(forged["evidence"].as_str().unwrap())
+        .unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    forged["evidence"] = json!(STANDARD.encode(bytes));
+    assert!(worker.send(&forged).get("error").is_some());
+    let execute = worker.request(1, "encrypt", b"still permitted", 30_000);
+    assert!(worker.send(&execute).get("output").is_some());
+    let output = worker.send(&request);
+    assert_eq!(
+        worker.verify_fence(&output, &command).in_flight,
+        InFlightDisposition::Drained
+    );
     worker.finish();
 }

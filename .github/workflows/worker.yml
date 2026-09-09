@@ -1,0 +1,45 @@
+name: Worker security
+
+# Required-context candidates must report for every target branch and change.
+# merge_group also reports when a repository owner enables a merge queue.
+on: [push, pull_request, merge_group]
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    name: Worker credential isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/test-worker-fixture-gates.py
+      - run: bash scripts/test-worker-isolation.sh
+
+  verification:
+    name: Worker bounded verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p keyrack-crypto-worker --test verification_claims
+      - run: cargo install --locked --version 0.67.0 kani-verifier --root "$RUNNER_TEMP/worker-tools"
+      - run: echo "$RUNNER_TEMP/worker-tools/bin" >> "$GITHUB_PATH"
+      - run: cargo kani setup
+      - run: python3 scripts/test-worker-kani.py
+      - run: rustup toolchain install nightly-2025-11-21 --profile minimal
+      - run: cargo install --locked --version 0.13.1 cargo-fuzz --root "$RUNNER_TEMP/worker-tools"
+      - run: bash scripts/test-worker-fuzz.sh
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2025-11-21
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: worker-fuzz-crashes
+          path: crates/keyrack-crypto-worker/fuzz/artifacts
+          if-no-files-found: ignore
