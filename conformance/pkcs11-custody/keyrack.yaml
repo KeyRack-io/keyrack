@@ -1,0 +1,41 @@
+grpc_addr: "127.0.0.1:50051"
+rest_addr: "127.0.0.1:8080"
+
+storage:
+  type: memory
+
+# Two PKCS#11 providers on the SAME library, each bound to its own token. The
+# proof takes one token away and gives it back; the other one is here to show
+# that recovering the first does not disturb it.
+providers:
+  - name: hsm-custody
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: custody
+    pin: "1234"
+  - name: hsm-sibling
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: sibling
+    pin: "5678"
+
+default_provider: hsm-custody
+
+provider_routing:
+  - match:
+      token: custody
+    provider: hsm-custody
+  - match:
+      token: sibling
+    provider: hsm-sibling
+
+# Test fixture only: authorization is disabled outright, stated explicitly
+# because omitting `pdp:` is a startup error rather than a silent allow.
+pdp:
+  type: always_allow
+
+audit:
+  type: stdout
+
+authn:
+  type: insecure

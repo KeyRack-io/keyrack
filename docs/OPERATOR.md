@@ -172,6 +172,37 @@ provider:
   pin: "${KMS_PKCS11_PIN}"
 ```
 
+#### When a token goes away and comes back
+
+Operations against a token that is not currently reachable fail with
+`ProviderUnavailable` — HTTP 503, gRPC `UNAVAILABLE` — and no key material is
+served from cache in its place.
+
+When the token becomes reachable again, service returns **without restarting
+KeyRack**. It is not automatic in the background: a PKCS#11 module keeps an
+unusable view of a token it lost, which does not clear by itself, so KeyRack
+reinitializes the library on the next request that fails against it and then
+retries that request. In practice the first call after custody returns
+succeeds. A client that treats 503 as retryable therefore recovers on its own;
+a client that treats it as fatal will keep the outage alive on its own side.
+
+Two consequences worth knowing before an incident:
+
+- Reinitializing is **per library, not per token**, so it briefly affects
+  every provider configured with the same `lib_path` — several tenant tokens
+  on one vendor `.so`, for example. Calls already in flight are allowed to
+  finish first and calls arriving during the reinitialization wait for it, so
+  the effect is added latency rather than failed requests. If in-flight calls
+  do not drain within five seconds, KeyRack **abandons** the recovery and
+  leaves the token unavailable, because finalizing a library while another
+  thread is inside it terminates the process.
+- Recovery is attempted **at most once every two seconds per library**. While
+  custody is still absent it cannot succeed, and repeating it per request
+  would keep interrupting the tokens that are still healthy.
+
+`token_label` is what gets re-resolved, not the slot number, so a token that
+returns on a different slot is still found.
+
 ### Vault Transit (FOSS — external KMS integration)
 
 Delegates key operations to HashiCorp Vault's Transit engine. Ideal for
