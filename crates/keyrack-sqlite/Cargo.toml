@@ -21,6 +21,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [dev-dependencies]
 keyrack-test-support = { workspace = true }
 blake3 = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

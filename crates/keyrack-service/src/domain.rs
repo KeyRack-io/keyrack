@@ -117,6 +117,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             | KeyRackError::KeyDestructionFenced(_)
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
+            | KeyRackError::InvalidIdentity(_)
             | KeyRackError::EncryptionContextMismatch
             | KeyRackError::DepthLimitExceeded { .. }
             | KeyRackError::CycleDetected { .. } => Self::InvalidArgument(e.to_string()),
@@ -222,8 +223,10 @@ fn transition_err(from: KeyState, to: KeyState) -> DomainError {
 /// attributes repeat (keys stay unique/opaque); the caller attributes enrich
 /// `identity_tags` so routing rules can match on them.
 pub fn generate_key_lid_from_attrs(
-    caller_attrs: std::collections::BTreeMap<String, String>,
-) -> (Lid, keyrack_core::attr::AttributeSet) {
+    caller_attrs: &std::collections::BTreeMap<String, String>,
+) -> Result<(Lid, keyrack_core::attr::AttributeSet), DomainError> {
+    let caller_attrs = keyrack_core::attr::normalize_flat(caller_attrs)
+        .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
     let mut attrs = keyrack_core::attr::AttributeSet::new();
     for (k, v) in caller_attrs {
         attrs.insert(&k, keyrack_core::attr::AttributeValue::String(v));
@@ -233,9 +236,10 @@ pub fn generate_key_lid_from_attrs(
         keyrack_core::attr::AttributeValue::String(uuid::Uuid::new_v4().to_string()),
     );
     let canonical =
-        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(keyrack_core::canon::CanonicalizationVersion::V1, &canonical);
-    (lid, attrs)
+        keyrack_core::canon::canonicalize(keyrack_core::canon::CanonicalizationVersion::V2, &attrs)
+            .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
+    let lid = Lid::derive(keyrack_core::canon::CanonicalizationVersion::V2, &canonical);
+    Ok((lid, attrs))
 }
 
 /// Generate a unique LID for a new key.
@@ -243,8 +247,8 @@ pub fn generate_key_lid_from_attrs(
 /// Seeds the attribute set with a UUID so that every `CreateKey` call
 /// produces a distinct LID even when the caller supplies no identity
 /// attributes.
-pub fn generate_key_lid() -> (Lid, keyrack_core::attr::AttributeSet) {
-    generate_key_lid_from_attrs(std::collections::BTreeMap::new())
+pub fn generate_key_lid() -> Result<(Lid, keyrack_core::attr::AttributeSet), DomainError> {
+    generate_key_lid_from_attrs(&std::collections::BTreeMap::new())
 }
 
 // ── Key lifecycle ───────────────────────────────────────────────────
@@ -723,8 +727,9 @@ pub async fn create_key(
     if !namespace.is_empty() {
         caller_attrs.insert("namespace".to_string(), namespace);
     }
-    let (lid, attrs) = generate_key_lid_from_attrs(caller_attrs);
-    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs);
+    let (lid, attrs) = generate_key_lid_from_attrs(&caller_attrs)?;
+    let identity_tags = keyrack_core::tags::IdentityTags::from_attribute_set(&attrs)
+        .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
 
     // Resolve the binding (tag routing + explicit selectors) in one place.
     let provider_name = resolve_create_provider(
@@ -762,7 +767,7 @@ pub async fn create_key(
 
     let record = KeyRecord {
         lid,
-        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V1,
+        canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid,
         occ_version: 1,
         current_key_version: 1,
@@ -774,6 +779,7 @@ pub async fn create_key(
         provider_ref: Some(provider_name.clone()),
         exportability: input.exportable,
         first_exported_at: None,
+        was_compromised: false,
         owner_principal_id: None,
         identity_tags,
         user_tags: keyrack_core::tags::UserTags::new(),
@@ -866,7 +872,7 @@ pub async fn enable_key(state: &Arc<ServiceState>, key_id: &str) -> Result<KeyRe
     let lid = parse_lid(key_id)?;
     let mut record = state
         .storage
-        .get_key(&lid)
+        .get_key_for_use(&lid)
         .await
         .map_err(DomainError::from)?;
     let old_state = record.state.to_string();
@@ -925,7 +931,7 @@ pub async fn disable_key(
     use keyrack_core::error::KeyRackError;
 
     let lid = *lid;
-    let mut record = state.storage.get_key(&lid).await?;
+    let mut record = state.storage.get_key_for_use(&lid).await?;
     let old_state = record.state.to_string();
     record
         .transition_to(KeyState::Disabled)
@@ -991,7 +997,7 @@ pub async fn schedule_key_deletion(
     let lid = parse_lid(key_id)?;
     let mut record = state
         .storage
-        .get_key(&lid)
+        .get_key_for_use(&lid)
         .await
         .map_err(DomainError::from)?;
     let days = if grace_period_days == 0 {
@@ -1019,7 +1025,7 @@ pub async fn cancel_key_deletion(
     let lid = parse_lid(key_id)?;
     let mut record = state
         .storage
-        .get_key(&lid)
+        .get_key_for_use(&lid)
         .await
         .map_err(DomainError::from)?;
     if record.state != KeyState::PendingDeletion {
@@ -1046,7 +1052,7 @@ pub async fn report_key_compromise(
     let lid = parse_lid(key_id)?;
     let mut record = state
         .storage
-        .get_key(&lid)
+        .get_key_for_use(&lid)
         .await
         .map_err(DomainError::from)?;
     let old_state = record.state.to_string();
@@ -1113,10 +1119,10 @@ pub async fn rotate_key(
     let lid = *lid;
     let mut record = state
         .storage
-        .get_key(&lid)
+        .get_key_for_use(&lid)
         .await
         .map_err(DomainError::from)?;
-    if record.state != KeyState::Enabled {
+    if !record.permits_encrypt() {
         return Err(DomainError::FailedPrecondition(
             "key must be Enabled to rotate".into(),
         ));
@@ -1256,8 +1262,10 @@ pub async fn rotate_key(
 /// Reject a crypto operation when the key's state does not permit it.
 ///
 /// `encrypt`-direction operations (sign, `generate_mac`, encrypt, `generate_data_key`)
-/// require `permits_encrypt()`; `decrypt`-direction operations (verify, `verify_mac`,
-/// decrypt) require `permits_decrypt()`.
+/// require `permits_encrypt()`; decrypt requires `permits_decrypt()`.
+/// Verify/VerifyMac retain the separate mathematical verification predicate;
+/// successful verification does not establish trustworthy key provenance.
+/// Legacy decrypt uses the explicit, per-use-audited compromise gate instead.
 ///
 /// Both gRPC and REST handlers call this so enforcement cannot diverge.
 pub fn enforce_state_for_key_op(
@@ -1269,10 +1277,10 @@ pub fn enforce_state_for_key_op(
         AuditAction::Encrypt
         | AuditAction::Sign
         | AuditAction::GenerateMac
-        | AuditAction::GenerateDataKey => record.state.permits_encrypt(),
-        AuditAction::Decrypt | AuditAction::Verify | AuditAction::VerifyMac => {
-            record.state.permits_decrypt()
-        }
+        | AuditAction::GenerateDataKey
+        | AuditAction::GenerateDataKeyWithoutPlaintext => record.permits_encrypt(),
+        AuditAction::Decrypt => record.permits_decrypt(),
+        AuditAction::Verify | AuditAction::VerifyMac => record.state.permits_verify(),
         // `ReEncrypt` is deliberately absent: it touches two keys in opposite
         // directions, so no single-record predicate is correct for it. The
         // handlers gate the source with `permits_decrypt` and the destination
@@ -1331,11 +1339,11 @@ pub mod crypto {
         let lid = parse_lid(&input.key_id)?;
         let record = state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(DomainError::from)?;
 
-        if !record.state.permits_encrypt() {
+        if !record.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
                 "key {} is in state {} — encrypt not permitted",
                 input.key_id, record.state
@@ -1388,6 +1396,9 @@ pub mod crypto {
         pub key_id: String,
         pub ciphertext_blob: Vec<u8>,
         pub encryption_context: Option<EncryptionContext>,
+        /// The caller's already-authorized operation context, used for per-use
+        /// legacy audit evidence. This helper does not evaluate the PDP.
+        pub audit_context: crate::ops::OpContext,
     }
 
     pub struct DecryptOutput {
@@ -1402,16 +1413,11 @@ pub mod crypto {
         let lid = parse_lid(&input.key_id)?;
         let record = state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(DomainError::from)?;
 
-        if !record.state.permits_decrypt() {
-            return Err(DomainError::FailedPrecondition(format!(
-                "key {} is in state {} — decrypt not permitted",
-                input.key_id, record.state
-            )));
-        }
+        let decrypt_permission = crate::compromise::check_decrypt(state, &record)?;
 
         let (header, ciphertext) = CiphertextHeader::unwrap_payload(&input.ciphertext_blob)
             .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
@@ -1446,6 +1452,9 @@ pub mod crypto {
 
         let aad = header.build_aad(&ec_aad);
 
+        decrypt_permission
+            .record_use(state, &record, &input.audit_context)
+            .await;
         let plaintext = entry
             .provider
             .decrypt(
@@ -1472,6 +1481,8 @@ pub mod crypto {
         pub destination_encryption_context: Option<EncryptionContext>,
         pub principal_scope: Option<String>,
         pub principal_id: String,
+        /// The caller's already-authorized operation context for per-use audit.
+        pub audit_context: crate::ops::OpContext,
     }
 
     pub struct ReEncryptOutput {
@@ -1489,12 +1500,12 @@ pub mod crypto {
 
         let src_record = state
             .storage
-            .get_key(&src_lid)
+            .get_key_for_use(&src_lid)
             .await
             .map_err(DomainError::from)?;
         let dst_record = state
             .storage
-            .get_key(&dst_lid)
+            .get_key_for_use(&dst_lid)
             .await
             .map_err(DomainError::from)?;
 
@@ -1503,13 +1514,8 @@ pub mod crypto {
         // would get if called on its own. Checking one predicate for both would
         // let a caller reach either operation through the pair that it could not
         // reach directly.
-        if !src_record.state.permits_decrypt() {
-            return Err(DomainError::FailedPrecondition(format!(
-                "key {} is in state {} — decrypt not permitted",
-                input.source_key_id, src_record.state
-            )));
-        }
-        if !dst_record.state.permits_encrypt() {
+        let decrypt_permission = crate::compromise::check_decrypt(state, &src_record)?;
+        if !dst_record.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
                 "key {} is in state {} — encrypt not permitted",
                 input.destination_key_id, dst_record.state
@@ -1588,6 +1594,9 @@ pub mod crypto {
         // regardless of the Arc::ptr_eq check.
         // Cross-provider path: decrypt on source, re-encrypt on destination
         // (plaintext transits service memory).
+        decrypt_permission
+            .record_use(state, &src_record, &input.audit_context)
+            .await;
         let output = if Arc::ptr_eq(&src_entry.provider, &dst_entry.provider) {
             src_entry
                 .provider
@@ -1633,11 +1642,11 @@ pub mod crypto {
         let lid = parse_lid(&input.key_id)?;
         let record = state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(DomainError::from)?;
 
-        if !record.state.permits_encrypt() {
+        if !record.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
                 "key {} is in state {} — sign not permitted",
                 input.key_id, record.state
@@ -1690,11 +1699,11 @@ pub mod crypto {
         let lid = parse_lid(&input.key_id)?;
         let record = state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(DomainError::from)?;
 
-        if !record.state.permits_decrypt() {
+        if !record.state.permits_verify() {
             return Err(DomainError::FailedPrecondition(format!(
                 "key {} is in state {} — verify not permitted",
                 input.key_id, record.state
@@ -1750,11 +1759,11 @@ pub mod crypto {
         let lid = parse_lid(&input.key_id)?;
         let record = state
             .storage
-            .get_key(&lid)
+            .get_key_for_use(&lid)
             .await
             .map_err(DomainError::from)?;
 
-        if !record.state.permits_encrypt() {
+        if !record.permits_encrypt() {
             return Err(DomainError::FailedPrecondition(format!(
                 "key {} is in state {} — generate data key not permitted",
                 input.key_id, record.state
@@ -2462,10 +2471,11 @@ mod resolve_tests {
             )],
             ProviderRef::new("shared"),
         )
+        .unwrap()
     }
 
     fn no_rules_router() -> ProviderRouter {
-        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+        ProviderRouter::new(vec![], ProviderRef::new("shared")).unwrap()
     }
 
     fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
@@ -2473,8 +2483,8 @@ mod resolve_tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let (_, attr_set) = generate_key_lid_from_attrs(attrs);
-        IdentityTags::from_attribute_set(&attr_set)
+        let (_, attr_set) = generate_key_lid_from_attrs(&attrs).unwrap();
+        IdentityTags::from_attribute_set(&attr_set).unwrap()
     }
 
     #[test]
@@ -2718,10 +2728,11 @@ mod explain_tests {
             )],
             ProviderRef::new("shared"),
         )
+        .unwrap()
     }
 
     fn no_rules_router() -> ProviderRouter {
-        ProviderRouter::new(vec![], ProviderRef::new("shared"))
+        ProviderRouter::new(vec![], ProviderRef::new("shared")).unwrap()
     }
 
     fn tags(pairs: &[(&str, &str)]) -> IdentityTags {
@@ -2729,7 +2740,7 @@ mod explain_tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        IdentityTags::from_map(map)
+        IdentityTags::from_map(map).unwrap()
     }
 
     #[test]

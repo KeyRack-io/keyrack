@@ -102,12 +102,16 @@ local acknowledgement is not proof that that broader workflow finished.
 
 ### In-flight disposition and mid-delivery fences (v1 ruling)
 
-**Keep the two existing tags: `Drained = 1`, `OutputsSuppressed = 2`.** There is
+**Keep the two existing tags: `Drained = 1`, `FurtherReleaseBlocked = 2`.** There is
 no third successful "partially delivered" or "unknown but fenced" disposition.
+Tag `2` was formerly named `OutputsSuppressed`. Only the Rust identifier and
+reference-vector labels changed: canonical bytes, digests, signatures and the
+v1 wire version are unchanged. The new name deliberately makes a forward-looking
+claim; it does not say that earlier committed outputs were suppressed.
 The classification is local to the exact command's entire authority scope and
 executor incarnation, not to the bounded diagnostic lease list.
 
-**The ordinary mixed case emits one `OutputsSuppressed` receipt.** This is a
+**The ordinary mixed case emits one `FurtherReleaseBlocked` receipt.** This is a
 fence-wide postcondition, not a per-operation outcome vector. The existing
 `RevocationResult.authority.scope` is the explicit scope, authenticated together
 with its issuer/generation, executor and exact command digest. No additional
@@ -128,7 +132,7 @@ fenced authority can occur after F.
   can still sit in a pipe or be retained/read by its recipient. This is not a claim
   that the recipient consumed or erased it. Finishing crypto while leaving an
   unguarded output queue is not draining.
-- **OutputsSuppressed:** every response unreleased at F permanently loses its
+- **FurtherReleaseBlocked:** every response unreleased at F permanently loses its
   ability to commit usable output under the fenced authority. This includes
   queued/staged responses and late results of still-running computation. It
   does not claim that earlier commits were suppressed, nor that every secret
@@ -140,23 +144,23 @@ key-capsule release (see its [transport description](../crates/keyrack-crypto-wo
 
 | State at F | Disposition for the local scope |
 | --- | --- |
-| Ciphertext partly/fully staged, capsule not committed, remaining release capabilities cancelled | `OutputsSuppressed` |
-| Capsule commit returns EAGAIN/interruption without writing, then fence cancels retry | `OutputsSuppressed` |
+| Ciphertext partly/fully staged, capsule not committed, remaining release capabilities cancelled | `FurtherReleaseBlocked` |
+| Capsule commit returns EAGAIN/interruption without writing, then fence cancels retry | `FurtherReleaseBlocked` |
 | Capsule committed before F and no other work/release obligation remains | `Drained`; do not relabel the prior commit as suppressed |
-| Some prior commits plus other responses cancelled at F | `OutputsSuppressed` for the unreleased set; prior commits are not recalled |
+| Some prior commits plus other responses cancelled at F | `FurtherReleaseBlocked` for the unreleased set; prior commits are not recalled |
 | Usable bytes partly released and continuation/scope coverage unresolved | Neither; do not emit a successful `RevocationResult` |
 
 For example, under **one** fence, operations A and B have committed capsules,
 C has only staged ciphertext, and D is computing. If the gate permanently
 cancels C's release capability and rejects D's eventual result, emit **one
-`OutputsSuppressed`** for the full command scope. A/B remain prior released output;
+`FurtherReleaseBlocked`** for the full command scope. A/B remain prior released output;
 neither is claimed suppressed. C/D and every other unreleased result are covered
 whether or not their leases appear in diagnostics. Waiting for A/B's recipient
 to read the pipe is not a prerequisite for this receipt.
 
 The aggregation rule is: any still-unresolved affected release path means no
 completion receipt; otherwise a scope with suppressed pending/future results
-uses `OutputsSuppressed`, including a mix with prior commits. Use `Drained` when
+uses `FurtherReleaseBlocked`, including a mix with prior commits. Use `Drained` when
 all computation and release obligations have finished/terminated and none remains
 pending. **Mixed prior commits plus suppression is not the unresolved case.**
 The rule describes the producer's runtime obligation; it does not authorize

@@ -374,16 +374,17 @@ proptest! {
 
         let mut attrs = AttributeSet::new();
         attrs.insert("t", AttributeValue::String("test".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
         let record = KeyRecord {
             lid,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
@@ -392,7 +393,7 @@ proptest! {
             exportability: keyrack_core::key::Exportability::default(),
             first_exported_at: None,
             owner_principal_id: None,
-            identity_tags: IdentityTags::from_attribute_set(&attrs),
+            identity_tags: IdentityTags::from_attribute_set(&attrs).unwrap(),
             user_tags: UserTags::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

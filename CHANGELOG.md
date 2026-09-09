@@ -25,18 +25,17 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
-- **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
-  source-key permit alone no longer permits re-encryption into an unauthorized
-  destination. Policies must grant `kms:ReEncryptFrom` on the source and
-  `kms:ReEncryptTo` on the destination, even for same-key requests; standalone
-  `Decrypt`/`Encrypt` grants are not required. The two PDP requests have distinct
-  IDs and independently validated responses, with the outer request ID retained
-  for audit correlation. Destination denial names the destination in the audit
-  log and prevents all provider calls. Source provider-scope checks now use the
-  ciphertext's historical key version rather than the current primary binding.
-  The old aggregate `kms:ReEncrypt` action is removed without an alias; policies
-  and custom PDP action schemas must use the directional names. The API remains
-  `ReEncrypt`.
+- **Compromised keys now deny decrypt by default, including ReEncrypt sources.**
+  Persisted compromise history prevents deletion cancellation or rotation from
+  restoring decrypt or raw export. Security-sensitive reads bypass metadata
+  caches, including a fresh export check after PDP authorization. An explicit,
+  default-off `legacy_compromised_key_decrypt` flag restores only dangerous legacy
+  decrypt behavior with startup/per-use warnings and structured, best-effort
+  audit markers. It is not controlled recovery or audit-failure release
+  suppression. Disabled and mathematical verification behavior are unchanged.
+  Upgrade all service/storage writers together and deploy the companion shim
+  plaintext-cache bypass fix; old writers can discard the sticky JSON marker.
+  See the operator guide for migration limits and per-use marker semantics.
 - **KMIP wire format: four constants named the wrong thing.** Each collided
   with a value the specification does define, so requests were well-formed and
   meant something else: `SymmetricKey` was `0x01` (Certificate) — which is
@@ -72,7 +71,18 @@ All notable changes to KeyRack will be documented in this file.
   service installs one at startup, so this was reachable only by other
   embedders, for whom a panic inside a connection attempt is the wrong report
   of a missing initialisation step. It is now an error naming the omission.
-
+- **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
+  source-key permit alone no longer permits re-encryption into an unauthorized
+  destination. Policies must grant `kms:ReEncryptFrom` on the source and
+  `kms:ReEncryptTo` on the destination, even for same-key requests; standalone
+  `Decrypt`/`Encrypt` grants are not required. The two PDP requests have distinct
+  IDs and independently validated responses, with the outer request ID retained
+  for audit correlation. Destination denial names the destination in the audit
+  log and prevents all provider calls. Source provider-scope checks now use the
+  ciphertext's historical key version rather than the current primary binding.
+  The old aggregate `kms:ReEncrypt` action is removed without an alias; policies
+  and custom PDP action schemas must use the directional names. The API remains
+  `ReEncrypt`.
 - **PDP responses are now checked against the request they answer.** Both PDP
   clients returned any response that parsed, without confirming its
   `request_id` echoed the request's, so a well-formed decision belonging to a

@@ -189,6 +189,10 @@ Storage tracks this relationship. The service provides two query APIs:
 
 ### Decrypt (version resolution from ciphertext)
 
+The lifecycle read is authoritative (`get_key_for_use`), not a cached permission.
+Compromised keys deny by default; see the [dangerous legacy opt-in](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in)
+for the separately audited exception.
+
 ```
   Client                    Service                   Storage          Provider
     │                          │                         │                │
@@ -204,8 +208,8 @@ Storage tracks this relationship. The service provides two query APIs:
     │                          │         KeyRecord       │                │
     │                          │◀────────────────────────│                │
     │                          │                         │                │
-    │                          │  check state.permits_decrypt()           │
-    │                          │  (Enabled, Disabled, or Compromised)     │
+    │                          │  check record.permits_decrypt()          │
+    │                          │  Enabled/Disabled, no compromise history │
     │                          │                         │                │
     │                          │  find version matching  │                │
     │                          │  header.key_version     │                │
@@ -365,7 +369,7 @@ the correct provider based on the record's `provider_class`.
 The LID is deterministic for a given set of attributes:
 
 ```
-attributes → canonicalize(V1, attrs) → CanonicalForm (bytes)
+attributes → canonicalize(V2, attrs) → CanonicalForm (bytes)
                                             │
                         ┌───────────────────┘
                         ▼
@@ -377,7 +381,10 @@ attributes → canonicalize(V1, attrs) → CanonicalForm (bytes)
 
 In the current `CreateKey` flow, the attributes contain a random UUID
 (`_keyrack_key_id`), making each LID unique. The canonicalization version
-is `V1` and is stored on the record to support future migration.
+is `V2` and is stored on the record. V1 records are rejected; this baseline
+is not an in-place upgrade for a V1 database. Stored-LID lookups and
+attribute-based recomputation are distinct paths; see
+[Canonical identity](CANONICAL_IDENTITY.md).
 
 ---
 

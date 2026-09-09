@@ -28,11 +28,13 @@
 
 pub mod cache;
 pub mod cert_reload;
+pub mod compromise;
 pub mod config;
 pub mod convert;
 pub mod domain;
 pub mod grpc;
 pub mod hsm_registration;
+pub mod identity_input;
 pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;

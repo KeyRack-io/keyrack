@@ -425,7 +425,7 @@ pub struct RevocationCommand {
 /// after that point. Output irrevocably committed before it is not retractable
 /// and is not included in the suppression claim.
 /// This is ONE scope-wide result: a mix of prior commits and suppressed pending
-/// responses is `OutputsSuppressed`, not an unrepresentable outcome. The scope
+/// responses is `FurtherReleaseBlocked`, not an unrepresentable outcome. The scope
 /// comes from `RevocationResult.authority.scope`, never `observed_leases`.
 ///
 /// A consuming profile must qualify its irrevocable usable-output release point.
@@ -445,7 +445,7 @@ pub enum InFlightDisposition {
     /// late results of computation still running. Earlier commits are NOT claimed
     /// suppressed. Ciphertext/status transport may continue only if it cannot
     /// release the suppressed response. This is not a secret-erasure claim.
-    OutputsSuppressed,
+    FurtherReleaseBlocked,
 }
 
 /// Local applied-fence observation, NEVER all-holder completion. The bounded

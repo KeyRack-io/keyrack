@@ -29,6 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Verify independent custody contract vectors
+        run: node scripts/custody-contract-vectors.mjs --check
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -77,6 +82,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
+
+  postgres-compromise-history:
+    name: PostgreSQL compromise history
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: keyrack_test
+          POSTGRES_PASSWORD: disposable_ci_only
+          POSTGRES_DB: keyrack_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keyrack_test -d keyrack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://keyrack_test:disposable_ci_only@127.0.0.1:5432/keyrack_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run the two persistent-compromise regressions (no zero-test pass)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            conformance_compromise_history_is_monotonic
+            conformance_compromised_live_state_normalizes_history
+          )
+          listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
+          for test_name in "${tests[@]}"; do
+            grep -Fxq "${test_name}: test" <<< "$listing"
+            cargo test -p keyrack-postgres --features live-tests --test conformance "$test_name" -- --exact
+          done
 
   docker:
     name: Docker build

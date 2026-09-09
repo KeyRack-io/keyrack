@@ -71,10 +71,10 @@ fn identity_pipeline_round_trip() {
     attrs.insert("user", AttributeValue::String("alice".into()));
     attrs.insert("doc", AttributeValue::String("invoice-42".into()));
 
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
     assert!(!form.bytes().is_empty(), "canonical form must be non-empty");
 
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
     // Simulate serialization boundary (API response, database, audit event).
     let lid_string = lid.to_string();
@@ -104,16 +104,16 @@ fn identity_pipeline_determinism_across_construction_paths() {
     map.insert("region".into(), AttributeValue::String("eu-west-1".into()));
     let b = AttributeSet::from(map);
 
-    let form_a = canonicalize(CanonicalizationVersion::V1, &a);
-    let form_b = canonicalize(CanonicalizationVersion::V1, &b);
+    let form_a = canonicalize(CanonicalizationVersion::V2, &a).unwrap();
+    let form_b = canonicalize(CanonicalizationVersion::V2, &b).unwrap();
     assert_eq!(
         form_a.bytes(),
         form_b.bytes(),
         "same attributes must canonicalize identically regardless of construction order"
     );
 
-    let lid_a = Lid::derive(CanonicalizationVersion::V1, &form_a);
-    let lid_b = Lid::derive(CanonicalizationVersion::V1, &form_b);
+    let lid_a = Lid::derive(CanonicalizationVersion::V2, &form_a);
+    let lid_b = Lid::derive(CanonicalizationVersion::V2, &form_b);
     assert_eq!(lid_a, lid_b, "same attributes must produce the same LID");
 }
 
@@ -130,12 +130,12 @@ fn identity_pipeline_unicode_normalization() {
     decomposed.insert("name", AttributeValue::String("e\u{0301}milie".into()));
 
     let lid_composed = Lid::derive(
-        CanonicalizationVersion::V1,
-        &canonicalize(CanonicalizationVersion::V1, &composed),
+        CanonicalizationVersion::V2,
+        &canonicalize(CanonicalizationVersion::V2, &composed).unwrap(),
     );
     let lid_decomposed = Lid::derive(
-        CanonicalizationVersion::V1,
-        &canonicalize(CanonicalizationVersion::V1, &decomposed),
+        CanonicalizationVersion::V2,
+        &canonicalize(CanonicalizationVersion::V2, &decomposed).unwrap(),
     );
 
     assert_eq!(
@@ -161,8 +161,8 @@ fn identity_pipeline_complex_attributes() {
     attrs.insert("extra", AttributeValue::Record(extra));
     attrs.insert("active", AttributeValue::Bool(true));
 
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
     // Must survive the full serialization gauntlet.
     let s = lid.to_string();
@@ -173,8 +173,8 @@ fn identity_pipeline_complex_attributes() {
 
     // Re-derive from the same attributes — determinism check.
     let lid2 = Lid::derive(
-        CanonicalizationVersion::V1,
-        &canonicalize(CanonicalizationVersion::V1, &attrs),
+        CanonicalizationVersion::V2,
+        &canonicalize(CanonicalizationVersion::V2, &attrs).unwrap(),
     );
     assert_eq!(lid, lid2);
 }
@@ -188,8 +188,8 @@ fn identity_pipeline_distinct_keys() {
         a.insert("tenant", AttributeValue::String("acme".into()));
         a.insert("kind", AttributeValue::String(kind.into()));
         Lid::derive(
-            CanonicalizationVersion::V1,
-            &canonicalize(CanonicalizationVersion::V1, &a),
+            CanonicalizationVersion::V2,
+            &canonicalize(CanonicalizationVersion::V2, &a).unwrap(),
         )
     };
 
@@ -332,9 +332,9 @@ fn tags_model_e2e() {
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("acme".into()));
     attrs.insert("kind", AttributeValue::String("dek".into()));
-    attrs.insert("priority", AttributeValue::I64(7));
+    attrs.insert("priority", AttributeValue::String("7".into()));
 
-    let identity = IdentityTags::from_attribute_set(&attrs);
+    let identity = IdentityTags::from_attribute_set(&attrs).unwrap();
     assert_eq!(identity.get("tenant"), Some("acme"));
     assert_eq!(identity.get("kind"), Some("dek"));
     assert_eq!(identity.get("priority"), Some("7"));
@@ -370,7 +370,7 @@ fn tags_model_e2e() {
 fn tags_serde_round_trip() {
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("acme".into()));
-    let identity = IdentityTags::from_attribute_set(&attrs);
+    let identity = IdentityTags::from_attribute_set(&attrs).unwrap();
     let json = serde_json::to_string(&identity).unwrap();
     let parsed: IdentityTags = serde_json::from_str(&json).unwrap();
     assert_eq!(identity, parsed);
@@ -394,19 +394,20 @@ fn full_key_lifecycle_with_tags() {
     attrs.insert("tenant", AttributeValue::String("globex".into()));
     attrs.insert("kind", AttributeValue::String("dek".into()));
 
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
-    let identity_tags = IdentityTags::from_attribute_set(&attrs);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
+    let identity_tags = IdentityTags::from_attribute_set(&attrs).unwrap();
     let mut user_tags = UserTags::new();
     user_tags.set("environment", "dev");
 
     let mut record = KeyRecord {
         lid,
-        canonicalization_version: CanonicalizationVersion::V1,
+        canonicalization_version: CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
         state: KeyState::Creating,
+        was_compromised: false,
         key_usage: KeyUsage::EncryptDecrypt,
         key_spec: KeySpec::Aes256,
         origin: KeyOrigin::KeyRack,
@@ -601,8 +602,8 @@ fn ciphertext_header_round_trip() {
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("acme".into()));
     attrs.insert("kind", AttributeValue::String("dek".into()));
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
     let mut ctx = EncryptionContext::new();
     ctx.insert("volume_id", "vol-123");
@@ -626,8 +627,8 @@ fn ciphertext_header_no_context() {
     let lid = {
         let mut attrs = AttributeSet::new();
         attrs.insert("t", AttributeValue::String("x".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        Lid::derive(CanonicalizationVersion::V1, &form)
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        Lid::derive(CanonicalizationVersion::V2, &form)
     };
 
     let header = CiphertextHeader::new(lid, 1, ZERO_CONTEXT_HASH);
@@ -644,8 +645,8 @@ fn ciphertext_header_wrap_unwrap_payload() {
     let lid = {
         let mut attrs = AttributeSet::new();
         attrs.insert("t", AttributeValue::String("x".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        Lid::derive(CanonicalizationVersion::V1, &form)
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        Lid::derive(CanonicalizationVersion::V2, &form)
     };
 
     let header = CiphertextHeader::new(lid, 1, ZERO_CONTEXT_HASH);
@@ -694,8 +695,8 @@ async fn integrated_encrypt_with_header_and_context() {
 
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("acme".into()));
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
     let mut ctx = EncryptionContext::new();
     ctx.insert("volume_id", "vol-456");
@@ -909,23 +910,24 @@ fn hsm_connection_lifecycle() {
 fn make_test_lid(name: &str) -> Lid {
     let mut attrs = AttributeSet::new();
     attrs.insert("name", AttributeValue::String(name.into()));
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    Lid::derive(CanonicalizationVersion::V1, &form)
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    Lid::derive(CanonicalizationVersion::V2, &form)
 }
 
 fn make_test_record(state: KeyState) -> KeyRecord {
     let mut attrs = AttributeSet::new();
     attrs.insert("tenant", AttributeValue::String("test-tenant".into()));
-    let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-    let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+    let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+    let lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
     KeyRecord {
         lid,
-        canonicalization_version: CanonicalizationVersion::V1,
+        canonicalization_version: CanonicalizationVersion::V2,
         parent_lid: None,
         occ_version: 1,
         current_key_version: 1,
         state,
+        was_compromised: false,
         key_usage: KeyUsage::EncryptDecrypt,
         key_spec: KeySpec::Aes256,
         origin: KeyOrigin::KeyRack,
@@ -934,7 +936,7 @@ fn make_test_record(state: KeyState) -> KeyRecord {
         exportability: keyrack_core::key::Exportability::default(),
         first_exported_at: None,
         owner_principal_id: None,
-        identity_tags: IdentityTags::from_attribute_set(&attrs),
+        identity_tags: IdentityTags::from_attribute_set(&attrs).unwrap(),
         user_tags: UserTags::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),

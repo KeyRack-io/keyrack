@@ -346,6 +346,67 @@ pub async fn parent_state_and_retirement(store: &dyn StorageBackend) {
     );
 }
 
+pub async fn compromise_history_blocks_reservation(store: &dyn StorageBackend) {
+    for (parent_compromised, child_compromised) in [(false, false), (true, false), (false, true)] {
+        let (mut parent, mut request) = fixture();
+        // The durable marker must deny creation even if the live state says Enabled.
+        parent.was_compromised = parent_compromised;
+        request.record.was_compromised = child_compromised;
+        assert_eq!(parent.state, KeyState::Enabled);
+        assert_eq!(request.record.state, KeyState::Enabled);
+        store.create_key(&parent).await.unwrap();
+        if parent_compromised || child_compromised {
+            assert!(store.reserve_creation(&request).await.is_err());
+            assert!(store.get_creation(request.operation).await.is_err());
+            assert!(store.get_key(&request.record.lid).await.is_err());
+        } else {
+            // Positive control traverses the same storage and publication path.
+            resolved(store, &request).await;
+            let published = store
+                .publish_creation(request.operation, request.owner, 3)
+                .await
+                .unwrap();
+            assert!(same_json(&published, &request.record).unwrap());
+            assert!(!published.has_compromise_history());
+        }
+    }
+}
+
+pub async fn compromise_history_preempts_dispatch_and_publication(store: &dyn StorageBackend) {
+    for before_dispatch in [true, false] {
+        let (mut parent, request) = fixture();
+        store.create_key(&parent).await.unwrap();
+        if before_dispatch {
+            store.reserve_creation(&request).await.unwrap();
+        } else {
+            resolved(store, &request).await;
+        }
+        let before = store.get_creation(request.operation).await.unwrap();
+        parent.was_compromised = true;
+        parent.occ_version += 1;
+        assert_eq!(parent.state, KeyState::Enabled);
+        store.update_key(&parent).await.unwrap();
+        if before_dispatch {
+            assert!(store
+                .claim_creation_dispatch(request.operation, request.owner)
+                .await
+                .is_err());
+        } else {
+            assert!(store
+                .publish_creation(request.operation, request.owner, 3)
+                .await
+                .is_err());
+        }
+        let after = store.get_creation(request.operation).await.unwrap();
+        assert!(same_json(&before, &after).unwrap());
+        assert!(store.get_key(&request.record.lid).await.is_err());
+        assert!(store
+            .read_creation_envelope(request.operation)
+            .await
+            .is_err());
+    }
+}
+
 pub async fn committed_material_is_not_ordinary_crud(store: &dyn StorageBackend) {
     let (parent, request) = fixture();
     store.create_key(&parent).await.unwrap();
@@ -486,6 +547,17 @@ macro_rules! creation_conformance_tests {
             $crate::creation_conformance::parent_state_and_retirement(&$store).await;
         }
         #[tokio::test]
+        async fn a2_compromise_history_blocks_reservation() {
+            $crate::creation_conformance::compromise_history_blocks_reservation(&$store).await;
+        }
+        #[tokio::test]
+        async fn a2_compromise_history_preempts_dispatch_and_publication() {
+            $crate::creation_conformance::compromise_history_preempts_dispatch_and_publication(
+                &$store,
+            )
+            .await;
+        }
+        #[tokio::test]
         async fn a2_committed_material_is_not_ordinary_crud() {
             $crate::creation_conformance::committed_material_is_not_ordinary_crud(&$store).await;
         }
@@ -604,6 +676,71 @@ mod tests {
             *provider_ref = None;
         }
         assert!(request.validate_records(None, &wrong_parent).is_err());
+    }
+
+    #[test]
+    fn enabled_compromise_history_is_ineligible_without_an_occ_change() {
+        let (parent, request) = fixture();
+        request.validate_records(None, &parent).unwrap();
+
+        let mut compromised_child = request.clone();
+        compromised_child.record.was_compromised = true;
+        assert_eq!(compromised_child.record.state, KeyState::Enabled);
+        assert!(compromised_child.validate().is_err());
+        assert!(CreationJournal::reserved(compromised_child).is_err());
+
+        let mut compromised_parent = parent.clone();
+        compromised_parent.was_compromised = true;
+        assert_eq!(compromised_parent.state, KeyState::Enabled);
+        assert_eq!(compromised_parent.occ_version, request.expected_parent_occ);
+        assert!(request.validate_records(None, &compromised_parent).is_err());
+
+        // Keep OCC identical to isolate compromise-history eligibility from
+        // the independently enforced stale-snapshot check in storage tests.
+        let mut journal = CreationJournal::reserved(request.clone()).unwrap();
+        journal.claim_dispatch(request.owner).unwrap();
+        journal.stage(request.owner, 1, TEST_ENVELOPE).unwrap();
+        journal
+            .resolve(request.owner, 2, &closure(&request))
+            .unwrap();
+        let before = journal.clone();
+        assert!(journal
+            .publication(request.owner, 3, None, &compromised_parent)
+            .is_err());
+        assert!(same_json(&before, &journal).unwrap());
+        journal
+            .publication(request.owner, 3, None, &parent)
+            .unwrap();
+    }
+
+    #[test]
+    fn rotating_an_enabled_child_requires_no_compromise_history() {
+        let (parent, mut request) = fixture();
+        let mut current = request.record.clone();
+        current.key_versions[0].material = parent.key_versions[0].material.clone();
+        let mut next = request.record.key_versions[0].clone();
+        next.version_number = 2;
+        request.record = current.clone();
+        request.record.key_versions[0].is_primary = false;
+        request.record.key_versions.push(next);
+        request.record.current_key_version = 2;
+        request.record.occ_version += 1;
+        request.expected_key_occ = Some(current.occ_version);
+        request.context_bytes = request.context().unwrap().canonical_bytes().unwrap();
+        request.validate_records(Some(&current), &parent).unwrap();
+
+        current.was_compromised = true;
+        assert_eq!(current.state, KeyState::Enabled);
+        assert_eq!(Some(current.occ_version), request.expected_key_occ);
+        assert_eq!(
+            request
+                .validate_records(Some(&current), &parent)
+                .unwrap_err()
+                .to_string(),
+            invalid("invalid new version").to_string(),
+        );
+        request.record.was_compromised = true;
+        assert!(request.validate().is_err());
     }
 
     proptest! {

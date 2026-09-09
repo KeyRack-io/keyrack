@@ -334,7 +334,7 @@ mod tests {
         );
         let ns = make_ns("test", vec![rule]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
 
         let diags = lint(&reg);
         assert_eq!(diags.len(), 1);
@@ -354,7 +354,7 @@ mod tests {
         );
         let ns = make_ns("test", vec![rule]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
 
         let diags = lint(&reg);
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
@@ -364,7 +364,7 @@ mod tests {
     fn empty_namespace_warning() {
         let ns = make_ns("empty", vec![]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
         let diags = lint(&reg);
         assert!(diags.iter().any(|d| d.code == "W001"));
     }
@@ -374,7 +374,7 @@ mod tests {
         let rule = make_rule(&[("kind", "app-root")], ParentRef::Attachment, 0);
         let ns = make_ns("app", vec![rule]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
         let diags = lint(&reg);
         assert!(diags.iter().any(|d| d.code == "E001"));
     }
@@ -388,7 +388,7 @@ mod tests {
             max_depth: 2,
         };
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
         let diags = lint(&reg);
         assert!(diags.iter().any(|d| d.code == "W002"));
     }
@@ -397,13 +397,13 @@ mod tests {
     fn ambiguous_rules_detected() {
         let r1 = make_rule(&[("kind", "$K")], ParentRef::Root, 0);
         let r2 = make_rule(
-            &[("kind", "$K")],
+            &[("kind", "$OTHER")],
             ParentRef::Pattern(BTreeMap::from([("kind".into(), "other".into())])),
             0,
         );
         let ns = make_ns("ambig", vec![r1, r2]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
         let diags = lint(&reg);
         assert!(
             diags.iter().any(|d| d.code == "W004"),
@@ -418,12 +418,12 @@ mod tests {
         // general has specificity (0,1), specific has (1,1) — specific dominates
         // But general matches a superset, so it's NOT unreachable
         // Let's make a case where it IS unreachable:
-        let dominated = make_rule(&[("kind", "dek")], ParentRef::Root, 0);
-        let dominator = make_rule(&[("kind", "dek")], ParentRef::Root, 10);
+        let dominated = make_rule(&[("kind", "$LOW")], ParentRef::Root, 0);
+        let dominator = make_rule(&[("kind", "$HIGH")], ParentRef::Root, 10);
 
         let ns = make_ns("shadow", vec![dominated, dominator, general, specific]);
         let mut reg = RuleRegistry::new();
-        reg.register(ns);
+        reg.register(ns).unwrap();
         let diags = lint(&reg);
         assert!(
             diags.iter().any(|d| d.code == "W005"),

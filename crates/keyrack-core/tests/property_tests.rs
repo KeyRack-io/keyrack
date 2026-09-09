@@ -65,8 +65,8 @@ proptest! {
     /// Same input always produces the same canonical bytes.
     #[test]
     fn canon_deterministic(attrs in arb_attribute_set()) {
-        let a = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let b = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let a = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let b = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         prop_assert_eq!(a.bytes(), b.bytes());
     }
 
@@ -80,11 +80,11 @@ proptest! {
         let reversed: BTreeMap<String, AttributeValue> =
             attrs.0.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-        let a = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let a = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         let b = canonicalize(
-            CanonicalizationVersion::V1,
+            CanonicalizationVersion::V2,
             &AttributeSet::from(reversed),
-        );
+        ).unwrap();
         prop_assert_eq!(a.bytes(), b.bytes());
     }
 
@@ -95,8 +95,8 @@ proptest! {
         let mut attrs = AttributeSet::new();
         attrs.insert("k", AttributeValue::String(s));
 
-        let first = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let second = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let first = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let second = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
         prop_assert_eq!(first.bytes(), second.bytes());
     }
 
@@ -111,8 +111,8 @@ proptest! {
         let mut sb = AttributeSet::new();
         sb.insert("n", AttributeValue::I64(b));
 
-        let fa = canonicalize(CanonicalizationVersion::V1, &sa);
-        let fb = canonicalize(CanonicalizationVersion::V1, &sb);
+        let fa = canonicalize(CanonicalizationVersion::V2, &sa).unwrap();
+        let fb = canonicalize(CanonicalizationVersion::V2, &sb).unwrap();
         prop_assert_ne!(fa.bytes(), fb.bytes());
     }
 
@@ -124,8 +124,8 @@ proptest! {
         let mut sb = AttributeSet::new();
         sb.insert("flag", AttributeValue::Bool(!v));
 
-        let fa = canonicalize(CanonicalizationVersion::V1, &sa);
-        let fb = canonicalize(CanonicalizationVersion::V1, &sb);
+        let fa = canonicalize(CanonicalizationVersion::V2, &sa).unwrap();
+        let fb = canonicalize(CanonicalizationVersion::V2, &sb).unwrap();
         prop_assert_ne!(fa.bytes(), fb.bytes());
     }
 }
@@ -140,17 +140,17 @@ proptest! {
     /// Same (version, canonical form) always produces the same LID.
     #[test]
     fn lid_deterministic(attrs in arb_attribute_set()) {
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let a = Lid::derive(CanonicalizationVersion::V1, &form);
-        let b = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let a = Lid::derive(CanonicalizationVersion::V2, &form);
+        let b = Lid::derive(CanonicalizationVersion::V2, &form);
         prop_assert_eq!(a, b);
     }
 
     /// Display/FromStr round-trip preserves the LID.
     #[test]
     fn lid_display_fromstr_round_trip(attrs in arb_attribute_set()) {
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &form);
         let s = lid.to_string();
         let parsed: Lid = s.parse().expect("valid LID string");
         prop_assert_eq!(lid, parsed);
@@ -159,8 +159,8 @@ proptest! {
     /// LID display starts with "lid_" and is 68 chars total.
     #[test]
     fn lid_display_format(attrs in arb_attribute_set()) {
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &form);
         let s = lid.to_string();
         prop_assert!(s.starts_with("lid_"));
         prop_assert_eq!(s.len(), 68);
@@ -184,13 +184,13 @@ proptest! {
 
         prop_assume!(set_a != set_b);
 
-        let form_a = canonicalize(CanonicalizationVersion::V1, &set_a);
-        let form_b = canonicalize(CanonicalizationVersion::V1, &set_b);
+        let form_a = canonicalize(CanonicalizationVersion::V2, &set_a).unwrap();
+        let form_b = canonicalize(CanonicalizationVersion::V2, &set_b).unwrap();
 
         // If canonical forms differ, LIDs must differ.
         if form_a.bytes() != form_b.bytes() {
-            let lid_a = Lid::derive(CanonicalizationVersion::V1, &form_a);
-            let lid_b = Lid::derive(CanonicalizationVersion::V1, &form_b);
+            let lid_a = Lid::derive(CanonicalizationVersion::V2, &form_a);
+            let lid_b = Lid::derive(CanonicalizationVersion::V2, &form_b);
             prop_assert_ne!(lid_a, lid_b);
         }
     }

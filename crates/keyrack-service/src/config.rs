@@ -93,8 +93,8 @@ pub struct ServiceConfig {
     pub grpc_keepalive: Option<GrpcKeepaliveConfig>,
 
     /// Key record cache configuration. Enables in-memory caching of
-    /// `get_key` results for improved latency. The TTL also serves as
-    /// the upper bound on time-to-lockout for HYOK disconnect scenarios.
+    /// metadata `get_key` results. Security-sensitive reads bypass this cache;
+    /// TTL is not an authorization or in-flight operation cutoff guarantee.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
 
@@ -114,6 +114,11 @@ pub struct ServiceConfig {
     /// the authenticity it advertises. Opting in must be deliberate.
     #[serde(default)]
     pub audit_signing_key_ephemeral: bool,
+
+    /// Dangerous legacy opt-in: allow decrypt with a currently Compromised key.
+    /// Each use emits a best-effort audit marker and warning. Default off.
+    #[serde(default)]
+    pub legacy_compromised_key_decrypt: bool,
 }
 
 /// A named provider entry in the `providers` list.
@@ -154,7 +159,11 @@ pub struct NamedProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRoutingRule {
     /// Identity-tag predicate. All entries must match (AND logic).
-    #[serde(rename = "match", default)]
+    #[serde(
+        rename = "match",
+        default,
+        deserialize_with = "keyrack_core::attr::deserialize_flat"
+    )]
     pub match_tags: std::collections::BTreeMap<String, String>,
     /// For `route` rules: name of the provider to pin to.
     /// For `delegate` and `delegate_any` rules: unused (ignored if present).
@@ -206,6 +215,7 @@ impl Default for ServiceConfig {
             cache: None,
             audit_signing_key_path: None,
             audit_signing_key_ephemeral: false,
+            legacy_compromised_key_decrypt: false,
         }
     }
 }
@@ -637,8 +647,7 @@ pub struct CacheConfig {
     #[serde(default = "default_cache_max_capacity")]
     pub max_capacity: u64,
     /// Cache TTL in seconds (default: 300 = 5 minutes).
-    /// For HYOK deployments, this is the upper bound on time-to-lockout
-    /// after a tenant disconnects their HSM.
+    /// Applies to metadata, not to lifecycle authorization or operation cutoff.
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -700,6 +709,7 @@ mod tests {
             cache: None,
             audit_signing_key_path: None,
             audit_signing_key_ephemeral: false,
+            legacy_compromised_key_decrypt: false,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();
