@@ -91,13 +91,93 @@ to `VerifiedA2Closure`; the storage owner must review that integration separatel
 fence UUID and validity. Applying it requires an independently authenticated issuer
 authorized for that scope, currentness checks and serialization with admission and
 output release. The result can report drained in-flight work or suppressed outputs;
-it cannot report success while allowing older-authority output to escape. Suppression
+it cannot report success while allowing a new usable-output commit under fenced
+authority after the applied fence. Earlier irrevocable commits are not recalled. Suppression
 does not itself establish erasure of still-running secret copies. `check_command`
 checks bindings, not these execution facts. Observed leases must be sorted, unique,
 local and at most 128 entries; this diagnostic list is deliberately **not** an
 exhaustive holder census. The applied fence must cover its whole scope, including
 leases absent from the list. Permanent erasure must also initiate revocation; a
 local acknowledgement is not proof that that broader workflow finished.
+
+### In-flight disposition and mid-delivery fences (v1 ruling)
+
+**Keep the two existing tags: `Drained = 1`, `OutputsSuppressed = 2`.** There is
+no third successful "partially delivered" or "unknown but fenced" disposition.
+The classification is local to the exact command's entire authority scope and
+executor incarnation, not to the bounded diagnostic lease list.
+
+**The ordinary mixed case emits one `OutputsSuppressed` receipt.** This is a
+fence-wide postcondition, not a per-operation outcome vector. The existing
+`RevocationResult.authority.scope` is the explicit scope, authenticated together
+with its issuer/generation, executor and exact command digest. No additional
+scope field or per-operation wire granularity is needed for this completion
+claim. `observed_leases` neither selects a subset nor narrows that scope.
+
+Let **F** be the linearization point at which authenticated fence application has
+established the applicable admission/use fence and the selected disposition's
+postcondition, serialized with irrevocable usable-output release. It is not
+command arrival, acknowledgement delivery or recipient read time. A qualified
+profile must identify and test that release point; a final userspace check
+followed by an uncoordinated write is not
+sufficient. Both dispositions require that no new usable-output commit under the
+fenced authority can occur after F.
+
+- **Drained:** all fenced work and output-release obligations finished or
+  terminated at or before F; nothing remains pending. Previously committed output
+  can still sit in a pipe or be retained/read by its recipient. This is not a claim
+  that the recipient consumed or erased it. Finishing crypto while leaving an
+  unguarded output queue is not draining.
+- **OutputsSuppressed:** every response unreleased at F permanently loses its
+  ability to commit usable output under the fenced authority. This includes
+  queued/staged responses and late results of still-running computation. It
+  does not claim that earlier commits were suppressed, nor that every secret
+  copy was erased. Ciphertext staging/status records can continue only if they
+  cannot make the suppressed response usable.
+
+For the current experimental worker's encrypted staging and atomic one-use
+key-capsule release (see its [transport description](../crates/keyrack-crypto-worker/OUTPUT_RELEASE.md)):
+
+| State at F | Disposition for the local scope |
+| --- | --- |
+| Ciphertext partly/fully staged, capsule not committed, remaining release capabilities cancelled | `OutputsSuppressed` |
+| Capsule commit returns EAGAIN/interruption without writing, then fence cancels retry | `OutputsSuppressed` |
+| Capsule committed before F and no other work/release obligation remains | `Drained`; do not relabel the prior commit as suppressed |
+| Some prior commits plus other responses cancelled at F | `OutputsSuppressed` for the unreleased set; prior commits are not recalled |
+| Usable bytes partly released and continuation/scope coverage unresolved | Neither; do not emit a successful `RevocationResult` |
+
+For example, under **one** fence, operations A and B have committed capsules,
+C has only staged ciphertext, and D is computing. If the gate permanently
+cancels C's release capability and rejects D's eventual result, emit **one
+`OutputsSuppressed`** for the full command scope. A/B remain prior released output;
+neither is claimed suppressed. C/D and every other unreleased result are covered
+whether or not their leases appear in diagnostics. Waiting for A/B's recipient
+to read the pipe is not a prerequisite for this receipt.
+
+The aggregation rule is: any still-unresolved affected release path means no
+completion receipt; otherwise a scope with suppressed pending/future results
+uses `OutputsSuppressed`, including a mix with prior commits. Use `Drained` when
+all computation and release obligations have finished/terminated and none remains
+pending. **Mixed prior commits plus suppression is not the unresolved case.**
+The rule describes the producer's runtime obligation; it does not authorize
+combining arbitrary receipts from different commands, scopes or incarnations.
+
+The last row is an unqualified/incomplete execution state, not a new successful
+wire outcome. A future raw-stream profile must establish its own complete release
+and fence semantics before producing either result. A profile that cannot prevent
+post-F usable release cannot fix that by choosing a more permissive enum tag.
+Expiry is a separate clock contract: a release-admission deadline is not a hard
+kernel-enqueue or receiver-delivery deadline.
+
+This ruling does **not** make the experimental worker's private fence notice a
+canonical receipt. The worker owner must authenticate/apply the exact canonical
+`RevocationCommand`, preserve its digest/UUID/scope/incarnation, observe the above
+postcondition under the delivery gate, and authenticate any returned evidence
+under a trusted executor identity. No lossy conversion from a private fence or
+invented command digest is permitted. Tests must exercise pre-capsule and
+post-capsule races, mixed prior/pending results, invalid fences and exact command
+binding. Encoding/signature tests here establish representation integrity, not
+those runtime facts; `check_command` alone does not establish fence completion.
 
 ## Signed evidence is not permission
 

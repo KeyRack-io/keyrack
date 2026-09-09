@@ -566,6 +566,83 @@ fn decoding_a_profile_name_does_not_qualify_it() {
 }
 
 #[test]
+fn revocation_disposition_tags_remain_v1_and_unknown_outcomes_fail_closed() {
+    // Empty diagnostics make the final fields exactly disposition:u8, count:u16.
+    // This tests the wire contract, not runtime drain/suppression truthfulness.
+    let mut result = revocation();
+    result.observed_leases.clear();
+    for (disposition, tag) in [
+        (InFlightDisposition::Drained, 1),
+        (InFlightDisposition::OutputsSuppressed, 2),
+    ] {
+        result.in_flight = disposition;
+        let bytes = result.canonical_bytes().unwrap();
+        assert_eq!(&bytes[bytes.len() - 3..], &[tag, 0, 0]);
+        assert_eq!(
+            RevocationResult::from_canonical_bytes(&bytes).unwrap(),
+            result
+        );
+        for unknown in [0, 3, 255] {
+            let mut changed = bytes.clone();
+            let offset = changed.len() - 3;
+            changed[offset] = unknown;
+            assert!(RevocationResult::from_canonical_bytes(&changed).is_err());
+        }
+    }
+}
+
+#[test]
+fn revocation_disposition_cannot_be_relabelled_after_signing() {
+    for disposition in [
+        InFlightDisposition::Drained,
+        InFlightDisposition::OutputsSuppressed,
+    ] {
+        let mut result = revocation();
+        result.in_flight = disposition;
+        let evidence = signed(result, "executor-a");
+        evidence.clone().authenticate(&key("executor-a")).unwrap();
+        let mut changed = evidence;
+        changed.claims.in_flight = match disposition {
+            InFlightDisposition::Drained => InFlightDisposition::OutputsSuppressed,
+            InFlightDisposition::OutputsSuppressed => InFlightDisposition::Drained,
+        };
+        assert!(changed.authenticate(&key("executor-a")).is_err());
+    }
+}
+
+#[test]
+fn both_revocation_dispositions_require_the_exact_canonical_command() {
+    for disposition in [
+        InFlightDisposition::Drained,
+        InFlightDisposition::OutputsSuppressed,
+    ] {
+        let mut result = revocation();
+        result.in_flight = disposition;
+        result.check_command(&command()).unwrap();
+        let mut changed = command();
+        changed.authority.issuer = id("other-authority");
+        assert!(result.check_command(&changed).is_err());
+        changed = command();
+        changed.authority.scope = AuthorityScope::Context([0xab; 32]);
+        assert!(result.check_command(&changed).is_err());
+        changed = command();
+        changed.authority.generation = nz(9);
+        assert!(result.check_command(&changed).is_err());
+        changed = command();
+        changed.executor = ExecutorIncarnation::new([1; 32]).unwrap();
+        assert!(result.check_command(&changed).is_err());
+        changed = command();
+        changed.fence = Uuid::from_bytes([1; 16]);
+        assert!(result.check_command(&changed).is_err());
+        changed = command();
+        changed.validity.not_after -= 1;
+        assert!(result.check_command(&changed).is_err());
+        result.command_sha256[0] ^= 1;
+        assert!(result.check_command(&command()).is_err());
+    }
+}
+
+#[test]
 fn local_fence_is_bound_to_command_and_does_not_claim_global_completion() {
     revocation().check_command(&command()).unwrap();
     let mut changed = command();

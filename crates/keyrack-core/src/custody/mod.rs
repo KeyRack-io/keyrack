@@ -418,11 +418,33 @@ pub struct RevocationCommand {
     pub validity: Validity,
 }
 
-/// Both outcomes require a fence serialized with admission and output release.
-/// No variant represents "still running, probably safe".
+/// Local completion at the linearization point where authenticated application
+/// establishes the admission/use fence and the selected postcondition, serialized
+/// with output release. Not command arrival or the receiver's eventual read time.
+/// Neither variant permits a new usable-output commit under fenced authority
+/// after that point. Output irrevocably committed before it is not retractable
+/// and is not included in the suppression claim.
+/// This is ONE scope-wide result: a mix of prior commits and suppressed pending
+/// responses is `OutputsSuppressed`, not an unrepresentable outcome. The scope
+/// comes from `RevocationResult.authority.scope`, never `observed_leases`.
+///
+/// A consuming profile must qualify its irrevocable usable-output release point.
+/// With encrypted staging and an atomic one-use key-capsule commit, staging alone
+/// is not usable-output release. A partial usable release with unresolved
+/// continuation is NOT a third successful disposition: emit no completion result
+/// until the profile establishes one of the two postconditions below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlightDisposition {
+    /// All work and output-release obligations under the fenced authority have
+    /// finished or terminated at or before the applied fence. No pending work or
+    /// release obligation remains. Previously committed output may still be
+    /// read by its recipient; this does not mean the recipient drained a pipe.
     Drained,
+    /// Every response still unreleased at the applied fence has permanently lost
+    /// its ability to commit usable output under the fenced authority, including
+    /// late results of computation still running. Earlier commits are NOT claimed
+    /// suppressed. Ciphertext/status transport may continue only if it cannot
+    /// release the suppressed response. This is not a secret-erasure claim.
     OutputsSuppressed,
 }
 
