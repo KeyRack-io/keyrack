@@ -573,7 +573,7 @@ fn revocation_disposition_tags_remain_v1_and_unknown_outcomes_fail_closed() {
     result.observed_leases.clear();
     for (disposition, tag) in [
         (InFlightDisposition::Drained, 1),
-        (InFlightDisposition::OutputsSuppressed, 2),
+        (InFlightDisposition::FurtherReleaseBlocked, 2),
     ] {
         result.in_flight = disposition;
         let bytes = result.canonical_bytes().unwrap();
@@ -595,7 +595,7 @@ fn revocation_disposition_tags_remain_v1_and_unknown_outcomes_fail_closed() {
 fn revocation_disposition_cannot_be_relabelled_after_signing() {
     for disposition in [
         InFlightDisposition::Drained,
-        InFlightDisposition::OutputsSuppressed,
+        InFlightDisposition::FurtherReleaseBlocked,
     ] {
         let mut result = revocation();
         result.in_flight = disposition;
@@ -603,8 +603,8 @@ fn revocation_disposition_cannot_be_relabelled_after_signing() {
         evidence.clone().authenticate(&key("executor-a")).unwrap();
         let mut changed = evidence;
         changed.claims.in_flight = match disposition {
-            InFlightDisposition::Drained => InFlightDisposition::OutputsSuppressed,
-            InFlightDisposition::OutputsSuppressed => InFlightDisposition::Drained,
+            InFlightDisposition::Drained => InFlightDisposition::FurtherReleaseBlocked,
+            InFlightDisposition::FurtherReleaseBlocked => InFlightDisposition::Drained,
         };
         assert!(changed.authenticate(&key("executor-a")).is_err());
     }
@@ -614,7 +614,7 @@ fn revocation_disposition_cannot_be_relabelled_after_signing() {
 fn both_revocation_dispositions_require_the_exact_canonical_command() {
     for disposition in [
         InFlightDisposition::Drained,
-        InFlightDisposition::OutputsSuppressed,
+        InFlightDisposition::FurtherReleaseBlocked,
     ] {
         let mut result = revocation();
         result.in_flight = disposition;

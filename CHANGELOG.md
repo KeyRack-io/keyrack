@@ -4,8 +4,73 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
+  parsed and then failed at startup with "KMIP provider not yet implemented",
+  so no deployment could use the backend the operator guide documents. Both
+  documented shapes — the single `provider:` block and an entry in the
+  `providers:` list with tag routing — now construct the provider.
+- **`conformance/kmip-provider/`: the KMIP backend is proven against a
+  third-party server.** The harness boots the service from the documented YAML
+  against PyKMIP and exercises create, encrypt, decrypt, tamper rejection,
+  describe, rotate, decrypt-after-rotate, disable, disabled-refuses-encrypt and
+  enable. A server nobody here wrote is the point: the client's unit tests
+  encoded and decoded with the same tables, so they agreed with themselves
+  whatever the values were. `check-constants.py` compares every wire constant
+  against that implementation's, and `crates/keyrack-kmip/tests/neutral_server.rs`
+  asserts what only a live server can settle — including that it binds the
+  encryption context rather than accepting the field and ignoring it. Pointing
+  the harness at another server is how to qualify that server.
+
 ### Fixed
 
+- **Compromised keys now deny decrypt by default, including ReEncrypt sources.**
+  Persisted compromise history prevents deletion cancellation or rotation from
+  restoring decrypt or raw export. Security-sensitive reads bypass metadata
+  caches, including a fresh export check after PDP authorization. An explicit,
+  default-off `legacy_compromised_key_decrypt` flag restores only dangerous legacy
+  decrypt behavior with startup/per-use warnings and structured, best-effort
+  audit markers. It is not controlled recovery or audit-failure release
+  suppression. Disabled and mathematical verification behavior are unchanged.
+  Upgrade all service/storage writers together and deploy the companion shim
+  plaintext-cache bypass fix; old writers can discard the sticky JSON marker.
+  See the operator guide for migration limits and per-use marker semantics.
+- **KMIP wire format: four constants named the wrong thing.** Each collided
+  with a value the specification does define, so requests were well-formed and
+  meant something else: `SymmetricKey` was `0x01` (Certificate) — which is
+  what every symmetric `Create` sent — `GCM` was `0x0E` (X9.102 AESKW),
+  `RNGRetrieve` was `0x2C` (Log), and `Ed25519` was `0x1B` (One Time Pad).
+- **KMIP protocol version: 2.1 was announced over 1.x payloads.** `Create`
+  carries a `TemplateAttribute`, which KMIP 2.0 removed, so the combination was
+  unusable at either version — a 1.x server refuses the major version and a 2.x
+  server cannot parse the body. The client now announces 1.4, which is what it
+  encodes.
+- **KMIP keys were created and never activated.** KMIP forbids cryptographic
+  use of a Pre-Active object, so `generate_key` returned a handle to a key that
+  refused every operation. Keys are now activated on creation, and revoked
+  before destruction, which KMIP likewise requires.
+- **KMIP AES-GCM discarded the authentication tag.** The tag was never read
+  from the `Encrypt` response, never sent on `Decrypt`, and no tag length was
+  requested, so the mode was authenticated in name only and the ciphertext
+  could not be decrypted. The tag is now carried, and the encryption context is
+  transmitted as `AuthenticatedEncryptionAdditionalData` instead of being
+  refused — the refusal existed because the tag could not be verified, which is
+  no longer the case.
+- **KMIP ciphertexts now record their own framing.** The blob assumed a 12-byte
+  nonce; a server that picks another length (the one this is proven against
+  picks 16) could not be decrypted at all. Nonce and tag lengths are written
+  into the blob. No migration concern: no deployment could reach this provider
+  before, so no ciphertext in the old shape exists.
+- **KMIP `RNGRetrieve` sent the byte count in `Data` instead of
+  `DataLength`,** producing a request no server can parse. Corrected, but still
+  unproven: the server this backend is proven against does not implement the
+  operation, and `docs/OPERATOR.md` now says so rather than leaving it to be
+  inferred.
+- **A KMIP connection panicked when no rustls provider was installed.** The
+  service installs one at startup, so this was reachable only by other
+  embedders, for whom a panic inside a connection attempt is the wrong report
+  of a missing initialisation step. It is now an error naming the omission.
 - **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
   source-key permit alone no longer permits re-encryption into an unauthorized
   destination. Policies must grant `kms:ReEncryptFrom` on the source and
@@ -30,7 +95,7 @@ All notable changes to KeyRack will be documented in this file.
   in-flight authorizations — rather than an unauthenticated allow. It also
   required a PDP endpoint reachable and trusted enough to answer at all.
   Uncorrelated responses now fail the operation instead of authorizing it.
-  Validation lives on `AuthzResponse::require_correlated` in `keyrack-core`
+  Validation lives on `AuthzResponse::into_enforceable` in `keyrack-core`
   and is called by both transports, because the gap was present in *both* the
   HTTP and gRPC clients and a per-transport check is how they drifted in the
   first place.

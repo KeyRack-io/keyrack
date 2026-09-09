@@ -130,7 +130,8 @@ impl LazyProvisioner {
         &self,
         attrs: &BTreeMap<String, String>,
     ) -> Result<ProvisionResult> {
-        let chain = resolve_chain(&self.rules, attrs, &self.config.resolver)?;
+        let attrs = crate::attr::normalize_flat(attrs)?;
+        let chain = resolve_chain(&self.rules, &attrs, &self.config.resolver)?;
 
         let mut created = Vec::new();
         let mut existed = Vec::new();
@@ -141,7 +142,7 @@ impl LazyProvisioner {
         for (i, lid) in reversed.iter().enumerate() {
             let parent_lid = if i > 0 { Some(&reversed[i - 1]) } else { None };
 
-            match self.ensure_key(lid, parent_lid, attrs).await? {
+            match self.ensure_key(lid, parent_lid, &attrs).await? {
                 KeyProvisionOutcome::Created => created.push(*lid),
                 KeyProvisionOutcome::Existed => existed.push(*lid),
             }
@@ -246,7 +247,7 @@ impl LazyProvisioner {
         for (k, v) in attrs {
             identity_attrs.insert(k, AttributeValue::String(v.clone()));
         }
-        let identity_tags = IdentityTags::from_attribute_set(&identity_attrs);
+        let identity_tags = IdentityTags::from_attribute_set(&identity_attrs)?;
 
         // Route the new key to the appropriate provider based on identity tags.
         let provider_name = self.router.select(&identity_tags);
@@ -263,6 +264,7 @@ impl LazyProvisioner {
             occ_version: 1,
             current_key_version: 1,
             state: KeyState::Enabled,
+            was_compromised: false,
             key_usage: self.config.default_key_usage,
             key_spec,
             origin: KeyOrigin::KeyRack,
@@ -352,7 +354,8 @@ mod tests {
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         reg.register(Namespace {
             name: "app".into(),
@@ -378,7 +381,8 @@ mod tests {
                     key_spec: None,
                 },
             ],
-        });
+        })
+        .unwrap();
 
         reg
     }
@@ -511,7 +515,7 @@ mod tests {
             registry,
             rules,
             ProvisionConfig::default(),
-            ProviderRouter::new(vec![], ProviderRef::new("default")),
+            ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         );
 
         let attrs = BTreeMap::from([
@@ -549,7 +553,7 @@ mod tests {
             registry,
             rules,
             ProvisionConfig::default(),
-            ProviderRouter::new(vec![], ProviderRef::new("default")),
+            ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         );
 
         let attrs = BTreeMap::from([
@@ -582,7 +586,7 @@ mod tests {
             registry,
             rules,
             ProvisionConfig::default(),
-            ProviderRouter::new(vec![], ProviderRef::new("default")),
+            ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         );
 
         let alice_attrs = BTreeMap::from([
@@ -624,7 +628,7 @@ mod tests {
             registry,
             rules,
             ProvisionConfig::default(),
-            ProviderRouter::new(vec![], ProviderRef::new("default")),
+            ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         ));
 
         let attrs = BTreeMap::from([
@@ -669,7 +673,7 @@ mod tests {
             registry,
             rules,
             ProvisionConfig::default(),
-            ProviderRouter::new(vec![], ProviderRef::new("default")),
+            ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         );
 
         let attrs = BTreeMap::from([

@@ -141,8 +141,8 @@ mod tests {
     fn make_lid(key: &str, val: &str) -> Lid {
         let mut attrs = AttributeSet::new();
         attrs.insert(key, AttributeValue::String(val.into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        Lid::derive(CanonicalizationVersion::V1, &form)
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        Lid::derive(CanonicalizationVersion::V2, &form)
     }
 
     #[test]
@@ -199,31 +199,31 @@ mod tests {
     fn different_version_different_lid() {
         let mut attrs = AttributeSet::new();
         attrs.insert("x", AttributeValue::I64(1));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
 
-        let lid_v1 = Lid::derive(CanonicalizationVersion::V1, &form);
+        let lid_v2 = Lid::derive(CanonicalizationVersion::V2, &form);
 
-        // Simulate V2 by manually hashing with a different version byte.
+        // A legacy prefix must never be interpreted as the current identity.
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&2_u32.to_le_bytes());
+        hasher.update(&1_u32.to_le_bytes());
         hasher.update(form.bytes());
-        let lid_v2_bytes = *hasher.finalize().as_bytes();
+        let legacy_bytes = *hasher.finalize().as_bytes();
 
-        assert_ne!(lid_v1.as_bytes(), &lid_v2_bytes);
+        assert_ne!(lid_v2.as_bytes(), &legacy_bytes);
     }
 
     #[test]
     fn single_byte_flip_changes_lid() {
         let mut attrs = AttributeSet::new();
         attrs.insert("x", AttributeValue::I64(0));
-        let form_a = canonicalize(CanonicalizationVersion::V1, &attrs);
+        let form_a = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
 
         let mut attrs_b = AttributeSet::new();
         attrs_b.insert("x", AttributeValue::I64(1));
-        let form_b = canonicalize(CanonicalizationVersion::V1, &attrs_b);
+        let form_b = canonicalize(CanonicalizationVersion::V2, &attrs_b).unwrap();
 
-        let lid_a = Lid::derive(CanonicalizationVersion::V1, &form_a);
-        let lid_b = Lid::derive(CanonicalizationVersion::V1, &form_b);
+        let lid_a = Lid::derive(CanonicalizationVersion::V2, &form_a);
+        let lid_b = Lid::derive(CanonicalizationVersion::V2, &form_b);
         assert_ne!(lid_a, lid_b);
     }
 

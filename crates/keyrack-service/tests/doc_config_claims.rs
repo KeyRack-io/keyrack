@@ -77,6 +77,13 @@ struct DefaultClaimRule {
 /// would be a worse control than none.
 const RULES: &[DefaultClaimRule] = &[
     DefaultClaimRule {
+        field: "legacy_compromised_key_decrypt",
+        subject_words: &["legacy_compromised_key_decrypt: true"],
+        true_when_default_is: "true",
+        hint:
+            "compromised decrypt is denied unless the dangerous legacy flag is explicitly enabled.",
+    },
+    DefaultClaimRule {
         field: "audit_signing_key_ephemeral",
         subject_words: &["ephemeral"],
         true_when_default_is: "true",
@@ -234,4 +241,17 @@ fn documented_config_defaults_match_config_rs() {
         violations.len(),
         violations.join("\n")
     );
+}
+
+#[test]
+fn compromised_legacy_operator_example_matches_literal_and_yaml_defaults() {
+    let root = repo_root();
+    let source = read(&root.join("crates/keyrack-service/src/config.rs"));
+    let defaults = service_config_defaults(&source);
+    let literal = &defaults["legacy_compromised_key_decrypt"];
+    let yaml = keyrack_service::config::ServiceConfig::from_yaml("pdp: {type: always_deny}\n")
+        .expect("missing legacy flag is valid");
+    assert_eq!(yaml.legacy_compromised_key_decrypt.to_string(), *literal);
+    let snippet = format!("```yaml\nlegacy_compromised_key_decrypt: {literal}\n```");
+    assert!(read(&root.join("docs/OPERATOR.md")).contains(&snippet));
 }

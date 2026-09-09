@@ -54,6 +54,57 @@ With `bootstrap_token` auth, set the token via the `KMS_BOOTSTRAP_TOKEN`
 environment variable. The token is hashed at startup — the plaintext is
 not retained in memory.
 
+### Compromised-key default denial and dangerous legacy opt-in
+
+Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.
+This is the default even when the following setting is absent:
+
+```yaml
+legacy_compromised_key_decrypt: false
+```
+
+An explicit `legacy_compromised_key_decrypt: true` restores dangerous legacy
+decrypt behavior for keys currently in `Compromised` state only. It does not
+permit encrypt, sign, MAC generation, data-key generation, destination-side
+ReEncrypt, rotation or raw key-material export. Normal authorization and scope
+checks still apply. It is not a controlled recovery mechanism.
+
+The setting emits a named WARN on every startup. Each exceptional decrypt or
+source-side ReEncrypt emits another named WARN and a structured audit event
+immediately before provider dispatch, with
+`metadata.legacy_compromised_key_decrypt = "true"`,
+`metadata.phase = "provider_dispatch"` and `metadata.key_state = "compromised"`.
+The event names the source key, authenticated principal, operation and request
+ID. Its `success` means the override was exercised, not that the subsequent
+crypto operation succeeded; the ordinary operation event records that outcome.
+Audit delivery is **best-effort**: an emit failure is logged, but does not withhold
+the operation or result. This change does not implement audit-failure release
+suppression or the separate controlled-recovery contract.
+
+Compromise history is a persisted, monotonic `was_compromised` marker on the
+logical key, independent of its current state and versions. Deletion cancellation
+still returns to `Disabled`, but a historically compromised key cannot be enabled,
+decrypted or exported from that state. Keys never marked compromised retain the
+existing deletion-cancellation and `Disabled` behavior. Rotation cannot clear the
+marker. Verify and VerifyMac retain their previous mathematical verification
+behavior for Enabled, Disabled and Compromised; validity does not establish
+trustworthy key provenance.
+
+Crypto and lifecycle decisions read authoritative storage through
+`get_key_for_use`, bypassing the metadata cache. Do not rely on cache TTL to
+enforce compromise. Deploy the companion AWS shim change that forwards every
+Decrypt to the service: older shim plaintext caches can bypass fresh service
+decisions. Metadata caching remains available for queries.
+
+**Upgrade all writers and serving replicas together.** Old binaries can ignore
+or erase the new JSON marker on a subsequent write, so mixed-version operation
+or rollback to those binaries is unsafe. Existing live Compromised records are
+recognized and latched when written. History already erased by the old laundering
+path cannot be reconstructed from a current Enabled, Disabled or PendingDeletion
+record; review historical incident/audit records before treating those keys as
+uncompromised. This does not protect against direct database tampering or cancel
+already-dispatched provider operations.
+
 ### Environment variables
 
 | Variable | Description | Default |
@@ -148,6 +199,39 @@ provider:
   client_key: "/etc/keyrack/tls/kmip-client-key.pem"
   ca_cert: "/etc/keyrack/tls/kmip-ca.pem"   # optional
 ```
+
+What your server has to provide for this to work:
+
+- **KMIP 1.4.** That is the version KeyRack announces and encodes. A
+  server that only speaks 2.x will reject the connection.
+- **An AEAD TLS cipher suite.** KeyRack's TLS implementation offers only
+  AEAD suites (AES-GCM and ChaCha20-Poly1305), so a server restricted to
+  CBC suites shares no cipher with it and the handshake fails. If your
+  server's AEAD suites are ECDHE-ECDSA, it needs an ECDSA certificate.
+- **Mutual TLS.** The client certificate is the only authentication
+  mechanism; there is no username or password field.
+- **`Create`, `Activate`, `Encrypt`, `Decrypt`, `Revoke`, `Destroy`.** Keys
+  are activated on creation, and revoked before destruction, because KMIP
+  forbids using a Pre-Active object and forbids destroying an Active one.
+- **`AuthenticatedEncryptionAdditionalData` that is actually bound.**
+  KeyRack sends the encryption context in this field and relies on the
+  server covering it with the authentication tag. A server that accepts
+  the field and ignores it produces ciphertexts that decrypt under any
+  context, which KeyRack cannot detect on its own.
+
+Not supported over KMIP:
+
+- **`generate-random`.** The request is built, but it has never been
+  exercised against a real server, because the server this backend is
+  proven against does not implement `RNGRetrieve`. Treat it as untested
+  rather than working.
+- **Signing keys.** Only AES-256 has been proven end to end. The other key
+  specs the provider advertises are unexercised.
+
+`conformance/kmip-provider/run-proof.sh` runs the whole lifecycle against a
+third-party KMIP server. Pointing it at your own server is the way to find
+out whether the requirements above hold there — in particular the AAD
+binding, which is asserted rather than assumed.
 
 ### In-memory (test fixtures)
 
@@ -571,7 +655,7 @@ nats_notify:
 
 ## Key record cache
 
-Enable in-memory caching of key records to reduce storage round-trips:
+Enable in-memory caching of key metadata queries to reduce storage round-trips:
 
 ```yaml
 cache:
@@ -579,9 +663,11 @@ cache:
   max_capacity: 10000    # maximum cached entries (default: 10,000)
 ```
 
-The cache is invalidated on key state changes and rotation. For HYOK
-deployments, `ttl_secs` is the upper bound on time-to-lockout after a
-tenant disconnects their HSM — lower it if faster revocation is required.
+Local writes replace cached entries; other replicas' metadata can remain stale
+until expiry. No cross-replica invalidation subscriber is wired in this service.
+Crypto, raw export, rotation and lifecycle transitions use authoritative
+`get_key_for_use` reads instead. `ttl_secs` is not an authorization lease,
+revocation bound or guarantee about already-dispatched operations.
 
 If omitted, caching is disabled and every operation hits the storage backend.
 

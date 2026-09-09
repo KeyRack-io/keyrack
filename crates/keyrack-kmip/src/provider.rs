@@ -96,6 +96,79 @@ fn default_timeout() -> u64 {
     30
 }
 
+/// Version byte prefixing the ciphertext blob this provider returns.
+const BLOB_VERSION: u8 = 1;
+
+/// Ciphertext blob layout:
+///
+/// ```text
+/// version(1) | nonce_len(1) | nonce | tag_len(1) | tag | ciphertext
+/// ```
+///
+/// The nonce and tag lengths are written down rather than assumed, because
+/// the server chooses them. GCM's recommended nonce is 12 bytes, but the
+/// specification permits others and servers do use them — the implementation
+/// this provider was first proven against returns 16. Hard-coding 12 makes
+/// every encryption fail against such a server, and hard-coding 16 would
+/// merely move the failure.
+fn frame_blob(nonce: &[u8], tag: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    if nonce.len() > u8::MAX as usize || tag.len() > u8::MAX as usize {
+        return Err(KeyRackError::Provider(format!(
+            "KMIP Encrypt: nonce ({} bytes) or tag ({} bytes) too long to frame",
+            nonce.len(),
+            tag.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(3 + nonce.len() + tag.len() + ciphertext.len());
+    out.push(BLOB_VERSION);
+    out.push(nonce.len() as u8);
+    out.extend_from_slice(nonce);
+    out.push(tag.len() as u8);
+    out.extend_from_slice(tag);
+    out.extend_from_slice(ciphertext);
+    Ok(out)
+}
+
+/// Split a blob written by [`frame_blob`] into nonce, tag and ciphertext.
+fn unframe_blob(blob: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
+    let malformed = |detail: &str| {
+        KeyRackError::Provider(format!(
+            "KMIP Decrypt: ciphertext is not a blob this provider produced: {detail}"
+        ))
+    };
+
+    let (&version, rest) = blob.split_first().ok_or_else(|| malformed("it is empty"))?;
+    if version != BLOB_VERSION {
+        return Err(malformed(&format!(
+            "unknown framing version {version} (this build writes {BLOB_VERSION})"
+        )));
+    }
+
+    let (&nonce_len, rest) = rest
+        .split_first()
+        .ok_or_else(|| malformed("no nonce length"))?;
+    if rest.len() < nonce_len as usize {
+        return Err(malformed("nonce is shorter than its stated length"));
+    }
+    let (nonce, rest) = rest.split_at(nonce_len as usize);
+
+    let (&tag_len, rest) = rest
+        .split_first()
+        .ok_or_else(|| malformed("no tag length"))?;
+    if rest.len() < tag_len as usize {
+        return Err(malformed("tag is shorter than its stated length"));
+    }
+    let (tag, ciphertext) = rest.split_at(tag_len as usize);
+
+    if tag.is_empty() {
+        return Err(malformed(
+            "no authentication tag, so nothing binds the ciphertext",
+        ));
+    }
+
+    Ok((nonce, tag, ciphertext))
+}
+
 /// KMIP cryptographic provider.
 ///
 /// All operations delegate to the remote KMIP server via the TTLV
@@ -180,28 +253,6 @@ impl KmipProvider {
             }
         })
     }
-
-    /// Fail closed when the caller supplies additional authenticated data.
-    ///
-    /// See the module documentation: this client transmits neither the KMIP
-    /// `Authenticated Encryption Additional Data` field nor the
-    /// `Authenticated Encryption Tag` that would authenticate it, so a
-    /// non-empty `aad` cannot be bound to the ciphertext. Refusing keeps the
-    /// caller's belief and the cryptographic reality in agreement; silently
-    /// discarding it would not. An empty `aad` binds nothing and is accepted.
-    fn reject_unbindable_aad(aad: &[u8], operation: &str) -> Result<()> {
-        if aad.is_empty() {
-            return Ok(());
-        }
-        Err(KeyRackError::Provider(format!(
-            "kmip provider cannot bind additional authenticated data: {operation} was given \
-             {} byte(s) of AAD, but this client does not transmit the KMIP Authenticated \
-             Encryption Additional Data field and cannot verify the Authenticated Encryption \
-             Tag. Refusing rather than discarding the encryption context — use a provider that \
-             supports AAD, or call with an empty AAD if no binding is required.",
-            aad.len()
-        )))
-    }
 }
 
 #[async_trait]
@@ -227,15 +278,31 @@ impl CryptoProvider for KmipProvider {
                 KeyRackError::Provider("KMIP Create: no UniqueIdentifier in response".into())
             })?;
 
+        let unique_id = unique_id.to_string();
+
+        // A created object is Pre-Active, and KMIP forbids cryptographic use
+        // of a Pre-Active object. Returning the handle here without
+        // activating would hand back a key that exists and refuses every
+        // operation, with the failure surfacing later and elsewhere.
+        let activate = self
+            .send_request(&messages::activate_request(&unique_id))
+            .await?;
+        Self::check_response(&activate).map_err(|e| {
+            KeyRackError::Provider(format!(
+                "KMIP Create succeeded but Activate failed for key {unique_id}, \
+                 leaving an unusable Pre-Active object on the server: {e}"
+            ))
+        })?;
+
         tracing::info!(
-            key_id = unique_id,
+            key_id = %unique_id,
             spec = ?spec,
             endpoint = %self.config.endpoint,
-            "KMIP key created"
+            "KMIP key created and activated"
         );
 
         Ok(KeyHandle {
-            key_id: unique_id.to_string(),
+            key_id: unique_id,
             key_spec: spec.clone(),
         })
     }
@@ -246,14 +313,7 @@ impl CryptoProvider for KmipProvider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<EncryptOutput> {
-        Self::reject_unbindable_aad(aad, "encrypt")?;
-
-        let request = messages::encrypt_request(
-            &handle.key_id,
-            plaintext,
-            None,
-            Some(ttlv::block_cipher_mode::GCM),
-        );
+        let request = messages::encrypt_request(&handle.key_id, plaintext, None, aad);
 
         let resp = self.send_request(&request).await?;
         Self::check_response(&resp)?;
@@ -269,17 +329,36 @@ impl CryptoProvider for KmipProvider {
             .ok_or_else(|| KeyRackError::Provider("KMIP Encrypt: no Data in response".into()))?
             .to_vec();
 
+        // The server chooses the nonce and returns it; its length is recorded
+        // in the blob rather than assumed.
         let iv = payload
             .find(tag::IV_COUNTER_NONCE)
             .and_then(|i| i.as_bytes())
-            .unwrap_or_default()
-            .to_vec();
+            .unwrap_or_default();
+        if iv.is_empty() {
+            return Err(KeyRackError::Provider(
+                "KMIP Encrypt: no IVCounterNonce in response; the ciphertext could not be \
+                 decrypted without the nonce it was produced under"
+                    .into(),
+            ));
+        }
 
-        let mut combined = iv;
-        combined.extend_from_slice(&ciphertext);
-
+        // Without the tag the mode is not authenticated. Refusing here rather
+        // than storing an unauthenticated blob keeps the failure at the point
+        // the guarantee is lost, instead of at some later decrypt.
+        let tag_bytes = payload
+            .find(tag::AUTHENTICATED_ENCRYPTION_TAG)
+            .and_then(|i| i.as_bytes())
+            .ok_or_else(|| {
+                KeyRackError::Provider(
+                    "KMIP Encrypt: no AuthenticatedEncryptionTag in response. AES-GCM without \
+                     its tag is unauthenticated and cannot be decrypted; refusing rather than \
+                     returning a ciphertext that only looks protected"
+                        .into(),
+                )
+            })?;
         Ok(EncryptOutput {
-            ciphertext: combined,
+            ciphertext: frame_blob(iv, tag_bytes, &ciphertext)?,
         })
     }
 
@@ -289,21 +368,12 @@ impl CryptoProvider for KmipProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
-        Self::reject_unbindable_aad(aad, "decrypt")?;
+        // A blob that does not parse cannot have come from this provider, so
+        // it is refused rather than sent to the server with a missing tag as
+        // though the tag were merely absent.
+        let (iv, auth_tag, ct) = unframe_blob(ciphertext)?;
 
-        // For AES-GCM, the first 12 bytes are the IV.
-        let (iv, ct) = if matches!(handle.key_spec, KeySpec::Aes256) && ciphertext.len() > 12 {
-            (&ciphertext[..12], &ciphertext[12..])
-        } else {
-            (&[][..], ciphertext)
-        };
-
-        let request = messages::decrypt_request(
-            &handle.key_id,
-            ct,
-            if iv.is_empty() { None } else { Some(iv) },
-            Some(ttlv::block_cipher_mode::GCM),
-        );
+        let request = messages::decrypt_request(&handle.key_id, ct, Some(iv), Some(auth_tag), aad);
 
         let resp = self.send_request(&request).await?;
         Self::check_response(&resp)?;
@@ -377,6 +447,26 @@ impl CryptoProvider for KmipProvider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        // KMIP forbids destroying an Active object, and `generate_key`
+        // activates every key it creates, so Destroy on its own always fails.
+        // A revoke failure is not fatal: the key may already be deactivated,
+        // or predate activation, and Destroy is the operation whose result
+        // actually decides whether the key is gone.
+        let revoked = match self
+            .send_request(&messages::revoke_request(&handle.key_id))
+            .await
+        {
+            Ok(resp) => Self::check_response(&resp),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = revoked {
+            tracing::debug!(
+                key_id = %handle.key_id,
+                error = %e,
+                "KMIP Revoke before Destroy did not succeed; attempting Destroy anyway"
+            );
+        }
+
         let request = messages::destroy_request(&handle.key_id);
 
         let resp = self.send_request(&request).await?;
@@ -499,64 +589,77 @@ mod tests {
         }
     }
 
-    // ── AAD contract ────────────────────────────────────────────────
+    // ── ciphertext framing ──────────────────────────────────────────
     //
-    // These tests run in-process under `cargo test --workspace`; they need no
-    // KMIP server. `test_config` points at a port nothing is listening on, so
-    // an assertion that the error names the AAD problem — rather than a
-    // connection failure — is itself the proof that the request was refused
-    // before it could reach the wire and lose the caller's context.
+    // These run in-process and need no KMIP server. `test_config` points at a
+    // port nothing is listening on, so an error naming the framing problem
+    // rather than a connection failure proves the blob was rejected before it
+    // reached the wire.
+    //
+    // AAD binding itself cannot be proved here: whether the server actually
+    // covers the additional data with the authentication tag is a property of
+    // the server, so it is asserted against a live third-party server in
+    // `tests/neutral_server.rs`.
 
     #[test]
-    fn empty_aad_is_accepted_by_the_guard() {
+    fn framing_round_trips_whatever_lengths_the_server_chose() {
+        // 16 rather than 12: the server picks the nonce length, and the
+        // implementation this was proven against picks 16.
+        for nonce_len in [12usize, 16] {
+            let nonce = vec![0xA5; nonce_len];
+            let tag = vec![0x5A; 16];
+            let ct = b"ciphertext bytes".to_vec();
+
+            let blob = frame_blob(&nonce, &tag, &ct).unwrap();
+            let (got_nonce, got_tag, got_ct) = unframe_blob(&blob).unwrap();
+
+            assert_eq!(got_nonce, &nonce[..], "nonce of {nonce_len} bytes");
+            assert_eq!(got_tag, &tag[..]);
+            assert_eq!(got_ct, &ct[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_rejects_a_blob_it_cannot_parse() {
+        let provider = KmipProvider::new(test_config());
+        // Claims a 200-byte nonce it does not carry.
+        let err = provider
+            .decrypt(&test_handle(), &[BLOB_VERSION, 200, 0, 0], b"")
+            .await
+            .expect_err("an unparseable blob must be refused");
+
+        let msg = err.to_string();
         assert!(
-            KmipProvider::reject_unbindable_aad(&[], "encrypt").is_ok(),
-            "an empty AAD asserts no binding and must remain usable"
+            msg.contains("not a blob this provider produced"),
+            "the error must name the framing problem rather than surface as a \
+             connection failure, which is what proves nothing was sent: {msg}"
         );
     }
 
     #[tokio::test]
-    async fn encrypt_rejects_non_empty_aad() {
+    async fn decrypt_refuses_a_blob_with_no_authentication_tag() {
         let provider = KmipProvider::new(test_config());
+        // Well-formed framing with a zero-length tag: parseable, and
+        // unauthenticated. Sending it on would ask the server to decrypt
+        // something nothing binds.
+        let blob = [BLOB_VERSION, 1, 0xAA, 0, b'c', b't'];
         let err = provider
-            .encrypt(&test_handle(), b"plaintext", b"tenant=acme")
+            .decrypt(&test_handle(), &blob, b"")
             .await
-            .expect_err("non-empty AAD must be refused, not silently discarded");
+            .expect_err("a blob with an empty tag must be refused");
 
         assert!(
-            matches!(err, KeyRackError::Provider(_)),
-            "expected a provider error, got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("additional authenticated data") && msg.contains("encrypt"),
-            "error must name the unsupported AAD binding and the operation: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn decrypt_rejects_non_empty_aad() {
-        let provider = KmipProvider::new(test_config());
-        let err = provider
-            .decrypt(&test_handle(), b"ciphertext", b"tenant=acme")
-            .await
-            .expect_err("non-empty AAD must be refused, not silently discarded");
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("additional authenticated data") && msg.contains("decrypt"),
-            "error must name the unsupported AAD binding and the operation: {msg}"
+            err.to_string().contains("nothing binds the ciphertext"),
+            "got: {err}"
         );
     }
 
     // `re_encrypt` and `generate_data_key` use the trait's default
-    // implementations, which compose `encrypt`/`decrypt` — so they must inherit
-    // the refusal rather than route around it. `re_encrypt` decrypts first, so
-    // the guard is reachable without a server; `generate_data_key` calls
-    // `generate_random` first, so it only fails once the server has been
-    // contacted and is therefore not covered in-process here.
+    // implementations, which compose `encrypt`/`decrypt`, so they inherit
+    // whatever those two enforce. `re_encrypt` decrypts first, which makes the
+    // framing check reachable without a server.
     #[tokio::test]
-    async fn re_encrypt_inherits_the_aad_refusal() {
+    async fn re_encrypt_inherits_the_framing_check() {
         let provider = KmipProvider::new(test_config());
         let err = provider
             .re_encrypt(
@@ -567,11 +670,12 @@ mod tests {
                 b"tenant=acme",
             )
             .await
-            .expect_err("re_encrypt must not launder a non-empty AAD");
+            .expect_err("re_encrypt must not accept a blob its decrypt would reject");
 
         assert!(
-            err.to_string().contains("additional authenticated data"),
-            "expected the AAD refusal to propagate, got: {err}"
+            err.to_string()
+                .contains("not a blob this provider produced"),
+            "expected the framing refusal to propagate, got: {err}"
         );
     }
 

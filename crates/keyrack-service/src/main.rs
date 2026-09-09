@@ -380,8 +380,29 @@ async fn build_provider(
                 keyrack_core::key::ProviderClass::Pkcs11,
             )
         }
-        ProviderConfig::Kmip { .. } => {
-            return Err("KMIP provider not yet implemented".into());
+        ProviderConfig::Kmip {
+            host,
+            port,
+            client_cert,
+            client_key,
+            ca_cert,
+        } => {
+            let kmip_config = keyrack_kmip::KmipProviderConfig {
+                endpoint: format!("kmip://{host}:{port}"),
+                client_cert_path: Some(client_cert.clone()),
+                client_key_path: Some(client_key.clone()),
+                ca_cert_path: ca_cert.clone(),
+                timeout_secs: 30,
+                // Mutual TLS is the authentication mechanism; the config
+                // exposes no username or password, so a KMIP deployment that
+                // authenticates by credential is not supported here yet.
+                username: None,
+                password: None,
+            };
+            (
+                Arc::new(keyrack_kmip::KmipProvider::new(kmip_config)),
+                keyrack_core::key::ProviderClass::Kmip,
+            )
         }
         ProviderConfig::VaultTransit {
             vault_addr,
@@ -509,6 +530,13 @@ async fn build_state(
     use keyrack_service::config::{PdpConfig, StorageConfig};
     use keyrack_service::routing::ProviderRouter;
 
+    if config.legacy_compromised_key_decrypt {
+        tracing::warn!(
+            legacy_compromised_key_decrypt = true,
+            "SECURITY: legacy_compromised_key_decrypt restores dangerous legacy decrypt behavior for compromised keys; per-use audit delivery is best-effort"
+        );
+    }
+
     let storage: Arc<dyn keyrack_core::storage::StorageBackend> = match &config.storage {
         StorageConfig::Sqlite { path } => Arc::new(keyrack_sqlite::SqliteStorage::open(path)?),
         StorageConfig::Postgres { database_url } => {
@@ -629,7 +657,7 @@ async fn build_state(
         });
     }
 
-    let provider_router = ProviderRouter::with_rules(routing_rules, default_ref);
+    let provider_router = ProviderRouter::with_rules(routing_rules, default_ref)?;
 
     let pdp_config = config
         .resolved_pdp()
@@ -720,6 +748,7 @@ async fn build_state(
         authn,
         metrics_handle,
         max_plaintext_bytes: config.max_plaintext_bytes,
+        legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
         nats_publisher,
     })
 }

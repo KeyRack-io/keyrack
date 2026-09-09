@@ -577,7 +577,7 @@ impl Wire for RevocationResult {
         w.fixed(&self.command_sha256);
         w.u8(match self.in_flight {
             InFlightDisposition::Drained => 1,
-            InFlightDisposition::OutputsSuppressed => 2,
+            InFlightDisposition::FurtherReleaseBlocked => 2,
         });
         if self.observed_leases.len() > MAX_RECEIPT_LEASES {
             return Err(ContractError::Binding("too many observed leases"));
@@ -602,7 +602,7 @@ impl Wire for RevocationResult {
         let command_sha256 = r.fixed()?;
         let in_flight = match r.u8()? {
             1 => InFlightDisposition::Drained,
-            2 => InFlightDisposition::OutputsSuppressed,
+            2 => InFlightDisposition::FurtherReleaseBlocked,
             _ => return Err(unknown()),
         };
         let n = usize::from(r.u16()?);

@@ -46,6 +46,8 @@ pub struct ServiceState {
     pub authn: Arc<AuthenticatorChain>,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub max_plaintext_bytes: usize,
+    /// Explicit dangerous legacy opt-in, copied from the startup configuration.
+    pub legacy_compromised_key_decrypt: bool,
     pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
 }
 

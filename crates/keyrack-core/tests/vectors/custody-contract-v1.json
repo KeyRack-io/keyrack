@@ -85,7 +85,7 @@
     },
     "in_flight": {
       "Drained": 1,
-      "OutputsSuppressed": 2
+      "FurtherReleaseBlocked": 2
     }
   },
   "vectors": [
@@ -723,7 +723,7 @@
           "generation": "8"
         },
         "command_sha256": "85a3e56d5346542e3e742268a1f397f85e1810dae21917259a2c897c80802b7f",
-        "in_flight": "OutputsSuppressed",
+        "in_flight": "FurtherReleaseBlocked",
         "observed_leases": [
           {
             "$ref": "lease_identity"

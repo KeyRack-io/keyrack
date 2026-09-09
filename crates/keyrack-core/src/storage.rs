@@ -190,14 +190,25 @@ pub trait StorageBackend: Send + Sync {
 
     // ── Keys ──────────────────────────────────────────────────────
 
-    /// Insert a new key record. Fails if the LID already exists.
+    /// Insert a new key record. Fails if the LID already exists. Persist
+    /// `was_compromised` as true whenever `has_compromise_history()` is true.
     async fn create_key(&self, record: &KeyRecord) -> Result<()>;
 
     /// Fetch a key by LID. Returns `KeyNotFound` if absent.
     async fn get_key(&self, lid: &Lid) -> Result<KeyRecord>;
 
+    /// Fetch authoritative lifecycle state before a key-use decision.
+    /// Cache decorators must bypass cached records here: a cached enabled key
+    /// is not evidence that its current lifecycle state permits an operation.
+    /// Backends without a record cache can use the default implementation.
+    async fn get_key_for_use(&self, lid: &Lid) -> Result<KeyRecord> {
+        self.get_key(lid).await
+    }
+
     /// Atomic update with OCC. Checks `occ_version` matches; on
-    /// mismatch returns `OptimisticConcurrencyConflict`.
+    /// mismatch returns `OptimisticConcurrencyConflict`. Refuse to clear
+    /// persisted compromise history, including legacy records whose live state
+    /// is compromised, and normalize that history into `was_compromised`.
     async fn update_key(&self, record: &KeyRecord) -> Result<()>;
 
     /// List keys with optional filtering and pagination.
@@ -266,15 +277,16 @@ mod tests {
     fn make_test_record(state: KeyState) -> KeyRecord {
         let mut attrs = AttributeSet::new();
         attrs.insert("tenant", AttributeValue::String("test-tenant".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let lid = Lid::derive(CanonicalizationVersion::V2, &form);
         KeyRecord {
             lid,
-            canonicalization_version: CanonicalizationVersion::V1,
+            canonicalization_version: CanonicalizationVersion::V2,
             parent_lid: None,
             occ_version: 1,
             current_key_version: 1,
             state,
+            was_compromised: false,
             key_usage: KeyUsage::EncryptDecrypt,
             key_spec: KeySpec::Aes256,
             origin: KeyOrigin::KeyRack,
@@ -283,7 +295,7 @@ mod tests {
             exportability: crate::key::Exportability::default(),
             first_exported_at: None,
             owner_principal_id: None,
-            identity_tags: IdentityTags::from_attribute_set(&attrs),
+            identity_tags: IdentityTags::from_attribute_set(&attrs).unwrap(),
             user_tags: UserTags::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -534,8 +546,8 @@ mod tests {
         let mut attrs_a = AttributeSet::new();
         attrs_a.insert("k", AttributeValue::String("a".into()));
         key_a.lid = Lid::derive(
-            CanonicalizationVersion::V1,
-            &canonicalize(CanonicalizationVersion::V1, &attrs_a),
+            CanonicalizationVersion::V2,
+            &canonicalize(CanonicalizationVersion::V2, &attrs_a).unwrap(),
         );
 
         let mut key_b = make_test_record(KeyState::Enabled);
@@ -543,8 +555,8 @@ mod tests {
         let mut attrs_b = AttributeSet::new();
         attrs_b.insert("k", AttributeValue::String("b".into()));
         key_b.lid = Lid::derive(
-            CanonicalizationVersion::V1,
-            &canonicalize(CanonicalizationVersion::V1, &attrs_b),
+            CanonicalizationVersion::V2,
+            &canonicalize(CanonicalizationVersion::V2, &attrs_b).unwrap(),
         );
 
         let mut key_legacy = make_test_record(KeyState::Enabled);
@@ -552,8 +564,8 @@ mod tests {
         let mut attrs_l = AttributeSet::new();
         attrs_l.insert("k", AttributeValue::String("legacy".into()));
         key_legacy.lid = Lid::derive(
-            CanonicalizationVersion::V1,
-            &canonicalize(CanonicalizationVersion::V1, &attrs_l),
+            CanonicalizationVersion::V2,
+            &canonicalize(CanonicalizationVersion::V2, &attrs_l).unwrap(),
         );
 
         store.create_key(&key_a).await.unwrap();
@@ -641,13 +653,13 @@ mod tests {
 
         let mut attrs = AttributeSet::new();
         attrs.insert("name", AttributeValue::String("parent".into()));
-        let form = canonicalize(CanonicalizationVersion::V1, &attrs);
-        let parent_lid = Lid::derive(CanonicalizationVersion::V1, &form);
+        let form = canonicalize(CanonicalizationVersion::V2, &attrs).unwrap();
+        let parent_lid = Lid::derive(CanonicalizationVersion::V2, &form);
 
         let mut attrs2 = AttributeSet::new();
         attrs2.insert("name", AttributeValue::String("child".into()));
-        let form2 = canonicalize(CanonicalizationVersion::V1, &attrs2);
-        let child_lid = Lid::derive(CanonicalizationVersion::V1, &form2);
+        let form2 = canonicalize(CanonicalizationVersion::V2, &attrs2).unwrap();
+        let child_lid = Lid::derive(CanonicalizationVersion::V2, &form2);
 
         let job = RotationJob::new("job-1", parent_lid, child_lid, 2);
         store.create_rotation_job(&job).await.unwrap();

@@ -463,7 +463,9 @@ impl PostgresStorage {
         if reserved {
             return Err(invalid("child identity is reserved by a creation"));
         }
-        insert_key(&mut transaction, record).await?;
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        insert_key(&mut transaction, &persisted).await?;
         transaction.commit().await.map_err(database_error)
     }
 
@@ -491,6 +493,11 @@ impl PostgresStorage {
             });
         }
         let previous = decode_key(&row, &record.lid)?;
+        if previous.has_compromise_history() && !record.has_compromise_history() {
+            return Err(KeyRackError::Other(
+                "cannot clear a key's compromise history".into(),
+            ));
+        }
         crate::destruction::guard_write(&mut transaction, record).await?;
         if record.state == keyrack_core::key::KeyState::Destroyed {
             return Err(keyrack_core::destruction::invalid(
@@ -522,7 +529,9 @@ impl PostgresStorage {
         if material_referenced {
             guard_referenced_parent(&previous, record)?;
         }
-        replace_key(&mut transaction, record, expected).await?;
+        let mut persisted = record.clone();
+        persisted.was_compromised = record.has_compromise_history();
+        replace_key(&mut transaction, &persisted, expected).await?;
         transaction.commit().await.map_err(database_error)
     }
 }

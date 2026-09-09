@@ -34,53 +34,58 @@
 //! `ImmutableTagError`.
 
 use crate::attr::{AttributeSet, AttributeValue};
+use crate::canon::{normalize_text, CanonicalizationError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Identity tags derived from the attribute set at key creation.
 ///
 /// Immutable after creation. Serialized as a separate field on `KeyRecord`
-/// (not mixed with user tags). The serialization convention is a flat map
-/// where complex attribute values are JSON-stringified.
+/// (not mixed with user tags). Identity rules operate on normalized string maps;
+/// typed canonical attributes must not be flattened into this representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdentityTags(BTreeMap<String, String>);
+pub struct IdentityTags(
+    #[serde(deserialize_with = "crate::attr::deserialize_flat")] BTreeMap<String, String>,
+);
 
 impl IdentityTags {
     /// Derive identity tags from an attribute set.
     ///
-    /// All attribute values are flattened to strings: `String` values are
-    /// kept as-is, other types are JSON-serialized. This ensures identity
-    /// tags are always simple key-value pairs suitable for inclusion in
-    /// audit events and PDP requests.
-    #[must_use]
-    pub fn from_attribute_set(attrs: &AttributeSet) -> Self {
-        let map = attrs
+    /// Reject non-string values rather than lose type information and collapse
+    /// distinct canonical identities into one policy-visible value.
+    pub fn from_attribute_set(attrs: &AttributeSet) -> Result<Self, CanonicalizationError> {
+        let normalized = crate::attr::normalize_attributes(attrs)?;
+        let map = normalized
             .iter()
             .map(|(k, v)| {
                 let s = match v {
                     AttributeValue::String(s) => s.clone(),
-                    other => serde_json::to_string(other).unwrap_or_default(),
+                    _ => return Err(CanonicalizationError::NonStringIdentity(k.clone())),
                 };
-                (k.clone(), s)
+                Ok((k.clone(), s))
             })
-            .collect();
-        Self(map)
+            .collect::<Result<_, _>>()?;
+        Ok(Self(map))
     }
 
     /// Construct directly from a string map (useful for tests and routing).
-    #[must_use]
-    pub fn from_map(map: BTreeMap<String, String>) -> Self {
-        Self(map)
+    pub fn from_map(map: BTreeMap<String, String>) -> Result<Self, CanonicalizationError> {
+        let attrs = AttributeSet(
+            map.into_iter()
+                .map(|(k, v)| (k, AttributeValue::String(v)))
+                .collect(),
+        );
+        Self::from_attribute_set(&attrs)
     }
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).map(String::as_str)
+        self.0.get(&normalize_text(key)).map(String::as_str)
     }
 
     #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.0.contains_key(key)
+        self.0.contains_key(&normalize_text(key))
     }
 
     #[must_use]
@@ -187,15 +192,15 @@ mod tests {
         let mut attrs = AttributeSet::new();
         attrs.insert("tenant", AttributeValue::String("acme".into()));
         attrs.insert("kind", AttributeValue::String("dek".into()));
-        attrs.insert("priority", AttributeValue::I64(1));
-        attrs.insert("active", AttributeValue::Bool(true));
+        attrs.insert("priority", AttributeValue::String("1".into()));
+        attrs.insert("active", AttributeValue::String("true".into()));
         attrs
     }
 
     #[test]
     fn identity_tags_from_attribute_set() {
         let attrs = sample_attrs();
-        let tags = IdentityTags::from_attribute_set(&attrs);
+        let tags = IdentityTags::from_attribute_set(&attrs).unwrap();
 
         assert_eq!(tags.get("tenant"), Some("acme"));
         assert_eq!(tags.get("kind"), Some("dek"));
@@ -216,9 +221,10 @@ mod tests {
         rec.insert("x".into(), AttributeValue::I64(1));
         attrs.insert("extra", AttributeValue::Record(rec));
 
-        let tags = IdentityTags::from_attribute_set(&attrs);
-        assert!(tags.get("tags").unwrap().starts_with('['));
-        assert!(tags.get("extra").unwrap().starts_with('{'));
+        assert!(matches!(
+            IdentityTags::from_attribute_set(&attrs),
+            Err(CanonicalizationError::NonStringIdentity(_))
+        ));
     }
 
     #[test]
@@ -244,7 +250,7 @@ mod tests {
     #[test]
     fn validate_tag_mutation_blocks_identity_keys() {
         let attrs = sample_attrs();
-        let identity = IdentityTags::from_attribute_set(&attrs);
+        let identity = IdentityTags::from_attribute_set(&attrs).unwrap();
 
         let result = validate_tag_mutation(&identity, "tenant");
         assert!(result.is_err());
@@ -257,7 +263,7 @@ mod tests {
     #[test]
     fn validate_tag_mutation_allows_non_identity_keys() {
         let attrs = sample_attrs();
-        let identity = IdentityTags::from_attribute_set(&attrs);
+        let identity = IdentityTags::from_attribute_set(&attrs).unwrap();
 
         assert!(validate_tag_mutation(&identity, "env").is_ok());
         assert!(validate_tag_mutation(&identity, "team").is_ok());
@@ -267,7 +273,7 @@ mod tests {
     #[test]
     fn serde_round_trip_identity() {
         let attrs = sample_attrs();
-        let tags = IdentityTags::from_attribute_set(&attrs);
+        let tags = IdentityTags::from_attribute_set(&attrs).unwrap();
         let json = serde_json::to_string(&tags).unwrap();
         let parsed: IdentityTags = serde_json::from_str(&json).unwrap();
         assert_eq!(tags, parsed);

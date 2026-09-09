@@ -107,6 +107,7 @@ impl CreationRequest {
         let record = &self.record;
         let material = self.material()?;
         if record.state != KeyState::Enabled
+            || record.has_compromise_history()
             || record.exportability != Exportability::NonExportable
             || record.first_exported_at.is_some()
             || record.scheduled_deletion_at.is_some()
@@ -157,6 +158,7 @@ impl CreationRequest {
         if parent.lid != material.parent().lid
             || parent.occ_version != self.expected_parent_occ
             || parent.state != KeyState::Enabled
+            || parent.has_compromise_history()
             || parent.scheduled_deletion_at.is_some()
             || parent.key_spec != self.parent_spec
         {
@@ -194,6 +196,7 @@ impl CreationRequest {
                     .ok_or(invalid("version overflow"))?;
                 if self.record.current_key_version != next_version
                     || current.state != KeyState::Enabled
+                    || current.has_compromise_history()
                 {
                     return Err(invalid("invalid new version"));
                 }

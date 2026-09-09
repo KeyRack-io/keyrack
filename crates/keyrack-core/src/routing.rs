@@ -89,9 +89,11 @@ impl ProviderRouter {
     /// Build a router from a list of `(match_tags, provider_ref)` rules and
     /// a default provider name.
     ///
-    /// This is the backward-compatible constructor for the simple route-only
-    /// model (pre-0.3.0). Each rule is a `Route` action.
-    pub fn new(rules: Vec<(BTreeMap<String, String>, ProviderRef)>, default: ProviderRef) -> Self {
+    /// Each rule is a `Route` action. Invalid normalized match maps are rejected.
+    pub fn new(
+        rules: Vec<(BTreeMap<String, String>, ProviderRef)>,
+        default: ProviderRef,
+    ) -> crate::error::Result<Self> {
         let rules = rules
             .into_iter()
             .map(|(match_tags, provider)| RoutingRule {
@@ -99,12 +101,19 @@ impl ProviderRouter {
                 action: RuleAction::Route(provider),
             })
             .collect();
-        Self { rules, default }
+        Self::with_rules(rules, default)
     }
 
     /// Build a router with the full rule model (route + delegate).
-    pub fn with_rules(rules: Vec<RoutingRule>, default: ProviderRef) -> Self {
-        Self { rules, default }
+    /// Normalize all match maps before storing any policy; reject ambiguous keys.
+    pub fn with_rules(
+        mut rules: Vec<RoutingRule>,
+        default: ProviderRef,
+    ) -> crate::error::Result<Self> {
+        for rule in &mut rules {
+            rule.match_tags = crate::attr::normalize_flat(&rule.match_tags)?;
+        }
+        Ok(Self { rules, default })
     }
 
     /// Evaluate routing rules and return the outcome (without resolving caller
@@ -182,7 +191,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        IdentityTags::from_map(map)
+        IdentityTags::from_map(map).unwrap()
     }
 
     #[test]
@@ -193,7 +202,8 @@ mod tests {
                 ProviderRef::new("acme-hsm"),
             )],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("tenant", "acme")])),
             RouteOutcome::Pinned(ProviderRef::new("acme-hsm"))
@@ -208,7 +218,8 @@ mod tests {
                 ProviderRef::new("acme-hsm"),
             )],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("tenant", "other")])),
             RouteOutcome::Default(ProviderRef::new("default"))
@@ -226,7 +237,8 @@ mod tests {
                 action: RuleAction::Delegate(set.clone()),
             }],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("tier", "premium")])),
             RouteOutcome::Delegated(set)
@@ -241,7 +253,8 @@ mod tests {
                 action: RuleAction::DelegateAny,
             }],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("mode", "imperative")])),
             RouteOutcome::DelegatedAny
@@ -262,7 +275,8 @@ mod tests {
                 },
             ],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("tenant", "acme")])),
             RouteOutcome::Pinned(ProviderRef::new("first"))
@@ -277,7 +291,8 @@ mod tests {
                 action: RuleAction::DelegateAny,
             }],
             ProviderRef::new("default"),
-        );
+        )
+        .unwrap();
         // select() without explicit caller choice falls back to default
         assert_eq!(
             router.select(&tags(&[("tier", "premium")])),
@@ -287,7 +302,7 @@ mod tests {
 
     #[test]
     fn backward_compat_no_rules_returns_default() {
-        let router = ProviderRouter::new(vec![], ProviderRef::new("software"));
+        let router = ProviderRouter::new(vec![], ProviderRef::new("software")).unwrap();
         assert_eq!(
             router.evaluate(&tags(&[("anything", "here")])),
             RouteOutcome::Default(ProviderRef::new("software"))
@@ -296,5 +311,47 @@ mod tests {
             router.select(&tags(&[("anything", "here")])),
             ProviderRef::new("software")
         );
+    }
+
+    #[test]
+    fn provider_policy_matches_normalized_keys_and_values() {
+        let router = ProviderRouter::new(
+            vec![(
+                BTreeMap::from([("te\u{301}nant".into(), "e\u{301}".into())]),
+                ProviderRef::new("matched"),
+            )],
+            ProviderRef::new("default"),
+        )
+        .unwrap();
+        let input = tags(&[("ténant", "é")]);
+        assert_eq!(
+            router.evaluate(&input),
+            RouteOutcome::Pinned(ProviderRef::new("matched"))
+        );
+        assert_eq!(
+            router.evaluate_with_index(&input),
+            (RouteOutcome::Pinned(ProviderRef::new("matched")), Some(0))
+        );
+    }
+
+    #[test]
+    fn invalid_provider_policy_is_rejected_before_default_can_be_used() {
+        let pattern = BTreeMap::from([
+            ("é".into(), "same".into()),
+            ("e\u{301}".into(), "same".into()),
+        ]);
+        assert!(ProviderRouter::new(
+            vec![(pattern.clone(), ProviderRef::new("pin"))],
+            ProviderRef::new("default")
+        )
+        .is_err());
+        assert!(ProviderRouter::with_rules(
+            vec![RoutingRule {
+                match_tags: pattern,
+                action: RuleAction::DelegateAny
+            }],
+            ProviderRef::new("default")
+        )
+        .is_err());
     }
 }

@@ -29,7 +29,7 @@ const tags = {
   clock: { UnixMilliseconds: 1, ExecutorMonotonicMilliseconds: 2 },
   outcome: { ProviderSessionClosed: 1, ProviderTemporaryObjectDestroyed: 2, NativeWrappedOnlyGenerated: 3 },
   reason: { Released: 1, ResidencyExpired: 2, AuthorityFenced: 3 },
-  in_flight: { Drained: 1, OutputsSuppressed: 2 },
+  in_flight: { Drained: 1, FurtherReleaseBlocked: 2 },
 };
 const exercisedTags = new Set();
 const domain = Buffer.from('KeyRack:CustodyContract\0', 'ascii');
@@ -319,7 +319,7 @@ add('grant_decrypt_unix_domain', 'AuthorityGrant', { ...baseGrant, authority: re
   validity: { clock: { kind: 'UnixMilliseconds' }, not_before: '100', not_after: '200' } });
 add('cleanup_expired', 'LeaseCleanupResult', { record: ref('lease_record'), reason: 'ResidencyExpired' });
 add('cleanup_fenced', 'LeaseCleanupResult', { record: ref('lease_record'), reason: 'AuthorityFenced' });
-add('revocation_suppressed', 'RevocationResult', { ...baseResult, in_flight: 'OutputsSuppressed',
+add('revocation_suppressed', 'RevocationResult', { ...baseResult, in_flight: 'FurtherReleaseBlocked',
   observed_leases: [ref('lease_identity'), { executor_hex: executor, counter: '12' }] });
 add('revocation_empty', 'RevocationResult', { ...baseResult, observed_leases: [] });
 

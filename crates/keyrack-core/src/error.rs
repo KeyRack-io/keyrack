@@ -26,6 +26,8 @@ use crate::lid::Lid;
 /// Top-level error type for core operations.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyRackError {
+    #[error(transparent)]
+    InvalidIdentity(#[from] crate::canon::CanonicalizationError),
     #[error("key not found: {0}")]
     KeyNotFound(Lid),
 

@@ -18,14 +18,15 @@ interface. REST is generated from annotations on these protos.
 
 ---
 
-## 2. Canonicalization V1
+## 2. Canonicalization V2
 
 **Status:** locked.
 
 Defines the byte format that turns an `AttributeSet` into a deterministic
 `CanonicalForm`. The version field is stored in every key record; future
-format changes bump the version and follow the alias-based migration in
-`MIGRATION.md`.
+format changes require an explicit transition design. Only V2 is supported;
+V1 records fail deserialization. There is no V1 upgrade or alias fallback.
+See [Canonical identity](CANONICAL_IDENTITY.md) for validation and test scope.
 
 ### 2.1 Attribute value types
 
@@ -45,7 +46,9 @@ is encoded as:
 1. **Key**: TAG_STRING (`0x01`) + `u32 LE` byte length + NFC-normalised UTF-8 bytes.
 2. **Value**: per the type-specific encoding below.
 
-Pairs appear in `BTreeMap` iteration order (lexicographic by key bytes).
+Keys are NFC-normalized before validation, duplicate detection and sorting.
+Ambiguous normalized names are rejected, even when their values agree.
+Pairs appear in normalized `BTreeMap` iteration order (lexicographic by key bytes).
 This is deterministic across Rust versions since `BTreeMap` is a B-tree
 with stable ordering.
 
@@ -64,7 +67,12 @@ PAYLOAD:
 
 #### NFC normalisation
 
-Every string value and every map key is NFC-normalised before encoding.
+Every string value and every map key is NFC-normalised before validation,
+storage and rule matching, including nested records and list values.
+Identity tags and routing accept flat string maps; the general byte format
+also supports the typed values above. Typed values cannot be flattened into
+identity tags. Normalization uses Unicode 17.0.0 and is checked against the
+complete published normalization corpus.
 This ensures that `U+00E9` (precomposed e-acute) and `U+0065 U+0301`
 (e + combining acute) produce the same canonical bytes.
 
@@ -108,7 +116,7 @@ LID = BLAKE3(canonicalization_version_le32 || canonical_form_bytes)
 ```
 
 - `canonicalization_version` is encoded as 4 bytes, little-endian `u32`.
-  V1 = `[0x01, 0x00, 0x00, 0x00]`.
+  V2 = `[0x02, 0x00, 0x00, 0x00]`; no V1 enum variant remains.
 - `canonical_form_bytes` is the output of §2.
 - The result is 32 bytes (256 bits).
 - Displayed as `lid_` + 64 lowercase hex characters (68 chars total).
@@ -119,11 +127,10 @@ LID = BLAKE3(canonicalization_version_le32 || canonical_form_bytes)
 
 Including the version in the BLAKE3 input means the same attribute set
 under different canonicalization versions produces a different LID. This
-is deliberate: it makes canonicalization-version migration a
-LID-identity-change, which the alias table (`lid_alias`) in
-`MIGRATION.md` handles explicitly. Without the version in the hash,
-a canonicalization bug fix that doesn't change the byte output would
-be ambiguous — "is this the V1 LID or the V2 LID?"
+is deliberate: a canonicalization change re-identifies keys. This baseline
+provides no legacy decoder or transparent migration. Stored references,
+recomputed hierarchy identities and recovery paths all need explicit treatment
+before any deployed database can transition; see [MIGRATION.md](../MIGRATION.md).
 
 ### 3.2 Property tests
 
@@ -324,18 +331,28 @@ creating ──► enabled ◄──► disabled
 | `creating` | no | no |
 | `enabled` | yes | yes |
 | `disabled` | no | yes (data recovery) |
+| `compromised` | no | no (dangerous legacy decrypt opt-in only) |
 | `pending_deletion` | no | no |
 | `destroyed` | no | no |
 
 ### 7.2 Valid transitions
 
+The state predicates above are also constrained by persisted logical-key
+compromise history: `KeyRecord` refuses encrypt/decrypt/export if
+`was_compromised` is set, regardless of the current enum. The legacy exception
+applies only while the current state is Compromised, with per-use evidence.
+Verification retains its separate mathematical predicate; see
+[the operator guide](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in).
+
 | From | To | API | Notes |
 |---|---|---|---|
 | `creating` | `enabled` | `CreateKey` | Sync for software; async (`TaskRef`) for HSM |
 | `enabled` | `disabled` | `DisableKey` | Blocks encrypt/sign; decrypt still allowed |
-| `disabled` | `enabled` | `EnableKey` | |
+| `disabled` | `enabled` | `EnableKey` | Only without compromise history |
 | `enabled` | `pending_deletion` | `ScheduleKeyDeletion` | 7–30 day grace period |
 | `disabled` | `pending_deletion` | `ScheduleKeyDeletion` | |
+| `enabled` / `disabled` | `compromised` | `ReportKeyCompromise` | Sets durable compromise history |
+| `compromised` | `pending_deletion` | `ScheduleKeyDeletion` | Retains compromise history |
 | `pending_deletion` | `disabled` | `CancelKeyDeletion` | Returns to disabled, not enabled |
 | `pending_deletion` | `destroyed` | Background worker | HSM material erased, terminal |
 

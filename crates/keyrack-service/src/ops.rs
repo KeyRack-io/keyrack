@@ -69,6 +69,7 @@ pub fn extract_request_id_rest(headers: &axum::http::HeaderMap) -> String {
 pub struct PeerCertificates(pub Vec<Vec<u8>>);
 
 /// Describes a pending operation for PDP + audit purposes.
+#[derive(Clone)]
 pub struct OpContext {
     pub action: AuditAction,
     pub principal: Principal,

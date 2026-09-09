@@ -151,6 +151,19 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16)> {
 fn build_tls_config(config: &KmipProviderConfig) -> Result<rustls::ClientConfig> {
     use rustls::ClientConfig;
 
+    // `ClientConfig::builder` panics when no process-wide provider has been
+    // installed. The host binary installs one at startup, but a panic deep
+    // inside a connection attempt is the wrong failure for a missing
+    // initialisation step, so it is reported as an error instead.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(KeyRackError::Provider(
+            "no rustls CryptoProvider is installed in this process, so no TLS connection can \
+             be made to a KMIP server. The host binary must call install_default() on a \
+             provider during startup."
+                .into(),
+        ));
+    }
+
     let mut root_store = rustls::RootCertStore::empty();
 
     if let Some(ca_path) = &config.ca_cert_path {

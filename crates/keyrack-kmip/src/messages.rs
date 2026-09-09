@@ -21,12 +21,20 @@
 //! KMIP message construction and response parsing.
 
 use crate::ttlv::{
-    byte_string, enumeration, integer, object_type, operation, structure, tag, text_string,
-    TtlvItem, TtlvType, TtlvValue,
+    block_cipher_mode, byte_string, crypto_algorithm, enumeration, integer, object_type, operation,
+    revocation_reason, structure, tag, text_string, TtlvItem, TtlvType, TtlvValue,
 };
 
-const KMIP_VERSION_MAJOR: i32 = 2;
-const KMIP_VERSION_MINOR: i32 = 1;
+/// Protocol version announced in every request header.
+///
+/// 1.4, because that is the version this module actually encodes: `Create`
+/// carries a `TemplateAttribute` holding named `Attribute` structures, which
+/// KMIP 2.0 removed in favour of typed `Attributes`. Announcing 2.1 while
+/// sending 1.x payloads — as this client previously did — is rejected by
+/// servers at either version: a 1.x server refuses the major version outright,
+/// and a 2.x server cannot parse the body.
+const KMIP_VERSION_MAJOR: i32 = 1;
+const KMIP_VERSION_MINOR: i32 = 4;
 
 fn request_header() -> TtlvItem {
     structure(
@@ -97,52 +105,127 @@ pub fn create_asymmetric_key(algorithm: u32, key_length: i32) -> TtlvItem {
     wrap_request(operation::CREATE, payload)
 }
 
-/// Build a KMIP Encrypt request.
+/// AES-GCM authentication tag length, in bytes.
+///
+/// Sent explicitly because a server may refuse an authenticated mode that
+/// does not state one, and because the tag has to be separated from the
+/// ciphertext by length on the way back.
+pub const GCM_TAG_LEN: usize = 16;
+
+/// `CryptographicParameters` for an AES-GCM operation.
+///
+/// The algorithm is included alongside the mode: a server is entitled to
+/// require it, and a mode alone does not say which cipher it modifies.
+fn aes_gcm_parameters() -> TtlvItem {
+    structure(
+        tag::CRYPTOGRAPHIC_PARAMETERS,
+        vec![
+            enumeration(tag::BLOCK_CIPHER_MODE, block_cipher_mode::GCM),
+            enumeration(tag::CRYPTOGRAPHIC_ALGORITHM, crypto_algorithm::AES),
+            integer(tag::TAG_LENGTH, GCM_TAG_LEN as i32),
+        ],
+    )
+}
+
+/// Build a KMIP Encrypt request for AES-GCM.
+///
+/// `aad` is sent as `AuthenticatedEncryptionAdditionalData`: covered by the
+/// authentication tag but not encrypted, which is what binds a ciphertext to
+/// the context it was created in.
 pub fn encrypt_request(
     unique_id: &str,
     plaintext: &[u8],
     iv_nonce: Option<&[u8]>,
-    block_cipher_mode: Option<u32>,
+    aad: &[u8],
 ) -> TtlvItem {
     let mut children = vec![
         text_string(tag::UNIQUE_ID, unique_id),
+        aes_gcm_parameters(),
         byte_string(tag::DATA, plaintext.to_vec()),
     ];
     if let Some(iv) = iv_nonce {
         children.push(byte_string(tag::IV_COUNTER_NONCE, iv.to_vec()));
     }
-    if let Some(mode) = block_cipher_mode {
-        children.push(structure(
-            tag::CRYPTOGRAPHIC_PARAMETERS,
-            vec![enumeration(tag::BLOCK_CIPHER_MODE, mode)],
+    if !aad.is_empty() {
+        children.push(byte_string(
+            tag::AUTHENTICATED_ENCRYPTION_ADDITIONAL_DATA,
+            aad.to_vec(),
         ));
     }
     let payload = structure(tag::REQUEST_PAYLOAD, children);
     wrap_request(operation::ENCRYPT, payload)
 }
 
-/// Build a KMIP Decrypt request.
+/// Build a KMIP Decrypt request for AES-GCM.
+///
+/// The tag is a separate field, not a suffix of the ciphertext. Sending it is
+/// what makes the mode authenticated: without it the server has nothing to
+/// verify the ciphertext against.
 pub fn decrypt_request(
     unique_id: &str,
     ciphertext: &[u8],
     iv_nonce: Option<&[u8]>,
-    block_cipher_mode: Option<u32>,
+    auth_tag: Option<&[u8]>,
+    aad: &[u8],
 ) -> TtlvItem {
     let mut children = vec![
         text_string(tag::UNIQUE_ID, unique_id),
+        aes_gcm_parameters(),
         byte_string(tag::DATA, ciphertext.to_vec()),
     ];
     if let Some(iv) = iv_nonce {
         children.push(byte_string(tag::IV_COUNTER_NONCE, iv.to_vec()));
     }
-    if let Some(mode) = block_cipher_mode {
-        children.push(structure(
-            tag::CRYPTOGRAPHIC_PARAMETERS,
-            vec![enumeration(tag::BLOCK_CIPHER_MODE, mode)],
+    // Additional data precedes the tag, and the order is not cosmetic: KMIP
+    // payload fields are positional, so a server reading them in specification
+    // order rejects the whole message as unparseable if they are swapped.
+    if !aad.is_empty() {
+        children.push(byte_string(
+            tag::AUTHENTICATED_ENCRYPTION_ADDITIONAL_DATA,
+            aad.to_vec(),
         ));
+    }
+    if let Some(t) = auth_tag {
+        children.push(byte_string(tag::AUTHENTICATED_ENCRYPTION_TAG, t.to_vec()));
     }
     let payload = structure(tag::REQUEST_PAYLOAD, children);
     wrap_request(operation::DECRYPT, payload)
+}
+
+/// Build a KMIP Activate request.
+///
+/// A created object is Pre-Active, and KMIP forbids using a Pre-Active object
+/// for cryptography, so this is not optional bookkeeping — without it the key
+/// exists and every Encrypt against it is refused.
+pub fn activate_request(unique_id: &str) -> TtlvItem {
+    let payload = structure(
+        tag::REQUEST_PAYLOAD,
+        vec![text_string(tag::UNIQUE_ID, unique_id)],
+    );
+    wrap_request(operation::ACTIVATE, payload)
+}
+
+/// Build a KMIP Revoke request with reason Cessation of Operation.
+///
+/// KMIP forbids destroying an Active object, so an activated key must be
+/// revoked first. The reason is fixed: this is called from key destruction,
+/// which is an operational retirement, not a compromise report — claiming
+/// compromise would put a false assertion in the server's audit trail.
+pub fn revoke_request(unique_id: &str) -> TtlvItem {
+    let payload = structure(
+        tag::REQUEST_PAYLOAD,
+        vec![
+            text_string(tag::UNIQUE_ID, unique_id),
+            structure(
+                tag::REVOCATION_REASON,
+                vec![enumeration(
+                    tag::REVOCATION_REASON_CODE,
+                    revocation_reason::CESSATION_OF_OPERATION,
+                )],
+            ),
+        ],
+    );
+    wrap_request(operation::REVOKE, payload)
 }
 
 /// Build a KMIP Sign request.
@@ -197,8 +280,15 @@ pub fn destroy_request(unique_id: &str) -> TtlvItem {
 }
 
 /// Build a KMIP RNG Retrieve request.
+///
+/// The byte count goes in `DataLength`. Sending it as `Data` — which is what
+/// this did — produces a request the server cannot parse, because `Data` is
+/// where payload bytes live.
 pub fn rng_retrieve_request(length: i32) -> TtlvItem {
-    let payload = structure(tag::REQUEST_PAYLOAD, vec![integer(tag::DATA, length)]);
+    let payload = structure(
+        tag::REQUEST_PAYLOAD,
+        vec![integer(tag::DATA_LENGTH, length)],
+    );
     wrap_request(operation::RNG_RETRIEVE, payload)
 }
 
@@ -272,7 +362,120 @@ mod tests {
         let header = decoded.find(tag::REQUEST_HEADER).unwrap();
         let version = header.find(tag::PROTOCOL_VERSION).unwrap();
         let major = version.find(tag::PROTOCOL_VERSION_MAJOR).unwrap();
-        assert_eq!(major.as_integer(), Some(2));
+        let minor = version.find(tag::PROTOCOL_VERSION_MINOR).unwrap();
+        // Must match the encoding below it: `Create` sends a TemplateAttribute,
+        // which is KMIP 1.x. This assertion previously demanded major 2, which
+        // is how a header no server would accept stayed in place.
+        assert_eq!(major.as_integer(), Some(1));
+        assert_eq!(minor.as_integer(), Some(4));
+        assert!(
+            decoded.find(tag::BATCH_ITEM).is_some_and(|b| b
+                .find(tag::REQUEST_PAYLOAD)
+                .is_some_and(|p| p.find(tag::TEMPLATE_ATTRIBUTE).is_some())),
+            "the announced version has to match the payload shape; a TemplateAttribute \
+             body under a 2.x header is unparseable at either version"
+        );
+    }
+
+    /// Values that a round-trip test cannot catch.
+    ///
+    /// Encoding and decoding with the same table agrees with itself whatever
+    /// the number is, so these are pinned against the specification's
+    /// enumerations directly. Four of them were wrong simultaneously, each
+    /// naming a different defined value, so every request was well-formed and
+    /// described something other than what was intended.
+    #[test]
+    fn wire_constants_are_the_specification_values() {
+        use crate::ttlv::{crypto_algorithm, object_type, result_status};
+
+        // 0x01 here is Certificate, and was what every symmetric Create sent.
+        assert_eq!(object_type::SYMMETRIC_KEY, 0x02);
+        // 0x0E is X9.102 AESKW, a key-wrapping mode, not GCM.
+        assert_eq!(block_cipher_mode::GCM, 0x09);
+        // 0x2C is Log.
+        assert_eq!(operation::RNG_RETRIEVE, 0x25);
+        // 0x1B is One Time Pad.
+        assert_eq!(crypto_algorithm::ED25519, 0x37);
+
+        assert_eq!(operation::ACTIVATE, 0x12);
+        assert_eq!(operation::REVOKE, 0x13);
+        assert_eq!(crypto_algorithm::AES, 0x03);
+        assert_eq!(object_type::PRIVATE_KEY, 0x04);
+        assert_eq!(result_status::SUCCESS, 0x00);
+    }
+
+    #[test]
+    fn encrypt_request_states_the_mode_the_algorithm_and_the_tag_length() {
+        let msg = encrypt_request("key-1", b"plaintext", None, b"");
+        let params = msg
+            .find(tag::BATCH_ITEM)
+            .and_then(|b| b.find(tag::REQUEST_PAYLOAD))
+            .and_then(|p| p.find(tag::CRYPTOGRAPHIC_PARAMETERS))
+            .expect("Encrypt must carry CryptographicParameters");
+
+        assert_eq!(
+            params
+                .find(tag::BLOCK_CIPHER_MODE)
+                .and_then(TtlvItem::as_enum),
+            Some(block_cipher_mode::GCM)
+        );
+        assert_eq!(
+            params
+                .find(tag::CRYPTOGRAPHIC_ALGORITHM)
+                .and_then(TtlvItem::as_enum),
+            Some(crypto_algorithm::AES),
+            "a mode alone does not say which cipher it modifies"
+        );
+        assert_eq!(
+            params.find(tag::TAG_LENGTH).and_then(TtlvItem::as_integer),
+            Some(GCM_TAG_LEN as i32),
+            "a server may refuse an authenticated mode with no stated tag length"
+        );
+    }
+
+    #[test]
+    fn decrypt_request_sends_the_authentication_tag() {
+        let msg = decrypt_request("key-1", b"ct", Some(&[7u8; 12]), Some(&[9u8; 16]), b"ctx");
+        let payload = msg
+            .find(tag::BATCH_ITEM)
+            .and_then(|b| b.find(tag::REQUEST_PAYLOAD))
+            .unwrap();
+
+        assert_eq!(
+            payload
+                .find(tag::AUTHENTICATED_ENCRYPTION_TAG)
+                .and_then(|i| i.as_bytes()),
+            Some(&[9u8; 16][..]),
+            "the tag is a separate field; without it the server has nothing to verify \
+             the ciphertext against and the mode is authenticated in name only"
+        );
+    }
+
+    #[test]
+    fn activate_and_revoke_name_their_operations() {
+        let activate = activate_request("k");
+        assert_eq!(
+            activate
+                .find(tag::BATCH_ITEM)
+                .and_then(|b| b.find(tag::OPERATION))
+                .and_then(TtlvItem::as_enum),
+            Some(operation::ACTIVATE)
+        );
+
+        let revoke = revoke_request("k");
+        let payload = revoke
+            .find(tag::BATCH_ITEM)
+            .and_then(|b| b.find(tag::REQUEST_PAYLOAD))
+            .unwrap();
+        assert_eq!(
+            payload
+                .find(tag::REVOCATION_REASON)
+                .and_then(|r| r.find(tag::REVOCATION_REASON_CODE))
+                .and_then(TtlvItem::as_enum),
+            Some(crate::ttlv::revocation_reason::CESSATION_OF_OPERATION),
+            "destruction is an operational retirement; reporting compromise would write \
+             a false assertion into the server's audit trail"
+        );
     }
 
     /// A server's failure text is only reachable if `RESULT_MESSAGE` names the
@@ -305,7 +508,7 @@ mod tests {
 
     #[test]
     fn encrypt_request_round_trip() {
-        let msg = encrypt_request("key-1", b"plaintext", None, Some(block_cipher_mode::GCM));
+        let msg = encrypt_request("key-1", b"plaintext", None, b"");
         let encoded = encode(&msg);
         let mut slice: &[u8] = &encoded;
         let decoded = decode(&mut slice).unwrap();
