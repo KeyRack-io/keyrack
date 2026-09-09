@@ -1,0 +1,101 @@
+name: PKCS#11 custody proof
+
+# Drives the real keyrack-service binary through losing custody of a PKCS#11
+# token and getting it back, and asserts that service returns without the
+# process being restarted.
+#
+# It runs the binary rather than the library on purpose. The defect it guards
+# against lived in state that only exists in a long-running process — a module
+# holding an unusable view of a token — so a test that constructs a provider,
+# exercises it and drops it cannot see it. That is the shape that passes
+# in-process and fails in deployment.
+#
+# It also holds an unrelated token under continuous load for the whole
+# recovery window. That is not decoration: recovery reinitializes a library
+# shared by every provider on it, and doing that while another thread is
+# inside the library does not fail, it takes the process down. The concurrent
+# half of this proof is what caught that.
+#
+# The status check this job publishes is named `Custody loss and restoration
+# without a restart`, which is the string to add to the branch protection
+# rule. Renaming the job silently detaches it from that rule, so the two have
+# to move together.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: pkcs11-custody-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: Custody loss and restoration without a restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The proof needs the service binary and the PKCS#11 module in one
+      # process, so everything happens inside one Linux container — including
+      # the build. Same entry point a contributor runs locally.
+      - name: Run the proof
+        run: |
+          set -euo pipefail
+          mkdir -p conformance/pkcs11-custody/run
+          ./conformance/pkcs11-custody/run-proof.sh \
+            | tee conformance/pkcs11-custody/run/proof-output.txt
+
+      # The proof asserts its own outcomes, so this guards against the other
+      # failure: a harness that reports success because it stopped asserting.
+      - name: Confirm the proof actually asserted something
+        run: |
+          set -euo pipefail
+          log=conformance/pkcs11-custody/run/proof-output.txt
+          if [ ! -f "$log" ]; then
+            echo "the proof produced no transcript, so it proved nothing"
+            exit 1
+          fi
+
+          passes=$(grep -c '^  PASS' "$log" || true)
+          echo "$passes checks passed"
+
+          # Read the floor from the harness rather than restating it here, and
+          # refuse a lowered floor: dropping it is the cheapest way to make a
+          # failing proof green, so it has to be visible in this diff.
+          floor=$(grep -oP '^MIN_EXPECTED_PASSES=\K[0-9]+' \
+            conformance/pkcs11-custody/proof.sh)
+          echo "harness floor is $floor"
+          if [ "$floor" -lt 13 ]; then
+            echo "the harness floor was lowered to $floor; it must stay at 13 or above"
+            exit 1
+          fi
+          if [ "$passes" -lt "$floor" ]; then
+            echo "expected at least $floor passing checks, saw $passes"
+            exit 1
+          fi
+
+          # The two claims the whole exercise exists to make. Checking the
+          # count alone would let a rewritten suite pass with the wrong
+          # assertions.
+          grep -q 'serves again' "$log" \
+            || { echo "the restoration check did not run"; exit 1; }
+          grep -q 'never restarted' "$log" \
+            || { echo "nothing confirmed the process was not restarted"; exit 1; }
+          grep -q 'sibling served all' "$log" \
+            || { echo "the unrelated provider was not held under load"; exit 1; }
+
+      - name: Upload the transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkcs11-custody-proof
+          path: conformance/pkcs11-custody/run/proof-output.txt
+          if-no-files-found: warn

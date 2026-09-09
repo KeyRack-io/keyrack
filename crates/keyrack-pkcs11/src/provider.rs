@@ -39,7 +39,9 @@ use keyrack_core::provider::{
 use keyrack_core::sensitive::Sensitive;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
@@ -56,6 +58,13 @@ fn make_auth_pin(pin: &str) -> AuthPin {
 }
 
 /// Classify a cryptoki error as a transient HSM connectivity/session failure.
+///
+/// `GeneralError` is included because that is what a module reports once its
+/// in-memory view of a token has been invalidated — the token going away under
+/// a live module wedges it, and every later call on that slot fails this way
+/// even after the token comes back. It is a connectivity fault, not a
+/// permanent provider defect, so it must read as "unavailable, retry" rather
+/// than "broken build".
 fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
     matches!(
         e,
@@ -64,7 +73,9 @@ fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
                 | cryptoki::error::RvError::DeviceRemoved
                 | cryptoki::error::RvError::TokenNotPresent
                 | cryptoki::error::RvError::SessionClosed
-                | cryptoki::error::RvError::SessionHandleInvalid,
+                | cryptoki::error::RvError::SessionHandleInvalid
+                | cryptoki::error::RvError::SlotIdInvalid
+                | cryptoki::error::RvError::GeneralError,
             _,
         )
     )
@@ -80,34 +91,280 @@ fn map_pkcs11_error(context: &str, e: &cryptoki::error::Error) -> KeyRackError {
     }
 }
 
+/// Shortest interval between two module reinitializations, per library.
+///
+/// A reinitialization is process-wide for the library, so while custody is
+/// still absent — when it cannot possibly succeed — repeating it per request
+/// would keep interrupting the providers that are still healthy. One attempt
+/// per interval bounds that to a rare event while still restoring service
+/// within a few seconds of custody actually returning.
+const MIN_REINIT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long recovery waits for in-flight calls to drain before giving up.
+///
+/// If the module does not go quiet in this time, recovery is abandoned rather
+/// than forced: see [`Gate`] for why finalizing under active calls is not an
+/// option.
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Admission control for one PKCS#11 library, so that it can be reinitialized
+/// with no call in flight.
+///
+/// `C_Finalize` may not be called while other threads are inside the library
+/// — PKCS#11 puts that on the application, and a module that is finalized
+/// under active calls does not return an error, it takes the process down.
+/// So every call registers here for its duration, and recovery closes the
+/// gate and waits for the count to reach zero before finalizing. If it never
+/// reaches zero, recovery is skipped: a token that stays unavailable is a far
+/// better outcome than a crash that takes every other provider with it.
+struct Gate {
+    inner: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    in_flight: usize,
+    closed: bool,
+}
+
+/// Registers one in-flight call for as long as it is held.
+struct InFlight<'a> {
+    gate: &'a Gate,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.inner.lock() {
+            state.in_flight -= 1;
+            if state.in_flight == 0 {
+                self.gate.changed.notify_all();
+            }
+        }
+    }
+}
+
+/// Holds the gate closed, with the module guaranteed quiet, for as long as it
+/// is held.
+struct Quiesced<'a> {
+    gate: &'a Gate,
+}
+
+impl Drop for Quiesced<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.inner.lock() {
+            state.closed = false;
+        }
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Admit one call, waiting while the module is being reinitialized.
+    fn enter(&self) -> Result<InFlight<'_>> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| KeyRackError::Provider("PKCS#11 module gate poisoned".into()))?;
+        while state.closed {
+            let (guard, timeout) = self
+                .changed
+                .wait_timeout(state, QUIESCE_TIMEOUT)
+                .map_err(|_| KeyRackError::Provider("PKCS#11 module gate poisoned".into()))?;
+            state = guard;
+            if timeout.timed_out() && state.closed {
+                return Err(KeyRackError::ProviderUnavailable(
+                    "PKCS#11 module is being reinitialized and did not become available".into(),
+                ));
+            }
+        }
+        state.in_flight += 1;
+        Ok(InFlight { gate: self })
+    }
+
+    /// Close the gate and wait for the module to go quiet.
+    ///
+    /// `None` means it did not, and the caller must not finalize.
+    fn quiesce(&self) -> Option<Quiesced<'_>> {
+        let mut state = self.inner.lock().ok()?;
+        state.closed = true;
+
+        let deadline = Instant::now() + QUIESCE_TIMEOUT;
+        while state.in_flight > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.closed = false;
+                drop(state);
+                self.changed.notify_all();
+                return None;
+            }
+            let (guard, _) = self.changed.wait_timeout(state, remaining).ok()?;
+            state = guard;
+        }
+
+        drop(state);
+        Some(Quiesced { gate: self })
+    }
+}
+
+/// An initialized PKCS#11 module, shared by every provider on that library.
+///
+/// PKCS#11 permits `C_Initialize` only once per library per process, so
+/// providers backed by the same `.so` (several tokens / HSM partitions driven
+/// by one vendor library) share this and select different slots.
+///
+/// The module also owns recovery, because that is the granularity the
+/// operation has: reinitializing is the only way to clear a module's stale
+/// view of a token, and it affects every provider on the library at once.
+/// Keeping it here means concurrent failures collapse into one attempt
+/// instead of one per provider.
+struct SharedModule {
+    lib_path: String,
+    ctx: Pkcs11,
+    /// Advanced by each successful reinitialization. A caller that saw a
+    /// failure under generation *n* and finds the generation already past *n*
+    /// knows someone else recovered, and can simply retry.
+    generation: AtomicU64,
+    gate: Gate,
+    reinit: Mutex<LastReinit>,
+}
+
+struct LastReinit {
+    at: Option<Instant>,
+}
+
+impl SharedModule {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Reinitialize the library so it re-reads the tokens present now.
+    ///
+    /// `C_Finalize` + `C_Initialize` is deliberate: it runs on the *same*
+    /// loaded library, so every provider's existing handle and slot stay
+    /// valid and no provider has to be rebuilt. Unloading the library instead
+    /// would only work once every clone had been dropped, which no provider
+    /// can guarantee for another.
+    ///
+    /// Returns `true` when the module has been reinitialized since
+    /// `seen_generation` — by this call or a concurrent one — so the caller
+    /// may retry. Returns `false` when the attempt was skipped by the
+    /// interval; the caller then reports the original failure.
+    fn recover(&self, seen_generation: u64) -> bool {
+        let Ok(mut last) = self.reinit.lock() else {
+            return false;
+        };
+
+        // Another caller already recovered this failure out from under us.
+        if self.generation() != seen_generation {
+            return true;
+        }
+
+        if let Some(at) = last.at {
+            if at.elapsed() < MIN_REINIT_INTERVAL {
+                return false;
+            }
+        }
+        last.at = Some(Instant::now());
+
+        tracing::warn!(
+            lib_path = %self.lib_path,
+            "PKCS#11 module reported an unusable token; reinitializing the library"
+        );
+
+        // Finalizing while another thread is inside the library crashes the
+        // process, so recovery only proceeds once the module is quiet.
+        let Some(_quiesced) = self.gate.quiesce() else {
+            tracing::error!(
+                lib_path = %self.lib_path,
+                "PKCS#11 calls did not drain; skipping reinitialization rather than \
+                 finalizing the library under them"
+            );
+            return false;
+        };
+
+        // A module that is already finalized (or was never usable) reports an
+        // error here that says nothing about whether the reinitialization will
+        // work, so this is logged and stepped past rather than treated as
+        // fatal. C_Initialize below is the step that decides.
+        if let Err(error) = self.ctx.clone().finalize() {
+            tracing::debug!(
+                lib_path = %self.lib_path,
+                %error,
+                "C_Finalize before reinitialization did not succeed; continuing"
+            );
+        }
+
+        match self
+            .ctx
+            .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        {
+            Ok(()) => {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                tracing::info!(
+                    lib_path = %self.lib_path,
+                    "PKCS#11 module reinitialized"
+                );
+                true
+            }
+            // The module is initialized, just not by this call — the finalize
+            // above did not take effect. Nothing was recovered.
+            Err(cryptoki::error::Error::Pkcs11(
+                cryptoki::error::RvError::CryptokiAlreadyInitialized,
+                _,
+            )) => {
+                tracing::error!(
+                    lib_path = %self.lib_path,
+                    "PKCS#11 module could not be finalized, so it cannot be reinitialized"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::error!(
+                    lib_path = %self.lib_path,
+                    %error,
+                    "PKCS#11 module reinitialization failed"
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Process-wide registry of initialized PKCS#11 modules, keyed by library
-/// path.
-///
-/// PKCS#11 permits `C_Initialize` only once per library per process. Multiple
-/// providers backed by the same library (e.g. several tokens / HSM partitions
-/// driven by one vendor `.so`) must therefore share a single initialized
-/// context and select different slots. Without sharing, constructing the
-/// second provider fails with `CKR_CRYPTOKI_ALREADY_INITIALIZED`.
-///
-/// `Pkcs11` is internally reference-counted, so cloning the stored handle is
-/// cheap and all clones drive the same initialized module.
-fn shared_module(lib_path: &str) -> Result<Pkcs11> {
-    static MODULES: OnceLock<Mutex<HashMap<String, Pkcs11>>> = OnceLock::new();
+/// path. See [`SharedModule`] for why one module is shared per library.
+fn shared_module(lib_path: &str) -> Result<Arc<SharedModule>> {
+    static MODULES: OnceLock<Mutex<HashMap<String, Arc<SharedModule>>>> = OnceLock::new();
     let modules = MODULES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = modules
         .lock()
         .map_err(|_| KeyRackError::Provider("PKCS#11 module registry poisoned".into()))?;
 
-    if let Some(ctx) = guard.get(lib_path) {
-        return Ok(ctx.clone());
+    if let Some(module) = guard.get(lib_path) {
+        return Ok(Arc::clone(module));
     }
 
     let ctx = Pkcs11::new(Path::new(lib_path))
         .map_err(|e| KeyRackError::Provider(format!("load PKCS#11 lib: {e}")))?;
     ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         .map_err(|e| KeyRackError::Provider(format!("C_Initialize: {e}")))?;
-    guard.insert(lib_path.to_owned(), ctx.clone());
-    Ok(ctx)
+
+    let module = Arc::new(SharedModule {
+        lib_path: lib_path.to_owned(),
+        ctx,
+        generation: AtomicU64::new(0),
+        gate: Gate::new(),
+        reinit: Mutex::new(LastReinit { at: None }),
+    });
+    guard.insert(lib_path.to_owned(), Arc::clone(&module));
+    Ok(module)
 }
 
 /// Configuration for constructing a [`Pkcs11Provider`].
@@ -123,9 +380,14 @@ pub struct Pkcs11ProviderConfig {
 /// All cryptographic operations are dispatched to the HSM via PKCS#11.
 /// Sessions are opened per-operation — production HSMs benefit from a
 /// session pool (future enhancement behind a feature flag).
+///
+/// Nothing about a token is cached beyond what can be re-derived: the slot is
+/// re-resolved from `token_label` after the module is reinitialized, so a
+/// token that returns on a different slot is still found.
 pub struct Pkcs11Provider {
-    ctx: Pkcs11,
-    slot: cryptoki::slot::Slot,
+    module: Arc<SharedModule>,
+    token_label: String,
+    slot: RwLock<cryptoki::slot::Slot>,
     pin: Zeroizing<String>,
 }
 
@@ -136,9 +398,14 @@ impl Pkcs11Provider {
         // Share one initialized module per library path so several providers
         // (e.g. one per tenant token) can be backed by the same `.so` without
         // a second `C_Initialize` failing with ALREADY_INITIALIZED.
-        let ctx = shared_module(&config.lib_path)?;
+        let module = shared_module(&config.lib_path)?;
+        let ctx = &module.ctx;
 
-        let slot = find_slot_by_label(&ctx, &config.token_label)?;
+        // Construction touches the library like any other call, so it waits
+        // out a reinitialization rather than racing one.
+        let in_flight = module.gate.enter()?;
+
+        let slot = find_slot_by_label(ctx, &config.token_label)?;
 
         // Verify we can actually log in
         let session = ctx
@@ -154,25 +421,108 @@ impl Pkcs11Provider {
             "PKCS#11 provider initialized"
         );
 
+        drop(in_flight);
         Ok(Self {
-            ctx,
-            slot,
+            module,
+            token_label: config.token_label.clone(),
+            slot: RwLock::new(slot),
             pin: Zeroizing::new(config.pin.clone()),
         })
     }
 
+    fn current_slot(&self) -> Result<cryptoki::slot::Slot> {
+        self.slot
+            .read()
+            .map(|s| *s)
+            .map_err(|_| KeyRackError::Provider("PKCS#11 slot lock poisoned".into()))
+    }
+
     /// Run a synchronous PKCS#11 operation on a blocking Tokio thread.
+    ///
+    /// A token can be taken away from a running module — an HSM restart, a
+    /// re-attached partition, a token volume that disappears. That leaves the
+    /// module holding an unusable view of the token, and it does not clear
+    /// when the token returns: every later call on that slot keeps failing,
+    /// including on a brand-new session, until the module is reinitialized.
+    /// So when an operation fails that way, this reinitializes the module and
+    /// tries once more, which is what turns "down until the process is
+    /// restarted" into "down until custody comes back".
     async fn run<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&Session) -> Result<R> + Send + 'static,
+        F: Fn(&Session) -> Result<R> + Send + Sync + 'static,
         R: Send + 'static,
     {
-        let ctx = self.ctx.clone();
-        let slot = self.slot;
+        let f = Arc::new(f);
+        let generation = self.module.generation();
+
+        let first = self.attempt(Arc::clone(&f)).await;
+        let Err(error) = first else {
+            return first;
+        };
+        if !matches!(error, KeyRackError::ProviderUnavailable(_)) {
+            return Err(error);
+        }
+
+        let module = Arc::clone(&self.module);
+        let recovered = tokio::task::spawn_blocking(move || module.recover(generation))
+            .await
+            .map_err(|e| KeyRackError::Provider(format!("blocking task: {e}")))?;
+        if !recovered {
+            return Err(error);
+        }
+
+        // The token may have come back on a different slot, so re-resolve it
+        // by label before retrying. If it cannot be found, the original
+        // failure is the honest one to report.
+        if let Err(resolve_error) = self.resolve_slot() {
+            tracing::warn!(
+                token_label = %self.token_label,
+                error = %resolve_error,
+                "token not found after reinitializing the PKCS#11 module"
+            );
+            return Err(error);
+        }
+
+        self.attempt(f).await
+    }
+
+    /// Re-resolve this provider's slot from its token label.
+    fn resolve_slot(&self) -> Result<()> {
+        let in_flight = self.module.gate.enter()?;
+        let resolved = find_slot_by_label(&self.module.ctx, &self.token_label);
+        drop(in_flight);
+        let slot = resolved?;
+        let mut current = self
+            .slot
+            .write()
+            .map_err(|_| KeyRackError::Provider("PKCS#11 slot lock poisoned".into()))?;
+        if *current != slot {
+            tracing::info!(
+                token_label = %self.token_label,
+                "token returned on a different PKCS#11 slot; rebinding"
+            );
+            *current = slot;
+        }
+        Ok(())
+    }
+
+    /// One pass at the operation: fresh session, login, run.
+    async fn attempt<F, R>(&self, f: Arc<F>) -> Result<R>
+    where
+        F: Fn(&Session) -> Result<R> + Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let module = Arc::clone(&self.module);
+        let slot = self.current_slot()?;
         let pin = Zeroizing::new(self.pin.as_str().to_owned());
 
         tokio::task::spawn_blocking(move || {
-            let session = ctx
+            // Registered for the whole call, so a concurrent recovery waits
+            // for this to finish instead of finalizing the library under it.
+            let _in_flight = module.gate.enter()?;
+
+            let session = module
+                .ctx
                 .open_rw_session(slot)
                 .map_err(|e| map_pkcs11_error("open session", &e))?;
             // Login state is shared by this process's sessions on the token.
@@ -859,6 +1209,120 @@ mod tests {
         ];
         assert_eq!(hash, expected);
     }
+
+    // ── module recovery admission control ────────────────────────────────
+    //
+    // These need no PKCS#11 library: the property under test is that
+    // reinitialization can never run while a call is inside the module,
+    // because finalizing under an active call takes the process down rather
+    // than returning an error.
+
+    #[test]
+    fn a_wedged_module_reads_as_unavailable_not_as_a_permanent_fault() {
+        // The status a caller sees decides whether they ever come back, and a
+        // module holding a stale view of a token recovers on the next call.
+        let wedged = cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::GeneralError,
+            cryptoki::context::Function::Login,
+        );
+        assert!(is_transient_pkcs11_error(&wedged));
+        assert!(matches!(
+            map_pkcs11_error("login", &wedged),
+            KeyRackError::ProviderUnavailable(_)
+        ));
+
+        // A genuinely permanent fault must not be dressed up as retryable.
+        let permanent = cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::AttributeValueInvalid,
+            cryptoki::context::Function::Encrypt,
+        );
+        assert!(!is_transient_pkcs11_error(&permanent));
+        assert!(matches!(
+            map_pkcs11_error("encrypt", &permanent),
+            KeyRackError::Provider(_)
+        ));
+    }
+
+    #[test]
+    fn quiescing_waits_for_calls_already_inside_the_module() {
+        let gate = Arc::new(Gate::new());
+        let in_flight = gate.enter().expect("gate admits the first call");
+
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let quiesced = {
+            let gate = Arc::clone(&gate);
+            let waiting = Arc::clone(&waiting);
+            std::thread::spawn(move || {
+                waiting.store(true, Ordering::Release);
+                gate.quiesce().is_some()
+            })
+        };
+
+        // Give the waiter a chance to observe the in-flight call.
+        while !waiting.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !quiesced.is_finished(),
+            "quiesce returned while a call was still inside the module"
+        );
+
+        drop(in_flight);
+        assert!(
+            quiesced.join().expect("quiesce thread"),
+            "quiesce should succeed once the module goes quiet"
+        );
+    }
+
+    #[test]
+    fn a_call_that_never_returns_blocks_recovery_rather_than_crashing_it() {
+        let gate = Gate::new();
+        let _stuck = gate.enter().expect("gate admits the call");
+
+        let started = Instant::now();
+        assert!(
+            gate.quiesce().is_none(),
+            "recovery must refuse to finalize a module it could not quiet"
+        );
+        assert!(
+            started.elapsed() >= QUIESCE_TIMEOUT,
+            "quiesce gave up before waiting for the module to go quiet"
+        );
+
+        // Having given up, it must leave the gate open — a failed recovery
+        // may not lock out the calls that were still working.
+        gate.enter().expect("gate reopened after a failed quiesce");
+    }
+
+    #[test]
+    fn calls_wait_while_the_module_is_being_reinitialized() {
+        let gate = Arc::new(Gate::new());
+        let quiesced = gate.quiesce().expect("an idle module quiesces at once");
+
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let caller = {
+            let gate = Arc::clone(&gate);
+            let admitted = Arc::clone(&admitted);
+            std::thread::spawn(move || {
+                let entered = gate.enter().is_ok();
+                admitted.store(entered, Ordering::Release);
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "a call was admitted while the module was being reinitialized"
+        );
+
+        drop(quiesced);
+        caller.join().expect("caller thread");
+        assert!(
+            admitted.load(Ordering::Acquire),
+            "calls must resume once reinitialization finishes"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "softhsm-tests"))]
@@ -896,8 +1360,9 @@ mod concurrent_login_tests {
             .await
             .expect("regression key generation");
         let anchor = first
+            .module
             .ctx
-            .open_rw_session(first.slot)
+            .open_rw_session(first.current_slot().expect("anchor slot"))
             .expect("anchor session open");
         anchor
             .login(UserType::User, Some(&make_auth_pin(&config.pin)))
