@@ -3,7 +3,7 @@
 This enumerates the private worker transport and the evidence used by its
 [canonical receipt path](REVOCATION_RECEIPTS.md). A2's ruling at `3fc2bd2` requires
 one result for the command's whole authority scope, no new field or variant.
-Not-yet-committed output cancels as `OutputsSuppressed`; committed output is
+Not-yet-committed output cancels as `FurtherReleaseBlocked`; committed output is
 irrevocable; unresolved paths may claim neither. Mixed prior commits plus pending
 cancellation produce one wire-value-2 result without recalling earlier commits.
 
@@ -49,16 +49,16 @@ the worker cannot observe whether it has actually read or used them.
 | No accepted operation, or authorization/primitive failure before a result exists | Nothing was staged; no successful response exists. Redacted control errors are separate. | No response to classify. An empty affected set may be vacuously `Drained`; rejection is not proof of fence-caused suppression. |
 | A result exists, but preparation or enqueue rejects it (size, capacity, identifier exhaustion, time or incarnation/generation) | Nothing was staged for that delivery; no capsule was committed. Any prepared transport key is dropped on rejection. No admitted delivery ID records this failure. | Suppression/non-release is a local fact if a result existed; not completed delivery. Include it only if the receipt's defined population includes such pre-enqueue results. |
 | Prepared value held by another Delivery caller when fence is accepted | Nothing was staged; the later enqueue is refused and drops its key. Fence does not reach into the caller's still-held Prepared value. | Admission is fenced. Not a statement that all caller-owned buffers were already erased at the barrier. This overlap is absent from the current executable's single command thread. |
-| Enqueued, no writer step yet | Nothing was staged. Fence drops the pending transport key. | `OutputsSuppressed`; not `Drained`. |
-| Some complete ciphertext records staged | A ciphertext prefix remains, but no transport key was committed. Fence drops that key. | `OutputsSuppressed`; ciphertext prefix is not partial usable-output delivery. |
-| A ciphertext staging syscall is currently in progress | That record may finish after fence acceptance. Its release key is dropped under the fence lock. | `OutputsSuppressed` for usable output; not “no bytes after fence.” |
-| All ciphertext staged, capsule not attempted | Entire ciphertext remains unreadable without the withheld key. Fence drops the key. | `OutputsSuppressed`. |
-| Capsule attempted and returned `EAGAIN` or `Interrupted` | Under the verified atomic FIFO assumption, zero capsule bytes committed. Permit remains pending until fence drops its key. | `OutputsSuppressed`, including a blocked writer. |
+| Enqueued, no writer step yet | Nothing was staged. Fence drops the pending transport key. | `FurtherReleaseBlocked`; not `Drained`. |
+| Some complete ciphertext records staged | A ciphertext prefix remains, but no transport key was committed. Fence drops that key. | `FurtherReleaseBlocked`; ciphertext prefix is not partial usable-output delivery. |
+| A ciphertext staging syscall is currently in progress | That record may finish after fence acceptance. Its release key is dropped under the fence lock. | `FurtherReleaseBlocked` for usable output; not “no bytes after fence.” |
+| All ciphertext staged, capsule not attempted | Entire ciphertext remains unreadable without the withheld key. Fence drops the key. | `FurtherReleaseBlocked`. |
+| Capsule attempted and returned `EAGAIN` or `Interrupted` | Under the verified atomic FIFO assumption, zero capsule bytes committed. Permit remains pending until fence drops its key. | `FurtherReleaseBlocked`, including a blocked writer. |
 | Capsule write holds the mutex when a fence arrives | Fence has not yet been accepted. Full success resolves to the committed row below; retry resolves to the preceding row; hard failure resolves to a fault row. | No additional “half committed at an accepted fence” state under the pipe assumption. |
 | Deadline elapsed, but the permit has not yet been swept | No capsule committed; the fence drops the still-present key. | Suppression is true. Do not claim the fence was the only cause: release was already ineligible. |
-| Prior expiry/admission recheck removed the permit; ciphertext or a cancellation notification is still queued/writer-held | Nothing, some ciphertext, or all ciphertext was staged; no key committed. Cancellation happened before this fence. | `OutputsSuppressed` for this scope; historical cancellation also conservatively selects wire 2. Never infer `Drained` just from permit absence. |
+| Prior expiry/admission recheck removed the permit; ciphertext or a cancellation notification is still queued/writer-held | Nothing, some ciphertext, or all ciphertext was staged; no key committed. Cancellation happened before this fence. | `FurtherReleaseBlocked` for this scope; historical cancellation also conservatively selects wire 2. Never infer `Drained` just from permit absence. |
 | Suppression notification already committed and its job removed | No usable response was released; the receiver can learn it was cancelled. The outcome ledger retains suppression after the notification job is removed. | Historical suppression, not historical delivery. Outside a cohort of currently outstanding responses; relevant to an incarnation-wide history. |
-| Complete capsule committed, including the interval before Writer clears its current job | All ciphertext and its complete key capsule precede fence acceptance. Output remains readable indefinitely. | `Drained` at the accepted transport-commit meaning; never `OutputsSuppressed` for this response. Receiver consumption cannot be claimed. |
+| Complete capsule committed, including the interval before Writer clears its current job | All ciphertext and its complete key capsule precede fence acceptance. Output remains readable indefinitely. | `Drained` at the accepted transport-commit meaning; never `FurtherReleaseBlocked` for this response. Receiver consumption cannot be claimed. |
 | Capsule committed after release admission but after its clock deadline because of OS preemption | Same complete readable response as above; it still committed before an accepted fence because the mutex was held. | `Drained` as a delivery fact; **not** evidence of a hard physical deadline. The existing deadline limitation remains. |
 | Normal shutdown/EOF already dropped pending keys and queues | Uncommitted outputs are suppressed; earlier committed outputs remain readable. A fence acknowledgement is not assured. | Not a successful new fence receipt. The command may not be processed, and a stopped transport rejects acknowledgement enqueue. |
 
@@ -80,7 +80,7 @@ not an additional normal state hidden by queue ordering.
 | Capsule construction/serialization fails before the syscall | No capsule written. The worker retains suppression, drops pending keys and latches transport failure before unlocking. | Non-release can be established, but the writer is aborting; do not promise a delivered acknowledgement. |
 | Hard error while staging, or capsule error known to have written zero bytes | No key release for the affected response. Writer stops and drops remaining keys. Earlier releases remain. | Failed/aborted transport, not a new successful completion receipt. |
 | Short ciphertext-record write | Incomplete ciphertext, no capsule yet; writer aborts. | No usable response, but the atomic-record contract failed. No successful fence receipt on that transport. |
-| **Short capsule write** | A prefix may contain **the entire key**, even if the syscall omits the final JSON delimiter or newline. Output may already be readable. | Neither `Drained` nor `OutputsSuppressed` is justified from that return value. Treat disclosure as indeterminate and fail the receipt path. |
+| **Short capsule write** | A prefix may contain **the entire key**, even if the syscall omits the final JSON delimiter or newline. Output may already be readable. | Neither `Drained` nor `FurtherReleaseBlocked` is justified from that return value. Treat disclosure as indeterminate and fail the receipt path. |
 | Sink writes some/all bytes and then reports a non-retry error | Return status cannot establish how much key material escaped. | Same indeterminate result; no successful receipt. |
 | Mutex poisoning, panic, process death or lost connection | Applied-fence state and/or acknowledgement delivery may be unavailable. Prior commits cannot be retracted. | Absence/failure of evidence, not either success disposition. |
 
@@ -142,7 +142,7 @@ delivery callback alone is not authenticated evidence.
 
 A deterministic mixed-history test commits response 1, partly stages response 2,
 and fences before response 2's capsule. Response 1 remains readable; response 2
-loses its release capability. A2 defines this as one `OutputsSuppressed` result
+loses its release capability. A2 defines this as one `FurtherReleaseBlocked` result
 for the whole command scope, excluding prior irrevocable commits from the
 suppression assertion. It is not a uniform historical label for every operation.
 

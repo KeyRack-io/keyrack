@@ -3,7 +3,7 @@
 The provisional executable accepts authenticated canonical
 `Evidence<RevocationCommand>` and returns authenticated
 `Evidence<RevocationResult>` for the command's whole authority scope. It consumes
-A2's v1 ruling at `3fc2bd2`: one result, no per-operation field or third disposition.
+A2's v1 ruling at `3fc2bd2` and source rename at `be2ede3`: one result, no per-operation field or third disposition.
 This implements a local applied-fence observation, not all-holder completion,
 production profile approval, destruction, or a revocation platform.
 
@@ -43,16 +43,17 @@ The whole-scope disposition is derived from the retained ledger:
 | Evidence at the applied fence | Result |
 | --- | --- |
 | No admitted outputs, or all retained outputs committed and no operation is still computing | `Drained` (wire 1) |
-| Pending outputs cancelled, including mixed history with earlier committed output | `OutputsSuppressed` (wire 2); earlier commits are not recalled |
+| Pending outputs cancelled, including mixed history with earlier committed output | `FurtherReleaseBlocked` (wire 2); earlier commits are not recalled |
 | Retained historical suppression, even if its notification may already have completed | Conservatively wire 2: the suppression postcondition still holds; this does not claim that the old notification remains pending |
 | Indeterminate capsule outcome, recorded transport fault or unresolved ledger entry | Error; no successful canonical receipt |
 
-`Drained` does not assert receiver consumption. `OutputsSuppressed` covers every
+`Drained` does not assert receiver consumption. `FurtherReleaseBlocked` covers every
 unreleased response in the scope, including responses not named by lease
 diagnostics. It asserts permanent loss of future release capability, not erasure
 of all copies. The scope comes from the authenticated command, never a subset
-selected by `observed_leases`. The source-level variant name may change in A2;
-wire values remain 1 and 2 and are encoded solely by the shared codec.
+selected by `observed_leases`. A2 renamed the source variant to
+`FurtherReleaseBlocked` at `be2ede3`; wire values remain 1 and 2 and are encoded
+solely by the shared codec.
 
 The exact linearization point, atomic capsule assumption, staging-fault scope,
 and release-admission/OS-preemption limit are described in

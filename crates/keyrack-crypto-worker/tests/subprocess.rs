@@ -640,7 +640,10 @@ fn process_fence_cancels_staged_output_before_key_release() {
     assert_eq!(cancelled["delivery"], cancelled_id);
     let observed = response(&mut worker.output, &mut captured);
     let receipt = worker.verify_fence(&observed, &command);
-    assert_eq!(receipt.in_flight, InFlightDisposition::OutputsSuppressed);
+    assert_eq!(
+        receipt.in_flight,
+        InFlightDisposition::FurtherReleaseBlocked
+    );
     assert_eq!(receipt.observed_leases.len(), 1);
     for line in captured.lines() {
         let record: Value = serde_json::from_str(line).unwrap();

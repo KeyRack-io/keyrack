@@ -179,7 +179,7 @@ fn canonical_receipt_maps_empty_committed_pending_and_mixed_scope() {
         assert_eq!(
             result.in_flight,
             if pending {
-                InFlightDisposition::OutputsSuppressed
+                InFlightDisposition::FurtherReleaseBlocked
             } else {
                 InFlightDisposition::Drained
             }

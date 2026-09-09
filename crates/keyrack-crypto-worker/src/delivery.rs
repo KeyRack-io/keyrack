@@ -242,7 +242,7 @@ impl<C: Clock> Delivery<C> {
         // justify suppression, without claiming those notifications are pending.
         // Prior commits remain irrevocable; a mixed history is wire value 2.
         let disposition = if s.outcomes.values().any(|o| o.phase == Release::Suppressed) {
-            InFlightDisposition::OutputsSuppressed
+            InFlightDisposition::FurtherReleaseBlocked
         } else {
             InFlightDisposition::Drained
         };
