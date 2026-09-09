@@ -4,8 +4,7 @@
 //! This neither qualifies a Vault profile nor publishes into the A2 journal.
 use super::{digest, Clock, Error, MaterialSource, Worker};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::VerifyingKey;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signer, VerifyingKey};
 use keyrack_core::{
     creation::CreationOwner,
     custody::{
@@ -15,7 +14,6 @@ use keyrack_core::{
         WrappingIdentifier,
     },
 };
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::result::Result;
 use uuid::Uuid;
@@ -99,7 +97,6 @@ pub(super) struct Reservation {
     context: CustodyContext,
     expected: RequestBinding,
     state: AttemptState,
-    observer: SigningKey,
 }
 
 pub(crate) struct CreationEvidence {
@@ -151,7 +148,6 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             context,
             expected,
             state: AttemptState::Ready,
-            observer: SigningKey::generate(&mut OsRng),
         });
         Ok(())
     }
@@ -166,12 +162,12 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         self.creation.as_ref().map(|r| &r.expected)
     }
 
-    pub(crate) fn observation_key(&self) -> Option<EvidenceKey> {
-        self.creation.as_ref().map(|r| EvidenceKey {
+    pub(crate) fn observation_key(&self) -> EvidenceKey {
+        EvidenceKey {
             issuer: WrappingIdentifier::new("development-worker-observation").unwrap(),
             key_id: WrappingIdentifier::new("incarnation-key").unwrap(),
-            key: r.observer.verifying_key(),
-        })
+            key: self.observer.verifying_key(),
+        }
     }
 
     fn check_creation(&self, grant: &AuthorityGrant) -> Result<(), Error> {
@@ -264,7 +260,7 @@ impl<S: NativeGeneration, C: Clock> Worker<S, C> {
             claims,
             signature: [0; 64],
         };
-        result.signature = r
+        result.signature = self
             .observer
             .sign(&result.signing_bytes().map_err(|_| Error::Material)?)
             .to_bytes();

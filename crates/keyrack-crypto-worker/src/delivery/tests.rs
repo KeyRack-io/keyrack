@@ -80,7 +80,7 @@ fn no_release(delivery: &Delivery<Arc<Time>>, sink: &Capture) {
 #[test]
 fn fence_between_authorization_and_enqueue_suppresses() {
     let (_, d, p) = fixture();
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     assert!(d.enqueue(p).is_err());
     no_release(&d, &Capture::default());
 }
@@ -93,7 +93,7 @@ fn fence_mid_blocked_write_cancels_remaining_staging_and_key() {
     w.step(&d, &mut sink).unwrap(); // Receiver has only one ciphertext fragment.
     sink.blocked = true;
     w.step(&d, &mut sink).unwrap();
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     sink.blocked = false;
     run(&mut w, &d, &mut sink);
     assert_eq!(
@@ -119,7 +119,7 @@ fn fence_after_enqueue_before_capsule_flush_suppresses() {
     }
     sink.blocked = true;
     w.step(&d, &mut sink).unwrap(); // Atomic capsule returns EAGAIN.
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     sink.blocked = false;
     run(&mut w, &d, &mut sink);
     no_release(&d, &sink);
@@ -154,11 +154,13 @@ fn retry_revalidates_deadline_and_incarnation_and_generation() {
 fn committed_output_precedes_fence_and_invalid_fence_cannot_cancel() {
     let (_, d, p) = fixture();
     d.enqueue(p).unwrap();
-    assert!(d.fence(|| Err::<(), _>(Error::Authority)).is_err());
+    assert!(d
+        .fence("instance", 2, || Err::<(), _>(Error::Authority))
+        .is_err());
     let mut w = Writer::new();
     let mut sink = Capture::default();
     run(&mut w, &d, &mut sink);
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     let capsule = sink.records.last().unwrap();
     assert_eq!(capsule["event"], "release");
     assert_eq!(capsule["generation"], 1);
@@ -234,7 +236,7 @@ fn fence_arrives_inside_staging_write_without_waiting_for_writer() {
         sink.capture
     });
     entered.wait();
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     resume.wait();
     no_release(&d, &thread.join().unwrap());
 }
@@ -253,7 +255,7 @@ fn successful_commit_after_admission_is_never_relabelled_suppressed() {
     }
     assert_eq!(sink.capture.records.last().unwrap()["event"], "release");
     assert!(d.state.lock().unwrap().permits.is_empty());
-    d.fence(|| Ok(())).unwrap(); // The prior commit is irrevocable, not suppressed.
+    d.fence("instance", 2, || Ok(())).unwrap(); // The prior commit is irrevocable, not suppressed.
 }
 
 // These tests enumerate transport facts, not canonical receipt dispositions.
@@ -281,7 +283,7 @@ fn fence_cancels_every_precommit_staging_position() {
             w.step(&d, &mut sink).unwrap();
         }
         assert_eq!(sink.records.len(), staged);
-        d.fence(|| Ok(())).unwrap();
+        d.fence("instance", 2, || Ok(())).unwrap();
         run(&mut w, &d, &mut sink);
         no_release(&d, &sink);
         assert!(cancelled(&sink, 1));
@@ -332,7 +334,7 @@ fn retained_outcomes_distinguish_commit_from_expiry_with_empty_queues() {
                 s.queue.len(),
             )
         };
-        d.fence(|| Ok(())).unwrap();
+        d.fence("instance", 2, || Ok(())).unwrap();
         let s = d.state.lock().unwrap();
         (
             (
@@ -366,7 +368,7 @@ fn mixed_committed_and_cancelled_response_history_is_reachable() {
     second.authority.sequence = 2;
     d.enqueue(second).unwrap();
     w.step(&d, &mut sink).unwrap(); // Delivery 2 only partly staged.
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     run(&mut w, &d, &mut sink);
     let released: Vec<_> = sink
         .records
@@ -415,7 +417,7 @@ fn injected_short_capsule_write_is_not_non_disclosure_evidence() {
     assert!(d.stopped()); // Latch is set before release returns, without writer cleanup.
     let mut purged = false;
     assert!(d
-        .fence(|| {
+        .fence("instance", 2, || {
             purged = true;
             Ok(())
         })
@@ -467,7 +469,7 @@ fn empty_queue_and_permits_can_hide_writer_held_cancellation() {
     }
     assert!(w.current.is_some());
     assert!(!cancelled(&sink, 1)); // Cancellation is still unresolved to the reader.
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     run(&mut w, &d, &mut sink);
     no_release(&d, &sink);
     assert!(cancelled(&sink, 1));
@@ -494,7 +496,7 @@ fn full_history_rejects_admission_without_evicting_terminal_provenance() {
         sink.records.clear();
     }
     assert!(matches!(d.enqueue(sample), Err(Error::Limit)));
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     d.stop();
     let s = d.state.lock().unwrap();
     assert!(s.permits.is_empty());
@@ -552,7 +554,7 @@ fn capsule_errors_are_sticky_and_preserve_other_delivery_outcomes() {
         assert!(w.step(&d, &mut Fault(mode)).is_err());
         for _ in 0..2 {
             d.expire();
-            assert!(d.fence(|| Ok(())).is_err());
+            assert!(d.fence("instance", 2, || Ok(())).is_err());
             d.stop();
             assert_eq!(phase(&d, 1), Release::Committed);
             assert_eq!(phase(&d, 2), Release::Indeterminate);
@@ -579,7 +581,7 @@ fn staging_fault_records_cancellation_and_prevents_later_observation() {
     d.enqueue(p).unwrap();
     assert!(Writer::new().step(&d, &mut Broken).is_err());
     assert_eq!(phase(&d, 1), Release::Suppressed); // Capsule never attempted.
-    assert!(d.fence(|| Ok(())).is_err());
+    assert!(d.fence("instance", 2, || Ok(())).is_err());
     assert!(d.stopped());
 }
 
@@ -621,7 +623,7 @@ fn pending_capsule_fault_excludes_a_concurrent_successful_fence() {
     let worker = d.clone();
     let fence = std::thread::spawn(move || {
         let mut purged = false;
-        let result = worker.fence(|| {
+        let result = worker.fence("instance", 2, || {
             purged = true;
             Ok(())
         });
@@ -662,10 +664,10 @@ fn fence_during_staging_fault_only_establishes_key_cancellation() {
     entered.wait();
     // Staging has no capsule bytes and runs outside the gate. The fence can
     // cancel its key now, without asserting success of this in-flight syscall.
-    d.fence(|| Ok(())).unwrap();
+    d.fence("instance", 2, || Ok(())).unwrap();
     assert_eq!(phase(&d, 1), Release::Suppressed);
     resume.wait();
     assert!(writer.join().unwrap().is_err());
-    assert!(d.fence(|| Ok(())).is_err());
+    assert!(d.fence("instance", 2, || Ok(())).is_err());
     assert_eq!(phase(&d, 1), Release::Suppressed);
 }

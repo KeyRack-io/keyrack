@@ -1,12 +1,11 @@
-# Delivery facts for revocation disposition arbitration
+# Delivery facts for canonical revocation receipts
 
-This is an enumeration of the current private worker transport, supplied before
-canonical receipt implementation. It proposes no wire encoding. `Drained` and
-`OutputsSuppressed` below name the existing custody variants; their aggregate
-scope remains A2's decision. A2 has ruled that per-capsule mapping needs no third
-variant: not-yet-committed output cancels as `OutputsSuppressed`, committed output
-is irrevocable, and unresolved paths may claim neither. Canonical receipt wiring
-remains held pending the fence-scoped receipt's per-operation granularity.
+This enumerates the private worker transport and the evidence used by its
+[canonical receipt path](REVOCATION_RECEIPTS.md). A2's ruling at `3fc2bd2` requires
+one result for the command's whole authority scope, no new field or variant.
+Not-yet-committed output cancels as `OutputsSuppressed`; committed output is
+irrevocable; unresolved paths may claim neither. Mixed prior commits plus pending
+cancellation produce one wire-value-2 result without recalling earlier commits.
 
 The code supports **two normal per-response output outcomes and now retains
 incarnation-local outcome evidence under the release mutex**. A complete release capsule committed
@@ -41,7 +40,7 @@ Sources: [delivery admission and writer](src/delivery.rs),
 ## Per-response enumeration
 
 `S` means an output-suppression fact; `D` means a completed transport-commit fact.
-These are proposed inputs to a receipt, not dispositions currently emitted.
+These are per-response facts aggregated into the one scope-wide receipt.
 “Readable” means that the receiver has enough bytes to recover the response;
 the worker cannot observe whether it has actually read or used them.
 
@@ -57,7 +56,7 @@ the worker cannot observe whether it has actually read or used them.
 | Capsule attempted and returned `EAGAIN` or `Interrupted` | Under the verified atomic FIFO assumption, zero capsule bytes committed. Permit remains pending until fence drops its key. | `OutputsSuppressed`, including a blocked writer. |
 | Capsule write holds the mutex when a fence arrives | Fence has not yet been accepted. Full success resolves to the committed row below; retry resolves to the preceding row; hard failure resolves to a fault row. | No additional “half committed at an accepted fence” state under the pipe assumption. |
 | Deadline elapsed, but the permit has not yet been swept | No capsule committed; the fence drops the still-present key. | Suppression is true. Do not claim the fence was the only cause: release was already ineligible. |
-| Prior expiry/admission recheck removed the permit; ciphertext or a cancellation notification is still queued/writer-held | Nothing, some ciphertext, or all ciphertext was staged; no key committed. Cancellation happened before this fence. | `OutputsSuppressed` if this unresolved response belongs to the chosen cohort. Never infer `Drained` just from permit absence. |
+| Prior expiry/admission recheck removed the permit; ciphertext or a cancellation notification is still queued/writer-held | Nothing, some ciphertext, or all ciphertext was staged; no key committed. Cancellation happened before this fence. | `OutputsSuppressed` for this scope; historical cancellation also conservatively selects wire 2. Never infer `Drained` just from permit absence. |
 | Suppression notification already committed and its job removed | No usable response was released; the receiver can learn it was cancelled. The outcome ledger retains suppression after the notification job is removed. | Historical suppression, not historical delivery. Outside a cohort of currently outstanding responses; relevant to an incarnation-wide history. |
 | Complete capsule committed, including the interval before Writer clears its current job | All ciphertext and its complete key capsule precede fence acceptance. Output remains readable indefinitely. | `Drained` at the accepted transport-commit meaning; never `OutputsSuppressed` for this response. Receiver consumption cannot be claimed. |
 | Capsule committed after release admission but after its clock deadline because of OS preemption | Same complete readable response as above; it still committed before an accepted fence because the mutex was held. | `Drained` as a delivery fact; **not** evidence of a hard physical deadline. The existing deadline limitation remains. |
@@ -135,29 +134,25 @@ outcomes; durable receipt/restart reconciliation remains external work.
 The retained phases distinguish histories previously indistinguishable from queue
 and permit state. They do **not** record exact ciphertext-byte progress, receiver
 consumption, cancellation-notification delivery or fence-acknowledgement delivery.
-Those are separate facts; this ledger cannot settle the outstanding A2 choice of
-receipt population. A successful generic local observation is still not a
-canonical `RevocationResult` or an `OutputsSuppressed` claim.
+Those are separate facts. A2's receipt population is the entire command scope.
+The canonical consumer validates the command and signs its result; the generic
+delivery callback alone is not authenticated evidence.
 
-## Aggregate mapping and the actual contract choice
+## Approved whole-scope aggregation
 
 A deterministic mixed-history test commits response 1, partly stages response 2,
-and fences before response 2's capsule. Response 1 stays released; response 2 gets
-a cancellation notification. This is reachable in the real writer architecture.
+and fences before response 2's capsule. Response 1 remains readable; response 2
+loses its release capability. A2 defines this as one `OutputsSuppressed` result
+for the whole command scope, excluding prior irrevocable commits from the
+suppression assertion. It is not a uniform historical label for every operation.
 
-| Defined receipt population | Existing variants sufficient? |
-|---|---|
-| One normal response | Yes: committed -> `Drained`; uncommitted key discarded -> `OutputsSuppressed`. |
-| Outstanding, unresolved responses at the accepted fence barrier, with earlier completed releases excluded | Yes, if that scope is explicit. Actual cancellation of this set -> `OutputsSuppressed`; a confirmed empty set can be vacuously `Drained`. Prior committed bytes remain readable. Previously suppressed but unresolved notifications must not masquerade as delivered work. |
-| An entire batch/history containing both committed and suppressed responses | **No**, if each variant describes the whole population. `Drained` misreports the cancelled responses; `OutputsSuppressed` misreports the committed ones. A third **mixed outcome** (or per-response outcomes) is required for that interpretation. It is not a “partially committed capsule” variant. |
-| Transport failure with indeterminate disclosure | Neither success variant suffices. Fail or withhold the receipt. If the protocol requires encoding failures as results, it needs an explicit failure representation, not a successful completion disposition. |
-
-**Ruling and remaining decision:** keep the two canonical variants for
-per-capsule mapping. The mixed-history row is a counterexample to uniformly
-labelling a whole population, not a request for a third per-capsule variant.
-A2 still decides whether fence-scoped receipts need per-operation granularity.
-Terminal retention and fault rejection are implemented independently; no shared
-contract or canonical receipt emission changes here.
+The worker emits `Drained` for an empty/all-committed ledger with no concurrently
+computing work, established by the serialized command loop and mutable worker
+borrow. Pending cancellations and retained historical suppression conservatively
+select wire 2. Historical cancellation need not still be pending: the result
+asserts the scope's suppression postcondition rather than notification status.
+Indeterminate/faulted/unresolved paths yield no successful result. The bounded
+lease diagnostic list never restricts the fence's scope.
 
 ## Reproducible evidence
 
@@ -194,5 +189,6 @@ The following deterministic tests add the classification evidence:
   recorded faults from an in-flight staging syscall with no release key.
 
 Run with `cargo test -p keyrack-crypto-worker delivery::tests`. These tests establish
-classification facts and counterexamples; they emit no canonical receipt and do
-not approve any interpretation of the shared enum.
+classification facts. The additional core revocation and real-process tests in
+[REVOCATION_RECEIPTS.md](REVOCATION_RECEIPTS.md) authenticate canonical evidence
+and enforce A2's approved whole-scope aggregation.

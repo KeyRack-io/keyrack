@@ -1,10 +1,11 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Private cancellable response transport. No canonical revocation receipt.
+//! Private cancellable transport supplying facts for canonical revocation evidence.
 use crate::core::{Clock, Error};
 use crate::release_state::{Phase as Release, Policy, Window};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use keyrack_core::custody::InFlightDisposition;
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, Value};
 use std::{
@@ -208,17 +209,44 @@ impl<C: Clock> Delivery<C> {
     }
     // Validation, core purge and transport cancellation share the release lock.
     // Invalid fences cannot cancel anything. Keys are dropped before observation.
-    pub fn fence<T>(&self, apply: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    pub fn fence<T>(
+        &self,
+        worker: &str,
+        generation: u64,
+        apply: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<(T, InFlightDisposition), Error> {
         let mut s = self.state.lock().map_err(|_| Error::Material)?;
+        // This gate belongs to one trusted provider/domain and incarnation.
+        // Never attest another worker's or a newer generation's release state.
+        if s.worker != worker
+            || generation == 0
+            || s.outcomes
+                .values()
+                .any(|o| o.authority.worker != worker || o.authority.generation >= generation)
+        {
+            return Err(Error::Authority);
+        }
         let observation = apply()?;
         s.policy.fence(true);
         s.suppress_pending();
         // Apply valid authority revocation and purge even on a failed transport,
         // but never turn uncertain disclosure into a successful observation.
-        if s.faulted {
+        if s.faulted
+            || s.outcomes
+                .values()
+                .any(|o| matches!(o.phase, Release::Pending | Release::Indeterminate))
+        {
             return Err(Error::Material);
         }
-        Ok(observation)
+        // Conservative scope-wide postcondition: historical cancellations also
+        // justify suppression, without claiming those notifications are pending.
+        // Prior commits remain irrevocable; a mixed history is wire value 2.
+        let disposition = if s.outcomes.values().any(|o| o.phase == Release::Suppressed) {
+            InFlightDisposition::OutputsSuppressed
+        } else {
+            InFlightDisposition::Drained
+        };
+        Ok((observation, disposition))
     }
     pub fn stop(&self) {
         if let Ok(mut s) = self.state.lock() {

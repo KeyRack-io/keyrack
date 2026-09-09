@@ -41,7 +41,8 @@ pub(crate) enum Request {
         input: String,
     },
     Fence {
-        signed: Signed,
+        // Base64 canonical Evidence<RevocationCommand>, not the legacy JSON body.
+        evidence: String,
     },
 }
 

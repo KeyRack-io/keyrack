@@ -1,7 +1,8 @@
 # Private worker output release and cancellation
 
-This is the unpublished harness transport, not a shared IPC revision or a
-canonical `RevocationResult`. The worker does not emit `OutputsSuppressed`.
+This is the unpublished harness transport, not a shared IPC revision. Its release
+gate now supports [authenticated canonical local revocation receipts](REVOCATION_RECEIPTS.md)
+under A2's whole-scope ruling; indeterminate output cannot produce a success receipt.
 [The delivery-state enumeration](REVOCATION_DELIVERY_STATES.md) distinguishes
 retained terminal outcomes, evidence limits, and
 transport faults which cannot support a successful canonical disposition.
@@ -39,8 +40,9 @@ kernel enqueue after that deadline. Such a successful write remains committed;
 we do not falsely label it suppressed. Receiver read time is also outside this
 claim. A deterministic test explicitly exercises this case. Any stronger physical
 delivery deadline requires additional OS/transport support and a separately
-reviewed contract; these local outcomes must not be promoted to canonical
-`OutputsSuppressed` or platform-wide completion.
+reviewed contract. The canonical suppression postcondition is scoped to future
+release after the applied fence; it is neither that stronger deadline guarantee
+nor platform-wide completion.
 
 ## Mechanism and bounds
 
@@ -98,7 +100,7 @@ Previously staged output can be cancelled as soon as the fence is validated.
 ## Private records and tests
 
 - `control`: base64 JSON chunks with part/last markers, for public ready metadata,
-  redacted errors, correlated `output suppressed` results and local fence notices.
+  redacted errors, correlated `output suppressed` results and canonical local revocation evidence.
 - `staged`: delivery ID, part/last markers and base64 ciphertext chunks.
 - `release`: delivery ID, worker incarnation, generation, sequence, grant digest
   and one-use key. Only this capsule makes the staged response usable.

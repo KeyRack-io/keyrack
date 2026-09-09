@@ -110,7 +110,7 @@ fn run() -> Result<(), Error> {
         "context_sha256": core::context_digest(&context)?, "pid": std::process::id(),
         "creation_request": worker.creation_request().map(|r| r.canonical_bytes().map(|b| STANDARD.encode(b))).transpose().map_err(|_| Error::Context)?,
         "custody_context": STANDARD.encode(fixture::custody_context(&context).canonical_bytes().map_err(|_| Error::Context)?),
-        "observation_key": worker.observation_key().map(|k| STANDARD.encode(k.key.as_bytes()))}),
+        "observation_key": STANDARD.encode(worker.observation_key().key.as_bytes())}),
     )?;
     // Bounded queue and bounded frames. Reader owns no credentials or key bytes.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -169,9 +169,12 @@ fn run() -> Result<(), Error> {
                 .map_err(|_| Error::Context)
                 .and_then(|input| worker.execute_for_delivery(&signed, &principal, &context, operation, &input))
                 .and_then(|(authority, output)| delivery.enqueue(delivery::Prepared::new(authority, &json!({"output": STANDARD.encode(output.as_slice())}))?)),
-            Ok(Request::Fence { signed }) => delivery
-                .fence(|| worker.fence(&signed))
-                .and_then(|observation| emit(json!({"local_fence": observation}))),
+            Ok(Request::Fence { evidence }) => STANDARD.decode(evidence)
+                .map_err(|_| Error::Authority)
+                .and_then(|bytes| worker.revoke(&bytes, &delivery))
+                .and_then(|observation| emit(json!({"revocation": STANDARD.encode(
+                    observation.canonical_bytes().map_err(|_| Error::Material)?
+                )}))),
             Err(_) => Err(Error::Context),
         };
         if let Err(error) = result {

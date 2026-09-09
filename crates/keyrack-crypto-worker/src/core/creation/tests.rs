@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
 use crate::core::{Limits, MonotonicClock, Secret};
+use ed25519_dalek::SigningKey;
 use keyrack_core::custody::{Validity, WrappingContext};
+use rand::rngs::OsRng;
 use std::{cell::Cell, num::NonZeroU64, rc::Rc};
 use zeroize::Zeroizing;
 
@@ -175,7 +177,7 @@ fn canonical_creation_binds_reservation_material_and_independent_authority() {
     let (mut worker, key) = setup();
     assert_eq!(worker.source.calls, 0);
     let signed = sign(grant(&worker), &key);
-    let observation_key = worker.observation_key().unwrap();
+    let observation_key = worker.observation_key();
     let output = worker.generate(&signed).unwrap();
     let receipt = output
         .result

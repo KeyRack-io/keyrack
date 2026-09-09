@@ -46,7 +46,8 @@ binds request/attempt/executor, storage owner, and complete material digest, wit
 `NativeWrappedOnlyGenerated`. It is neither provider-object closure nor verified
 A2 publication permission. The observer key is created inside the worker; its
 advertisement over the trusted test child channel is **not production key
-distribution or attestation**. No other receipt family is migrated in this slice.
+distribution or attestation**. The same incarnation-wide signer now authenticates
+canonical local revocation results; lease cleanup remains provisional.
 
 ## Existing private crypto behavior
 
@@ -64,11 +65,27 @@ distribution or attestation**. No other receipt family is migrated in this slice
   local observation;
   signed wrong-domain, stale or wrong-incarnation fences fail. Fencing is terminal
   for the incarnation: this slice invents no reinstatement protocol.
-- Separate local residency-cleanup and authority-fence observations. Neither is
-  an authenticated integration receipt, creation destruction or all-holder proof.
+- Canonical authenticated authority-fence results, distinct from provisional
+  residency cleanup. Neither family establishes creation destruction or all-holder completion.
 - Bounded input frames and queues; output backpressure terminates the worker and
   drops custody state instead of blocking expiry indefinitely. Provider errors
   are redacted. No raw-key return or generic parent-decrypt command exists.
+
+## Revocation receipts and availability
+
+The [canonical local receipt path](REVOCATION_RECEIPTS.md) authenticates the exact
+`RevocationCommand` and returns a signed, command-bound `RevocationResult` for its
+whole authority scope. A2's ruling at `3fc2bd2` maps mixed prior commits and pending
+suppression to one wire-value-2 result; indeterminate output yields no receipt.
+Lease diagnostics are sorted, bounded to 128 and do not limit the domain-wide purge.
+
+**Delivery outcome ledger depth is 4,096 admitted responses per incarnation.**
+At capacity, result admission fails with `worker limit exceeded` rather than evicting
+evidence. The operation may already have run and its grant remains consumed.
+Successful delivery, expiry and fencing do not clear entries. There is no reset API:
+only destruction of the worker instance clears this in-memory ledger. A replacement
+starts empty with a fresh incarnation and needs fresh grants; it proves no old
+outcomes and does not replace durable evidence/restart reconciliation.
 
 ## Validation
 
@@ -198,8 +215,9 @@ inspection, independent decryption and live controls. **Production profile appro
 remains UNMET**; the contract codec itself does not qualify a provider. A2 owns
 review of these findings, the proposed transcript/profile and eventual storage
 acceptance. Encrypt/decrypt test grants, application-data AAD, local lease
-cleanup and local fencing still use their explicitly provisional adapters; this
-is not a completed shared IPC/authority migration. Native creation does not publish
+cleanup still use their explicitly provisional adapters. Canonical fencing now
+consumes A2's command/result types, while this remains an incomplete shared
+IPC/authority migration. Native creation does not publish
 anything into the hierarchy or bypass `VerifiedA2Closure` requirements.
 
 The current test engine supports one authority domain and AES-256 leaves. It has
@@ -218,8 +236,8 @@ incarnation through encrypted staging and an atomic, nonblocking key-capsule
 commit serialized with fencing. Cancelled responses have terminal status; queued
 keys expire even behind blocked control output. The document defines admission,
 irrevocable release and fence observation precisely, including OS preemption and
-receiver-read limitations. This remains a private transport and creates no
-canonical `OutputsSuppressed` claim.
+receiver-read limitations. This remains a private transport; its retained facts now
+support the scoped canonical revocation receipt under A2's approved semantics.
 
 Owned raw buffers and AES schedules enable available zeroization features.
 Compiler/OS copies, HTTP header buffers, swap/crash dumps, and all GCM-derived
