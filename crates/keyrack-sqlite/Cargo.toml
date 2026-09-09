@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+uuid = { workspace = true }
 keyrack-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -19,6 +20,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 keyrack-test-support = { workspace = true }
+blake3 = { workspace = true }
 tempfile = "3"
 
 [lints]

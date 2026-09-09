@@ -71,7 +71,6 @@ All notable changes to KeyRack will be documented in this file.
   service installs one at startup, so this was reachable only by other
   embedders, for whom a panic inside a connection attempt is the wrong report
   of a missing initialisation step. It is now an error naming the omission.
-
 - **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
   source-key permit alone no longer permits re-encryption into an unauthorized
   destination. Policies must grant `kms:ReEncryptFrom` on the source and

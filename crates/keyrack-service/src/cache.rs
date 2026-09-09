@@ -40,7 +40,9 @@ use std::time::Duration;
 /// Caches `get_key` results by LID with a configurable TTL and max capacity.
 /// Writes always go through to the underlying backend and replace the local entry.
 ///
-/// TTL bounds metadata caching, not authorization or operation completion.
+/// Metadata TTL is not a crypto-worker lease or a revocation guarantee. Durable
+/// destruction claims bypass this cache; storage fences remain authoritative
+/// even if another replica or an in-flight read retains an older record.
 /// Crypto/lifecycle checks must use the authoritative `get_key_for_use` path.
 pub struct CachingStorage {
     inner: Arc<dyn StorageBackend>,
@@ -80,6 +82,30 @@ impl CachingStorage {
 
 #[async_trait::async_trait]
 impl StorageBackend for CachingStorage {
+    async fn claim_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<keyrack_core::destruction::DestructionClaim>> {
+        self.invalidate(lid).await;
+        let result = self.inner.claim_destruction(lid, expected_occ, now).await;
+        // Include ambiguous commit errors and already-claimed responses.
+        self.invalidate(lid).await;
+        result
+    }
+
+    async fn complete_destruction(
+        &self,
+        claim: keyrack_core::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        let lid = claim.record().lid;
+        self.invalidate(&lid).await;
+        let result = self.inner.complete_destruction(claim).await;
+        self.invalidate(&lid).await;
+        result
+    }
+
     // ── Keys ──────────────────────────────────────────────────────
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
@@ -183,5 +209,59 @@ impl StorageBackend for CachingStorage {
 
     async fn ping(&self) -> Result<()> {
         self.inner.ping().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyrack_core::key::KeyState;
+    use keyrack_test_support::destruction_conformance::due;
+    use keyrack_test_support::fixtures::unique_test_key_record;
+
+    #[tokio::test]
+    async fn destruction_uses_inner_state_and_evicts_on_error_claim_and_completion() {
+        let inner = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap());
+        let cache = CachingStorage::new(inner.clone(), 100, Duration::from_secs(3600));
+        let record = unique_test_key_record(KeyState::Enabled);
+        cache.create_key(&record).await.unwrap();
+        assert_eq!(
+            cache.get_key(&record.lid).await.unwrap().state,
+            KeyState::Enabled
+        );
+        let mut pending = due(record.clone());
+        pending.occ_version += 1;
+        inner.update_key(&pending).await.unwrap();
+        // The cache deliberately holds Enabled. It cannot authorize a claim.
+        assert!(cache
+            .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+            .await
+            .is_err());
+        assert_eq!(
+            cache.get_key(&record.lid).await.unwrap().state,
+            KeyState::PendingDeletion
+        );
+        let claim = cache
+            .claim_destruction(&record.lid, pending.occ_version, chrono::Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache.get_key(&record.lid).await.unwrap().occ_version,
+            claim.record().occ_version
+        );
+        let mut cancelled = cache.get_key(&record.lid).await.unwrap();
+        cancelled.transition_to(KeyState::Disabled).unwrap();
+        assert!(cache.update_key(&cancelled).await.is_err());
+        cache.complete_destruction(claim).await.unwrap();
+        assert_eq!(
+            cache.get_key(&record.lid).await.unwrap().state,
+            KeyState::Destroyed
+        );
+        assert!(cache
+            .claim_destruction(&record.lid, pending.occ_version, chrono::Utc::now())
+            .await
+            .unwrap()
+            .is_none());
     }
 }

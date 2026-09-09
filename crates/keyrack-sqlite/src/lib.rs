@@ -26,6 +26,9 @@
 
 #![forbid(unsafe_code)]
 
+mod creation;
+mod destruction;
+
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::hsm::HsmConnection;
@@ -58,6 +61,12 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
     state        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rotation_jobs_state ON rotation_jobs(state);
+CREATE TABLE IF NOT EXISTS destruction_journal (
+    lid TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    record_json TEXT NOT NULL,
+    completed INTEGER NOT NULL CHECK(completed IN (0,1))
+);
 ";
 
 /// `SQLite`-backed storage.
@@ -72,6 +81,8 @@ impl SqliteStorage {
             Connection::open(path).map_err(|e| KeyRackError::Storage(format!("open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(creation::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -83,6 +94,8 @@ impl SqliteStorage {
             .map_err(|e| KeyRackError::Storage(format!("open in-memory: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(creation::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -115,15 +128,97 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for SqliteStorage {
+    async fn claim_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<keyrack_core::destruction::DestructionClaim>> {
+        self.destruction_claim(lid, expected_occ, now)
+    }
+
+    async fn complete_destruction(
+        &self,
+        claim: keyrack_core::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        self.destruction_complete(claim)
+    }
+
+    async fn reserve_creation(
+        &self,
+        request: &keyrack_core::creation::CreationRequest,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.reserve_a2(request)
+    }
+    async fn get_creation(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.get_a2(operation)
+    }
+    async fn stage_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        envelope: &[u8],
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.stage_a2(operation, owner, revision, envelope)
+    }
+    async fn resolve_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        closure: &keyrack_core::creation::VerifiedA2Closure,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.resolve_a2(operation, owner, revision, closure)
+    }
+    async fn publish_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+    ) -> Result<KeyRecord> {
+        self.publish_a2(operation, owner, revision)
+    }
+    async fn read_creation_envelope(&self, operation: uuid::Uuid) -> Result<Vec<u8>> {
+        self.read_a2_envelope(operation)
+    }
+    async fn claim_creation_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationDispatch> {
+        self.claim_a2_dispatch(operation, owner)
+    }
+    async fn creation_snapshot(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationSnapshot> {
+        self.snapshot_a2(operation, owner)
+    }
+    async fn recoverable_creations(
+        &self,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Result<keyrack_core::creation::CreationPage> {
+        self.recover_a2(after, limit)
+    }
+
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         let lid_str = record.lid.to_string();
         let mut persisted = record.clone();
         persisted.was_compromised = record.has_compromise_history();
         let json = serde_json::to_string(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let occ = record.occ_version as i64;
+        let occ = i64::try_from(record.occ_version)
+            .map_err(|_| keyrack_core::creation::invalid("key OCC out of range"))?;
 
-        self.with_conn(|conn| {
+        self.creation_tx(|conn| {
+            creation::guard_create(conn, &record.lid)?;
+            destruction::guard_write(conn, record)?;
             conn.execute(
                 "INSERT INTO keys (lid, record_json, occ_version) VALUES (?1, ?2, ?3)",
                 rusqlite::params![lid_str, json, occ],
@@ -164,30 +259,29 @@ impl StorageBackend for SqliteStorage {
                 "occ_version must be > 0 for updates".into(),
             ));
         }
-        let current = self.get_key(&record.lid).await?;
-        if current.occ_version != record.occ_version - 1 {
-            return Err(KeyRackError::OptimisticConcurrencyConflict {
-                lid: record.lid,
-                expected: record.occ_version - 1,
-                actual: current.occ_version,
-            });
-        }
-        if current.has_compromise_history() && !record.has_compromise_history() {
-            return Err(KeyRackError::Other(
-                "cannot clear a key's compromise history".into(),
-            ));
-        }
         let lid_str = record.lid.to_string();
         let mut persisted = record.clone();
         persisted.was_compromised = record.has_compromise_history();
         let json = serde_json::to_string(&persisted)
             .map_err(|e| KeyRackError::Storage(format!("serialize: {e}")))?;
-        let new_occ = record.occ_version as i64;
-        let expected_occ = (record.occ_version - 1) as i64;
+        let new_occ = i64::try_from(record.occ_version)
+            .map_err(|_| keyrack_core::creation::invalid("key OCC out of range"))?;
+        let expected_occ = new_occ - 1;
 
-        self.with_conn(|conn| {
-            // The OCC predicate also rejects changes made after the history
-            // check above, so a concurrent compromise cannot be overwritten.
+        self.creation_tx(|conn| {
+            let previous = creation::key(conn, &record.lid)?.ok_or(KeyRackError::KeyNotFound(record.lid))?;
+            if previous.occ_version != record.occ_version - 1 {
+                return Err(KeyRackError::OptimisticConcurrencyConflict {
+                    lid: record.lid, expected: record.occ_version - 1, actual: previous.occ_version,
+                });
+            }
+            if previous.has_compromise_history() && !record.has_compromise_history() {
+                return Err(KeyRackError::Other(
+                    "cannot clear a key's compromise history".into(),
+                ));
+            }
+            creation::guard_update(conn, &previous, record)?;
+            destruction::guard_update(conn, record)?;
             let rows = conn
                 .execute(
                     "UPDATE keys SET record_json = ?1, occ_version = ?2 WHERE lid = ?3 AND occ_version = ?4",
@@ -552,6 +646,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_material_survives_database_reopen_and_stale_update() {
+        use keyrack_core::key::{KeyMaterial, KeyState};
+        use keyrack_test_support::fixtures::mixed_material_key_record;
+
+        let record = mixed_material_key_record(KeyState::Enabled);
+        let path = std::env::temp_dir().join(format!("keyrack-material-{}.sqlite", record.lid));
+        // Reserve only our unique fixture path; never overwrite an existing DB.
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+
+        let store = SqliteStorage::open(&path).unwrap();
+        store.create_key(&record).await.unwrap();
+        let json = store
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT record_json FROM keys WHERE lid = ?1",
+                        [record.lid.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| map_sql(&error))
+            })
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(wire["key_versions"][0].get("key_handle").is_some());
+        assert!(wire["key_versions"][1].get("key_handle").is_none());
+        let parent = record.parent_lid.unwrap();
+        assert_eq!(
+            wire["key_versions"][1]["material"]["parent_lid"],
+            serde_json::to_value(parent.as_bytes()).unwrap()
+        );
+        drop(store);
+
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let fetched = reopened.get_key(&record.lid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&fetched).unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+        assert!(matches!(
+            fetched.key_versions[1].material,
+            KeyMaterial::ParentWrapped(_)
+        ));
+        assert!(fetched.key_versions[1].resident_handle().is_err());
+        let mut updated = fetched;
+        updated.occ_version += 1;
+        updated.description = "updated after reopening".into();
+        reopened.update_key(&updated).await.unwrap();
+        drop(reopened);
+
+        let reopened_again = SqliteStorage::open(&path).unwrap();
+        let mut stale = record.clone();
+        stale.occ_version += 1;
+        stale.key_versions.truncate(1);
+        stale.current_key_version = 1;
+        assert!(matches!(
+            reopened_again.update_key(&stale).await,
+            Err(KeyRackError::OptimisticConcurrencyConflict { .. })
+        ));
+        let actual = reopened_again.get_key(&record.lid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&updated).unwrap()
+        );
+        drop(reopened_again);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
     async fn compromise_history_survives_database_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("compromise.sqlite");
@@ -661,4 +829,6 @@ mod tests {
     }
 
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
+    keyrack_test_support::creation_conformance_tests!(SqliteStorage::in_memory().unwrap());
+    keyrack_test_support::destruction_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }

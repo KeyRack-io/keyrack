@@ -196,10 +196,10 @@ macro_rules! storage_conformance_tests {
         async fn conformance_key_crud() {
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::{KeyFilter, StorageBackend};
-            use keyrack_test_support::fixtures::test_key_record;
+            use keyrack_test_support::fixtures::unique_test_key_record;
 
             let store = $storage_expr;
-            let record = test_key_record(KeyState::Creating);
+            let record = unique_test_key_record(KeyState::Creating);
 
             store.create_key(&record).await.unwrap();
             let fetched = store.get_key(&record.lid).await.unwrap();
@@ -219,10 +219,10 @@ macro_rules! storage_conformance_tests {
             use keyrack_core::error::KeyRackError;
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::StorageBackend;
-            use keyrack_test_support::fixtures::test_key_record;
+            use keyrack_test_support::fixtures::unique_test_key_record;
 
             let store = $storage_expr;
-            let record = test_key_record(KeyState::Enabled);
+            let record = unique_test_key_record(KeyState::Enabled);
             store.create_key(&record).await.unwrap();
 
             let v1 = store.get_key(&record.lid).await.unwrap();
@@ -240,14 +240,71 @@ macro_rules! storage_conformance_tests {
         }
 
         #[tokio::test]
+        async fn conformance_mixed_material_round_trip_and_occ() {
+            use keyrack_core::error::KeyRackError;
+            use keyrack_core::key::{KeyMaterial, KeyState};
+            use keyrack_core::storage::{KeyFilter, StorageBackend};
+            use keyrack_test_support::fixtures::mixed_material_key_record;
+
+            let store = $storage_expr;
+            let record = mixed_material_key_record(KeyState::Enabled);
+            store.create_key(&record).await.unwrap();
+            let fetched = store.get_key(&record.lid).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(&fetched).unwrap(),
+                serde_json::to_value(&record).unwrap()
+            );
+            assert!(matches!(
+                fetched.key_versions[0].material,
+                KeyMaterial::ProviderResident { .. }
+            ));
+            assert!(matches!(
+                fetched.key_versions[1].material,
+                KeyMaterial::ParentWrapped(_)
+            ));
+            assert!(fetched.key_versions[0].resident_handle().is_ok());
+            assert!(fetched.key_versions[1].resident_handle().is_err());
+
+            let mut update = fetched.clone();
+            update.description = "mixed material metadata update".into();
+            update.occ_version += 1;
+            store.update_key(&update).await.unwrap();
+
+            let mut stale = fetched;
+            stale.description = "stale update must not replace material".into();
+            stale.key_versions.truncate(1);
+            stale.current_key_version = 1;
+            stale.occ_version += 1;
+            assert!(matches!(
+                store.update_key(&stale).await,
+                Err(KeyRackError::OptimisticConcurrencyConflict { .. })
+            ));
+
+            let actual = store.get_key(&record.lid).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&update).unwrap()
+            );
+            let page = store.list_keys(&KeyFilter::default()).await.unwrap();
+            let listed = page
+                .items
+                .iter()
+                .find(|item| item.lid == record.lid)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(listed).unwrap(),
+                serde_json::to_value(&update).unwrap()
+            );
+        }
+
+        #[tokio::test]
         async fn conformance_compromise_history_is_monotonic() {
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::StorageBackend;
-            use keyrack_test_support::fixtures::{test_key_record, test_lid};
+            use keyrack_test_support::fixtures::unique_test_key_record;
 
             let store = $storage_expr;
-            let mut record = test_key_record(KeyState::Enabled);
-            record.lid = test_lid("conformance-compromise-history-monotonic");
+            let mut record = unique_test_key_record(KeyState::Enabled);
             store.create_key(&record).await.unwrap();
             record.transition_to(KeyState::Compromised).unwrap();
             store.update_key(&record).await.unwrap();
@@ -276,11 +333,10 @@ macro_rules! storage_conformance_tests {
         async fn conformance_compromised_live_state_normalizes_history() {
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::StorageBackend;
-            use keyrack_test_support::fixtures::{test_key_record, test_lid};
+            use keyrack_test_support::fixtures::unique_test_key_record;
 
             let store = $storage_expr;
-            let mut record = test_key_record(KeyState::Compromised);
-            record.lid = test_lid("conformance-compromised-normalization");
+            let mut record = unique_test_key_record(KeyState::Compromised);
             assert!(!record.was_compromised);
             store.create_key(&record).await.unwrap();
             assert!(store.get_key(&record.lid).await.unwrap().was_compromised);
@@ -299,24 +355,24 @@ macro_rules! storage_conformance_tests {
         async fn conformance_alias_round_trip() {
             use keyrack_core::key::KeyState;
             use keyrack_core::storage::{AliasRecord, StorageBackend};
-            use keyrack_test_support::fixtures::test_key_record;
+            use keyrack_test_support::fixtures::unique_test_key_record;
 
             let store = $storage_expr;
-            let record = test_key_record(KeyState::Enabled);
+            let record = unique_test_key_record(KeyState::Enabled);
             store.create_key(&record).await.unwrap();
 
             let alias = AliasRecord {
-                alias_name: "alias/conformance/test".into(),
+                alias_name: format!("alias/conformance/{}", record.lid),
                 target_lid: record.lid,
                 created_at: chrono::Utc::now(),
             };
             store.create_alias(&alias).await.unwrap();
 
-            let lid = store.resolve_alias("alias/conformance/test").await.unwrap();
+            let lid = store.resolve_alias(&alias.alias_name).await.unwrap();
             assert_eq!(lid, alias.target_lid);
 
-            store.delete_alias("alias/conformance/test").await.unwrap();
-            assert!(store.resolve_alias("alias/conformance/test").await.is_err());
+            store.delete_alias(&alias.alias_name).await.unwrap();
+            assert!(store.resolve_alias(&alias.alias_name).await.is_err());
         }
 
         #[tokio::test]

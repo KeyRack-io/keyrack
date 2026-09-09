@@ -72,6 +72,122 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Commit a one-shot resident destruction fence before any provider effect.
+    /// Re-read state, due time, OCC and full material history in the transaction;
+    /// reject all parent/child creation references. All writers must honor the
+    /// fence. None means already claimed, NEVER permission to dispatch again.
+    /// A commit/response failure is ambiguous and must not be retried as work.
+    async fn claim_destruction(
+        &self,
+        _lid: &Lid,
+        _expected_occ: u64,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::destruction::DestructionClaim>> {
+        Err(crate::destruction::invalid(
+            "transactional fencing unsupported",
+        ))
+    }
+
+    /// Atomically publish Destroyed for the exact claim after ALL provider
+    /// destroys succeeded. Consume the ticket; errors retain the durable fence.
+    /// This is a trusted service/storage boundary, not external authorization.
+    async fn complete_destruction(
+        &self,
+        _claim: crate::destruction::DestructionClaim,
+    ) -> Result<KeyRecord> {
+        Err(crate::destruction::invalid(
+            "transactional fencing unsupported",
+        ))
+    }
+
+    // A2 creation transactions. Unsupported wrappers/backends MUST NOT emulate
+    // these using separate CRUD calls. No production hierarchy activation yet.
+    async fn reserve_creation(
+        &self,
+        _request: &crate::creation::CreationRequest,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn get_creation(
+        &self,
+        _operation: uuid::Uuid,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    /// Atomically permit at most one provider dispatch. A lost response is
+    /// ambiguous, never permission to retry Generate. Publication revisions are
+    /// unchanged; the separately persisted decision is monotonic.
+    async fn claim_creation_dispatch(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+    ) -> Result<crate::creation::CreationDispatch> {
+        Err(crate::creation::invalid(
+            "transactional dispatch unsupported",
+        ))
+    }
+    /// Owner-fenced internal recovery, including immutable staged bytes. Not a
+    /// public envelope read or a substitute for current authority checks.
+    async fn creation_snapshot(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+    ) -> Result<crate::creation::CreationSnapshot> {
+        Err(crate::creation::invalid(
+            "transactional recovery snapshot unsupported",
+        ))
+    }
+    async fn stage_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+        _envelope: &[u8],
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn resolve_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+        _closure: &crate::creation::VerifiedA2Closure,
+    ) -> Result<crate::creation::CreationJournal> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn publish_creation(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: crate::creation::CreationOwner,
+        _revision: u64,
+    ) -> Result<KeyRecord> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn read_creation_envelope(&self, _operation: uuid::Uuid) -> Result<Vec<u8>> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    async fn recoverable_creations(
+        &self,
+        _after: Option<uuid::Uuid>,
+        _limit: u32,
+    ) -> Result<crate::creation::CreationPage> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+
     // ── Keys ──────────────────────────────────────────────────────
 
     /// Insert a new key record. Fails if the LID already exists. Persist
@@ -185,16 +301,16 @@ mod tests {
             updated_at: chrono::Utc::now(),
             scheduled_deletion_at: None,
             description: String::new(),
-            key_versions: vec![KeyVersionRecord {
-                version_number: 1,
-                key_handle: KeyHandle {
+            key_versions: vec![KeyVersionRecord::provider_resident(
+                1,
+                KeyHandle {
                     key_id: "test".into(),
                     key_spec: KeySpec::Aes256,
                 },
-                provider_ref: None,
-                created_at: chrono::Utc::now(),
-                is_primary: true,
-            }],
+                None,
+                chrono::Utc::now(),
+                true,
+            )],
         }
     }
 
@@ -215,6 +331,22 @@ mod tests {
                 rotation_jobs: Mutex::new(HashMap::new()),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_destruction_fencing_fails_closed() {
+        let store = MemoryStorage::new();
+        let mut record = make_test_record(KeyState::PendingDeletion);
+        record.scheduled_deletion_at = Some(chrono::Utc::now());
+        store.create_key(&record).await.unwrap();
+        assert!(store
+            .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+            .await
+            .is_err());
+        assert_eq!(
+            store.get_key(&record.lid).await.unwrap().state,
+            KeyState::PendingDeletion
+        );
     }
 
     #[async_trait]

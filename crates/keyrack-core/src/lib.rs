@@ -30,6 +30,10 @@ pub mod audit;
 pub mod authn;
 pub mod canon;
 pub mod cascade;
+pub mod creation;
+pub mod creation_driver;
+pub mod custody;
+pub mod destruction;
 pub mod encryption_context;
 pub mod error;
 pub mod header;
@@ -37,6 +41,7 @@ pub mod hsm;
 pub mod key;
 pub mod lid;
 pub mod lint;
+pub mod material;
 pub mod migration;
 pub mod pdp;
 pub mod provider;
@@ -50,6 +55,7 @@ pub mod secret;
 pub mod sensitive;
 pub mod storage;
 pub mod tags;
+pub mod wrapping;
 
 #[cfg(kani)]
 mod kani_proofs;

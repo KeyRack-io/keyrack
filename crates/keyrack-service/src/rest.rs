@@ -210,6 +210,7 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
+        KeyRackError::KeyDestructionFenced(_) => (StatusCode::CONFLICT, "KeyDestructionFenced"),
         KeyRackError::InvalidStateTransition { .. } => {
             (StatusCode::CONFLICT, "InvalidStateTransition")
         }
@@ -422,13 +423,7 @@ async fn create_key(
                 updated_at: now,
                 scheduled_deletion_at: None,
                 description: desc,
-                key_versions: vec![keyrack_core::key::KeyVersionRecord {
-                    version_number: 1,
-                    key_handle: handle,
-                    provider_ref: Some(provider_name.clone()),
-                    created_at: now,
-                    is_primary: true,
-                }],
+                key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true)],
             };
 
             // Born-exportable double-gate + leaf-only + provider wiring.
@@ -920,13 +915,13 @@ async fn import_key(
             updated_at: now,
             scheduled_deletion_at: None,
             description: desc,
-            key_versions: vec![keyrack_core::key::KeyVersionRecord {
-                version_number: 1,
-                key_handle: handle,
-                provider_ref: Some(provider_name.clone()),
-                created_at: now,
-                is_primary: true,
-            }],
+            key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+                1,
+                handle,
+                Some(provider_name.clone()),
+                now,
+                true,
+            )],
         };
 
         if exportable {
@@ -1006,17 +1001,13 @@ async fn encrypt(
             .get("encryption_context")
             .and_then(|v| v.as_object())
             .and_then(build_ec);
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let ec_aad = ec
             .as_ref()
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
@@ -1037,7 +1028,11 @@ async fn encrypt(
             .map_err(map_core_err)?;
         let output = enc_entry
             .provider
-            .encrypt(&primary.key_handle, &plaintext, &aad)
+            .encrypt(
+                primary.resident_handle().map_err(map_core_err)?,
+                &plaintext,
+                &aad,
+            )
             .await
             .map_err(map_core_err)?;
         let blob = header.wrap_payload(&output.ciphertext);
@@ -1144,7 +1139,11 @@ async fn decrypt(
             .await;
         let plaintext = dec_entry
             .provider
-            .decrypt(&version_record.key_handle, ciphertext, &aad)
+            .decrypt(
+                version_record.resident_handle().map_err(map_core_err)?,
+                ciphertext,
+                &aad,
+            )
             .await
             .map_err(map_core_err)?;
         Ok(Json(serde_json::json!({
@@ -1205,17 +1204,13 @@ async fn sign(
         }
         let message_b64 = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
         let message = base64_decode(message_b64)?;
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let sign_entry = state
             .providers
             .resolve_for_primary(&record)
@@ -1223,7 +1218,11 @@ async fn sign(
         let signature = if use_digest {
             sign_entry
                 .provider
-                .sign_digest(&primary.key_handle, alg, &message)
+                .sign_digest(
+                    primary.resident_handle().map_err(map_core_err)?,
+                    alg,
+                    &message,
+                )
                 .await
                 .map_err(|e| {
                     ops::rest_error(StatusCode::BAD_REQUEST, "InvalidArgument", &e.to_string())
@@ -1231,7 +1230,11 @@ async fn sign(
         } else {
             sign_entry
                 .provider
-                .sign(&primary.key_handle, alg, &message)
+                .sign(
+                    primary.resident_handle().map_err(map_core_err)?,
+                    alg,
+                    &message,
+                )
                 .await
                 .map_err(map_core_err)?
         };
@@ -1295,17 +1298,13 @@ async fn verify(
         let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
         let signature =
             base64_decode(body.get("signature").and_then(|v| v.as_str()).unwrap_or(""))?;
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let verify_entry = state
             .providers
             .resolve_for_primary(&record)
@@ -1313,7 +1312,12 @@ async fn verify(
         let valid = if use_digest {
             verify_entry
                 .provider
-                .verify_digest(&primary.key_handle, alg, &message, &signature)
+                .verify_digest(
+                    primary.resident_handle().map_err(map_core_err)?,
+                    alg,
+                    &message,
+                    &signature,
+                )
                 .await
                 .map_err(|e| {
                     ops::rest_error(StatusCode::BAD_REQUEST, "InvalidArgument", &e.to_string())
@@ -1321,7 +1325,12 @@ async fn verify(
         } else {
             verify_entry
                 .provider
-                .verify(&primary.key_handle, alg, &message, &signature)
+                .verify(
+                    primary.resident_handle().map_err(map_core_err)?,
+                    alg,
+                    &message,
+                    &signature,
+                )
                 .await
                 .map_err(map_core_err)?
         };
@@ -1437,24 +1446,24 @@ async fn generate_mac(
             .unwrap_or("");
         let alg = parse_mac_algorithm(alg_str)?;
         let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let mac_entry = state
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
         let mac = mac_entry
             .provider
-            .generate_mac(&primary.key_handle, alg, &message)
+            .generate_mac(
+                primary.resident_handle().map_err(map_core_err)?,
+                alg,
+                &message,
+            )
             .await
             .map_err(map_core_err)?;
         Ok(Json(serde_json::json!({
@@ -1511,24 +1520,25 @@ async fn verify_mac(
         let alg = parse_mac_algorithm(alg_str)?;
         let message = base64_decode(body.get("message").and_then(|v| v.as_str()).unwrap_or(""))?;
         let mac = base64_decode(body.get("mac").and_then(|v| v.as_str()).unwrap_or(""))?;
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let mac_entry = state
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
         let mac_valid = mac_entry
             .provider
-            .verify_mac(&primary.key_handle, alg, &message, &mac)
+            .verify_mac(
+                primary.resident_handle().map_err(map_core_err)?,
+                alg,
+                &message,
+                &mac,
+            )
             .await
             .map_err(map_core_err)?;
         Ok(Json(serde_json::json!({
@@ -1587,17 +1597,13 @@ async fn generate_data_key(
         )
         .await
         .map_err(|e| e.to_rest_error())?;
-        let primary = record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "no primary version",
-                )
-            })?;
+        let primary = record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "no primary version",
+            )
+        })?;
         let ec = body
             .get("encryption_context")
             .and_then(|v| v.as_object())
@@ -1627,7 +1633,11 @@ async fn generate_data_key(
             .map_err(map_core_err)?;
         let output = gdek_entry
             .provider
-            .generate_data_key(&primary.key_handle, dek_len, &aad)
+            .generate_data_key(
+                primary.resident_handle().map_err(map_core_err)?,
+                dek_len,
+                &aad,
+            )
             .await
             .map_err(map_core_err)?;
         Ok(Json(serde_json::json!({
@@ -1758,17 +1768,13 @@ async fn re_encrypt(
             .providers
             .resolve_for_primary(&dst_record)
             .map_err(map_core_err)?;
-        let dst_primary = dst_record
-            .key_versions
-            .iter()
-            .find(|v| v.is_primary)
-            .ok_or_else(|| {
-                ops::rest_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "NoVersion",
-                    "dest has no primary",
-                )
-            })?;
+        let dst_primary = dst_record.primary_version().ok_or_else(|| {
+            ops::rest_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NoVersion",
+                "dest has no primary",
+            )
+        })?;
         let dst_ec_hash = dst_ec.as_ref().map_or(
             [0u8; 32],
             keyrack_core::encryption_context::EncryptionContext::hash,
@@ -1783,30 +1789,27 @@ async fn re_encrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
+        // Validate both representations before invoking either provider.
+        let src_handle = src_version.resident_handle().map_err(map_core_err)?;
+        let dst_handle = dst_primary.resident_handle().map_err(map_core_err)?;
         decrypt_permission
             .record_use(&state, &src_record, &legacy_audit_context)
             .await;
         let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
             src_re_entry
                 .provider
-                .re_encrypt(
-                    &src_version.key_handle,
-                    ciphertext,
-                    &src_aad,
-                    &dst_primary.key_handle,
-                    &dst_aad,
-                )
+                .re_encrypt(src_handle, ciphertext, &src_aad, dst_handle, &dst_aad)
                 .await
                 .map_err(map_core_err)?
         } else {
             let plaintext = src_re_entry
                 .provider
-                .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                .decrypt(src_handle, ciphertext, &src_aad)
                 .await
                 .map_err(map_core_err)?;
             dst_re_entry
                 .provider
-                .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                .encrypt(dst_handle, plaintext.expose(), &dst_aad)
                 .await
                 .map_err(map_core_err)?
         };

@@ -1,0 +1,15 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!proto/
+!proto/**
+!examples/
+!examples/**
+!scripts/
+!scripts/test-pkcs11-wrapping.sh
+**/target
+**/.git
+**/.env

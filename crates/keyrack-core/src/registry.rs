@@ -22,13 +22,13 @@
 //! version.
 //!
 //! `KeyRack` can be configured with several named providers (e.g. a software
-//! default plus one HSM per tenant). Each [`KeyRecord`]/[`KeyVersionRecord`]
-//! carries an optional [`ProviderRef`] selecting one of them; `None` means
-//! "use the default". The registry turns that binding into a concrete
-//! provider at call time.
+//! default plus one HSM per tenant). A [`KeyRecord`] and its provider-resident
+//! versions carry optional [`ProviderRef`] bindings. The registry turns those
+//! bindings into a concrete provider at call time. Parent-wrapped material
+//! requires a separate custody-aware path and is refused here.
 //!
 //! Resolution order for a version (see [`KeyRecord::effective_provider_ref`]):
-//! `version.provider_ref` -> `record.provider_ref` -> registry default.
+//! `version.provider_ref()` -> `record.provider_ref` -> registry default.
 //!
 //! This is the routing layer that lets a single service front multiple
 //! backends (multi-tenant HYOK, per-node hierarchy backends) and lets a key
@@ -61,13 +61,18 @@ pub trait ProviderRegistry: Send + Sync {
     fn default_ref(&self) -> &ProviderRef;
 
     /// Resolve the effective provider for a specific key version, applying
-    /// the `version -> record -> default` precedence.
+    /// the `version -> record -> default` precedence for resident material.
+    /// Missing versions and parent-wrapped material fail before provider lookup.
     fn resolve_for_version(
         &self,
         record: &KeyRecord,
         version_number: u64,
     ) -> Result<ProviderEntry> {
-        match record.effective_provider_ref(version_number) {
+        let version = record
+            .get_version(version_number)
+            .ok_or(KeyRackError::KeyNotFound(record.lid))?;
+        version.resident_handle()?;
+        match version.provider_ref().or(record.provider_ref.as_ref()) {
             Some(name) => self.resolve(name),
             None => Ok(self.default_entry()),
         }
@@ -306,7 +311,7 @@ impl ProviderRegistry for DynamicProviderRegistry {
 mod tests {
     use super::*;
     use crate::key::tests::make_test_record;
-    use crate::key::KeyState;
+    use crate::key::{KeyMaterial, KeyState};
     use crate::provider::inmem::InMemoryProvider;
 
     fn entry() -> ProviderEntry {
@@ -325,6 +330,21 @@ mod tests {
             ProviderRef::new("default"),
         )
         .unwrap()
+    }
+
+    fn bind_version(record: &mut KeyRecord, binding: Option<ProviderRef>) {
+        let KeyMaterial::ProviderResident { provider_ref, .. } =
+            &mut record.key_versions[0].material
+        else {
+            panic!("resident test fixture required");
+        };
+        *provider_ref = binding;
+    }
+
+    fn assert_resolves_to(registry: &dyn ProviderRegistry, record: &KeyRecord, name: &str) {
+        let expected = registry.resolve(&ProviderRef::new(name)).unwrap();
+        let actual = registry.resolve_for_version(record, 1).unwrap();
+        assert!(Arc::ptr_eq(&expected.provider, &actual.provider));
     }
 
     #[test]
@@ -363,17 +383,45 @@ mod tests {
         let mut record = make_test_record(KeyState::Enabled);
 
         // No binding => default.
-        assert!(reg.resolve_for_version(&record, 1).is_ok());
+        assert_resolves_to(&reg, &record, "default");
+
+        // An unbound resident version inherits the record binding.
+        record.provider_ref = Some(ProviderRef::new("tenant-a"));
+        assert_resolves_to(&reg, &record, "tenant-a");
+
+        // A version binding overrides the record, including an explicit default.
+        bind_version(&mut record, Some(ProviderRef::new("default")));
+        assert_resolves_to(&reg, &record, "default");
 
         // Version-level binding to a known provider resolves.
-        record.key_versions[0].provider_ref = Some(ProviderRef::new("tenant-a"));
-        assert!(reg.resolve_for_version(&record, 1).is_ok());
+        record.provider_ref = Some(ProviderRef::new("default"));
+        bind_version(&mut record, Some(ProviderRef::new("tenant-a")));
+        assert_resolves_to(&reg, &record, "tenant-a");
 
         // Version-level binding to an unknown provider errors.
-        record.key_versions[0].provider_ref = Some(ProviderRef::new("ghost"));
+        bind_version(&mut record, Some(ProviderRef::new("ghost")));
         assert!(matches!(
             reg.resolve_for_version(&record, 1),
             Err(KeyRackError::ProviderUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn missing_version_never_falls_back_to_record_or_default() {
+        let reg = registry();
+        let mut record = make_test_record(KeyState::Enabled);
+        for binding in [None, Some("tenant-a"), Some("ghost")] {
+            record.provider_ref = binding.map(ProviderRef::new);
+            assert!(matches!(
+                reg.resolve_for_version(&record, 999),
+                Err(KeyRackError::KeyNotFound(lid)) if lid == record.lid
+            ));
+        }
+
+        record.current_key_version = 999;
+        assert!(matches!(
+            reg.resolve_for_primary(&record),
+            Err(KeyRackError::KeyNotFound(lid)) if lid == record.lid
         ));
     }
 
@@ -461,7 +509,7 @@ mod tests {
         let reg = dynamic_registry();
         reg.register(ProviderRef::new("tenant-a"), entry()).unwrap();
         let mut record = make_test_record(KeyState::Enabled);
-        record.key_versions[0].provider_ref = Some(ProviderRef::new("tenant-a"));
-        assert!(reg.resolve_for_version(&record, 1).is_ok());
+        bind_version(&mut record, Some(ProviderRef::new("tenant-a")));
+        assert_resolves_to(&reg, &record, "tenant-a");
     }
 }

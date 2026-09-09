@@ -148,9 +148,7 @@ impl KeyService for KeyServiceImpl {
                 let ec = build_encryption_context(&req.encryption_context);
 
                 let primary_version = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
 
                 let ec_aad = ec
@@ -177,7 +175,13 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
                 let output = enc_entry
                     .provider
-                    .encrypt(&primary_version.key_handle, &req.plaintext, &aad)
+                    .encrypt(
+                        primary_version
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        &req.plaintext,
+                        &aad,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
 
@@ -289,7 +293,13 @@ impl KeyService for KeyServiceImpl {
                     .await;
                 let plaintext = dec_entry
                     .provider
-                    .decrypt(&version_record.key_handle, ciphertext, &aad)
+                    .decrypt(
+                        version_record
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        ciphertext,
+                        &aad,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
 
@@ -417,9 +427,7 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
 
                 let dst_primary = dst_record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("destination has no primary version"))?;
 
                 let dst_ec_hash = dst_ec.as_ref().map_or(
@@ -438,6 +446,13 @@ impl KeyService for KeyServiceImpl {
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
                 let dst_aad = new_header.build_aad(&dst_ec_aad);
+                // Validate both representations before invoking either provider.
+                let src_handle = src_version
+                    .resident_handle()
+                    .map_err(convert::error_to_status)?;
+                let dst_handle = dst_primary
+                    .resident_handle()
+                    .map_err(convert::error_to_status)?;
 
                 decrypt_permission
                     .record_use(&state, &src_record, &legacy_audit_context)
@@ -446,24 +461,18 @@ impl KeyService for KeyServiceImpl {
                     if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
                         src_re_entry
                             .provider
-                            .re_encrypt(
-                                &src_version.key_handle,
-                                ciphertext,
-                                &src_aad,
-                                &dst_primary.key_handle,
-                                &dst_aad,
-                            )
+                            .re_encrypt(src_handle, ciphertext, &src_aad, dst_handle, &dst_aad)
                             .await
                             .map_err(convert::error_to_status)?
                     } else {
                         let plaintext = src_re_entry
                             .provider
-                            .decrypt(&src_version.key_handle, ciphertext, &src_aad)
+                            .decrypt(src_handle, ciphertext, &src_aad)
                             .await
                             .map_err(convert::error_to_status)?;
                         dst_re_entry
                             .provider
-                            .encrypt(&dst_primary.key_handle, plaintext.expose(), &dst_aad)
+                            .encrypt(dst_handle, plaintext.expose(), &dst_aad)
                             .await
                             .map_err(convert::error_to_status)?
                     };
@@ -537,9 +546,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(|e| e.to_grpc_status())?;
 
                 let primary = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
 
                 let ec = build_encryption_context(&req.encryption_context);
@@ -568,7 +575,13 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
                 let output = gdek_entry
                     .provider
-                    .generate_data_key(&primary.key_handle, dek_len, &aad)
+                    .generate_data_key(
+                        primary
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        dek_len,
+                        &aad,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
 
@@ -626,9 +639,7 @@ impl KeyService for KeyServiceImpl {
                     return Err(Status::failed_precondition("key not in Enabled state"));
                 }
                 let primary = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let ec = build_encryption_context(&req.encryption_context);
                 let ec_aad = ec
@@ -652,7 +663,13 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
                 let output = gdkwp_entry
                     .provider
-                    .generate_data_key(&primary.key_handle, dek_len, &aad)
+                    .generate_data_key(
+                        primary
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        dek_len,
+                        &aad,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
                 Ok(Response::new(
@@ -765,9 +782,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let sign_entry = state
                     .providers
@@ -776,13 +791,25 @@ impl KeyService for KeyServiceImpl {
                 let signature = if use_digest {
                     sign_entry
                         .provider
-                        .sign_digest(&primary_version.key_handle, alg, &req.message)
+                        .sign_digest(
+                            primary_version
+                                .resident_handle()
+                                .map_err(convert::error_to_status)?,
+                            alg,
+                            &req.message,
+                        )
                         .await
                         .map_err(|e| Status::invalid_argument(e.to_string()))?
                 } else {
                     sign_entry
                         .provider
-                        .sign(&primary_version.key_handle, alg, &req.message)
+                        .sign(
+                            primary_version
+                                .resident_handle()
+                                .map_err(convert::error_to_status)?,
+                            alg,
+                            &req.message,
+                        )
                         .await
                         .map_err(convert::error_to_status)?
                 };
@@ -860,9 +887,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let verify_entry = state
                     .providers
@@ -872,7 +897,9 @@ impl KeyService for KeyServiceImpl {
                     verify_entry
                         .provider
                         .verify_digest(
-                            &primary_version.key_handle,
+                            primary_version
+                                .resident_handle()
+                                .map_err(convert::error_to_status)?,
                             alg,
                             &req.message,
                             &req.signature,
@@ -883,7 +910,9 @@ impl KeyService for KeyServiceImpl {
                     verify_entry
                         .provider
                         .verify(
-                            &primary_version.key_handle,
+                            primary_version
+                                .resident_handle()
+                                .map_err(convert::error_to_status)?,
                             alg,
                             &req.message,
                             &req.signature,
@@ -955,9 +984,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let mac_entry = state
                     .providers
@@ -965,7 +992,13 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
                 let mac = mac_entry
                     .provider
-                    .generate_mac(&primary_version.key_handle, alg, &req.message)
+                    .generate_mac(
+                        primary_version
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        alg,
+                        &req.message,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::GenerateMacResponse {
@@ -1032,9 +1065,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(|e| e.to_grpc_status())?;
 
                 let primary_version = record
-                    .key_versions
-                    .iter()
-                    .find(|v| v.is_primary)
+                    .primary_version()
                     .ok_or_else(|| Status::internal("no primary key version"))?;
                 let mac_entry = state
                     .providers
@@ -1042,7 +1073,14 @@ impl KeyService for KeyServiceImpl {
                     .map_err(convert::error_to_status)?;
                 let mac_valid = mac_entry
                     .provider
-                    .verify_mac(&primary_version.key_handle, alg, &req.message, &req.mac)
+                    .verify_mac(
+                        primary_version
+                            .resident_handle()
+                            .map_err(convert::error_to_status)?,
+                        alg,
+                        &req.message,
+                        &req.mac,
+                    )
                     .await
                     .map_err(convert::error_to_status)?;
                 Ok(Response::new(proto::VerifyMacResponse {
@@ -1193,13 +1231,7 @@ impl KeyService for KeyServiceImpl {
                     updated_at: now,
                     scheduled_deletion_at: None,
                     description: req.description,
-                    key_versions: vec![keyrack_core::key::KeyVersionRecord {
-                        version_number: 1,
-                        key_handle: handle,
-                        provider_ref: Some(provider_name.clone()),
-                        created_at: now,
-                        is_primary: true,
-                    }],
+                    key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true)],
                 };
 
                 // Born-exportable double-gate: shared domain enforcement for
@@ -2676,7 +2708,11 @@ impl KeyService for KeyServiceImpl {
                 .map_err(convert::error_to_status)?;
             let material = entry
                 .provider
-                .export_key_material(&version.key_handle)
+                .export_key_material(
+                    version
+                        .resident_handle()
+                        .map_err(convert::error_to_status)?,
+                )
                 .await
                 .map_err(convert::error_to_status)?;
 
@@ -2749,6 +2785,7 @@ impl KeyService for KeyServiceImpl {
 
         ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
             // Provider-level: tell the backend this key is exportable.
+            crate::domain::require_resident_versions(&record).map_err(|e| e.to_grpc_status())?;
             let entry = state
                 .providers
                 .resolve_for_version(&record, record.current_key_version)
@@ -2758,7 +2795,11 @@ impl KeyService for KeyServiceImpl {
                 .ok_or_else(|| Status::internal("primary version not found"))?;
             entry
                 .provider
-                .make_key_exportable(&primary.key_handle)
+                .make_key_exportable(
+                    primary
+                        .resident_handle()
+                        .map_err(convert::error_to_status)?,
+                )
                 .await
                 .map_err(convert::error_to_status)?;
 
@@ -2802,6 +2843,7 @@ impl KeyService for KeyServiceImpl {
 
         ops::execute_with_resource_attrs(&self.state, op_ctx, resource_attrs, |state| async move {
             let mut updated = record.clone();
+            crate::domain::require_resident_versions(&updated).map_err(|e| e.to_grpc_status())?;
             updated
                 .transition_exportability(keyrack_core::key::Exportability::NonExportable)
                 .map_err(Status::failed_precondition)?;
@@ -2812,8 +2854,12 @@ impl KeyService for KeyServiceImpl {
             let version_handles: Vec<_> = updated
                 .key_versions
                 .iter()
-                .map(|v| (v.version_number, v.key_handle.clone()))
-                .collect();
+                .map(|v| {
+                    v.resident_handle()
+                        .map(|handle| (v.version_number, handle.clone()))
+                })
+                .collect::<keyrack_core::error::Result<_>>()
+                .map_err(convert::error_to_status)?;
             for (vnum, old_handle) in &version_handles {
                 let entry = state
                     .providers
@@ -2827,7 +2873,8 @@ impl KeyService for KeyServiceImpl {
                 {
                     for v in &mut updated.key_versions {
                         if v.version_number == *vnum {
-                            v.key_handle = new_handle;
+                            *v.resident_handle_mut().map_err(convert::error_to_status)? =
+                                new_handle;
                             break;
                         }
                     }
@@ -2957,13 +3004,13 @@ impl KeyService for KeyServiceImpl {
                 updated_at: now,
                 scheduled_deletion_at: None,
                 description: req.description,
-                key_versions: vec![keyrack_core::key::KeyVersionRecord {
-                    version_number: 1,
-                    key_handle: handle,
-                    provider_ref: Some(provider_name.clone()),
-                    created_at: now,
-                    is_primary: true,
-                }],
+                key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+                    1,
+                    handle,
+                    Some(provider_name.clone()),
+                    now,
+                    true,
+                )],
             };
 
             if req.exportable {

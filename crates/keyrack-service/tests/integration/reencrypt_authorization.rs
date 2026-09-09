@@ -607,7 +607,7 @@ fn install_alternate_provider(fixture: &mut Fixture) -> Arc<RecordingProvider> {
 /// Construct a resident-version fixture, not a custody-preserving migration.
 /// The new destination material is generated on the second in-memory backend.
 async fn bind_destination_to_alternate(fixture: &Fixture, alternate: &RecordingProvider) {
-    use keyrack_core::key::{KeySpec, ProviderRef};
+    use keyrack_core::key::{KeyMaterial, KeySpec, ProviderRef};
 
     let mut destination = fixture
         .state
@@ -615,9 +615,10 @@ async fn bind_destination_to_alternate(fixture: &Fixture, alternate: &RecordingP
         .get_key(&fixture.destination.parse().unwrap())
         .await
         .unwrap();
-    destination.key_versions[0].key_handle =
-        alternate.generate_key(&KeySpec::Aes256).await.unwrap();
-    destination.key_versions[0].provider_ref = Some(ProviderRef::new("alternate"));
+    destination.key_versions[0].material = KeyMaterial::ProviderResident {
+        key_handle: alternate.generate_key(&KeySpec::Aes256).await.unwrap(),
+        provider_ref: Some(ProviderRef::new("alternate")),
+    };
     destination.occ_version += 1;
     fixture
         .state
@@ -668,13 +669,15 @@ async fn source_scope_follows_ciphertext_version_not_current_primary_on_both_tra
                 .await
                 .unwrap();
             source.key_versions[0].is_primary = false;
-            source.key_versions.push(KeyVersionRecord {
-                version_number: 2,
-                key_handle: alternate.generate_key(&KeySpec::Aes256).await.unwrap(),
-                provider_ref: Some(ProviderRef::new("alternate")),
-                created_at: chrono::Utc::now(),
-                is_primary: true,
-            });
+            source
+                .key_versions
+                .push(KeyVersionRecord::provider_resident(
+                    2,
+                    alternate.generate_key(&KeySpec::Aes256).await.unwrap(),
+                    Some(ProviderRef::new("alternate")),
+                    chrono::Utc::now(),
+                    true,
+                ));
             source.current_key_version = 2;
             source.occ_version += 1;
             fixture.state.storage.update_key(&source).await.unwrap();

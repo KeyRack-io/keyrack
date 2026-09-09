@@ -102,7 +102,7 @@ impl PolicyDecisionPoint for CountingPdp {
     }
 }
 
-/// Provider that records crypto calls and can be made to fail `destroy_key`.
+/// Provider that records material operations and can fail `destroy_key`.
 ///
 /// Lets the deletion-reaper tests distinguish "`KeyRack` marked the record
 /// destroyed" from "the backend material was actually deleted".
@@ -112,6 +112,14 @@ struct RecordingProvider {
     calls: Mutex<Vec<&'static str>>,
     destroyed: Mutex<Vec<String>>,
     fail_destroy: bool,
+    fail_destroy_at: Option<usize>,
+    destroy_gate: Option<Arc<DestroyGate>>,
+}
+
+#[derive(Default)]
+struct DestroyGate {
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 impl RecordingProvider {
@@ -121,6 +129,8 @@ impl RecordingProvider {
             calls: Mutex::new(Vec::new()),
             destroyed: Mutex::new(Vec::new()),
             fail_destroy,
+            fail_destroy_at: None,
+            destroy_gate: None,
         }
     }
 
@@ -131,6 +141,10 @@ impl RecordingProvider {
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
     }
+
+    fn record_call(&self, operation: &'static str) {
+        self.calls.lock().unwrap().push(operation);
+    }
 }
 
 #[async_trait::async_trait]
@@ -139,7 +153,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         spec: &keyrack_core::key::KeySpec,
     ) -> keyrack_core::error::Result<keyrack_core::provider::KeyHandle> {
-        self.calls.lock().unwrap().push("generate_key");
+        self.record_call("generate_key");
         self.inner.generate_key(spec).await
     }
 
@@ -149,7 +163,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> keyrack_core::error::Result<keyrack_core::provider::EncryptOutput> {
-        self.calls.lock().unwrap().push("encrypt");
+        self.record_call("encrypt");
         self.inner.encrypt(handle, plaintext, aad).await
     }
 
@@ -159,7 +173,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
-        self.calls.lock().unwrap().push("decrypt");
+        self.record_call("decrypt");
         self.inner.decrypt(handle, ciphertext, aad).await
     }
 
@@ -169,7 +183,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         algorithm: keyrack_core::provider::SigningAlgorithm,
         message: &[u8],
     ) -> keyrack_core::error::Result<Vec<u8>> {
-        self.calls.lock().unwrap().push("sign");
+        self.record_call("sign");
         self.inner.sign(handle, algorithm, message).await
     }
 
@@ -180,7 +194,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         message: &[u8],
         signature: &[u8],
     ) -> keyrack_core::error::Result<bool> {
-        self.calls.lock().unwrap().push("verify");
+        self.record_call("verify");
         self.inner
             .verify(handle, algorithm, message, signature)
             .await
@@ -190,7 +204,7 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         length: usize,
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
-        self.calls.lock().unwrap().push("generate_random");
+        self.record_call("generate_random");
         self.inner.generate_random(length).await
     }
 
@@ -198,9 +212,13 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         handle: &keyrack_core::provider::KeyHandle,
     ) -> keyrack_core::error::Result<()> {
-        self.calls.lock().unwrap().push("destroy_key");
+        self.record_call("destroy_key");
         self.destroyed.lock().unwrap().push(handle.key_id.clone());
-        if self.fail_destroy {
+        if let Some(gate) = &self.destroy_gate {
+            gate.started.notify_one();
+            gate.resume.notified().await;
+        }
+        if self.fail_destroy || self.fail_destroy_at == Some(self.destroyed.lock().unwrap().len()) {
             return Err(keyrack_core::error::KeyRackError::Provider(
                 "simulated backend delete failure".into(),
             ));
@@ -216,8 +234,24 @@ impl keyrack_core::provider::CryptoProvider for RecordingProvider {
         &self,
         handle: &keyrack_core::provider::KeyHandle,
     ) -> keyrack_core::error::Result<keyrack_core::sensitive::Sensitive<Vec<u8>>> {
-        self.calls.lock().unwrap().push("export_key_material");
+        self.record_call("export_key_material");
         self.inner.export_key_material(handle).await
+    }
+
+    async fn make_key_exportable(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<()> {
+        self.record_call("make_key_exportable");
+        self.inner.make_key_exportable(handle).await
+    }
+
+    async fn revoke_key_exportability(
+        &self,
+        handle: &keyrack_core::provider::KeyHandle,
+    ) -> keyrack_core::error::Result<Option<keyrack_core::provider::KeyHandle>> {
+        self.record_call("revoke_key_exportability");
+        self.inner.revoke_key_exportability(handle).await
     }
 }
 
@@ -927,8 +961,8 @@ async fn routing_no_match_uses_default_provider() {
     let record = state.storage.get_key(&lid).await.expect("key exists");
     assert_eq!(record.provider_ref, Some(ProviderRef::new("default")));
     assert_eq!(
-        record.key_versions[0].provider_ref,
-        Some(ProviderRef::new("default"))
+        record.key_versions[0].provider_ref(),
+        Some(&ProviderRef::new("default"))
     );
 
     // Encrypt/decrypt round-trip.
@@ -1035,13 +1069,13 @@ async fn routing_matching_rule_selects_tenant_b() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "routing test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(selected.clone()),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(selected.clone()),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.expect("created");
 
@@ -1049,8 +1083,8 @@ async fn routing_matching_rule_selects_tenant_b() {
     let fetched = state.storage.get_key(&lid).await.expect("found");
     assert_eq!(fetched.provider_ref, Some(ProviderRef::new("tenant-b")));
     assert_eq!(
-        fetched.key_versions[0].provider_ref,
-        Some(ProviderRef::new("tenant-b"))
+        fetched.key_versions[0].provider_ref(),
+        Some(&ProviderRef::new("tenant-b"))
     );
 
     // Encrypt/decrypt via the domain layer.
@@ -1113,8 +1147,8 @@ async fn routing_create_with_attributes_routes_to_tenant_b() {
     let record = state.storage.get_key(&lid).await.expect("key exists");
     assert_eq!(record.provider_ref, Some(ProviderRef::new("tenant-b")));
     assert_eq!(
-        record.key_versions[0].provider_ref,
-        Some(ProviderRef::new("tenant-b"))
+        record.key_versions[0].provider_ref(),
+        Some(&ProviderRef::new("tenant-b"))
     );
 }
 
@@ -1157,7 +1191,10 @@ async fn routing_unknown_provider_yields_unavailable() {
     // Corrupt the record to reference a nonexistent provider.
     let mut record = state.storage.get_key(&lid).await.expect("found");
     record.provider_ref = Some(ProviderRef::new("ghost-provider"));
-    record.key_versions[0].provider_ref = Some(ProviderRef::new("ghost-provider"));
+    record.key_versions[0].material = keyrack_core::key::KeyMaterial::ProviderResident {
+        key_handle: record.key_versions[0].resident_handle().unwrap().clone(),
+        provider_ref: Some(ProviderRef::new("ghost-provider")),
+    };
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
     state.storage.update_key(&record).await.expect("updated");
@@ -1230,20 +1267,16 @@ async fn routing_legacy_record_none_provider_ref_uses_default() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "legacy".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: None,
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1, handle, None, now, true,
+        )],
     };
     state.storage.create_key(&record).await.expect("created");
 
     // Verify: effective_provider_ref returns None (uses registry default).
     let fetched = state.storage.get_key(&lid).await.expect("found");
     assert_eq!(fetched.provider_ref, None);
-    assert_eq!(fetched.key_versions[0].provider_ref, None);
+    assert_eq!(fetched.key_versions[0].provider_ref(), None);
     assert_eq!(fetched.effective_provider_ref(1), None);
 
     // Encrypt/decrypt should still work via the default provider.
@@ -1313,13 +1346,13 @@ async fn routing_cross_version_migration() {
     let v2_num = record.current_key_version + 1;
     record
         .key_versions
-        .push(keyrack_core::key::KeyVersionRecord {
-            version_number: v2_num,
-            key_handle: v2_handle,
-            provider_ref: Some(ProviderRef::new("tenant-b")),
-            created_at: chrono::Utc::now(),
-            is_primary: true,
-        });
+        .push(keyrack_core::key::KeyVersionRecord::provider_resident(
+            v2_num,
+            v2_handle,
+            Some(ProviderRef::new("tenant-b")),
+            chrono::Utc::now(),
+            true,
+        ));
     record.current_key_version = v2_num;
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
@@ -1380,6 +1413,308 @@ async fn create_aes_key(svc: &keyrack_service::grpc::KeyServiceImpl) -> String {
         .metadata
         .expect("metadata")
         .key_id
+}
+
+/// Construct a resident fixture with a version binding different from its
+/// record binding. No wrapped transport or migration protocol is exercised.
+async fn primary_bound_to_tenant_b(state: &Arc<ServiceState>) -> String {
+    use keyrack_core::key::{KeyMaterial, KeySpec, ProviderRef};
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_aes_key(&svc).await;
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    let provider = state
+        .providers
+        .resolve(&ProviderRef::new("tenant-b"))
+        .unwrap();
+    let handle = provider
+        .provider
+        .generate_key(&KeySpec::Aes256)
+        .await
+        .unwrap();
+    record.key_versions[0].material = KeyMaterial::ProviderResident {
+        key_handle: handle,
+        provider_ref: Some(ProviderRef::new("tenant-b")),
+    };
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.unwrap();
+    key_id
+}
+
+async fn assert_rotated_on_tenant_b(state: &Arc<ServiceState>, key_id: &str) {
+    use keyrack_core::key::ProviderRef;
+
+    let record = state
+        .storage
+        .get_key(&key_id.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(record.provider_ref, Some(ProviderRef::new("default")));
+    assert_eq!(record.current_key_version, 2);
+    let version = record.get_version(2).unwrap();
+    assert_eq!(version.provider_ref(), Some(&ProviderRef::new("tenant-b")));
+    let actual = state.providers.resolve_for_version(&record, 2).unwrap();
+    let expected = state
+        .providers
+        .resolve(&ProviderRef::new("tenant-b"))
+        .unwrap();
+    assert!(Arc::ptr_eq(&actual.provider, &expected.provider));
+    let handle = version.resident_handle().unwrap();
+    let encrypted = expected
+        .provider
+        .encrypt(handle, b"rotation routing", b"")
+        .await
+        .unwrap();
+    let plaintext = expected
+        .provider
+        .decrypt(handle, &encrypted.ciphertext, b"")
+        .await
+        .unwrap();
+    assert_eq!(plaintext.expose(), b"rotation routing");
+    assert!(state
+        .providers
+        .default_entry()
+        .provider
+        .encrypt(handle, b"wrong backend", b"")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn grpc_rotation_preserves_primary_version_provider_override() {
+    let state = build_two_provider_state(vec![]);
+    let key_id = primary_bound_to_tenant_b(&state).await;
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .expect("rotate on primary's backend");
+    assert_rotated_on_tenant_b(&state, &key_id).await;
+}
+
+#[tokio::test]
+async fn rest_rotation_preserves_primary_version_provider_override() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let state = build_two_provider_state(vec![]);
+    let key_id = primary_bound_to_tenant_b(&state).await;
+    let response = keyrack_service::rest::router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/keys/{key_id}/actions-rotate"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_rotated_on_tenant_b(&state, &key_id).await;
+}
+
+/// This metadata is deliberately not an authenticated or usable wrapped key.
+/// It represents future/unsupported persisted material that must fail closed.
+fn unsupported_wrapped_material() -> keyrack_core::key::KeyMaterial {
+    use keyrack_core::key::{KeyMaterial, ParentWrappedMaterial, ProviderRef};
+    use keyrack_core::wrapping::{
+        VersionedKeyId, WrappedKeyFormat, WrappingContextVersion, WrappingIdentifier,
+    };
+
+    KeyMaterial::ParentWrapped(
+        ParentWrappedMaterial::new(
+            ProviderRef::new("default"),
+            WrappingIdentifier::new("unsupported-test-domain").unwrap(),
+            VersionedKeyId::new(keyrack_core::lid::Lid::from_bytes([0x5a; 32]), 1).unwrap(),
+            WrappingContextVersion::V1,
+            WrappedKeyFormat::RawSecret,
+            WrappingIdentifier::new("unqualified-test-mechanism").unwrap(),
+            WrappingIdentifier::new("unverified-wrapped-material-reference").unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn assert_wrapped_refusal(status: &tonic::Status) {
+    assert!(
+        status.message().contains("parent-wrapped"),
+        "unexpected refusal: {status}"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_primary_refuses_crypto_export_and_reencrypt_without_provider_calls() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let state = build_test_state_with_provider(
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let source_id = create_aes_key(&svc).await;
+    let key_id = create_exportable_key(&svc).await;
+    let own_ciphertext = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: b"payload before unsupported metadata".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .ciphertext_blob;
+    let ciphertext = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: source_id.clone(),
+            plaintext: b"source payload".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .ciphertext_blob;
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    record.key_versions[0].material = unsupported_wrapped_material();
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.unwrap();
+    let before = provider.calls();
+
+    let status = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: b"blocked".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("wrapped encryption must be refused");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let status = svc
+        .decrypt(Request::new(proto::DecryptRequest {
+            key_id: key_id.clone(),
+            ciphertext_blob: own_ciphertext,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("wrapped decryption must be refused");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let status = export(&svc, &key_id)
+        .await
+        .expect_err("wrapped export must be refused");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let status = svc
+        .re_encrypt(Request::new(proto::ReEncryptRequest {
+            source_key_id: source_id,
+            destination_key_id: key_id.clone(),
+            ciphertext_blob: ciphertext,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("wrapped destination must fail before source decryption");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let after = state.storage.get_key(&lid).await.unwrap();
+    assert_eq!(after.occ_version, record.occ_version);
+    assert_eq!(after.first_exported_at, None);
+}
+
+#[tokio::test]
+async fn mixed_material_lifecycle_refuses_before_resident_sibling_side_effects() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let audit = Arc::new(CapturingSink::new());
+    let state =
+        build_test_state_with_provider(provider.clone(), Arc::new(AlwaysAllow), audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    // Resident first: a one-at-a-time mutation loop would touch it before
+    // discovering the unsupported second version. The current version is 2,
+    // while stale is_primary flags point at resident version 1.
+    record
+        .key_versions
+        .push(keyrack_core::key::KeyVersionRecord {
+            version_number: 2,
+            material: unsupported_wrapped_material(),
+            created_at: chrono::Utc::now(),
+            is_primary: false,
+        });
+    record.current_key_version = 2;
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.unwrap();
+    let before = provider.calls();
+
+    let status = svc
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: key_id.clone(),
+            plaintext: b"stale flag must not select resident key".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("current version, not stale primary flag, must control selection");
+    assert_wrapped_refusal(&status);
+    let status = svc
+        .rotate_key(Request::new(proto::RotateKeyRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .expect_err("mixed rotation must be refused");
+    assert_wrapped_refusal(&status);
+    let status = svc
+        .revoke_key_exportability(Request::new(proto::RevokeKeyExportabilityRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .expect_err("mixed revocation must be refused");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let after = state.storage.get_key(&lid).await.unwrap();
+    assert_eq!(after.occ_version, record.occ_version);
+    assert_eq!(after.exportability, record.exportability);
+
+    let mut nonexportable = after;
+    nonexportable.exportability = keyrack_core::key::Exportability::NonExportable;
+    nonexportable.occ_version += 1;
+    state.storage.update_key(&nonexportable).await.unwrap();
+    let status = svc
+        .make_key_exportable(Request::new(proto::MakeKeyExportableRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .expect_err("mixed exportability change must be refused");
+    assert_wrapped_refusal(&status);
+    assert_eq!(provider.calls(), before);
+    let after = state.storage.get_key(&lid).await.unwrap();
+    assert_eq!(after.occ_version, nonexportable.occ_version);
+    assert_eq!(after.exportability, nonexportable.exportability);
+
+    // Scheduling is a metadata operation. Actual deletion must preflight the
+    // entire history and retain both the resident material and pending state.
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(provider.calls(), before);
+    assert!(provider.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+    assert!(!audit
+        .events()
+        .iter()
+        .any(|event| event.action == keyrack_core::audit::AuditAction::KeyDestroyed));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1731,13 +2066,13 @@ async fn scope_owner_mismatch_denied_on_encrypt() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "scope test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
 
@@ -1847,13 +2182,13 @@ async fn scope_owner_unset_passes_without_check() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "unscoped test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new("unscoped-conn")),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
 
@@ -2038,13 +2373,13 @@ async fn setup_scoped_key(state: &Arc<ServiceState>) -> keyrack_core::lid::Lid {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "scope matrix test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
     lid
@@ -2105,13 +2440,13 @@ async fn setup_scoped_signing_key(state: &Arc<ServiceState>) -> keyrack_core::li
         updated_at: now,
         scheduled_deletion_at: None,
         description: "scope sign test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new(conn_id)),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
     lid
@@ -2549,13 +2884,13 @@ async fn scope_audit_success_on_unscoped_connection() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "audit unscoped test".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new("scoped-conn")),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
 
@@ -2992,13 +3327,13 @@ async fn setup_scoped_key_in(state: &Arc<ServiceState>, conn_id: &str) -> keyrac
         updated_at: now,
         scheduled_deletion_at: None,
         description: "scoped key".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: handle,
-            provider_ref: Some(keyrack_core::key::ProviderRef::new(conn_id)),
-            created_at: now,
-            is_primary: true,
-        }],
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            handle,
+            Some(keyrack_core::key::ProviderRef::new(conn_id)),
+            now,
+            true,
+        )],
     };
     state.storage.create_key(&record).await.unwrap();
     lid
@@ -4466,13 +4801,13 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         updated_at: chrono::Utc::now(),
         scheduled_deletion_at: None,
         description: String::new(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
             key_handle,
-            provider_ref: Some(prov_failing_ref),
-            created_at: chrono::Utc::now(),
-            is_primary: true,
-        }],
+            Some(prov_failing_ref),
+            chrono::Utc::now(),
+            true,
+        )],
     };
     real_storage.create_key(&record).await.unwrap();
     let key_id = lid.to_string();
@@ -6231,16 +6566,16 @@ async fn grpc_list_keys_legacy_unowned_key_visible_to_all() {
         updated_at: now,
         scheduled_deletion_at: None,
         description: "legacy platform key".into(),
-        key_versions: vec![keyrack_core::key::KeyVersionRecord {
-            version_number: 1,
-            key_handle: keyrack_core::provider::KeyHandle {
+        key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(
+            1,
+            keyrack_core::provider::KeyHandle {
                 key_id: "legacy-handle".into(),
                 key_spec: keyrack_core::key::KeySpec::Aes256,
             },
-            provider_ref: None,
-            created_at: now,
-            is_primary: true,
-        }],
+            None,
+            now,
+            true,
+        )],
     };
     storage
         .create_key(&legacy)
@@ -6915,7 +7250,7 @@ async fn deletion_reaper_destroys_provider_material() {
         .unwrap()
         .key_versions
         .iter()
-        .map(|v| v.key_handle.key_id.clone())
+        .map(|v| v.resident_handle().unwrap().key_id.clone())
         .collect();
     assert_eq!(handles.len(), 2, "expected two key versions after rotation");
 
@@ -7017,6 +7352,295 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
         failure.metadata.contains_key("error"),
         "failure event must carry the provider error for the operator"
     );
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.destroyed_handles().len(),
+        1,
+        "ambiguous failure must not redispatch"
+    );
+    assert!(svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_call() {
+    use tower::ServiceExt;
+
+    let gate = Arc::new(DestroyGate::default());
+    let mut recording = RecordingProvider::new(false);
+    recording.destroy_gate = Some(gate.clone());
+    let provider = Arc::new(recording);
+    let state = build_test_state_with_provider(
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    let scan_state = state.clone();
+    let scan = tokio::spawn(async move {
+        keyrack_service::workers::run_deletion_scan(&scan_state)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    let denied = svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest {
+            key_id: key_id.clone(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    assert!(denied.message().contains("destruction-fenced"));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/keys/{key_id}/actions-cancel-deletion"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let response = keyrack_service::rest::router(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(provider.destroyed_handles().len(), 1);
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn cancellation_before_destruction_claim_has_no_provider_effect() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let state = build_test_state_with_provider(
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    svc.cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert!(provider.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Disabled
+    );
+}
+
+#[tokio::test]
+async fn destruction_pins_provider_across_runtime_registry_replacement() {
+    use keyrack_core::key::{KeyMaterial, ProviderClass, ProviderRef};
+    use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
+
+    let gate = Arc::new(DestroyGate::default());
+    let mut recording = RecordingProvider::new(false);
+    recording.destroy_gate = Some(gate.clone());
+    let original = Arc::new(recording);
+    let replacement = Arc::new(RecordingProvider::new(false));
+    let binding = ProviderRef::new("default");
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(
+            [(
+                binding.clone(),
+                ProviderEntry {
+                    provider: original.clone(),
+                    class: ProviderClass::InMemory,
+                },
+            )],
+            binding.clone(),
+        )
+        .unwrap(),
+    );
+    let mut state = build_test_state_with_provider(
+        original.clone(),
+        Arc::new(AlwaysAllow),
+        Arc::new(CapturingSink::new()),
+    );
+    Arc::get_mut(&mut state).unwrap().providers = registry.clone();
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    // Exercise legacy default and explicit default as the SAME binding.
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    record.provider_ref = None;
+    if let KeyMaterial::ProviderResident { provider_ref, .. } = &mut record.key_versions[0].material
+    {
+        *provider_ref = None;
+    }
+    record.occ_version += 1;
+    let handles: Vec<_> = record
+        .key_versions
+        .iter()
+        .map(|v| v.resident_handle().unwrap().key_id.clone())
+        .collect();
+    state.storage.update_key(&record).await.unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    let scan_state = state.clone();
+    let scan = tokio::spawn(async move {
+        keyrack_service::workers::run_deletion_scan(&scan_state)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    registry
+        .register(
+            binding,
+            ProviderEntry {
+                provider: replacement.clone(),
+                class: ProviderClass::InMemory,
+            },
+        )
+        .unwrap();
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
+        .await
+        .unwrap();
+    gate.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), scan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.destroyed_handles(), handles);
+    assert!(replacement.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn unknown_provider_on_later_version_prevents_all_destruction_effects() {
+    let provider = Arc::new(RecordingProvider::new(false));
+    let audit = Arc::new(CapturingSink::new());
+    let state =
+        build_test_state_with_provider(provider.clone(), Arc::new(AlwaysAllow), audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    let lid = key_id.parse().unwrap();
+    let mut record = state.storage.get_key(&lid).await.unwrap();
+    if let keyrack_core::key::KeyMaterial::ProviderResident { provider_ref, .. } =
+        &mut record.key_versions[1].material
+    {
+        *provider_ref = Some(keyrack_core::key::ProviderRef::new("missing-provider"));
+    }
+    record.occ_version += 1;
+    state.storage.update_key(&record).await.unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert!(provider.destroyed_handles().is_empty());
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+    assert!(!audit
+        .events()
+        .iter()
+        .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed));
+}
+
+#[tokio::test]
+async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
+    let mut recording = RecordingProvider::new(false);
+    recording.fail_destroy_at = Some(2);
+    let provider = Arc::new(recording);
+    let audit = Arc::new(CapturingSink::new());
+    let state =
+        build_test_state_with_provider(provider.clone(), Arc::new(AlwaysAllow), audit.clone());
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let key_id = create_exportable_key(&svc).await;
+    svc.rotate_key(Request::new(proto::RotateKeyRequest {
+        key_id: key_id.clone(),
+    }))
+    .await
+    .unwrap();
+    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        key_id: key_id.clone(),
+        grace_period_days: 7,
+    }))
+    .await
+    .unwrap();
+    backdate_scheduled_deletion(&state, &key_id).await;
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    assert_eq!(provider.destroyed_handles().len(), 2);
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::PendingDeletion
+    );
+    assert!(svc
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
+        .await
+        .is_err());
+    assert!(!audit
+        .events()
+        .iter()
+        .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed));
 }
 
 /// `ReEncrypt` reached both a decrypt and an encrypt with no state gate on
