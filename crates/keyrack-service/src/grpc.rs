@@ -1639,7 +1639,7 @@ impl KeyService for KeyServiceImpl {
             let versions: Vec<_> = record
                 .key_versions
                 .iter()
-                .map(convert::key_version_to_proto)
+                .map(|v| convert::key_version_to_proto(&record, v))
                 .collect();
             Ok(Response::new(proto::ListKeyVersionsResponse {
                 versions,
@@ -1672,7 +1672,7 @@ impl KeyService for KeyServiceImpl {
                 .find(|v| v.version_number == u64::from(req.version))
                 .ok_or_else(|| Status::not_found(format!("version {} not found", req.version)))?;
             Ok(Response::new(proto::GetKeyVersionResponse {
-                version: Some(convert::key_version_to_proto(version)),
+                version: Some(convert::key_version_to_proto(&record, version)),
             }))
         })
         .await
