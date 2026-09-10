@@ -33,6 +33,31 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **A retained key version was reported as `Disabled`, so rewrapping older
+  ciphertext could be refused after a rotation.** `GetKeyVersion` and
+  `ListKeyVersions` derived a version's state from whether it was the primary,
+  which conflated an ordinal fact about rotation order with a lifecycle state.
+  Any caller that gated on the reported state saw every retained version as
+  unusable, so a rewrap left pending during an outage could be refused on retry
+  once the healthy key rotated underneath it — for data that was decryptable
+  the whole time, since the ciphertext header names the version and KeyRack
+  decrypts under it regardless of which version is primary. The version RPCs
+  now report the owning key's lifecycle state and report retention separately
+  in the new `KeyVersionMetadata.is_primary` field, matching what the REST
+  surface has always exposed. `is_primary` is proto field 4 on
+  `KeyVersionMetadata`; a consumer that needs to distinguish the primary
+  version should read it rather than inferring one from the reported state,
+  which no longer varies between versions of the same key.
+
+  The same derivation was wrong in the permissive direction, and that half is a
+  security fix: because the primary version was reported `Enabled` whatever the
+  key's state, a compromised or disabled key's current version was reported
+  usable. It is now reported `Compromised` or `Disabled`, and compromise
+  history is reported even where the live state has moved on, so a version can
+  never be reported usable while the key record refuses to decrypt under it.
+  This grants no new latitude: which keys may be decrypted is unchanged, and
+  compromised keys remain default-denied.
+
 - **A PKCS#11 token that came back stayed dead until KeyRack was restarted.**
   When a token became unreachable under a running process — an HSM restart, a
   re-attached partition, a token volume that went away — the module was left
