@@ -191,11 +191,16 @@ Two consequences worth knowing before an incident:
 - Reinitializing is **per library, not per token**, so it briefly affects
   every provider configured with the same `lib_path` — several tenant tokens
   on one vendor `.so`, for example. Calls already in flight are allowed to
-  finish first and calls arriving during the reinitialization wait for it, so
-  the effect is added latency rather than failed requests. If in-flight calls
-  do not drain within five seconds, KeyRack **abandons** the recovery and
-  leaves the token unavailable, because finalizing a library while another
-  thread is inside it terminates the process.
+  finish first and calls arriving during the reinitialization wait for it. A
+  caller waits up to ten seconds for the window to end; beyond that it
+  receives 503 `ProviderUnavailable`, because a library that has not reopened
+  by then is stuck rather than busy. So the usual effect on a healthy token
+  sharing the library is added latency, but a request can be refused, and a
+  client that treats 503 as retryable is what keeps that from becoming an
+  outage. If in-flight calls do not drain within five seconds, KeyRack
+  **abandons** the recovery and leaves the token unavailable, because
+  finalizing a library while another thread is inside it terminates the
+  process.
 - Recovery is attempted **at most once every two seconds per library**. While
   custody is still absent it cannot succeed, and repeating it per request
   would keep interrupting the tokens that are still healthy.
