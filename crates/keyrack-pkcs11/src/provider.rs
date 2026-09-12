@@ -91,6 +91,30 @@ fn map_pkcs11_error(context: &str, e: &cryptoki::error::Error) -> KeyRackError {
     }
 }
 
+/// Whether a failure could be the module's stale view of its token rather than
+/// something about the request itself.
+///
+/// Deliberately not the `ProviderUnavailable`-versus-`Provider` distinction.
+/// That one exists to tell a client whether retrying is worthwhile, and it is
+/// derived from the return code the module chose — so gating recovery on it
+/// made the mechanism depend on a vendor's choice of code. `SoftHSM` answers
+/// `CKR_GENERAL_ERROR` for a token it has lost, which maps to a retryable
+/// failure and recovers; a module answering a code that maps to a permanent
+/// fault would never have had recovery attempted at all, which is how a
+/// rotation after custody returned could report a permanent provider error
+/// while an encrypt on the same token recovered.
+///
+/// Both provider-side variants therefore reach the recovery path. A request
+/// that is simply invalid can now provoke at most one reinitialization per
+/// library per interval, which is latency for the tokens sharing that library;
+/// a token that never comes back is worse.
+fn may_be_module_failure(error: &KeyRackError) -> bool {
+    matches!(
+        error,
+        KeyRackError::Provider(_) | KeyRackError::ProviderUnavailable(_)
+    )
+}
+
 /// Shortest interval between two module reinitializations, per library.
 ///
 /// A reinitialization is process-wide for the library, so while custody is
@@ -120,6 +144,10 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 struct Gate {
     inner: Mutex<GateState>,
     changed: Condvar,
+    /// How long recovery waits for the module to go quiet. A field rather than
+    /// a constant so tests can drive the admission behaviour without waiting
+    /// the production value.
+    quiesce_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -161,29 +189,52 @@ impl Drop for Quiesced<'_> {
 
 impl Gate {
     fn new() -> Self {
+        Self::with_quiesce_timeout(QUIESCE_TIMEOUT)
+    }
+
+    fn with_quiesce_timeout(quiesce_timeout: Duration) -> Self {
         Self {
             inner: Mutex::new(GateState::default()),
             changed: Condvar::new(),
+            quiesce_timeout,
         }
     }
 
+    /// How long a caller waits for a recovery window to end before giving up.
+    ///
+    /// This must exceed the longest window recovery can legitimately hold, or
+    /// a caller can time out at the very moment the window closes and be told
+    /// its healthy token is unavailable. The window is bounded by the drain
+    /// wait plus the reinitialization itself, so twice the drain wait clears it
+    /// with room to spare while still bounding the wait on a gate that nobody
+    /// is going to reopen.
+    fn admission_timeout(&self) -> Duration {
+        self.quiesce_timeout * 2
+    }
+
     /// Admit one call, waiting while the module is being reinitialized.
+    ///
+    /// A caller blocked here is a caller whose own token may be perfectly
+    /// healthy — reinitializing is per library, not per token — so waiting for
+    /// the window is the right answer and refusing is the wrong one.
     fn enter(&self) -> Result<InFlight<'_>> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| KeyRackError::Provider("PKCS#11 module gate poisoned".into()))?;
+        let deadline = Instant::now() + self.admission_timeout();
         while state.closed {
-            let (guard, timeout) = self
-                .changed
-                .wait_timeout(state, QUIESCE_TIMEOUT)
-                .map_err(|_| KeyRackError::Provider("PKCS#11 module gate poisoned".into()))?;
-            state = guard;
-            if timeout.timed_out() && state.closed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(KeyRackError::ProviderUnavailable(
                     "PKCS#11 module is being reinitialized and did not become available".into(),
                 ));
             }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| KeyRackError::Provider("PKCS#11 module gate poisoned".into()))?;
+            state = guard;
         }
         state.in_flight += 1;
         Ok(InFlight { gate: self })
@@ -196,7 +247,7 @@ impl Gate {
         let mut state = self.inner.lock().ok()?;
         state.closed = true;
 
-        let deadline = Instant::now() + QUIESCE_TIMEOUT;
+        let deadline = Instant::now() + self.quiesce_timeout;
         while state.in_flight > 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -240,6 +291,27 @@ struct LastReinit {
     at: Option<Instant>,
 }
 
+impl LastReinit {
+    /// Whether the interval since the last attempt has elapsed.
+    fn may_attempt_now(&self) -> bool {
+        match self.at {
+            Some(at) => at.elapsed() >= MIN_REINIT_INTERVAL,
+            None => true,
+        }
+    }
+
+    /// Record that an attempt has run. Called when the attempt finishes, never
+    /// before it starts: an attempt that was abandoned without touching the
+    /// library has not spent what the interval exists to ration, and arming
+    /// the window up front meant a skipped recovery suppressed the next real
+    /// one. Recording afterwards also makes an abandoned attempt
+    /// self-limiting, because giving up on the drain already takes longer than
+    /// the interval.
+    fn record_attempt(&mut self) {
+        self.at = Some(Instant::now());
+    }
+}
+
 impl SharedModule {
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -267,12 +339,9 @@ impl SharedModule {
             return true;
         }
 
-        if let Some(at) = last.at {
-            if at.elapsed() < MIN_REINIT_INTERVAL {
-                return false;
-            }
+        if !last.may_attempt_now() {
+            return false;
         }
-        last.at = Some(Instant::now());
 
         tracing::warn!(
             lib_path = %self.lib_path,
@@ -282,6 +351,8 @@ impl SharedModule {
         // Finalizing while another thread is inside the library crashes the
         // process, so recovery only proceeds once the module is quiet.
         let Some(_quiesced) = self.gate.quiesce() else {
+            // Nothing was touched, so the interval is not armed: the next
+            // failure may try again as soon as the module goes quiet.
             tracing::error!(
                 lib_path = %self.lib_path,
                 "PKCS#11 calls did not drain; skipping reinitialization rather than \
@@ -289,6 +360,7 @@ impl SharedModule {
             );
             return false;
         };
+        last.record_attempt();
 
         // A module that is already finalized (or was never usable) reports an
         // error here that says nothing about whether the reinitialization will
@@ -459,7 +531,7 @@ impl Pkcs11Provider {
         let Err(error) = first else {
             return first;
         };
-        if !matches!(error, KeyRackError::ProviderUnavailable(_)) {
+        if !may_be_module_failure(&error) {
             return Err(error);
         }
 
@@ -1168,6 +1240,112 @@ mod tests {
     // library, so this test inspects the hardcoded values returned by
     // capabilities() at the source level. When SoftHSM integration
     // tests are available, replace this with a live capabilities() call.
+    // ── recovery trigger ────────────────────────────────────────────────
+    //
+    // These are unit tests on purpose. The container proof drives the real
+    // binary against SoftHSM, which loses a token by having its directory
+    // moved away and answers CKR_GENERAL_ERROR immediately — so every
+    // failure it can produce is already retryable, and it cannot show what
+    // happens to a module that answers a permanent code. A harness that can
+    // only produce the failures it already handles agrees with itself.
+
+    /// A permanent-looking provider error must still reach the recovery path.
+    /// This is the whole of the rotation defect: the trigger was the
+    /// client-facing variant, so a module that reported a permanent fault was
+    /// never offered recovery, whatever state it was actually in.
+    #[test]
+    fn a_permanent_provider_error_still_warrants_recovery() {
+        assert!(
+            may_be_module_failure(&KeyRackError::Provider("C_GenerateKey: failed".into())),
+            "a permanent provider error may still be a wedged module"
+        );
+        assert!(may_be_module_failure(&KeyRackError::ProviderUnavailable(
+            "token not present".into()
+        )));
+    }
+
+    /// Recovery must not be provoked by failures that are not the provider's.
+    #[test]
+    fn non_provider_failures_do_not_warrant_recovery() {
+        for error in [
+            KeyRackError::Storage("record not written".into()),
+            KeyRackError::Other("something else entirely".into()),
+        ] {
+            assert!(
+                !may_be_module_failure(&error),
+                "reinitializing the library cannot help with {error}"
+            );
+        }
+    }
+
+    /// The interval exists to ration reinitializations, so it is armed by an
+    /// attempt that ran — not by one that was abandoned before touching the
+    /// library, which used to suppress the next genuine attempt for the whole
+    /// interval.
+    #[test]
+    fn the_interval_is_armed_by_an_attempt_that_ran() {
+        let mut last = LastReinit { at: None };
+        assert!(last.may_attempt_now(), "nothing has been attempted yet");
+        last.record_attempt();
+        assert!(
+            !last.may_attempt_now(),
+            "an attempt that ran holds the window for the interval"
+        );
+    }
+
+    // ── admission during a recovery window ──────────────────────────────
+
+    /// A caller whose own token is healthy must wait out a recovery window
+    /// rather than be told the token is unavailable. Reinitializing is per
+    /// library, so this caller is very often a different token entirely.
+    ///
+    /// The window here is longer than the drain bound and shorter than the
+    /// admission bound, which is precisely the case a single shared bound
+    /// could not survive: the caller's patience ran out at the same moment
+    /// the window it was waiting for closed. The pre-existing test for this
+    /// behaviour held the gate for 50ms against a five-second bound, so it
+    /// could only ever observe the case that already worked.
+    #[test]
+    fn a_caller_waits_out_a_recovery_window_instead_of_being_refused() {
+        let drain = Duration::from_millis(200);
+        let gate = Arc::new(Gate::with_quiesce_timeout(drain));
+        let holder = Arc::clone(&gate);
+        let recovery = std::thread::spawn(move || {
+            let quiesced = holder.quiesce().expect("gate is idle, so it quiesces");
+            std::thread::sleep(drain + drain / 2);
+            drop(quiesced);
+        });
+        // Arrive while the gate is already closed, as a concurrent caller does.
+        std::thread::sleep(Duration::from_millis(20));
+        let admitted = gate.enter();
+        recovery.join().unwrap();
+        assert!(
+            admitted.is_ok(),
+            "a caller arriving during a bounded recovery must be admitted after it, got {:?}",
+            admitted.err()
+        );
+    }
+
+    /// The bound still exists: a gate held closed longer than any legitimate
+    /// recovery window fails the caller instead of hanging it forever.
+    #[test]
+    fn a_caller_is_refused_when_the_window_outlasts_the_bound() {
+        let gate = Arc::new(Gate::with_quiesce_timeout(Duration::from_millis(50)));
+        let holder = Arc::clone(&gate);
+        let stuck = std::thread::spawn(move || {
+            let quiesced = holder.quiesce().expect("gate is idle, so it quiesces");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(quiesced);
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        let admitted = gate.enter();
+        stuck.join().unwrap();
+        assert!(
+            matches!(admitted, Err(KeyRackError::ProviderUnavailable(_))),
+            "a gate nobody reopens must be reported unavailable, not waited on forever"
+        );
+    }
+
     #[test]
     fn capability_flags_are_honest() {
         let caps = ProviderCapabilities {

@@ -73,8 +73,8 @@ jobs:
           floor=$(grep -oP '^MIN_EXPECTED_PASSES=\K[0-9]+' \
             conformance/pkcs11-custody/proof.sh)
           echo "harness floor is $floor"
-          if [ "$floor" -lt 13 ]; then
-            echo "the harness floor was lowered to $floor; it must stay at 13 or above"
+          if [ "$floor" -lt 21 ]; then
+            echo "the harness floor was lowered to $floor; it must stay at 21 or above"
             exit 1
           fi
           if [ "$passes" -lt "$floor" ]; then

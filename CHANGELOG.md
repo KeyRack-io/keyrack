@@ -33,6 +33,38 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **PKCS#11 recovery could not be triggered by the failure that needed it.**
+  The recovery added in the previous entry was reached only when a failure had
+  been classified retryable. That classification comes from the return code the
+  module chose, so whether a lost token could recover at all depended on a
+  vendor's choice of code: SoftHSM answers `CKR_GENERAL_ERROR` and recovers,
+  while a module answering a code that maps to a permanent fault was never
+  offered recovery. A rotation could therefore report a permanent provider
+  error on a token that an encrypt would have recovered. Any provider-side
+  failure now reaches the recovery path, and the decision no longer depends on
+  the distinction KeyRack draws for the client's benefit. The cost is that an
+  invalid request can provoke at most one reinitialization per library per
+  interval, which is latency for the tokens sharing that library; a token that
+  never comes back is worse.
+- **A recovery window could refuse a healthy token on the same library.** A
+  caller waiting for a reinitialization to finish used the same bound as the
+  one recovery uses to wait for calls to drain, so its patience could run out
+  at the moment the window it was waiting for closed — answering 503 for a
+  token that was never affected. The caller's bound is now twice the drain
+  bound, which exceeds the longest window a recovery can hold.
+
+  **This retracts a claim made with the previous entry.** It said providers
+  sharing the library keep serving throughout a recovery, and pointed at
+  `conformance/pkcs11-custody/` as proof. That harness ran one request at a
+  time, so the module was almost always idle, draining was instant and the
+  window was far too short for the failure to appear. The harness now runs
+  concurrent load, and the case the bound gets wrong is covered by a unit test
+  on the admission gate, which is where it can be made deterministic.
+- **A skipped PKCS#11 recovery consumed the interval it never used.** The
+  interval between reinitializations was armed before the attempt, so an
+  attempt abandoned because calls would not drain — which touches nothing —
+  suppressed the next genuine attempt. It is now recorded once an attempt has
+  actually run.
 - **A retained key version was reported as `Disabled`, so rewrapping older
   ciphertext could be refused after a rotation.** `GetKeyVersion` and
   `ListKeyVersions` derived a version's state from whether it was the primary,
@@ -72,8 +104,9 @@ All notable changes to KeyRack will be documented in this file.
   is **abandoned** rather than forced if calls already inside the library do
   not drain within five seconds — finalizing a library under an active call
   terminates the process rather than returning an error. Providers sharing the
-  library keep serving throughout; `conformance/pkcs11-custody/` holds one
-  under continuous load across the whole recovery to prove it.
+  library wait for the window rather than failing, within the bound described
+  in the operator guide; `conformance/pkcs11-custody/` holds one under
+  continuous concurrent load across the whole recovery.
 - **REST reported an unreachable backend as an internal error.** `map_core_err`
   had no arm for `ProviderUnavailable`, so REST answered 500 where gRPC
   answered `UNAVAILABLE` for the identical failure. This is the difference
