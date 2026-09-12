@@ -251,16 +251,37 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
     }
 }
 
+/// Lifecycle state to report for a version of `record`.
+///
+/// A `KeyVersionRecord` carries no lifecycle state of its own, so the state a
+/// version reports is the owning logical key's. Being non-primary is an ordinal
+/// fact about rotation order, not a policy state: retained versions of a healthy
+/// key stay usable for decrypt and as a rewrap source, and `is_primary` reports
+/// retention separately.
+///
+/// Compromise history is surfaced as `Compromised` even where the live state has
+/// moved on, so a version can never read as usable while [`KeyRecord::permits_decrypt`]
+/// refuses it.
+///
+/// [`KeyRecord::permits_decrypt`]: keyrack_core::key::KeyRecord::permits_decrypt
+fn version_state(record: &keyrack_core::key::KeyRecord) -> keyrack_core::key::KeyState {
+    if record.has_compromise_history() {
+        keyrack_core::key::KeyState::Compromised
+    } else {
+        record.state
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
-pub fn key_version_to_proto(v: &keyrack_core::key::KeyVersionRecord) -> proto::KeyVersionMetadata {
+pub fn key_version_to_proto(
+    record: &keyrack_core::key::KeyRecord,
+    v: &keyrack_core::key::KeyVersionRecord,
+) -> proto::KeyVersionMetadata {
     proto::KeyVersionMetadata {
         version: v.version_number as u32,
         created_at: Some(datetime_to_timestamp(&v.created_at)),
-        state: if v.is_primary {
-            proto::KeyState::Enabled.into()
-        } else {
-            proto::KeyState::Disabled.into()
-        },
+        state: key_state_to_proto(&version_state(record)).into(),
+        is_primary: v.is_primary,
     }
 }
 

@@ -404,6 +404,15 @@ for decrypt/verify of existing ciphertext. The ciphertext header's
 | `created_at` | `DateTime<Utc>` | When this version was created |
 | `is_primary` | `bool` | `true` for the current encrypt/sign version |
 
+A version carries no lifecycle state of its own. `GetKeyVersion` and
+`ListKeyVersions` therefore report the owning logical key's state, and report
+retention separately in `is_primary`. Being non-primary is an ordinal fact about
+rotation order, not a policy state: a retained version of an enabled key stays
+usable for decrypt and as a `ReEncrypt` source, which is what the ciphertext
+header's `key_version` selects. Compromise history (§7.2) is reported as
+`Compromised` even where the live state has moved on, so a version can never be
+reported usable while the key record refuses to decrypt under it.
+
 ### 7.6 Version semantics
 
 Two distinct version concepts:

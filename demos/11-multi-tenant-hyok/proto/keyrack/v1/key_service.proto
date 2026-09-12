@@ -195,7 +195,12 @@ message KeyMetadata {
 message KeyVersionMetadata {
   uint32 version = 1;
   google.protobuf.Timestamp created_at = 2;
+  // Lifecycle state of the owning logical key. A version has no lifecycle of
+  // its own: retention is reported by is_primary, not by this field.
   KeyState state = 3;
+  // Whether this version is the current primary for encrypt and sign.
+  // Retained non-primary versions stay usable for decrypt and rewrap.
+  bool is_primary = 4;
 }
 
 // Lineage entry for hierarchy queries (§5.5).
