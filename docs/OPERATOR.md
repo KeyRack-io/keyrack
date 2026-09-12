@@ -203,7 +203,16 @@ Two consequences worth knowing before an incident:
   process.
 - Recovery is attempted **at most once every two seconds per library**. While
   custody is still absent it cannot succeed, and repeating it per request
-  would keep interrupting the tokens that are still healthy.
+  would keep interrupting the tokens that are still healthy. The one exception
+  is a library that an earlier attempt left finalized — if `C_Initialize`
+  itself failed, there are no healthy tokens on it left to protect, so the
+  next attempt is not deferred.
+- A 503 from this path **says what recovery did**: reinitialized, deferred
+  because one ran moments ago, abandoned because calls would not drain, or
+  attempted and the library is now uninitialized. The underlying PKCS#11
+  failure is kept in the same message. If you are reading one of these in an
+  incident, that phrase is the fastest way to tell a rationed attempt from a
+  failed one without the vendor module's own logs.
 
 `token_label` is what gets re-resolved, not the slot number, so a token that
 returns on a different slot is still found.
