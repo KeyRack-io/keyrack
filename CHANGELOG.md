@@ -33,6 +33,28 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Fixed
 
+- **A failed PKCS#11 reinitialization left the library unusable and then
+  rationed the repair.** When custody of a token is lost by its storage
+  becoming unreadable rather than disappearing, `C_Initialize` during recovery
+  can itself fail. `C_Finalize` has already succeeded at that point, so the
+  library is left finalized: every later call answers
+  `CKR_CRYPTOKI_NOT_INITIALIZED`, a code that appeared nowhere in the provider
+  and so was classified as a permanent provider defect. Callers were told their
+  request could never succeed when a reinitialization was the only thing
+  standing in the way. Worse, the failed attempt armed the interval that
+  rations reinitialization, so custody returning *inside* that interval — the
+  common case, since the interval is two seconds — was answered by deferring
+  the one operation that would have fixed it. Three changes: the code now reads
+  as retryable; a library left uninitialized is never rationed, because
+  rationing protects the providers still using the library and a library that
+  is down has none; and an incomplete recovery is reported as retryable rather
+  than as the operation's own failure.
+- **A caller could not tell why recovery had not happened.** Reinitialized,
+  deferred by the interval, abandoned because calls would not drain, and
+  attempted-and-now-down were one boolean, indistinguishable to the caller, the
+  logs and any test. Each is now named in the answer and logged, so the next
+  occurrence can be attributed from the caller's own error rather than from the
+  module's logs on someone else's host.
 - **PKCS#11 recovery could not be triggered by the failure that needed it.**
   The recovery added in the previous entry was reached only when a failure had
   been classified retryable. That classification comes from the return code the
