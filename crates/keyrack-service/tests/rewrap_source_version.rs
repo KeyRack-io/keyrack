@@ -59,6 +59,7 @@ impl Fixture {
              rest_addr: '127.0.0.1:{rest_port}'\n\
              storage:\n  type: sqlite\n  path: '{}'\n\
              provider:\n  type: software\n\
+             dev_only_allow_ephemeral_provider_with_persistent_metadata: true\n\
              pdp:\n  type: always_allow\n\
              audit:\n  type: file\n  path: '{}'\n\
              authn:\n  type: insecure\n",

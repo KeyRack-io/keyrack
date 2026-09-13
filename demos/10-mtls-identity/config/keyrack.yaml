@@ -8,6 +8,9 @@ storage:
 provider:
   type: software
 
+# DEVELOPMENT ONLY: key material is lost at restart despite persisted metadata.
+dev_only_allow_ephemeral_provider_with_persistent_metadata: true
+
 # Authorization: external Cedar PDP. Deny-by-default; only principals named in
 # the policy are permitted. The principal id is the client cert's CN.
 pdp:

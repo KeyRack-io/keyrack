@@ -51,6 +51,10 @@ pub struct ProviderEntry {
 ///
 /// Object-safe: used behind `Arc<dyn ProviderRegistry>` in the service.
 pub trait ProviderRegistry: Send + Sync {
+    /// Snapshot all registered providers for readiness, including nondefault
+    /// and runtime-registered entries. Never substitute only the default.
+    fn entries(&self) -> Result<Vec<(ProviderRef, ProviderEntry)>>;
+
     /// Resolve a provider by explicit name. Errors if the name is unknown.
     fn resolve(&self, name: &ProviderRef) -> Result<ProviderEntry>;
 
@@ -169,6 +173,14 @@ impl StaticProviderRegistry {
 }
 
 impl ProviderRegistry for StaticProviderRegistry {
+    fn entries(&self) -> Result<Vec<(ProviderRef, ProviderEntry)>> {
+        Ok(self
+            .providers
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect())
+    }
+
     fn resolve(&self, name: &ProviderRef) -> Result<ProviderEntry> {
         self.providers
             .get(name)
@@ -256,6 +268,16 @@ impl DynamicProviderRegistry {
 }
 
 impl ProviderRegistry for DynamicProviderRegistry {
+    fn entries(&self) -> Result<Vec<(ProviderRef, ProviderEntry)>> {
+        let providers = self.providers.read().map_err(|_| {
+            KeyRackError::ProviderUnavailable("provider registry lock poisoned".into())
+        })?;
+        Ok(providers
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect())
+    }
+
     fn resolve(&self, name: &ProviderRef) -> Result<ProviderEntry> {
         self.providers
             .read()

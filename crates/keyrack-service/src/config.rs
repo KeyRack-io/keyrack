@@ -23,6 +23,9 @@
 use keyrack_core::secret::SecretString;
 use serde::{Deserialize, Serialize};
 
+// Each boolean is an independently named operator opt-in; combining them would
+// obscure the separate startup and security decisions in the YAML interface.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     #[serde(default = "default_grpc_addr")]
@@ -114,6 +117,12 @@ pub struct ServiceConfig {
     /// the authenticity it advertises. Opting in must be deliberate.
     #[serde(default)]
     pub audit_signing_key_ephemeral: bool,
+
+    /// Development-only acknowledgement that persisted metadata will outlive
+    /// software/in-memory key material. Restarting loses that material and
+    /// existing records cannot decrypt. Startup logs a warning when exercised.
+    #[serde(default)]
+    pub dev_only_allow_ephemeral_provider_with_persistent_metadata: bool,
 
     /// Dangerous legacy opt-in: allow decrypt with a currently Compromised key.
     /// Each use emits a best-effort audit marker and warning. Default off.
@@ -215,6 +224,7 @@ impl Default for ServiceConfig {
             cache: None,
             audit_signing_key_path: None,
             audit_signing_key_ephemeral: false,
+            dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
         }
     }
@@ -247,7 +257,52 @@ impl ServiceConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.resolved_pdp()?;
         self.validate_audit_signing()?;
+        self.validate_provider_durability()?;
         Ok(())
+    }
+
+    /// List every active ephemeral provider paired with persistent metadata.
+    ///
+    /// Includes non-default providers: routing and existing records can select
+    /// them. The superseded legacy provider is not active when `providers` is set.
+    ///
+    /// # Errors
+    /// Returns provider configuration errors before startup opens any backend.
+    pub fn ephemeral_providers_with_persistent_metadata(&self) -> Result<Vec<String>, String> {
+        let (providers, _) = self.resolved_providers()?;
+        if !self.storage.is_persistent() {
+            return Ok(Vec::new());
+        }
+        Ok(providers
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.provider,
+                    ProviderConfig::Software | ProviderConfig::InMemory
+                )
+            })
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    /// Refuse a topology whose records survive but whose key material does not.
+    ///
+    /// # Errors
+    /// Returns a configuration error unless the development-only acknowledgement
+    /// explicitly accepts key-material loss at every process restart.
+    pub fn validate_provider_durability(&self) -> Result<(), String> {
+        let ephemeral = self.ephemeral_providers_with_persistent_metadata()?;
+        if ephemeral.is_empty() || self.dev_only_allow_ephemeral_provider_with_persistent_metadata {
+            return Ok(());
+        }
+        Err(format!(
+            "config error: persistent metadata is paired with ephemeral provider(s): {}. \
+             Software/in-memory key material is lost at restart; persisted records and handles \
+             cannot recover it. Configure a durable provider, use `storage: {{type: memory}}`, \
+             or explicitly set `dev_only_allow_ephemeral_provider_with_persistent_metadata: true` \
+             to acknowledge this data loss (DEVELOPMENT ONLY).",
+            ephemeral.join(", ")
+        ))
     }
 
     /// The configured PDP, or an error when `pdp:` was omitted.
@@ -348,6 +403,20 @@ pub enum StorageConfig {
     Memory,
 }
 
+impl StorageConfig {
+    /// Whether this configuration can leave metadata behind after process exit.
+    /// `SQLite`'s exact `:memory:` filename and empty temporary filename do not.
+    /// URI filenames are conservatively treated as persistent: use the explicit
+    /// `memory` storage type for an unambiguous ephemeral configuration.
+    pub fn is_persistent(&self) -> bool {
+        match self {
+            Self::Memory => false,
+            Self::Sqlite { path } => !path.is_empty() && path != ":memory:",
+            Self::Postgres { .. } => true,
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self::Sqlite {
@@ -364,7 +433,12 @@ pub enum ProviderConfig {
     InMemory,
     Pkcs11 {
         lib_path: String,
+        /// Inline token label; mutually exclusive with `token_label_ref`.
+        #[serde(default)]
         token_label: String,
+        /// Secret-backed label reference resolved under `KEYRACK_SECRET_ROOT`.
+        #[serde(default)]
+        token_label_ref: Option<String>,
         /// Inline PIN (Model A back-compat). Held in a redacting secret type so
         /// it never leaks via `Debug`/`Serialize`. Mutually exclusive with
         /// `pin_ref`; exactly one must be set.
@@ -709,6 +783,7 @@ mod tests {
             cache: None,
             audit_signing_key_path: None,
             audit_signing_key_ephemeral: false,
+            dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
@@ -743,7 +818,7 @@ mod tests {
 
     #[test]
     fn explicit_always_allow_is_accepted() {
-        let yaml = "pdp:\n  type: always_allow\n";
+        let yaml = "pdp:\n  type: always_allow\nstorage:\n  type: memory\n";
         let config = ServiceConfig::from_yaml(yaml).unwrap();
 
         config.validate().unwrap();
@@ -765,13 +840,13 @@ mod tests {
     #[test]
     fn signing_accepts_a_key_path_or_an_explicit_ephemeral_opt_in() {
         let persistent = ServiceConfig::from_yaml(
-            "pdp:\n  type: always_allow\nsign_audit_events: true\naudit_signing_key_path: /data/k\n",
+            "pdp:\n  type: always_allow\nstorage:\n  type: memory\nsign_audit_events: true\naudit_signing_key_path: /data/k\n",
         )
         .unwrap();
         persistent.validate().unwrap();
 
         let ephemeral = ServiceConfig::from_yaml(
-            "pdp:\n  type: always_allow\nsign_audit_events: true\naudit_signing_key_ephemeral: true\n",
+            "pdp:\n  type: always_allow\nstorage:\n  type: memory\nsign_audit_events: true\naudit_signing_key_ephemeral: true\n",
         )
         .unwrap();
         ephemeral.validate().unwrap();
@@ -781,7 +856,9 @@ mod tests {
     fn unsigned_audit_config_is_valid_and_still_chains() {
         // Chaining is unconditional, so an unsigned config needs no signing
         // key and must not be rejected.
-        let config = ServiceConfig::from_yaml("pdp:\n  type: always_deny\n").unwrap();
+        let config =
+            ServiceConfig::from_yaml("pdp:\n  type: always_deny\nstorage:\n  type: memory\n")
+                .unwrap();
         assert!(!config.sign_audit_events);
         config.validate().unwrap();
     }

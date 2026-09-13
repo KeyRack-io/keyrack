@@ -1,5 +1,5 @@
 # KeyRack service configuration for E2E testing.
-# This is NOT a production config -- it uses SQLite, software crypto, and
+# This is NOT a production config -- it uses ephemeral in-memory metadata, software crypto, and
 # no authentication so the test binary can exercise the API without TLS setup.
 
 grpc_addr: "0.0.0.0:50051"

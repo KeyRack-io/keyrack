@@ -548,10 +548,12 @@ pub struct Pkcs11ProviderConfig {
 /// Nothing about a token is cached beyond what can be re-derived: the slot is
 /// re-resolved from `token_label` after the module is reinitialized, so a
 /// token that returns on a different slot is still found.
+#[derive(Clone)]
 pub struct Pkcs11Provider {
     module: Arc<SharedModule>,
     token_label: String,
-    slot: RwLock<cryptoki::slot::Slot>,
+    slot: Arc<RwLock<cryptoki::slot::Slot>>,
+    readiness_gate: Arc<tokio::sync::Semaphore>,
     pin: Zeroizing<String>,
 }
 
@@ -589,7 +591,8 @@ impl Pkcs11Provider {
         Ok(Self {
             module,
             token_label: config.token_label.clone(),
-            slot: RwLock::new(slot),
+            slot: Arc::new(RwLock::new(slot)),
+            readiness_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pin: Zeroizing::new(config.pin.clone()),
         })
     }
@@ -645,7 +648,7 @@ impl Pkcs11Provider {
         // The token may have come back on a different slot, so re-resolve it
         // by label before retrying. If it cannot be found, the original
         // failure is the honest one to report.
-        if let Err(resolve_error) = self.resolve_slot() {
+        if let Err(resolve_error) = self.resolve_slot().await {
             tracing::warn!(
                 token_label = %self.token_label,
                 error = %resolve_error,
@@ -658,23 +661,27 @@ impl Pkcs11Provider {
     }
 
     /// Re-resolve this provider's slot from its token label.
-    fn resolve_slot(&self) -> Result<()> {
-        let in_flight = self.module.gate.enter()?;
-        let resolved = find_slot_by_label(&self.module.ctx, &self.token_label);
-        drop(in_flight);
-        let slot = resolved?;
-        let mut current = self
-            .slot
-            .write()
-            .map_err(|_| KeyRackError::Provider("PKCS#11 slot lock poisoned".into()))?;
-        if *current != slot {
-            tracing::info!(
-                token_label = %self.token_label,
-                "token returned on a different PKCS#11 slot; rebinding"
-            );
-            *current = slot;
-        }
-        Ok(())
+    async fn resolve_slot(&self) -> Result<()> {
+        let module = Arc::clone(&self.module);
+        let token_label = self.token_label.clone();
+        let slot = Arc::clone(&self.slot);
+        tokio::task::spawn_blocking(move || {
+            let in_flight = module.gate.enter()?;
+            let resolved = find_slot_by_label(&module.ctx, &token_label);
+            drop(in_flight);
+            let resolved = resolved?;
+            let mut current = slot
+                .write()
+                .map_err(|_| KeyRackError::Provider("PKCS#11 slot lock poisoned".into()))?;
+            if *current != resolved {
+                tracing::info!(token_label = %token_label,
+                    "token returned on a different PKCS#11 slot; rebinding");
+                *current = resolved;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| KeyRackError::Provider(format!("blocking task: {e}")))?
     }
 
     /// One pass at the operation: fresh session, login, run.
@@ -1175,6 +1182,28 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
 
 #[async_trait]
 impl CryptoProvider for Pkcs11Provider {
+    async fn check_readiness(&self) -> Result<()> {
+        // Cancellation cannot stop a native PKCS#11 call. The task owns the
+        // permit until that call actually exits, preventing overlapping probes
+        // from consuming an unbounded number of blocking threads.
+        let permit = Arc::clone(&self.readiness_gate)
+            .try_acquire_owned()
+            .map_err(|_| {
+                KeyRackError::ProviderUnavailable(
+                    "PKCS#11 readiness probe already in flight".into(),
+                )
+            })?;
+        let provider = self.clone();
+        tokio::spawn(async move {
+            // Retain the permit across recovery and slot resolution as well as
+            // session calls, even when the HTTP caller stops waiting.
+            let _permit = permit;
+            provider.run(|_session| Ok(())).await
+        })
+        .await
+        .map_err(|e| KeyRackError::Provider(format!("readiness task: {e}")))?
+    }
+
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
         let spec_owned = spec.clone();
         let label = uuid::Uuid::new_v4().to_string();
@@ -1707,11 +1736,55 @@ mod concurrent_login_tests {
     use tokio::sync::Barrier;
     use tokio::task::JoinSet;
 
+    // Both tests alter session login state on the same disposable token.
+    static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn readiness_authenticates_token_and_rejects_overlapping_probes() {
+        let _fixture = FIXTURE_LOCK.lock().await;
+        let config = Pkcs11ProviderConfig {
+            lib_path: std::env::var("KMS_PKCS11_LIB").expect("KMS_PKCS11_LIB required"),
+            token_label: std::env::var("KMS_PKCS11_TOKEN_LABEL")
+                .expect("KMS_PKCS11_TOKEN_LABEL required"),
+            pin: std::fs::read_to_string(
+                std::env::var("KMS_PKCS11_PIN_FILE").expect("PIN file required"),
+            )
+            .expect("read disposable token PIN"),
+        };
+        let provider = Pkcs11Provider::new(&config).expect("initialize disposable token");
+        provider
+            .check_readiness()
+            .await
+            .expect("valid authenticated session");
+        let held = Arc::clone(&provider.readiness_gate)
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert!(
+            provider.check_readiness().await.is_err(),
+            "an overlapping native readiness probe must be rejected"
+        );
+        drop(held);
+        provider.check_readiness().await.expect("permit released");
+        let mut wrong_pin = provider.clone();
+        let replacement = if wrong_pin.pin.starts_with('1') {
+            "2"
+        } else {
+            "1"
+        };
+        wrong_pin.pin.replace_range(0..1, replacement);
+        assert!(
+            wrong_pin.check_readiness().await.is_err(),
+            "readiness must authenticate, not inspect cached capabilities"
+        );
+    }
+
     /// Requires a disposable `SoftHSM` token. Missing fixture configuration fails
     /// the test; it never silently skips. This performs one incorrect-PIN check
     /// without ambient login, so it must not target a production token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_sessions_reuse_login_without_weakening_constructor() {
+        let _fixture = FIXTURE_LOCK.lock().await;
         let pin_file = std::env::var("KMS_PKCS11_PIN_FILE")
             .expect("KMS_PKCS11_PIN_FILE is required for the SoftHSM regression");
         let config = Pkcs11ProviderConfig {

@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;
 pub mod pdp_http;
+pub mod readiness;
 pub mod rest;
 pub mod routing;
 pub mod secret_ref;

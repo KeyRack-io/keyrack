@@ -48,6 +48,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .validate()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    let ephemeral = config.ephemeral_providers_with_persistent_metadata()?;
+    if !ephemeral.is_empty() {
+        tracing::warn!(
+            dev_only_allow_ephemeral_provider_with_persistent_metadata = true,
+            providers = ?ephemeral,
+            "DEVELOPMENT ONLY: persistent metadata does not persist these providers' key material; restarting loses keys and makes existing ciphertext undecryptable"
+        );
+    }
+
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install Prometheus metrics recorder");
@@ -356,9 +365,25 @@ async fn build_provider(
         ProviderConfig::Pkcs11 {
             lib_path,
             token_label,
+            token_label_ref,
             pin,
             pin_ref,
         } => {
+            let label = match (token_label.is_empty(), token_label_ref.as_deref()) {
+                (false, None) => token_label.clone(),
+                (true, Some(reference)) => keyrack_service::secret_ref::resolve_pin_ref_under(
+                    reference,
+                    &keyrack_service::secret_ref::secret_root(),
+                )?
+                .expose()
+                .to_string(),
+                _ => {
+                    return Err(format!(
+                    "pkcs11 provider '{name}': set exactly one of token_label or token_label_ref"
+                )
+                    .into())
+                }
+            };
             // Resolve the PIN from exactly one of inline `pin` or a `pin_ref`
             // secret reference (resolved under KEYRACK_SECRET_ROOT). Emits a
             // secret_access audit event for reference resolution.
@@ -372,7 +397,7 @@ async fn build_provider(
             .await?;
             let pkcs11_config = keyrack_pkcs11::Pkcs11ProviderConfig {
                 lib_path: lib_path.clone(),
-                token_label: token_label.clone(),
+                token_label: label,
                 pin: resolved_pin.expose().to_string(),
             };
             (

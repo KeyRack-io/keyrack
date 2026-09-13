@@ -27,7 +27,7 @@ echo "=================="
 # ── Wait for service ──────────────────────────────────────────────
 step "Waiting for KeyRack to be ready..."
 for i in $(seq 1 30); do
-    if curl -sf "$BASE_URL/healthz" > /dev/null 2>&1; then
+    if curl -sf "$BASE_URL/readyz" > /dev/null 2>&1; then
         ok "Service is healthy"
         break
     fi

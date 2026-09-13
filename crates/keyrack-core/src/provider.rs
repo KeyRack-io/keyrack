@@ -180,6 +180,16 @@ pub struct GenerateDataKeyOutput {
 /// Providers must be `Send + Sync` (shared across Tokio tasks).
 #[async_trait]
 pub trait CryptoProvider: Send + Sync {
+    /// Probe current backend availability without reading or changing key material.
+    ///
+    /// The default performs no remote check. PKCS#11 overrides this to open and
+    /// authenticate a fresh session; capability metadata is not a health probe.
+    /// Callers must bound the wait. Blocking backends must keep work off the
+    /// async executor and bound probes that outlive a cancelled caller.
+    async fn check_readiness(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Generate key material for the given spec. Returns a handle that
     /// can be used in subsequent encrypt/decrypt/sign/verify calls.
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle>;
