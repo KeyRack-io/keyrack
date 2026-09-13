@@ -24,10 +24,10 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
     }
 
     fn check_revocation(&self, command: &RevocationCommand) -> Result<(), Error> {
-        // Trusted unpublished harness policy: the launcher's authority key owns
+        // Trusted private runtime policy: the launcher's authority key owns
         // one exact provider/domain. Neither scope nor clock comes from IPC.
         let expected_scope = AuthorityScope::SecurityDomain {
-            provider_ref: crate::fixture::context().provider_ref,
+            provider_ref: self.provider_ref.clone(),
             security_domain: WrappingIdentifier::new(&self.domain).map_err(|_| Error::Context)?,
         };
         let executor = self.executor()?;
