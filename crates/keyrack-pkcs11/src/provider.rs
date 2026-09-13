@@ -65,6 +65,13 @@ fn make_auth_pin(pin: &str) -> AuthPin {
 /// even after the token comes back. It is a connectivity fault, not a
 /// permanent provider defect, so it must read as "unavailable, retry" rather
 /// than "broken build".
+///
+/// `CryptokiNotInitialized` is included for a sharper reason: it is a state
+/// *recovery itself creates*. An attempt finalizes the library and then fails
+/// to initialize it, and every call arriving afterwards reports this until an
+/// attempt succeeds. Reading it as a permanent provider defect told callers
+/// their request could never work, when in fact only a reinitialization stood
+/// between them and a healthy token.
 fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
     matches!(
         e,
@@ -75,6 +82,7 @@ fn is_transient_pkcs11_error(e: &cryptoki::error::Error) -> bool {
                 | cryptoki::error::RvError::SessionClosed
                 | cryptoki::error::RvError::SessionHandleInvalid
                 | cryptoki::error::RvError::SlotIdInvalid
+                | cryptoki::error::RvError::CryptokiNotInitialized
                 | cryptoki::error::RvError::GeneralError,
             _,
         )
@@ -287,13 +295,85 @@ struct SharedModule {
     reinit: Mutex<LastReinit>,
 }
 
+/// What a recovery attempt did.
+///
+/// Recovery used to answer yes or no, which made "reinitialized", "not
+/// attempted because one ran moments ago", "abandoned because calls would not
+/// drain" and "attempted, and the library is now down" indistinguishable — to
+/// the caller, to the logs and to a test. That gap is why a failure in the
+/// field could not be attributed without another host's logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOutcome {
+    /// This call reinitialized the module.
+    Reinitialized,
+    /// Another caller reinitialized it after this failure was seen.
+    AlreadyRecovered,
+    /// Not attempted: one ran within [`MIN_REINIT_INTERVAL`].
+    DeferredByInterval,
+    /// Attempted and abandoned: calls inside the library would not drain, and
+    /// finalizing under them would take the process down.
+    NotQuiesced,
+    /// Attempted, and `C_Finalize` did not take effect, so the library could
+    /// not be reinitialized. It is still initialized; nothing was recovered.
+    NotFinalized,
+    /// Attempted, and the library is now **finalized and not initialized**:
+    /// every call on it will report that until an attempt succeeds.
+    ModuleDown,
+}
+
+impl RecoveryOutcome {
+    /// Whether the caller may retry its operation now.
+    fn permits_retry(self) -> bool {
+        matches!(self, Self::Reinitialized | Self::AlreadyRecovered)
+    }
+
+    /// The reason, for a log field and for the caller's message.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Reinitialized => "module reinitialized",
+            Self::AlreadyRecovered => "another caller reinitialized the module",
+            Self::DeferredByInterval => "deferred: a reinitialization ran moments ago",
+            Self::NotQuiesced => "abandoned: calls inside the library did not drain",
+            Self::NotFinalized => "the library could not be finalized, so not reinitialized",
+            Self::ModuleDown => "the library is finalized and could not be initialized",
+        }
+    }
+}
+
+/// The failure to report when recovery did not complete.
+///
+/// Every outcome here is temporary by construction: the interval expires, calls
+/// in the library finish, a later attempt can initialize. So the answer must be
+/// the retryable one. Returning the operation's original failure instead is what
+/// turned a deferred recovery into a permanent error at the client — a client
+/// whose retry policy keys on the retryable status stops after one attempt, and
+/// no retry budget can rescue it. The original failure is kept in the message,
+/// where it is diagnostic rather than decisive.
+fn recovery_pending_error(outcome: RecoveryOutcome, original: &KeyRackError) -> KeyRackError {
+    KeyRackError::ProviderUnavailable(format!(
+        "PKCS#11 module recovery incomplete ({}); retry. Underlying failure: {original}",
+        outcome.reason()
+    ))
+}
+
 struct LastReinit {
     at: Option<Instant>,
+    /// Set when an attempt left the library finalized and not initialized.
+    ///
+    /// While it holds, the interval does not apply. Rationing exists to keep
+    /// reinitializations from disrupting the providers still using the library,
+    /// and a library that is not initialized has none to disrupt: every call on
+    /// it fails until an attempt succeeds. Deferring in that state defers the
+    /// only thing that can help.
+    left_uninitialized: bool,
 }
 
 impl LastReinit {
     /// Whether the interval since the last attempt has elapsed.
     fn may_attempt_now(&self) -> bool {
+        if self.left_uninitialized {
+            return true;
+        }
         match self.at {
             Some(at) => at.elapsed() >= MIN_REINIT_INTERVAL,
             None => true,
@@ -325,22 +405,22 @@ impl SharedModule {
     /// would only work once every clone had been dropped, which no provider
     /// can guarantee for another.
     ///
-    /// Returns `true` when the module has been reinitialized since
-    /// `seen_generation` — by this call or a concurrent one — so the caller
-    /// may retry. Returns `false` when the attempt was skipped by the
-    /// interval; the caller then reports the original failure.
-    fn recover(&self, seen_generation: u64) -> bool {
+    /// Reports what it did, so the caller can answer accurately and an
+    /// operator can tell a deferred attempt from a failed one.
+    fn recover(&self, seen_generation: u64) -> RecoveryOutcome {
         let Ok(mut last) = self.reinit.lock() else {
-            return false;
+            // A poisoned lock means an earlier attempt panicked mid-way, so
+            // the library's state is unknown and this is not a deferral.
+            return RecoveryOutcome::NotFinalized;
         };
 
         // Another caller already recovered this failure out from under us.
         if self.generation() != seen_generation {
-            return true;
+            return RecoveryOutcome::AlreadyRecovered;
         }
 
         if !last.may_attempt_now() {
-            return false;
+            return RecoveryOutcome::DeferredByInterval;
         }
 
         tracing::warn!(
@@ -358,7 +438,7 @@ impl SharedModule {
                 "PKCS#11 calls did not drain; skipping reinitialization rather than \
                  finalizing the library under them"
             );
-            return false;
+            return RecoveryOutcome::NotQuiesced;
         };
         last.record_attempt();
 
@@ -379,32 +459,41 @@ impl SharedModule {
             .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         {
             Ok(()) => {
+                last.left_uninitialized = false;
                 self.generation.fetch_add(1, Ordering::AcqRel);
                 tracing::info!(
                     lib_path = %self.lib_path,
                     "PKCS#11 module reinitialized"
                 );
-                true
+                RecoveryOutcome::Reinitialized
             }
             // The module is initialized, just not by this call — the finalize
-            // above did not take effect. Nothing was recovered.
+            // above did not take effect. Nothing was recovered, but the
+            // library is still usable by whoever holds it.
             Err(cryptoki::error::Error::Pkcs11(
                 cryptoki::error::RvError::CryptokiAlreadyInitialized,
                 _,
             )) => {
+                last.left_uninitialized = false;
                 tracing::error!(
                     lib_path = %self.lib_path,
                     "PKCS#11 module could not be finalized, so it cannot be reinitialized"
                 );
-                false
+                RecoveryOutcome::NotFinalized
             }
+            // C_Finalize took effect and C_Initialize did not, so the library
+            // is now down: nothing on it can work until an attempt succeeds.
+            // Recovery created this state, and it must not then ration the
+            // only operation that clears it.
             Err(error) => {
+                last.left_uninitialized = true;
                 tracing::error!(
                     lib_path = %self.lib_path,
                     %error,
-                    "PKCS#11 module reinitialization failed"
+                    "PKCS#11 module reinitialization failed; the library is left \
+                     uninitialized and the next attempt will not be deferred"
                 );
-                false
+                RecoveryOutcome::ModuleDown
             }
         }
     }
@@ -433,7 +522,10 @@ fn shared_module(lib_path: &str) -> Result<Arc<SharedModule>> {
         ctx,
         generation: AtomicU64::new(0),
         gate: Gate::new(),
-        reinit: Mutex::new(LastReinit { at: None }),
+        reinit: Mutex::new(LastReinit {
+            at: None,
+            left_uninitialized: false,
+        }),
     });
     guard.insert(lib_path.to_owned(), Arc::clone(&module));
     Ok(module)
@@ -536,11 +628,18 @@ impl Pkcs11Provider {
         }
 
         let module = Arc::clone(&self.module);
-        let recovered = tokio::task::spawn_blocking(move || module.recover(generation))
+        let outcome = tokio::task::spawn_blocking(move || module.recover(generation))
             .await
             .map_err(|e| KeyRackError::Provider(format!("blocking task: {e}")))?;
-        if !recovered {
-            return Err(error);
+        tracing::debug!(
+            lib_path = %self.module.lib_path,
+            token_label = %self.token_label,
+            outcome = ?outcome,
+            retry = outcome.permits_retry(),
+            "PKCS#11 recovery attempt finished"
+        );
+        if !outcome.permits_retry() {
+            return Err(recovery_pending_error(outcome, &error));
         }
 
         // The token may have come back on a different slot, so re-resolve it
@@ -1278,13 +1377,111 @@ mod tests {
         }
     }
 
+    /// A state recovery creates must read as recoverable. An attempt that
+    /// finalizes the library and then fails to initialize it leaves every
+    /// later call reporting this code; classifying it permanent told callers
+    /// their request could never work when a reinitialization was all that
+    /// stood in the way.
+    #[test]
+    fn an_uninitialized_library_reads_as_retryable_not_as_a_permanent_fault() {
+        let error = cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::CryptokiNotInitialized,
+            cryptoki::context::Function::OpenSession,
+        );
+        assert!(is_transient_pkcs11_error(&error));
+        assert!(
+            matches!(
+                map_pkcs11_error("open session", &error),
+                KeyRackError::ProviderUnavailable(_)
+            ),
+            "a client's retry policy keys on this variant; a permanent answer stops it"
+        );
+    }
+
+    /// Only an outcome that actually restored the module may send the caller
+    /// back to retry its operation.
+    #[test]
+    fn only_a_completed_recovery_permits_a_retry() {
+        assert!(RecoveryOutcome::Reinitialized.permits_retry());
+        assert!(RecoveryOutcome::AlreadyRecovered.permits_retry());
+        for outcome in [
+            RecoveryOutcome::DeferredByInterval,
+            RecoveryOutcome::NotQuiesced,
+            RecoveryOutcome::NotFinalized,
+            RecoveryOutcome::ModuleDown,
+        ] {
+            assert!(
+                !outcome.permits_retry(),
+                "{outcome:?} did not restore the module"
+            );
+        }
+    }
+
+    /// Every incomplete outcome is temporary, and each must say which one it
+    /// was. Answering the operation's own failure instead is what let a
+    /// deferred recovery reach a client as a permanent error.
+    #[test]
+    fn an_incomplete_recovery_is_reported_as_retryable_and_names_itself() {
+        let original = KeyRackError::Provider("open session: not initialized".into());
+        let mut seen = Vec::new();
+        for outcome in [
+            RecoveryOutcome::DeferredByInterval,
+            RecoveryOutcome::NotQuiesced,
+            RecoveryOutcome::NotFinalized,
+            RecoveryOutcome::ModuleDown,
+        ] {
+            let reported = recovery_pending_error(outcome, &original);
+            assert!(
+                matches!(reported, KeyRackError::ProviderUnavailable(_)),
+                "{outcome:?} is temporary, so it must read as retryable"
+            );
+            let text = reported.to_string();
+            assert!(
+                text.contains(outcome.reason()),
+                "{outcome:?} must be distinguishable in the answer: {text}"
+            );
+            assert!(
+                text.contains("open session: not initialized"),
+                "the underlying failure stays in the message for diagnosis: {text}"
+            );
+            seen.push(outcome.reason());
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "each outcome needs its own reason");
+    }
+
+    /// A library left finalized has no providers left to protect, so the
+    /// interval that exists to protect them must not defer the only operation
+    /// that can bring it back.
+    #[test]
+    fn a_down_library_is_not_rationed() {
+        let mut last = LastReinit {
+            at: None,
+            left_uninitialized: false,
+        };
+        last.record_attempt();
+        assert!(
+            !last.may_attempt_now(),
+            "a healthy module is protected by the interval"
+        );
+        last.left_uninitialized = true;
+        assert!(
+            last.may_attempt_now(),
+            "a down library must be repairable before the interval expires"
+        );
+    }
+
     /// The interval exists to ration reinitializations, so it is armed by an
     /// attempt that ran — not by one that was abandoned before touching the
     /// library, which used to suppress the next genuine attempt for the whole
     /// interval.
     #[test]
     fn the_interval_is_armed_by_an_attempt_that_ran() {
-        let mut last = LastReinit { at: None };
+        let mut last = LastReinit {
+            at: None,
+            left_uninitialized: false,
+        };
         assert!(last.may_attempt_now(), "nothing has been attempted yet");
         last.record_attempt();
         assert!(
