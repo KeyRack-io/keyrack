@@ -12,6 +12,8 @@ data:
       database_url: postgres://keyrack:keyrack@postgres:5432/keyrack
     provider:
       type: software
+    # DEVELOPMENT ONLY: key material is lost at restart despite persisted metadata.
+    dev_only_allow_ephemeral_provider_with_persistent_metadata: true
     pdp:
       type: http
       endpoint: http://cedar-pdp:8181/v1/authorize

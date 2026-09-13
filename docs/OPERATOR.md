@@ -19,7 +19,7 @@ Running KeyRack in production.
 
 KeyRack is configured via a YAML file. Point to it with the `KEYRACK_CONFIG`
 environment variable. If unset, the service falls back to built-in defaults
-(in-memory storage, software provider, mTLS auth) — but it will not start,
+(SQLite at `keyrack.db`, software provider, mTLS auth) — but it will not start,
 because there is no default authorization policy and `pdp:` has to be stated
 explicitly. A config file is therefore always required in practice.
 
@@ -34,7 +34,10 @@ storage:
   path: "/var/lib/keyrack/keyrack.db"
 
 provider:
-  type: software
+  type: pkcs11
+  lib_path: "/usr/lib/softhsm/libsofthsm2.so"
+  token_label_ref: "file:token-label"
+  pin_ref: "file:user-pin"
 
 pdp:
   type: http
@@ -49,6 +52,10 @@ authn:
   type: bootstrap_token
   max_age_secs: 900
 ```
+
+Mount the token label and user PIN as files beneath `KEYRACK_SECRET_ROOT`.
+The example pairs persistent metadata with a persistent token; see the
+[packaged SoftHSM deployment](SOFTHSM.md) for token initialization and storage.
 
 With `bootstrap_token` auth, set the token via the `KMS_BOOTSTRAP_TOKEN`
 environment variable. The token is hashed at startup — the plaintext is
@@ -160,6 +167,28 @@ provider:
   type: software
 ```
 
+### Metadata and key-material durability
+
+Startup rejects persistent SQLite or PostgreSQL metadata paired with any
+configured `software` or `in_memory` provider, including nondefault providers.
+Those providers lose key material at every process restart; stored records and
+handles cannot reconstruct it. Use a durable provider for persistent keys.
+`storage: {type: memory}` and SQLite's exact `:memory:` or empty temporary
+filename do not require an acknowledgement. SQLite URI filenames are treated
+conservatively as persistent; choose the explicit memory storage type for an
+unambiguous ephemeral configuration.
+
+A disposable development deployment may explicitly accept the loss:
+
+```yaml
+# DEVELOPMENT ONLY: restarting loses key material despite persisted metadata.
+dev_only_allow_ephemeral_provider_with_persistent_metadata: true
+```
+
+The acknowledgement defaults to false. When it permits an otherwise rejected
+configuration, startup emits a WARN naming the flag and affected providers.
+It does not preserve keys, repair old records, or provide a migration path.
+
 ### PKCS#11 (production)
 
 Delegates all cryptographic operations to an HSM via PKCS#11.
@@ -169,7 +198,7 @@ provider:
   type: pkcs11
   lib_path: "/usr/lib/softhsm/libsofthsm2.so"
   token_label: "keyrack-production"
-  pin: "${KMS_PKCS11_PIN}"
+  pin_ref: "file:user-pin"
 ```
 
 #### When a token goes away and comes back
@@ -293,6 +322,9 @@ or migrating keys between HSMs), use the `providers:` list instead. Each entry
 has a `name` plus the same fields the single `provider:` block accepts:
 
 ```yaml
+# This routing example uses ephemeral metadata for the software provider.
+storage:
+  type: memory
 providers:
   - name: shared-soft
     type: software
@@ -659,9 +691,17 @@ unverifiable.
 
 | Endpoint | Description |
 |---|---|
-| `GET /healthz` | Liveness: checks storage and crypto provider |
-| `GET /readyz` | Readiness: checks storage ping |
+| `GET /healthz` | Storage ping and default-provider capability metadata; no live token check |
+| `GET /readyz` | Bounded storage and registered-provider readiness checks; PKCS#11 opens and authenticates fresh token sessions |
 | `GET /metrics` | Prometheus-format metrics |
+
+Use `/readyz` for readiness probes. It returns 503 when a configured PKCS#11
+token cannot open and authenticate a session, including a nondefault token or
+a persisted connection that failed startup rehydration. The provider probe
+has a two-second total budget; a timeout fails readiness. Other provider
+implementations currently inherit a no-op readiness method, so a successful
+response does not prove KMIP or Vault connectivity. `/healthz` capability
+metadata is likewise not evidence that a token can be opened.
 
 ### Key metrics
 
@@ -761,7 +801,12 @@ The image includes both `keyrack-service` and `keyrack-cedar-pdp` binaries.
 3. **Back up config:** `keyrack.yaml` and TLS certificates
 4. **Audit logs are append-only** — archive with standard log rotation
 
-**Restore:** Deploy config, restore storage dump, start service.
+Metadata backups do not contain software-provider key material. For a
+file-backed SoftHSM token, stop all writers and preserve the token directory
+alongside metadata; follow the [quiesced backup and restore procedure](SOFTHSM.md).
+
+**Restore:** Restore config, metadata and the matching provider material before
+starting the service. Verify readiness and decrypt an existing ciphertext.
 
 ---
 
@@ -772,4 +817,4 @@ The image includes both `keyrack-service` and `keyrack-cedar-pdp` binaries.
 | `PERMISSION_DENIED` on all RPCs | PDP unreachable or denying all | Check PDP endpoint and policy |
 | `UNAVAILABLE` on startup | Storage backend not reachable | Check database connection or SQLite path |
 | Audit events missing | Sink misconfigured or disk full | Check sink config and disk space |
-| High latency on encrypt | HSM contention | Check HSM session pool or switch to software provider for non-sensitive keys |
+| High latency on encrypt | HSM contention | Check HSM session pool and durable-provider capacity |

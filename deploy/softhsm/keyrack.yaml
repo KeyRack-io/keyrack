@@ -1,0 +1,16 @@
+# Mount as /etc/keyrack/config.yaml. Supply an authenticated PDP/authn setup
+# before using the API; this staging profile starts with all operations denied.
+grpc_addr: '0.0.0.0:50051'
+rest_addr: '0.0.0.0:8080'
+storage:
+  type: sqlite
+  path: /var/lib/keyrack/metadata/keyrack.db
+provider:
+  type: pkcs11
+  lib_path: /usr/lib/softhsm/libsofthsm2.so
+  token_label_ref: file:token-label
+  pin_ref: file:user-pin
+pdp:
+  type: always_deny
+audit:
+  type: stdout

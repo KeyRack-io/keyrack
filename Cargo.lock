@@ -2863,6 +2863,7 @@ dependencies = [
  "blake3",
  "chrono",
  "criterion",
+ "cryptoki",
  "ed25519-dalek",
  "http-body-util",
  "keyrack-core",

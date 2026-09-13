@@ -8,6 +8,9 @@ storage:
 provider:
   type: software
 
+# DEVELOPMENT ONLY: key material is lost at restart despite persisted metadata.
+dev_only_allow_ephemeral_provider_with_persistent_metadata: true
+
 # Demo only: authorization is disabled outright. `always_allow` must be stated
 # explicitly — omitting `pdp:` is a startup error, not a silent allow.
 pdp:

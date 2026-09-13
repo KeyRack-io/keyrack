@@ -2062,18 +2062,24 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    let storage_ok = state.storage.ping().await.is_ok();
-    if storage_ok {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "ready", "storage": "ok" })),
-        )
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "not_ready", "storage": "error" })),
-        )
-    }
+    let (storage, providers_ok) = tokio::join!(
+        tokio::time::timeout(crate::readiness::PROBE_TIMEOUT, state.storage.ping()),
+        crate::readiness::providers_ready(Arc::clone(&state.providers), Arc::clone(&state.storage)),
+    );
+    let storage_ok = matches!(storage, Ok(Ok(())));
+    let ready = storage_ok && providers_ok;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "storage": if storage_ok { "ok" } else { "error" },
+            "providers": if providers_ok { "ok" } else { "error" },
+        })),
+    )
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {

@@ -10,6 +10,9 @@ storage:
 provider:
   type: software
 
+# DEVELOPMENT ONLY: key material is lost at restart despite persisted metadata.
+dev_only_allow_ephemeral_provider_with_persistent_metadata: true
+
 # Routing: regulated keys are pinned to the default (software) backend by
 # operator policy; everything else uses delegate_any (caller picks via
 # backend_id). This shows both route (authoritative pin) and delegate_any.

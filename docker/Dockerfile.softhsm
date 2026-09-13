@@ -1,0 +1,33 @@
+# Same source builds natively on linux/amd64 and linux/arm64.
+FROM rust:1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY proto/ proto/
+COPY examples/ examples/
+RUN cargo build --locked --release -j 2 -p keyrack-service --bins
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl softhsm2 util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -r /usr/lib/softhsm/libsofthsm2.so \
+    && chmod 0755 /etc/softhsm \
+    && groupadd --gid 10001 keyrack \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin keyrack \
+    && mkdir -p /var/lib/keyrack/tokens /var/lib/keyrack/metadata /backup \
+    && chown -R 10001:10001 /var/lib/keyrack /backup
+COPY --from=builder /build/target/release/keyrack-service /usr/local/bin/
+COPY --from=builder /build/target/release/keyrack-softhsm-init /usr/local/bin/
+COPY docker/softhsm/softhsm2.conf /etc/softhsm/softhsm2.conf
+COPY --chmod=0555 docker/softhsm/entrypoint.sh /usr/local/bin/keyrack-softhsm
+COPY --chmod=0555 docker/softhsm/archive.sh /usr/local/bin/keyrack-softhsm-archive
+ENV SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf \
+    KEYRACK_CONFIG=/etc/keyrack/config.yaml \
+    KEYRACK_SECRET_ROOT=/run/secrets/keyrack \
+    KEYRACK_SOFTHSM_LIB=/usr/lib/softhsm/libsofthsm2.so
+USER 10001:10001
+EXPOSE 50051 8080
+ENTRYPOINT ["/usr/local/bin/keyrack-softhsm"]
+CMD ["serve"]

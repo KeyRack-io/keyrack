@@ -326,8 +326,19 @@ Prometheus-format metrics on `/metrics`:
 
 ### Health
 
-- `/healthz`: probes storage + provider, returns 200 or 503
-- `/readyz`: storage ping
+- `/healthz`: storage ping and default-provider capability metadata; returns 200 or 503.
+- `/readyz`: bounded storage and registered-provider readiness checks. PKCS#11
+  opens and authenticates fresh sessions for every registered token, including
+  nondefault tokens. Missing persisted PKCS#11 connections fail readiness even
+  when startup rehydration could not register them. Probe failures and the
+  two-second provider budget return 503. Other providers currently inherit a
+  no-op readiness method; this endpoint does not prove KMIP or Vault connectivity.
+
+Startup also rejects persistent SQLite/PostgreSQL metadata paired with any
+software or in-memory provider unless the operator explicitly sets
+`dev_only_allow_ephemeral_provider_with_persistent_metadata: true`. That
+acknowledgement emits a development-only warning: records persist, but key
+material is lost at restart. See [durability configuration](OPERATOR.md#metadata-and-key-material-durability).
 
 ---
 
