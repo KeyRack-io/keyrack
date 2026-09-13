@@ -14,6 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["crypto-endpoints"]
 crypto-endpoints = []
+softhsm-init-tests = []
 
 [dependencies]
 keyrack-core = { workspace = true }
@@ -47,6 +48,7 @@ tokio-util = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+cryptoki = "0.12"
 
 [dev-dependencies]
 keyrack-test-support = { workspace = true }

@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keyrack-softhsm-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keyrack-softhsm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: keyrack-softhsm
+  template:
+    metadata:
+      labels:
+        app: keyrack-softhsm
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: token-init
+          # Replace with the published multi-arch digest before deployment.
+          image: ghcr.io/keyrack-io/keyrack-service-softhsm:edge
+          args: [init]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/keyrack}
+            - {name: init-secrets, mountPath: /run/secrets/keyrack, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        - name: keyrack
+          image: ghcr.io/keyrack-io/keyrack-service-softhsm:edge
+          args: [serve]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - {name: rest, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+          readinessProbe:
+            httpGet: {path: /readyz, port: rest}
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 1
+          startupProbe:
+            httpGet: {path: /healthz, port: rest}
+            timeoutSeconds: 5
+            periodSeconds: 2
+            failureThreshold: 30
+          # Token outages remove readiness; they must not induce restart loops.
+          livenessProbe:
+            tcpSocket: {port: rest}
+            timeoutSeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/keyrack}
+            - {name: config, mountPath: /etc/keyrack, readOnly: true}
+            - {name: service-secrets, mountPath: /run/secrets/keyrack, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: keyrack-softhsm-data}
+        - name: config
+          configMap: {name: keyrack-softhsm-config}
+        - name: init-secrets
+          secret:
+            secretName: keyrack-softhsm-secrets
+            defaultMode: 288
+            items:
+              - {key: token-label, path: token-label}
+              - {key: user-pin, path: user-pin}
+              - {key: so-pin, path: so-pin}
+        - name: service-secrets
+          secret:
+            secretName: keyrack-softhsm-secrets
+            defaultMode: 288
+            items:
+              - {key: token-label, path: token-label}
+              - {key: user-pin, path: user-pin}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keyrack-softhsm
+spec:
+  selector: {app: keyrack-softhsm}
+  ports:
+    - {name: rest, port: 8080, targetPort: rest}
+    - {name: grpc, port: 50051, targetPort: grpc}

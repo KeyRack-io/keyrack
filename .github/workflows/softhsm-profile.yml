@@ -1,0 +1,163 @@
+name: SoftHSM persistent profile
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, 'feat/**', 'fix/**', 'handback/**']
+
+permissions:
+  contents: read
+
+env:
+  SOFTHSM_IMAGE: ghcr.io/keyrack-io/keyrack-service-softhsm
+
+jobs:
+  controls:
+    name: SoftHSM guard removal controls
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler softhsm2
+      - name: Startup, readiness and native-session controls
+        env:
+          KEYRACK_SOFTHSM_TEST_LIB: /usr/lib/softhsm/libsofthsm2.so
+        run: python3 scripts/test-softhsm-deliverable-d-mutants.py --output-dir target/proofs/softhsm-deliverable-d
+      - name: Idempotent initializer controls
+        env:
+          KEYRACK_SOFTHSM_TEST_LIB: /usr/lib/softhsm/libsofthsm2.so
+        run: python3 scripts/test-softhsm-initializer-mutants.py
+      - name: Deployment constraint controls
+        run: python3 conformance/softhsm-profile/deployment_mutations.py --output-dir target/proofs/softhsm-deployment
+      - name: Release promotion controls
+        run: |
+          mkdir -p target/proofs
+          python3 conformance/softhsm-profile/release_controls.py | tee target/proofs/release-controls.log
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: softhsm-source-controls
+          path: target/proofs/
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    name: SoftHSM image and persistence (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, platform: linux/amd64, runner: ubuntu-24.04}
+          - {arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the image that will be tested and published
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.softhsm
+          platforms: ${{ matrix.platform }}
+          tags: keyrack-softhsm-test:local
+          load: true
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=softhsm-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=softhsm-${{ matrix.arch }}
+      - name: Native restart, token-loss and quiesced backup/restore proof
+        run: |
+          set -euo pipefail
+          mkdir -p proof-results
+          python3 conformance/softhsm-profile/proof.py --image keyrack-softhsm-test:local | tee proof-results/persistence.log
+      - name: Revert packaging guarantees and require specific failures
+        run: |
+          set -euo pipefail
+          python3 conformance/softhsm-profile/mutations.py --image keyrack-softhsm-test:local --output proof-results
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: softhsm-proof-${{ matrix.arch }}
+          path: proof-results/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: docker/login-action@v4
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the tested local image without rebuilding
+        if: github.event_name == 'push'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect keyrack-softhsm-test:local --format '{{.Architecture}}')" = "$ARCH"
+          tag="$SOFTHSM_IMAGE:sha-$GITHUB_SHA-$ARCH"
+          docker tag keyrack-softhsm-test:local "$tag"
+          docker push "$tag"
+          digest=$(docker image inspect "$tag" --format '{{json .RepoDigests}}' | python3 -c 'import json,os,sys; prefix=os.environ["SOFTHSM_IMAGE"]+"@"; matches=[x[len(prefix):] for x in json.load(sys.stdin) if x.startswith(prefix)]; assert len(matches)==1; print(matches[0])')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p /tmp/softhsm-digests
+          printf '%s\n' "$digest" > "/tmp/softhsm-digests/$ARCH"
+      - uses: actions/upload-artifact@v6
+        if: github.event_name == 'push'
+        with:
+          name: softhsm-digest-${{ matrix.arch }}
+          path: /tmp/softhsm-digests/
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    name: Publish tested SoftHSM manifest
+    if: github.event_name == 'push'
+    needs: [build, controls]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: /tmp/softhsm-digests
+          pattern: softhsm-digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compose and verify both native platforms
+        run: |
+          set -euo pipefail
+          amd=$(cat /tmp/softhsm-digests/amd64)
+          arm=$(cat /tmp/softhsm-digests/arm64)
+          [[ "$amd" =~ ^sha256:[0-9a-f]{64}$ && "$arm" =~ ^sha256:[0-9a-f]{64}$ ]]
+          short="${GITHUB_SHA:0:7}"
+          docker buildx imagetools create --tag "$SOFTHSM_IMAGE:sha-$short" --tag "$SOFTHSM_IMAGE:edge" --tag "$SOFTHSM_IMAGE:main" "$SOFTHSM_IMAGE@$amd" "$SOFTHSM_IMAGE@$arm"
+          digest=$(docker buildx imagetools inspect "$SOFTHSM_IMAGE:sha-$short" | awk '/^Digest:/ {print $2}')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$SOFTHSM_IMAGE@$digest" --raw > /tmp/softhsm-manifest.json
+          export SOFTHSM_MANIFEST_DIGEST="$digest"
+          python3 - <<'PY'
+          import json, os
+          manifest = json.load(open('/tmp/softhsm-manifest.json'))
+          platforms = sorted(x['platform']['os'] + '/' + x['platform']['architecture'] for x in manifest['manifests'])
+          assert platforms == ['linux/amd64', 'linux/arm64'], platforms
+          source = dict(schema=1, commit=os.environ['GITHUB_SHA'], image=os.environ['SOFTHSM_IMAGE'], digest=os.environ['SOFTHSM_MANIFEST_DIGEST'], platforms=platforms, run_id=os.environ['GITHUB_RUN_ID'], run_attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          with open('release-source.json', 'w') as output:
+              json.dump(source, output, indent=2)
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: softhsm-release-source
+          path: release-source.json
+          if-no-files-found: error
+          retention-days: 90
