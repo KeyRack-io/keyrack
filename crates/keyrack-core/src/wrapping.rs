@@ -32,6 +32,7 @@
 
 use crate::key::{KeySpec, ProviderRef};
 use crate::lid::Lid;
+use sha2::{Digest as _, Sha256};
 use std::num::NonZeroU64;
 
 /// Maximum encoded byte length of a provider, mechanism, format or domain name.
@@ -214,6 +215,16 @@ impl WrappingContext {
         Ok(bytes)
     }
 
+    /// SHA-256 over [`canonical_bytes`](Self::canonical_bytes).
+    ///
+    /// A binding identity for one exact profile, used where a fixed-width
+    /// value is needed instead of the full encoding. It is a digest of
+    /// caller-supplied metadata: it authenticates nothing, proves no custody,
+    /// and is not a key identifier.
+    pub fn context_sha256(&self) -> Result<[u8; 32], WrappingError> {
+        Ok(Sha256::digest(self.canonical_bytes()?).into())
+    }
+
     fn validate(&self) -> Result<(), WrappingError> {
         validate_identifier(self.provider_ref.as_str())?;
         validate_profile(
@@ -327,6 +338,29 @@ pub struct WrappingCapability {
 }
 
 impl WrappingCapability {
+    /// The exact tuple a context asks for, for matching against a declaration.
+    ///
+    /// A context carries no lifecycle: the caller states which object lifetime
+    /// it is prepared to accept, so that a provider offering only a different
+    /// one is refused here rather than silently substituted.
+    #[must_use]
+    pub fn requested(
+        context: &WrappingContext,
+        operation: WrappingOperation,
+        lifecycle: WrappedKeyLifecycle,
+    ) -> Self {
+        Self {
+            parent_spec: context.parent_spec.clone(),
+            child_spec: context.child_spec.clone(),
+            key_format: context.key_format.clone(),
+            purpose: context.purpose,
+            mechanism: context.mechanism.clone(),
+            context_version: context.version,
+            operation,
+            lifecycle,
+        }
+    }
+
     fn validate(&self) -> Result<(), WrappingError> {
         validate_profile(
             &self.parent_spec,
@@ -648,18 +682,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_core_providers_advertise_no_wrapping() {
-        let providers: Vec<Box<dyn CryptoProvider>> = vec![
-            Box::new(SoftwareProvider::new()),
-            Box::new(InMemoryProvider::new()),
-        ];
-        for provider in providers {
-            assert!(provider.wrapping_capabilities().tuples().is_empty());
-            assert_eq!(
-                provider.wrapping_capabilities().require(&tuple()),
-                Err(WrappingError::UnsupportedCapability)
-            );
-        }
+    fn providers_without_a_wrapping_profile_advertise_none() {
+        let provider = InMemoryProvider::new();
+        assert!(provider.wrapping_capabilities().tuples().is_empty());
+        assert_eq!(
+            provider.wrapping_capabilities().require(&tuple()),
+            Err(WrappingError::UnsupportedCapability)
+        );
+    }
+
+    #[test]
+    fn a_declared_profile_still_refuses_every_other_tuple() {
+        // The software provider declares one profile, so it is the case where a
+        // non-empty declaration must not become a general yes.
+        let capabilities = SoftwareProvider::new().wrapping_capabilities();
+        assert!(!capabilities.tuples().is_empty());
+        assert_eq!(
+            capabilities.require(&tuple()),
+            Err(WrappingError::UnsupportedCapability)
+        );
     }
 
     proptest! {

@@ -171,6 +171,81 @@ pub struct GenerateDataKeyOutput {
     pub encrypted_key: Vec<u8>,
 }
 
+/// A fresh wrapped child and the transient object that produced it.
+///
+/// `envelope` holds the child wrapped under the parent in the profile's
+/// format: ciphertext, never plaintext key bytes, and never an independently
+/// operable handle. The caller persists it and MUST close `lease`; a creation
+/// journal additionally requires the resulting closure before publication.
+#[derive(Debug)]
+pub struct GeneratedWrappedKey {
+    pub envelope: Vec<u8>,
+    pub lease: WrappedKeyLease,
+}
+
+/// One open wrapped child inside the provider that opened it.
+///
+/// [`handle`](Self::handle) is operable only while this lease is open and only
+/// in the issuing provider. It is not durable, not portable across providers
+/// or processes, and is never written to a key version: a wrapped version
+/// stores a [`ParentWrappedMaterial`](crate::material::ParentWrappedMaterial)
+/// reference, and opening is repeated per use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedKeyLease {
+    handle: KeyHandle,
+    object: crate::wrapping::WrappingIdentifier,
+    context_sha256: [u8; 32],
+}
+
+impl WrappedKeyLease {
+    /// Bind a provider object to the exact context it was opened under.
+    ///
+    /// Only the issuing provider constructs this. Construction records the
+    /// binding; it asserts nothing about isolation, authorization or erasure.
+    pub fn new(
+        handle: KeyHandle,
+        object: crate::wrapping::WrappingIdentifier,
+        context: &crate::wrapping::WrappingContext,
+    ) -> Result<Self> {
+        Ok(Self {
+            handle,
+            object,
+            context_sha256: context
+                .context_sha256()
+                .map_err(|e| crate::error::KeyRackError::Provider(e.to_string()))?,
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> &KeyHandle {
+        &self.handle
+    }
+
+    /// Provider-internal object identity, which a closure fact names.
+    #[must_use]
+    pub fn object(&self) -> &crate::wrapping::WrappingIdentifier {
+        &self.object
+    }
+
+    #[must_use]
+    pub fn context_sha256(&self) -> [u8; 32] {
+        self.context_sha256
+    }
+}
+
+/// A provider's report of what it closed.
+///
+/// This is not closure evidence on its own. A creation journal accepts it only
+/// after the provider's own
+/// [`A2ClosureVerifier`](crate::creation::A2ClosureVerifier) verifies the
+/// claim; a success value is never promoted to evidence by storage or by a
+/// generic adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedKeyClosure {
+    pub fact: crate::creation::A2ClosureFact,
+    pub context_sha256: [u8; 32],
+}
+
 /// Cryptographic provider trait.
 ///
 /// All methods are async — HSM providers (PKCS#11, KMIP) need I/O.
@@ -370,6 +445,82 @@ pub trait CryptoProvider: Send + Sync {
     /// constructing canonical context bytes alone supplies no such evidence.
     fn wrapping_capabilities(&self) -> crate::wrapping::WrappingCapabilities {
         crate::wrapping::WrappingCapabilities::default()
+    }
+
+    /// Generate a child key inside the provider and return it wrapped under
+    /// the parent named by `context`, per ADR-0005.
+    ///
+    /// `parent` addresses the parent's resident object in this provider; the
+    /// caller has resolved it from the exact parent version in `context` and
+    /// must not substitute a different key. The provider authenticates the
+    /// canonical context bytes within its own boundary and must refuse a tuple
+    /// it does not declare, independently of the caller's
+    /// [`require`](crate::wrapping::WrappingCapabilities::require) check.
+    ///
+    /// The returned lease is open and owed a [`close_wrapped_key`] call. An
+    /// error can mean effects occurred: implementations must not retry
+    /// generation internally after an ambiguous response, because a lost
+    /// response leaves an object that still needs closing.
+    ///
+    /// Implementing this activates the hierarchy path. It does not by itself
+    /// constitute custody: a provider that holds plaintext children in
+    /// ordinary process memory contains nothing, whatever it declares here.
+    ///
+    /// [`close_wrapped_key`]: Self::close_wrapped_key
+    async fn generate_wrapped_key(
+        &self,
+        _context: &crate::wrapping::WrappingContext,
+        _parent: &KeyHandle,
+    ) -> Result<GeneratedWrappedKey> {
+        Err(crate::error::KeyRackError::Provider(
+            "wrapped-key generation not supported by this provider".into(),
+        ))
+    }
+
+    /// Open a wrapped child for use, returning a lease over a transient object.
+    ///
+    /// `envelope` is the stored wrapped material for the exact child version
+    /// in `context`. The provider must authenticate the canonical context
+    /// bytes against the envelope and refuse on any mismatch: a caller that
+    /// supplies another version's envelope, another parent, or an altered
+    /// profile gets a failure, not a key.
+    ///
+    /// Callers must close every returned lease, including on the error paths
+    /// of whatever they do in between.
+    async fn open_wrapped_key(
+        &self,
+        _context: &crate::wrapping::WrappingContext,
+        _parent: &KeyHandle,
+        _envelope: &[u8],
+    ) -> Result<WrappedKeyLease> {
+        Err(crate::error::KeyRackError::Provider(
+            "opening wrapped keys not supported by this provider".into(),
+        ))
+    }
+
+    /// Close the exact object named by `lease`, idempotently.
+    ///
+    /// Repeating this for an already-closed lease must return the same fact
+    /// rather than fail, so that a lost response can be reconciled. Closing
+    /// must not generate, unwrap or rewrap anything to obtain a fact, and an
+    /// error leaves cleanup owed rather than completed.
+    async fn close_wrapped_key(&self, _lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
+        Err(crate::error::KeyRackError::Provider(
+            "closing wrapped keys not supported by this provider".into(),
+        ))
+    }
+
+    /// The provider's verifier for its own closure facts, if it has one.
+    ///
+    /// The journaled creation protocol publishes a wrapped child only after a
+    /// closure claim is verified inside the trust boundary that produced it.
+    /// `None`, the default, means this provider cannot evidence closure and so
+    /// cannot drive journaled creation; there is deliberately no accept-all
+    /// implementation to inherit.
+    fn wrapping_closure_verifier(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::creation::A2ClosureVerifier>> {
+        None
     }
 
     /// Export raw key material for an exportable key.
