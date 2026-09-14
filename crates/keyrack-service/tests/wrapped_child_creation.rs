@@ -432,7 +432,7 @@ async fn only_symmetric_encryption_keys_can_be_children() {
     for spec in [KeySpec::Hmac256, KeySpec::EcdsaP256Sha256] {
         let error = child_error(&state, input(spec.clone(), Some(&parent))).await;
         assert!(
-            error.contains("cannot be a child") || error.contains("encrypt and decrypt only"),
+            error.contains("cannot be a child"),
             "unexpected error for {spec:?}: {error}"
         );
     }

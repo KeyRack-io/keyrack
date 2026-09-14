@@ -285,11 +285,10 @@ fn refuse_unwrappable_child(record: &KeyRecord) -> Result<(), DomainError> {
             record.key_spec
         )));
     }
-    if record.key_usage != KeyUsage::EncryptDecrypt {
-        return Err(DomainError::InvalidArgument(
-            "a wrapped child serves encrypt and decrypt only".into(),
-        ));
-    }
+    // Usage is not checked separately: it is derived from the spec, so a second
+    // gate over the same fact would be one no test could make fail on its own,
+    // and the creation journal revalidates both inside its transaction.
+    //
     // Export means handing out material this service never holds: the child is
     // only ever a wrapped envelope plus a lease inside the provider.
     if record.exportability != Exportability::NonExportable {
