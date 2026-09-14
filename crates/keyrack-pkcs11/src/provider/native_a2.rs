@@ -399,7 +399,6 @@ fn child_template(request: &CreationRequest, creation: bool) -> Result<Vec<Attri
         Attribute::Sensitive(true),
         Attribute::Extractable(creation),
         Attribute::Copyable(false),
-        Attribute::Modifiable(false),
         Attribute::Destroyable(true),
         Attribute::Encrypt(!creation),
         Attribute::Decrypt(!creation),
@@ -410,6 +409,10 @@ fn child_template(request: &CreationRequest, creation: bool) -> Result<Vec<Attri
         Attribute::Derive(false),
         Attribute::Label(request.correlation.as_bytes().to_vec()),
         Attribute::Id(request.correlation.as_bytes().to_vec()),
+        // SoftHSM 2.6.1 applies the template in caller order and forbids further
+        // unwrap attributes after immutability. Set it last in the SAME native
+        // call; never omit it, repair afterward, or retry a weaker template.
+        Attribute::Modifiable(false),
     ])
 }
 
@@ -467,6 +470,36 @@ fn kw_size_observation_matches(actual: &[Attribute], wanted: &Attribute) -> bool
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn immutability_is_last_without_omitting_any_policy() {
+        let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        for creation in [true, false] {
+            let template = child_template(&request, creation).unwrap();
+            assert_eq!(template.last(), Some(&Attribute::Modifiable(false)));
+            assert_eq!(
+                template
+                    .iter()
+                    .filter(|a| matches!(a, Attribute::Modifiable(_)))
+                    .count(),
+                1
+            );
+            for attribute in [
+                Attribute::Token(false),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(creation),
+                Attribute::Copyable(false),
+                Attribute::Destroyable(true),
+                Attribute::Encrypt(!creation),
+                Attribute::Decrypt(!creation),
+                Attribute::Wrap(false),
+                Attribute::Unwrap(false),
+            ] {
+                assert!(template.contains(&attribute));
+            }
+        }
+    }
 
     #[test]
     fn kw_unknown_size_exception_is_exact_and_bounded() {

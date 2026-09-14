@@ -48,6 +48,15 @@ lengths refuse; all remaining attributes stay strict. Zero is not independent
 size evidence. GCM candidate, parent and generation readback retain exact size
 requirements. [SoftHSM 2.7.0 unwrap implementation](https://github.com/softhsm/SoftHSMv2/blob/2.7.0/src/lib/SoftHSM.cpp#L7073-L7102)
 
+The strict template puts `CKA_MODIFIABLE=false` last. SoftHSM 2.6.1 processes
+attributes in caller order and rejects further unwrap attributes once this flag
+has been applied; 2.7.0 exempts unwrap from that check. Ordering changes expression,
+not policy: the same flags are supplied in one native call, every flag is checked
+afterward, and there is no retry or post-creation attribute repair.
+[2.6.1 attribute processing](https://github.com/softhsm/SoftHSMv2/blob/2.6.1/src/lib/P11Objects.cpp#L218-L240),
+[2.6.1 immutability check](https://github.com/softhsm/SoftHSMv2/blob/2.6.1/src/lib/P11Attributes.cpp#L413-L417),
+[2.7.0 unwrap exemption](https://github.com/softhsm/SoftHSMv2/blob/2.7.0/src/lib/P11Attributes.cpp#L413-L417)
+
 Trusted wrapping/unwrap-template policy, exact trusted parent/provider/domain
 resolution, native nonce accounting, authority/freshness and per-token qualification
 remain gates. In particular, cryptoki's GCM wrap performs two native calls and a
