@@ -1,0 +1,640 @@
+{
+  "schema": 1,
+  "services": {
+    "keyrack.v1.KeyService": {
+      "role": "northbound",
+      "reason": "The service registers KeyService on its gRPC listener."
+    },
+    "keyrack.v1.PdpService": {
+      "role": "external_dependency",
+      "reason": "This is the external PDP protocol consumed by the service, not a service registered on its northbound listener."
+    }
+  },
+  "operations": [
+    {
+      "rpc": "Encrypt",
+      "grpc_handler": "encrypt",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-encrypt",
+        "handler": "encrypt",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "Decrypt",
+      "grpc_handler": "decrypt",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-decrypt",
+        "handler": "decrypt",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ReEncrypt",
+      "grpc_handler": "re_encrypt",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-re-encrypt",
+        "handler": "re_encrypt",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GenerateDataKey",
+      "grpc_handler": "generate_data_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-generate-data-key",
+        "handler": "generate_data_key",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GenerateDataKeyWithoutPlaintext",
+      "grpc_handler": "generate_data_key_without_plaintext",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "The REST GenerateDataKey operation always returns plaintext; no REST operation suppresses it. Use this gRPC RPC for ciphertext-only data keys."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GenerateRandom",
+      "grpc_handler": "generate_random",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/generate-random",
+        "handler": "generate_random",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "Sign",
+      "grpc_handler": "sign",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-sign",
+        "handler": "sign",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "Verify",
+      "grpc_handler": "verify",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-verify",
+        "handler": "verify",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GenerateMac",
+      "grpc_handler": "generate_mac",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-generate-mac",
+        "handler": "generate_mac",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "VerifyMac",
+      "grpc_handler": "verify_mac",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-verify-mac",
+        "handler": "verify_mac",
+        "feature": "crypto-endpoints"
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "CreateKey",
+      "grpc_handler": "create_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys",
+        "handler": "create_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKey",
+      "grpc_handler": "get_key",
+      "rest": {
+        "method": "GET",
+        "path": "/v1/keys/:key_id",
+        "handler": "get_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "DescribeKey",
+      "grpc_handler": "describe_key",
+      "rest": {
+        "method": "GET",
+        "path": "/v1/keys/:key_id/describe",
+        "handler": "describe_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "UpdateKey",
+      "grpc_handler": "update_key",
+      "rest": {
+        "method": "PUT",
+        "path": "/v1/keys/:key_id",
+        "handler": "update_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ListKeys",
+      "grpc_handler": "list_keys",
+      "rest": {
+        "method": "GET",
+        "path": "/v1/keys",
+        "handler": "list_keys",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "EnableKey",
+      "grpc_handler": "enable_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-enable",
+        "handler": "enable_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "DisableKey",
+      "grpc_handler": "disable_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-disable",
+        "handler": "disable_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ScheduleKeyDeletion",
+      "grpc_handler": "schedule_key_deletion",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-schedule-deletion",
+        "handler": "schedule_key_deletion",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "CancelKeyDeletion",
+      "grpc_handler": "cancel_key_deletion",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-cancel-deletion",
+        "handler": "cancel_key_deletion",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ReportKeyCompromise",
+      "grpc_handler": "report_key_compromise",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-report-compromise",
+        "handler": "report_key_compromise",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "RotateKey",
+      "grpc_handler": "rotate_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/actions-rotate",
+        "handler": "rotate_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ListKeyVersions",
+      "grpc_handler": "list_key_versions",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Dedicated version listing is available through gRPC; REST metadata embeds versions but has no equivalent list operation."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyVersion",
+      "grpc_handler": "get_key_version",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Version-specific retrieval has a gRPC handler and no REST route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "EnableKeyRotation",
+      "grpc_handler": "enable_key_rotation",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "DisableKeyRotation",
+      "grpc_handler": "disable_key_rotation",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyRotationStatus",
+      "grpc_handler": "get_key_rotation_status",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyRotationHistory",
+      "grpc_handler": "get_key_rotation_history",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyRotationPolicy",
+      "grpc_handler": "get_key_rotation_policy",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "SetKeyRotationPolicy",
+      "grpc_handler": "set_key_rotation_policy",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyDependents",
+      "grpc_handler": "get_key_dependents",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Dependent-key traversal has a gRPC handler and no REST route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyAncestors",
+      "grpc_handler": "get_key_ancestors",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Ancestor traversal has a gRPC handler and no REST route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "CreateAlias",
+      "grpc_handler": "create_alias",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/aliases",
+        "handler": "create_alias",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "DeleteAlias",
+      "grpc_handler": "delete_alias",
+      "rest": {
+        "method": "DELETE",
+        "path": "/v1/aliases/:alias_name",
+        "handler": "delete_alias",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ListAliases",
+      "grpc_handler": "list_aliases",
+      "rest": {
+        "method": "GET",
+        "path": "/v1/aliases",
+        "handler": "list_aliases",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "TagResource",
+      "grpc_handler": "tag_resource",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/tags",
+        "handler": "tag_resource",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "UntagResource",
+      "grpc_handler": "untag_resource",
+      "rest": {
+        "method": "DELETE",
+        "path": "/v1/keys/:key_id/tags",
+        "handler": "untag_resource",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ListResourceTags",
+      "grpc_handler": "list_resource_tags",
+      "rest": {
+        "method": "GET",
+        "path": "/v1/keys/:key_id/tags",
+        "handler": "list_resource_tags",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "CreateHsmConnection",
+      "grpc_handler": "create_hsm_connection",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "HSM connection administration is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetHsmConnection",
+      "grpc_handler": "get_hsm_connection",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "HSM connection administration is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ListHsmConnections",
+      "grpc_handler": "list_hsm_connections",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "HSM connection administration is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "DeleteHsmConnection",
+      "grpc_handler": "delete_hsm_connection",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "HSM connection administration is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetHsmConnectionStatus",
+      "grpc_handler": "get_hsm_connection_status",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "HSM connection administration is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "RegisterNamespace",
+      "grpc_handler": "register_namespace",
+      "rest": null,
+      "gap": {
+        "kind": "stub",
+        "reason": "The handler logs and echoes the name without storing a namespace. The namespace registry is not implemented."
+      },
+      "stub_body_sha256": "3e5d4d3e0dd5f3a1e96c35e373098e7dacc5e08aebc91e9606ad23f4166f2467"
+    },
+    {
+      "rpc": "ListNamespaces",
+      "grpc_handler": "list_namespaces",
+      "rest": null,
+      "gap": {
+        "kind": "stub",
+        "reason": "The handler always returns an empty list; the namespace registry is not implemented."
+      },
+      "stub_body_sha256": "556f0a78905184164863f7c4960800c0f69c200b18c0704d75e59abd623d5319"
+    },
+    {
+      "rpc": "DescribeNamespace",
+      "grpc_handler": "describe_namespace",
+      "rest": null,
+      "gap": {
+        "kind": "stub",
+        "reason": "The handler always returns NotFound; the namespace registry is not implemented."
+      },
+      "stub_body_sha256": "e75c79ff47c9a9780a2896f7903ad120669b0e78065e7f462746f09b050ca041"
+    },
+    {
+      "rpc": "ListRotationJobs",
+      "grpc_handler": "list_rotation_jobs",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation-job coordination is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "AcknowledgeRotationJob",
+      "grpc_handler": "acknowledge_rotation_job",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation-job coordination is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "CompleteRotationJob",
+      "grpc_handler": "complete_rotation_job",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation-job coordination is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "FailRotationJob",
+      "grpc_handler": "fail_rotation_job",
+      "rest": null,
+      "gap": {
+        "kind": "existing_gap",
+        "reason": "Rotation-job coordination is exposed by this gRPC handler; the REST facade has no corresponding route."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ExplainRouting",
+      "grpc_handler": "explain_routing",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/routing/explain",
+        "handler": "explain_routing",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "GetKeyMaterial",
+      "grpc_handler": "get_key_material",
+      "rest": null,
+      "gap": {
+        "kind": "intentional",
+        "reason": "The 0.4.0 exportability API intentionally exposes this operation only through gRPC (CHANGELOG: key export API, gRPC only)."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "MakeKeyExportable",
+      "grpc_handler": "make_key_exportable",
+      "rest": null,
+      "gap": {
+        "kind": "intentional",
+        "reason": "The 0.4.0 exportability API intentionally exposes this operation only through gRPC (CHANGELOG: key export API, gRPC only)."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "RevokeKeyExportability",
+      "grpc_handler": "revoke_key_exportability",
+      "rest": null,
+      "gap": {
+        "kind": "intentional",
+        "reason": "The 0.4.0 exportability API intentionally exposes this operation only through gRPC (CHANGELOG: key export API, gRPC only)."
+      },
+      "stub_body_sha256": null
+    },
+    {
+      "rpc": "ImportKey",
+      "grpc_handler": "import_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/import",
+        "handler": "import_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    }
+  ],
+  "rest_only": [
+    {
+      "route": {
+        "method": "GET",
+        "path": "/healthz",
+        "handler": "healthz",
+        "feature": null
+      },
+      "reason": "HTTP health metadata endpoint; no corresponding KeyService RPC."
+    },
+    {
+      "route": {
+        "method": "GET",
+        "path": "/readyz",
+        "handler": "readyz",
+        "feature": null
+      },
+      "reason": "HTTP readiness probe for storage and provider access; no corresponding KeyService RPC."
+    },
+    {
+      "route": {
+        "method": "GET",
+        "path": "/metrics",
+        "handler": "metrics_handler",
+        "feature": null
+      },
+      "reason": "Prometheus HTTP scrape endpoint; no corresponding KeyService RPC."
+    }
+  ]
+}
