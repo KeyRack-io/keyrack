@@ -143,7 +143,8 @@ provider binding, and a parent in another security domain — ADR-0004 A2 requir
 one domain, and this is a refusal, not a deferred feature.
 
 Keys created before 0.5.0 that name a parent while holding independently
-resident material carry the earlier meaning. They are detectable, refused as
-wrapping parents by name, and reported at startup so an operator learns that
-migration is needed before traffic arrives rather than from a first failed use.
+resident material carry the earlier meaning. That material is what identifies
+them: they are refused as wrapping parents with a message naming the change, and
+listed at startup so an operator learns that migration is needed before traffic
+arrives rather than from a first failed use.
 There is no migration script until someone needs one.
