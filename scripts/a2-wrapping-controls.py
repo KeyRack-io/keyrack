@@ -20,8 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CORE = "crates/keyrack-core/src/provider/software.rs"
 DRIVER = "crates/keyrack-core/src/creation_driver.rs"
+SERVICE = "crates/keyrack-service/src/hierarchy.rs"
 CORE_TEST = ("keyrack-core", "software_wrapping")
 SQLITE_TEST = ("keyrack-sqlite", "software_wrapping_creation")
+SERVICE_TEST = ("keyrack-service", "wrapped_child_creation")
 
 
 @dataclass
@@ -195,6 +197,112 @@ CONTROLS = [
         suite=SQLITE_TEST,
         test="a_provider_that_cannot_evidence_closure_cannot_be_installed",
     ),
+    # ── the service half: what CreateKey with a parent refuses ──
+    #
+    # Several of these sit in front of an invariant the creation journal
+    # rechecks inside its own transaction. Removing one can therefore leave the
+    # outcome refused while changing what the caller is told; the run prints the
+    # observed failure so the two cases stay distinguishable.
+    Control(
+        name="service-profile-required",
+        guard="a provider with no configured wrapping profile cannot wrap",
+        file=SERVICE,
+        before="""    let profile = state.wrapping.require(provider_name)?;""",
+        after="""    let profile: &WrappingProfile = Box::leak(Box::new(WrappingProfile {
+        mechanism: WrappingIdentifier::new("software:aes-256-gcm:v1").unwrap(),
+        security_domain: WrappingIdentifier::new("test-single-process").unwrap(),
+    }));""",
+        suite=SERVICE_TEST,
+        test="a_provider_without_a_configured_profile_refuses_child_creation",
+    ),
+    Control(
+        name="service-same-domain",
+        guard="parent and child must be in one security domain",
+        file=SERVICE,
+        before="""    if child != parent {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_child_must_be_in_the_same_security_domain_as_its_parent",
+    ),
+    Control(
+        name="service-child-spec",
+        guard="only a symmetric encryption key can be a wrapped child",
+        file=SERVICE,
+        before="""    if !matches!(record.key_spec, KeySpec::Aes128 | KeySpec::Aes256) {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="only_symmetric_encryption_keys_can_be_children",
+    ),
+    Control(
+        name="service-exportable-child",
+        guard="a wrapped child cannot be exportable",
+        file=SERVICE,
+        before="""    if record.exportability != Exportability::NonExportable {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_child_cannot_be_exportable",
+    ),
+    Control(
+        name="service-exportable-parent",
+        guard="an exportable parent protects nothing it wraps",
+        file=SERVICE,
+        before="""    if parent.exportability != Exportability::NonExportable || parent.first_exported_at.is_some() {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="an_exportable_parent_cannot_wrap_children",
+    ),
+    Control(
+        name="service-legacy-parent",
+        guard="a parent whose binding predates 0.5.0 is refused by name",
+        file=SERVICE,
+        before="""    if parent.has_legacy_parent_semantics() {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_parent_created_before_0_5_0_is_refused_by_name",
+    ),
+    Control(
+        name="service-parent-state",
+        guard="a disabled or compromised parent cannot wrap children",
+        file=SERVICE,
+        before="""    if parent.state != KeyState::Enabled || parent.has_compromise_history() {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_disabled_or_compromised_parent_cannot_wrap_children",
+    ),
+    Control(
+        name="service-resident-parent",
+        guard="a wrapped key cannot itself wrap children",
+        file=SERVICE,
+        before="""    if !parent
+        .primary_version()
+        .is_some_and(|v| matches!(v.material, KeyMaterial::ProviderResident { .. }))
+    {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_wrapped_key_cannot_itself_wrap_children",
+    ),
+    Control(
+        name="startup-mechanism-declared",
+        guard="a provider must declare the mechanism it is activated with",
+        file=SERVICE,
+        before="""        if !declared
+            .tuples()
+            .iter()
+            .any(|tuple| tuple.mechanism == profile.mechanism && tuple.operation == operation)
+        {""",
+        after="""        if false {""",
+        suite=SERVICE_TEST,
+        test="a_declared_profile_the_provider_does_not_implement_refuses_at_startup",
+    ),
+    Control(
+        name="startup-closure-evidence",
+        guard="a provider that cannot evidence closure must not start activated",
+        file=SERVICE,
+        before="""    if provider.wrapping_closure_verifier().is_none() {""",
+        after="""    if false {""",
+        suite=SERVICE_TEST,
+        test="a_declared_profile_the_provider_does_not_implement_refuses_at_startup",
+    ),
 ]
 
 # The accept-all verifier the design refuses to ship. It exists only inside the
@@ -222,7 +330,7 @@ def main() -> int:
     parser.add_argument("--filter", default="")
     args = parser.parse_args()
 
-    dirty = run(["git", "status", "--porcelain", CORE, DRIVER]).stdout.strip()
+    dirty = run(["git", "status", "--porcelain", CORE, DRIVER, SERVICE]).stdout.strip()
     if dirty:
         print(f"refusing to run with uncommitted changes to the files under control:\n{dirty}")
         return 2

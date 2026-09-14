@@ -120,6 +120,7 @@ fn state() -> (Arc<ServiceState>, Arc<CountingPdp>) {
         max_plaintext_bytes: 4096,
         nats_publisher: None,
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, pdp)
 }

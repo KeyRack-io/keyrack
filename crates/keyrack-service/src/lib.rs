@@ -33,6 +33,7 @@ pub mod config;
 pub mod convert;
 pub mod domain;
 pub mod grpc;
+pub mod hierarchy;
 pub mod hsm_registration;
 pub mod identity_input;
 pub mod metrics;
