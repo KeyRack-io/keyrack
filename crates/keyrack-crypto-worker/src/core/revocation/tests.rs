@@ -38,11 +38,18 @@ impl MaterialSource for Source {
 }
 type TestWorker = Worker<Source, Arc<Time>>;
 fn setup() -> (TestWorker, SigningKey, Arc<Time>, Delivery<Arc<Time>>) {
+    setup_scoped(fixture::context().provider_ref, "development-only")
+}
+fn setup_scoped(
+    provider_ref: ProviderRef,
+    domain: &str,
+) -> (TestWorker, SigningKey, Arc<Time>, Delivery<Arc<Time>>) {
     let key = SigningKey::generate(&mut OsRng);
     let time = Arc::new(Time(AtomicU64::new(0)));
-    let worker = Worker::new(
+    let worker = Worker::new_scoped(
         key.verifying_key(),
-        "development-only".into(),
+        provider_ref,
+        domain.into(),
         Source,
         time.clone(),
         Limits {
@@ -63,8 +70,8 @@ fn command(worker: &TestWorker) -> RevocationCommand {
         authority: keyrack_core::custody::AuthorityIdentity {
             issuer: authority_key(worker.verifier).issuer,
             scope: AuthorityScope::SecurityDomain {
-                provider_ref: fixture::context().provider_ref,
-                security_domain: WrappingIdentifier::new("development-only").unwrap(),
+                provider_ref: worker.provider_ref.clone(),
+                security_domain: WrappingIdentifier::new(&worker.domain).unwrap(),
             },
             generation: NonZeroU64::new(2).unwrap(),
         },
@@ -367,6 +374,75 @@ fn grants_cannot_admit_another_provider_into_the_fenced_domain() {
     context.provider_ref = ProviderRef::new("other-provider");
     assert!(use_key(&mut worker, &key, 1, &context).is_err());
     assert!(worker.resident.is_empty());
+}
+
+#[test]
+fn configured_scope_does_not_trust_a_signed_fixture_scope_or_fence() {
+    let (mut worker, key, _, delivery) =
+        setup_scoped(ProviderRef::new("configured-vault"), "configured-domain");
+    let mut context = fixture::context();
+    context.provider_ref = worker.provider_ref.clone();
+    context.security_domain = WrappingIdentifier::new(&worker.domain).unwrap();
+    use_key(&mut worker, &key, 1, &context).unwrap();
+    let mut second = context.clone();
+    second.child.version = NonZeroU64::new(2).unwrap();
+    use_key(&mut worker, &key, 2, &second).unwrap();
+    for wrong in [
+        fixture::context(),
+        {
+            let mut wrong = context.clone();
+            wrong.provider_ref = ProviderRef::new("other-provider");
+            wrong
+        },
+        {
+            let mut wrong = context.clone();
+            wrong.security_domain = WrappingIdentifier::new("other-domain").unwrap();
+            wrong
+        },
+    ] {
+        assert!(use_key(&mut worker, &key, 3, &wrong).is_err());
+        assert_eq!(worker.sequence, 2);
+        assert_eq!(worker.resident.len(), 2);
+    }
+    let mut wrong = command(&worker);
+    wrong.authority.scope = AuthorityScope::SecurityDomain {
+        provider_ref: fixture::context().provider_ref,
+        security_domain: WrappingIdentifier::new("development-only").unwrap(),
+    };
+    assert!(worker.revoke(&signed(&key, wrong), &delivery).is_err());
+    assert!(!worker.fenced);
+    assert_eq!(worker.resident.len(), 2);
+    let command = command(&worker);
+    let receipt = worker
+        .revoke(&signed(&key, command.clone()), &delivery)
+        .unwrap();
+    let result = verify(&worker, &receipt, &command);
+    assert_eq!(result.authority.scope, command.authority.scope);
+    assert_eq!(result.observed_leases.len(), 2);
+    assert!(worker.resident.is_empty());
+    assert!(use_key(&mut worker, &key, 3, &context).is_err());
+}
+
+#[test]
+fn configured_scope_cannot_install_the_unrelated_fixture_creation_plan() {
+    let (mut worker, _, _, _) =
+        setup_scoped(ProviderRef::new("configured-vault"), "development-only");
+    assert!(worker
+        .reserve_creation(
+            crate::core::creation::CreationPlan {
+                operation: Uuid::new_v4(),
+                attempt: Uuid::new_v4(),
+                owner: keyrack_core::creation::CreationOwner {
+                    instance: Uuid::new_v4(),
+                    generation: 1,
+                },
+                envelope_ref: "reserved-envelope".into(),
+                principal: "alice".into(),
+            },
+            fixture::custody_context(&fixture::context()),
+        )
+        .is_err());
+    assert!(worker.creation_request().is_none());
 }
 
 #[test]

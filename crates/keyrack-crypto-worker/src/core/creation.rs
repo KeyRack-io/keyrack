@@ -130,6 +130,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             .require_profile(&[supported.profile])
             .map_err(|_| Error::Context)?;
         if context.wrapping != crate::fixture::context()
+            || context.wrapping.provider_ref != self.provider_ref
             || context.wrapping.security_domain.as_str() != self.domain
         {
             return Err(Error::Context);

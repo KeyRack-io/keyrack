@@ -10,7 +10,7 @@ use aes_gcm::{
 };
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use keyrack_core::{
-    key::KeySpec,
+    key::{KeySpec, ProviderRef},
     material::ParentWrappedMaterial,
     wrapping::{WrappedKeyFormat, WrappingContext, WrappingKeyPurpose},
 };
@@ -177,6 +177,7 @@ pub(crate) struct Limits {
 
 pub(crate) struct Worker<S, C> {
     pub(crate) instance: String,
+    provider_ref: ProviderRef,
     domain: String,
     verifier: VerifyingKey,
     observer: SigningKey,
@@ -199,6 +200,30 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         clock: C,
         limits: Limits,
     ) -> Result<Self, Error> {
+        Self::new_scoped(
+            verifier,
+            crate::fixture::context().provider_ref,
+            domain,
+            source,
+            clock,
+            limits,
+        )
+    }
+
+    /// Private trusted-launcher seam: the scope is fixed before admission and
+    /// never inferred from a submitted grant. This does not qualify a profile
+    /// or enable the provisional operation transcript for service use.
+    pub(crate) fn new_scoped(
+        verifier: VerifyingKey,
+        provider_ref: ProviderRef,
+        domain: String,
+        source: S,
+        clock: C,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        keyrack_core::wrapping::WrappingIdentifier::new(provider_ref.as_str())
+            .map_err(|_| Error::Context)?;
+        keyrack_core::wrapping::WrappingIdentifier::new(&domain).map_err(|_| Error::Context)?;
         if limits.resident_keys == 0
             || limits.residence_ms == 0
             || limits.uses_per_residency == 0
@@ -212,6 +237,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, incarnation);
         Ok(Self {
             instance,
+            provider_ref,
             domain,
             verifier,
             observer: SigningKey::generate(&mut OsRng),
@@ -282,7 +308,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             || grant.context_sha256 != binding
             || grant.operation != operation
             || grant.input_sha256 != digest(input)
-            || context.provider_ref != crate::fixture::context().provider_ref
+            || context.provider_ref != self.provider_ref
             || context.security_domain.as_str() != self.domain
             || context.child_spec != KeySpec::Aes256
             || context.key_format != WrappedKeyFormat::RawSecret
