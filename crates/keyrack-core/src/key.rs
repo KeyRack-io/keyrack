@@ -318,10 +318,23 @@ impl KeyVersionRecord {
     }
 }
 
+/// What an operator is told about a key whose parent binding predates 0.5.0.
+///
+/// One wording, used by the access refusal and the startup warning alike, so
+/// that the log an operator reads first and the error a caller sees name the
+/// same change.
+pub const LEGACY_PARENT_SEMANTICS: &str = "keys created before 0.5.0 have different parent \
+     semantics and require migration before use in 0.5 and later";
+
 /// The primary key record. Stored in the storage backend.
 ///
 /// `parent_lid` is stored, not recomputed — existing keys preserve their
 /// parent relationships even when rules change (see `MIGRATION.md`).
+///
+/// From 0.5.0 a parent binding means the version's material is wrapped under
+/// that parent (ADR-0004 A2). Records written under the earlier lineage-only
+/// meaning are detectable ([`KeyRecord::has_legacy_parent_semantics`]) and are
+/// refused rather than reinterpreted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyRecord {
     pub lid: Lid,
@@ -442,6 +455,22 @@ impl KeyRecord {
         self.key_versions
             .iter()
             .find(|v| v.version_number == version_number)
+    }
+
+    /// Whether this record's parent binding predates the 0.5.0 semantics.
+    ///
+    /// From 0.5.0, `parent_lid` means the material is wrapped under that
+    /// parent. A record that names a parent while holding independently
+    /// resident material was created under the earlier lineage-only meaning,
+    /// so its own binding no longer describes it. The two meanings cannot be
+    /// told apart by intent, only by what the material is.
+    #[must_use]
+    pub fn has_legacy_parent_semantics(&self) -> bool {
+        self.parent_lid.is_some()
+            && self
+                .key_versions
+                .iter()
+                .any(|v| matches!(v.material, KeyMaterial::ProviderResident { .. }))
     }
 
     /// Resolve the effective provider binding for a given key version.

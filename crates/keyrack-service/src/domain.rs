@@ -745,12 +745,6 @@ pub async fn create_key(
         .resolve(&provider_name)
         .map_err(DomainError::from)?;
 
-    let handle = entry
-        .provider
-        .generate_key(&input.key_spec)
-        .await
-        .map_err(DomainError::from)?;
-
     let parent_lid = input
         .parent_key_id
         .as_deref()
@@ -765,7 +759,7 @@ pub async fn create_key(
         _ => KeyUsage::SignVerify,
     };
 
-    let record = KeyRecord {
+    let mut record = KeyRecord {
         lid,
         canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
         parent_lid,
@@ -773,7 +767,7 @@ pub async fn create_key(
         current_key_version: 1,
         state: KeyState::Enabled,
         key_usage,
-        key_spec: input.key_spec,
+        key_spec: input.key_spec.clone(),
         origin: keyrack_core::key::KeyOrigin::KeyRack,
         provider_class: entry.class,
         provider_ref: Some(provider_name.clone()),
@@ -787,20 +781,37 @@ pub async fn create_key(
         updated_at: now,
         scheduled_deletion_at: None,
         description: input.description.unwrap_or_default(),
-        key_versions: vec![KeyVersionRecord::provider_resident(
-            1,
-            handle,
-            Some(provider_name.clone()),
-            now,
-            true,
-        )],
+        key_versions: Vec::new(),
     };
 
-    state
-        .storage
-        .create_key(&record)
-        .await
-        .map_err(DomainError::from)?;
+    // A parent means this key's material is wrapped under it, so there is no
+    // independent key to generate: the provider generates the child already
+    // wrapped, inside a journaled creation, or the request is refused.
+    let record = if parent_lid.is_some() {
+        let proposal = crate::hierarchy::ChildProposal::new(record)?;
+        crate::hierarchy::create_wrapped_child(state, &provider_name, &entry, proposal).await?
+    } else {
+        let handle = entry
+            .provider
+            .generate_key(&input.key_spec)
+            .await
+            .map_err(DomainError::from)?;
+        record
+            .key_versions
+            .push(KeyVersionRecord::provider_resident(
+                1,
+                handle,
+                Some(provider_name.clone()),
+                now,
+                true,
+            ));
+        state
+            .storage
+            .create_key(&record)
+            .await
+            .map_err(DomainError::from)?;
+        record
+    };
 
     if let Some(nats) = &state.nats_publisher {
         if let Err(e) = nats.publish_key_created(&lid).await {

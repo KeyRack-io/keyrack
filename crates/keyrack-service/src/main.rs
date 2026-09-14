@@ -64,6 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (state, custody_readiness) = build_state(&config, metrics_handle).await?;
     let state = Arc::new(state);
 
+    // Say at startup that stored keys carry the earlier meaning of a parent
+    // binding, so an operator learns it here rather than from a refused use.
+    keyrack_service::hierarchy::warn_about_legacy_parents(&state.storage).await;
+
     let grpc_addr = config.grpc_addr.parse()?;
     let rest_addr: std::net::SocketAddr = config.rest_addr.parse()?;
 
@@ -351,6 +355,7 @@ async fn build_provider(
     name: &str,
     cfg: &keyrack_service::config::ProviderConfig,
     audit: &Arc<dyn keyrack_core::audit::AuditSink>,
+    wrapping: Option<&keyrack_service::hierarchy::WrappingProfile>,
 ) -> Result<
     (
         Arc<dyn keyrack_core::provider::CryptoProvider>,
@@ -361,7 +366,17 @@ async fn build_provider(
     use keyrack_service::config::ProviderConfig;
     let (provider, class): (Arc<dyn keyrack_core::provider::CryptoProvider>, _) = match cfg {
         ProviderConfig::Software => (
-            Arc::new(keyrack_core::provider::software::SoftwareProvider::new()),
+            // Bound to its declared identity when it wraps, so a context naming
+            // another backend is refused instead of quietly served here.
+            match wrapping {
+                Some(profile) => {
+                    Arc::new(keyrack_core::provider::software::SoftwareProvider::scoped(
+                        keyrack_core::key::ProviderRef::new(name),
+                        profile.security_domain.clone(),
+                    ))
+                }
+                None => Arc::new(keyrack_core::provider::software::SoftwareProvider::new()),
+            },
             keyrack_core::key::ProviderClass::Software,
         ),
         ProviderConfig::InMemory => (
@@ -605,9 +620,33 @@ async fn build_state(
         .resolved_providers()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    // Which providers the operator activated for parent-wrapped child keys, and
+    // with which exact profile. Validated as configuration already; each one is
+    // checked against the provider it names once that provider exists.
+    let wrapping = keyrack_service::hierarchy::WrappingProfiles::new(
+        config
+            .wrapping
+            .iter()
+            .map(|profile| -> Result<_, Box<dyn std::error::Error>> {
+                Ok((
+                    ProviderRef::new(profile.provider.clone()),
+                    keyrack_service::hierarchy::WrappingProfile {
+                        mechanism: keyrack_core::wrapping::WrappingIdentifier::new(
+                            profile.mechanism.clone(),
+                        )?,
+                        security_domain: keyrack_core::wrapping::WrappingIdentifier::new(
+                            profile.security_domain.clone(),
+                        )?,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
     let mut entries: Vec<(ProviderRef, ProviderEntry)> = Vec::new();
     let mut custody_readiness = keyrack_service::readiness::CustodyReadiness::default();
     for np in &named_providers {
+        let name = ProviderRef::new(np.name.clone());
         let (provider, class) =
             if np.custody == keyrack_service::readiness::ProviderCustody::Customer {
                 if let Some(deferred) = keyrack_service::provider_startup::defer_remote_provider(
@@ -619,15 +658,19 @@ async fn build_state(
                 {
                     deferred
                 } else {
-                    let (provider, class) = build_provider(&np.name, &np.provider, &audit).await?;
+                    let (provider, class) = build_provider(&np.name, &np.provider, &audit, None).await?;
                     (
                         keyrack_service::provider_startup::defer_ready_provider(&np.name, provider),
                         class,
                     )
                 }
             } else {
-                build_provider(&np.name, &np.provider, &audit).await?
+                build_provider(&np.name, &np.provider, &audit, wrapping.get(&name)).await?
             };
+        if let Some(profile) = wrapping.get(&name) {
+            keyrack_service::hierarchy::verify_wrapping_profile(&name, profile, provider.as_ref())
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
         let class_str = provider_class_str(class);
         if config.provider_deny.iter().any(|d| d == class_str) {
             return Err(format!(
@@ -642,10 +685,7 @@ async fn build_state(
             np.custody,
         );
         tracing::info!(name = %np.name, class = class_str, "registered provider");
-        entries.push((
-            ProviderRef::new(np.name.clone()),
-            ProviderEntry { provider, class },
-        ));
+        entries.push((name, ProviderEntry { provider, class }));
     }
 
     let default_ref = ProviderRef::new(default_name.clone());
@@ -810,6 +850,7 @@ async fn build_state(
             max_plaintext_bytes: config.max_plaintext_bytes,
             legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
             nats_publisher,
+            wrapping,
         },
         custody_readiness,
     ))
