@@ -10,6 +10,8 @@ repository.workspace = true
 [features]
 default = []
 softhsm-tests = []
+# Unqualified native mechanism/lifecycle tests, never service capability admission.
+native-a2-conformance = []
 
 [dependencies]
 keyrack-core = { workspace = true }
@@ -23,6 +25,7 @@ zeroize = "1"
 
 [dev-dependencies]
 keyrack-test-support = { workspace = true }
+keyrack-sqlite = { workspace = true }
 
 [lints]
 workspace = true

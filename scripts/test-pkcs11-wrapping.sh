@@ -10,7 +10,8 @@ command -v softhsm2-util >/dev/null || {
 }
 
 if [[ -z "${KMS_PKCS11_LIB:-}" ]]; then
-    for candidate in /usr/lib/softhsm/libsofthsm2.so \
+    for candidate in /opt/homebrew/lib/softhsm/libsofthsm2.so \
+        /usr/lib/softhsm/libsofthsm2.so \
         /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
         /usr/lib/aarch64-linux-gnu/softhsm/libsofthsm2.so; do
         if [[ -f "$candidate" ]]; then
@@ -18,6 +19,22 @@ if [[ -z "${KMS_PKCS11_LIB:-}" ]]; then
             break
         fi
     done
+fi
+
+# Fail before creating a token if the native owner test was removed, renamed or
+# ignored. A successful cargo invocation that ran no test is not conformance.
+native_test=provider::native_a2::tests::native_a2_soft_hsm
+native_listing=$(cargo test --locked -p keyrack-pkcs11 \
+    --features softhsm-tests,native-a2-conformance --lib -- --list)
+[[ $(printf '%s\n' "$native_listing" | grep -Fxc "$native_test: test") == 1 ]] || {
+    echo "Expected native A2 conformance test missing." >&2
+    exit 1
+}
+native_ignored=$(cargo test --locked -p keyrack-pkcs11 \
+    --features softhsm-tests,native-a2-conformance --lib -- --ignored --list)
+if printf '%s\n' "$native_ignored" | grep -Fq "$native_test: test"; then
+    echo "Native A2 conformance test must not be ignored." >&2
+    exit 1
 fi
 if [[ -z "${KMS_PKCS11_LIB:-}" || ! -f "$KMS_PKCS11_LIB" ]]; then
     echo "Set KMS_PKCS11_LIB to the SoftHSM2 module." >&2
@@ -48,3 +65,8 @@ softhsm2-util --init-token --free --label "$KMS_PKCS11_TOKEN_LABEL" \
 
 cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
     --test wrapping_probe -- --nocapture --test-threads=1
+
+# Same disposable stack, but a separate test process: no independent C_Initialize
+# or token-wide login race with the earlier direct-mechanism probe.
+cargo test --locked -p keyrack-pkcs11 --features softhsm-tests,native-a2-conformance \
+    --lib "$native_test" -- --exact --nocapture --test-threads=1
