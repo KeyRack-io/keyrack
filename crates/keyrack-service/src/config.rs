@@ -128,6 +128,45 @@ pub struct ServiceConfig {
     /// Each use emits a best-effort audit marker and warning. Default off.
     #[serde(default)]
     pub legacy_compromised_key_decrypt: bool,
+
+    /// Providers that may hold child keys wrapped under a parent (ADR-0004 A2).
+    ///
+    /// Absent — the default — means `CreateKey` with a `parent_key_id` is
+    /// refused. Creating keys that exist only inside a wrapping hierarchy is a
+    /// deployment decision with its own recovery properties, so it is stated
+    /// here rather than implied by whatever a provider happens to support.
+    #[serde(default)]
+    pub wrapping: Vec<WrappingProfileConfig>,
+}
+
+/// Activation of parent-wrapped child keys on one named provider.
+///
+/// Both values are written into every child's durable descriptor, so they are
+/// declared rather than derived: `mechanism` must be one the provider actually
+/// implements (startup checks this and refuses to start otherwise), and
+/// `security_domain` names the backend that can unwrap the material.
+///
+/// YAML example:
+/// ```yaml
+/// wrapping:
+///   - provider: default
+///     mechanism: software:aes-256-gcm:v1
+///     security_domain: dev-single-process
+/// ```
+///
+/// The software mechanism unwraps children into the service process's memory
+/// for the length of a lease. It makes the path usable for development and
+/// conformance; it is not custody, and a deployment that configures it has a
+/// hierarchy in shape only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WrappingProfileConfig {
+    /// Name of the provider this profile activates.
+    pub provider: String,
+    /// Exact wrapping mechanism identifier the provider must declare.
+    pub mechanism: String,
+    /// Identifier of the security domain the provider's material lives in.
+    pub security_domain: String,
 }
 
 /// A named provider entry in the `providers` list.
@@ -226,6 +265,7 @@ impl Default for ServiceConfig {
             audit_signing_key_ephemeral: false,
             dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
+            wrapping: Vec::new(),
         }
     }
 }
@@ -258,6 +298,52 @@ impl ServiceConfig {
         self.resolved_pdp()?;
         self.validate_audit_signing()?;
         self.validate_provider_durability()?;
+        self.validate_wrapping()?;
+        Ok(())
+    }
+
+    /// Check that each wrapping profile names one configured provider once,
+    /// with identifiers that can be written into a durable descriptor.
+    ///
+    /// Whether the named provider implements the mechanism is decided at
+    /// startup against the live provider, not here: only the provider knows.
+    ///
+    /// # Errors
+    /// Returns a configuration error for an unknown or repeated provider, or
+    /// for a mechanism or security domain that is not a valid identifier.
+    pub fn validate_wrapping(&self) -> Result<(), String> {
+        if self.wrapping.is_empty() {
+            return Ok(());
+        }
+        let (providers, _) = self.resolved_providers()?;
+        let mut seen = std::collections::BTreeSet::new();
+        for profile in &self.wrapping {
+            if !providers.iter().any(|p| p.name == profile.provider) {
+                return Err(format!(
+                    "config error: `wrapping` names provider '{}', which is not configured",
+                    profile.provider
+                ));
+            }
+            if !seen.insert(profile.provider.clone()) {
+                return Err(format!(
+                    "config error: provider '{}' has more than one wrapping profile; \
+                     a child's descriptor records one mechanism and one security domain",
+                    profile.provider
+                ));
+            }
+            for (field, value) in [
+                ("mechanism", &profile.mechanism),
+                ("security_domain", &profile.security_domain),
+            ] {
+                keyrack_core::wrapping::WrappingIdentifier::new(value.clone()).map_err(|e| {
+                    format!(
+                        "config error: `wrapping` {field} '{value}' for provider '{}' is not a \
+                         valid identifier: {e}",
+                        profile.provider
+                    )
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -785,6 +871,7 @@ mod tests {
             audit_signing_key_ephemeral: false,
             dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
+            wrapping: Vec::new(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();
@@ -902,6 +989,93 @@ provider_routing:
         assert_eq!(
             config.provider_routing[0].provider.as_deref(),
             Some("tenant-b")
+        );
+    }
+
+    #[test]
+    fn wrapping_is_absent_by_default_so_child_creation_is_off() {
+        let config = ServiceConfig::from_yaml("provider:\n  type: software\n").unwrap();
+        assert!(
+            config.wrapping.is_empty(),
+            "wrapping must never be implied by a provider that could do it"
+        );
+        config.validate_wrapping().unwrap();
+    }
+
+    #[test]
+    fn a_wrapping_profile_parses_and_names_a_configured_provider() {
+        let yaml = r"
+provider:
+  type: software
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev-single-process
+";
+        let config = ServiceConfig::from_yaml(yaml).unwrap();
+        config.validate_wrapping().unwrap();
+        assert_eq!(config.wrapping[0].provider, "default");
+        assert_eq!(config.wrapping[0].mechanism, "software:aes-256-gcm:v1");
+        assert_eq!(config.wrapping[0].security_domain, "dev-single-process");
+    }
+
+    #[test]
+    fn a_wrapping_profile_for_an_unknown_provider_is_refused() {
+        let yaml = r"
+provider:
+  type: software
+wrapping:
+  - provider: nonexistent
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev
+";
+        let error = ServiceConfig::from_yaml(yaml)
+            .unwrap()
+            .validate_wrapping()
+            .unwrap_err();
+        assert!(error.contains("not configured"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn one_provider_cannot_have_two_wrapping_profiles() {
+        let yaml = r"
+provider:
+  type: software
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: other-domain
+";
+        let error = ServiceConfig::from_yaml(yaml)
+            .unwrap()
+            .validate_wrapping()
+            .unwrap_err();
+        assert!(
+            error.contains("more than one wrapping profile"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn a_wrapping_identifier_that_cannot_be_stored_is_refused() {
+        let yaml = r"
+provider:
+  type: software
+wrapping:
+  - provider: default
+    mechanism: ''
+    security_domain: dev
+";
+        let error = ServiceConfig::from_yaml(yaml)
+            .unwrap()
+            .validate_wrapping()
+            .unwrap_err();
+        assert!(
+            error.contains("is not a valid identifier"),
+            "unexpected: {error}"
         );
     }
 

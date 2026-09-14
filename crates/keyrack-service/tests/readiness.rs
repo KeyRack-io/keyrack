@@ -99,6 +99,7 @@ fn state(providers: Arc<dyn ProviderRegistry>) -> Arc<ServiceState> {
             .handle(),
         max_plaintext_bytes: 4096,
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
         nats_publisher: None,
     })
 }
