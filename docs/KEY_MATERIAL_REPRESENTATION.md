@@ -1,11 +1,14 @@
 # Key-version material representation
 
 Status: implementation foundation on the hierarchy feature branch. Creating a
-parent-wrapped child is **not** reachable from the API: no service path builds
-one. What now exists below that line is the provider contract and one
-unqualified software implementation of it, described in
-[Wrapping operations](#wrapping-operations). No production wrapping profile,
-rewrap saga, or hierarchical erasure guarantee is implemented.
+parent-wrapped child is now reachable from `CreateKey`, on a provider the
+deployment explicitly activated, and is refused everywhere else; see
+[Wrapping operations](#wrapping-operations) for the provider contract and
+[Creating a child](#creating-a-child) for the service path. A created child is
+**not yet usable**: the data plane still refuses wrapped versions, so the lease
+path is the next increment and the two ship together. No production wrapping
+profile, rewrap saga, or hierarchical erasure guarantee is implemented, and the
+only implementation of the operations is software, which is not custody.
 
 ## Exclusive representation
 
@@ -98,3 +101,49 @@ is not at all. Nothing in this tranche makes a wrapped child provider-contained,
 and no provider with a custody boundary implements these operations yet:
 `keyrack-pkcs11` has no wrap or unwrap at all, and by ADR-0007 D4 Vault's
 hierarchy is worker-mediated rather than provider-native.
+
+## Creating a child
+
+From 0.5.0, `parent_key_id` on `CreateKey` means the child's material is wrapped
+under that parent. It is not a lineage annotation, and there is no separate
+field that carries the old meaning: a caller that sends a parent is asking for
+wrapped material and gets it or gets a refusal. All three surfaces — the domain
+path, gRPC and REST — take the same branch, so the semantics cannot hold on one
+surface and not another.
+
+Wrapping is activated per provider in configuration, never inferred:
+
+```yaml
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev-single-process
+```
+
+Both values are written into every child's descriptor, which is why they are
+declared rather than derived from a provider name that a later reconfiguration
+could reuse. Startup checks the named provider against the profile and refuses
+to start if it does not declare that mechanism for generate, open and close, or
+cannot evidence its own closures; a software mechanism logs that the hierarchy
+it forms is shape only. With no `wrapping:` block — the default — creating a key
+with a parent is refused everywhere.
+
+A child is then created through the crash-safe creation journal: reserve, stage
+the wrapped envelope, resolve against verified closure evidence, publish. The
+envelope lives in the journal row, which is what the descriptor's opaque
+reference names, and the version records the exact parent version it was wrapped
+under. A creation that ends unresolved is reported as such rather than as
+failure, because its durable claim needs reconciliation, not a retry.
+
+The refusals are deliberate, and each is tested separately: a provider with no
+profile, a provider that does not implement the profile, a child that is not a
+symmetric encryption key, an exportable child, an exportable parent, a parent
+that is not enabled, a parent that is itself wrapped, a parent with no explicit
+provider binding, and a parent in another security domain — ADR-0004 A2 requires
+one domain, and this is a refusal, not a deferred feature.
+
+Keys created before 0.5.0 that name a parent while holding independently
+resident material carry the earlier meaning. They are detectable, refused as
+wrapping parents by name, and reported at startup so an operator learns that
+migration is needed before traffic arrives rather than from a first failed use.
+There is no migration script until someone needs one.

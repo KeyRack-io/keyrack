@@ -377,8 +377,6 @@ async fn create_key(
 
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
 
-            let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
-
             let parent_lid = body.get("parent_key_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
@@ -405,7 +403,7 @@ async fn create_key(
                     .map_err(|e| e.to_rest_error())?;
             }
 
-            let record = keyrack_core::key::KeyRecord {
+            let mut record = keyrack_core::key::KeyRecord {
                 lid,
                 canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
                 parent_lid,
@@ -413,7 +411,7 @@ async fn create_key(
                 current_key_version: 1,
                 state: keyrack_core::key::KeyState::Enabled,
                 key_usage,
-                key_spec: spec,
+                key_spec: spec.clone(),
                 origin: keyrack_core::key::KeyOrigin::KeyRack,
                 provider_class: entry.class,
                 provider_ref: Some(provider_name.clone()),
@@ -431,22 +429,37 @@ async fn create_key(
                 updated_at: now,
                 scheduled_deletion_at: None,
                 description: desc,
-                key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true)],
+                key_versions: Vec::new(),
             };
 
-            // Born-exportable double-gate + leaf-only + provider wiring.
-            if exportable {
-                crate::domain::enforce_born_exportable(
-                    &state,
-                    &record,
-                    &principal_for_export_gate,
-                    &entry.provider,
-                )
-                .await
-                .map_err(|e| e.to_rest_error())?;
-            }
+            // A parent means this key's material is wrapped under it: there is
+            // no independent key to generate, and the provider must implement
+            // the configured wrapping profile or be refused.
+            let record = if parent_lid.is_some() {
+                let proposal = crate::hierarchy::ChildProposal::new(record)
+                    .map_err(|e| e.to_rest_error())?;
+                crate::hierarchy::create_wrapped_child(&state, &provider_name, &entry, proposal)
+                    .await
+                    .map_err(|e| e.to_rest_error())?
+            } else {
+                let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
+                record.key_versions.push(keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true));
 
-            state.storage.create_key(&record).await.map_err(map_core_err)?;
+                // Born-exportable double-gate + leaf-only + provider wiring.
+                if exportable {
+                    crate::domain::enforce_born_exportable(
+                        &state,
+                        &record,
+                        &principal_for_export_gate,
+                        &entry.provider,
+                    )
+                    .await
+                    .map_err(|e| e.to_rest_error())?;
+                }
+
+                state.storage.create_key(&record).await.map_err(map_core_err)?;
+                record
+            };
             Ok((StatusCode::CREATED, key_json(&record)))
         },
     ).await
