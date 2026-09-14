@@ -2829,6 +2829,7 @@ dependencies = [
  "async-trait",
  "cryptoki",
  "keyrack-core",
+ "keyrack-sqlite",
  "keyrack-test-support",
  "thiserror 2.0.18",
  "tokio",
