@@ -400,7 +400,6 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
     let verifier = provider.wrapping_closure_verifier().unwrap();
     let context = request.context().unwrap();
 
-    // An object this incarnation never issued.
     let claim = |object: &str, digest: [u8; 32]| A2ClosureClaim {
         intent_fingerprint: request.fingerprint().unwrap(),
         envelope_digest: digest,
@@ -408,9 +407,19 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
             object: object.to_owned(),
         },
     };
-    assert!(verifier
-        .verify(&request, &claim("kr-sw-a2-invented-1", [0; 32]))
-        .is_err());
+
+    // An object no incarnation of this provider issued, and one this provider
+    // never recorded destroying, are refused for distinguishable reasons. The
+    // difference matters to whoever has to reconcile: the first claim is about
+    // something else entirely, the second is about an object of ours that we
+    // cannot speak for, which is what a claim from a previous process looks
+    // like.
+    let foreign = format!("kr-sw-a2-{}-1", Uuid::new_v4());
+    let error = verifier
+        .verify(&request, &claim(&foreign, [0; 32]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("did not issue"), "{error}");
 
     // An object that was opened rather than generated: closing it is not
     // evidence that a creation attempt was cleaned up.
@@ -435,6 +444,14 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
         panic!("unexpected closure fact");
     };
     assert!(verifier.verify(&request, &claim(object, [1; 32])).is_err());
+
+    // Issued here, but never recorded as destroyed.
+    let (prefix, _) = object.rsplit_once('-').unwrap();
+    let error = verifier
+        .verify(&request, &claim(&format!("{prefix}-99999"), digest))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no recorded destruction"), "{error}");
 
     // The right object and bytes, but presented for a different creation: the
     // recorded context, not the object identity, is what ties them together.
