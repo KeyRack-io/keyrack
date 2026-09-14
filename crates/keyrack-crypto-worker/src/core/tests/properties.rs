@@ -146,7 +146,7 @@ proptest! {
             prop_assert_eq!(worker.source.calls,calls);
             prop_assert_eq!(worker.next_lease,lease);
             prop_assert!(worker.resident.len() <= capacity);
-            let actual: BTreeMap<_,_> = worker.resident.iter().map(|(k,v)|(*k,(v.until,v.lease,v.uses))).collect();
+            let actual: BTreeMap<_,_> = worker.resident.iter().map(|(k,v)|(*k,(v.until,v.lease.counter.get(),v.uses))).collect();
             prop_assert_eq!(&actual,&model);
             prop_assert!(actual.values().all(|v|v.2 <= 3));
         }

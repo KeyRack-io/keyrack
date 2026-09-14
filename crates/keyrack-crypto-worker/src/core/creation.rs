@@ -165,8 +165,8 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
 
     pub(crate) fn observation_key(&self) -> EvidenceKey {
         EvidenceKey {
-            issuer: WrappingIdentifier::new("development-worker-observation").unwrap(),
-            key_id: WrappingIdentifier::new("incarnation-key").unwrap(),
+            issuer: self.trust.observer_issuer.clone(),
+            key_id: self.trust.observer_key_id.clone(),
             key: self.observer.verifying_key(),
         }
     }
@@ -174,13 +174,12 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
     fn check_creation(&self, grant: &AuthorityGrant) -> Result<(), Error> {
         let r = self.creation.as_ref().ok_or(Error::Context)?;
         let expected_authority = AuthorityIdentity {
-            issuer: authority_key(self.verifier).issuer,
+            issuer: self.trust.authority.issuer.clone(),
             scope: AuthorityScope::SecurityDomain {
                 provider_ref: r.context.wrapping.provider_ref.clone(),
                 security_domain: r.context.wrapping.security_domain.clone(),
             },
-            // Trusted harness policy, not bootstrapped from a coordinator claim.
-            generation: std::num::NonZeroU64::new(1).unwrap(),
+            generation: self.generation,
         };
         if grant.authority != expected_authority {
             return Err(Error::Authority);
@@ -205,11 +204,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         {
             return Err(Error::Expired);
         }
-        if self.fenced
-            || self
-                .generation
-                .is_some_and(|g| g != grant.authority.generation.get())
-        {
+        if self.fenced {
             return Err(Error::Replay);
         }
         Ok(())
@@ -222,7 +217,7 @@ impl<S: NativeGeneration, C: Clock> Worker<S, C> {
             .map_err(|_| Error::Authority)?;
         let authenticated = evidence
             .clone()
-            .authenticate(&authority_key(self.verifier))
+            .authenticate(&self.trust.authority)
             .map_err(|_| Error::Authority)?;
         let grant = authenticated.claims();
         self.check_creation(grant)?;
@@ -234,7 +229,6 @@ impl<S: NativeGeneration, C: Clock> Worker<S, C> {
         // material remains unresolved. A new sequence cannot generate again.
         r.state = AttemptState::Consumed;
         self.sequence = grant.sequence.get();
-        self.generation = Some(grant.authority.generation.get());
         let context = r.context.clone();
         let envelope_ref =
             WrappingIdentifier::new(&r.plan.envelope_ref).map_err(|_| Error::Context)?;
@@ -255,9 +249,10 @@ impl<S: NativeGeneration, C: Clock> Worker<S, C> {
         claims
             .check_attempt(&r.expected, r.plan.owner, &material)
             .map_err(|_| Error::Material)?;
+        let observer = self.observation_key();
         let mut result = Evidence {
-            issuer: WrappingIdentifier::new("development-worker-observation").unwrap(),
-            key_id: WrappingIdentifier::new("incarnation-key").unwrap(),
+            issuer: observer.issuer,
+            key_id: observer.key_id,
             claims,
             signature: [0; 64],
         };
