@@ -6,6 +6,30 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Added
 
+- **Wrapping operations exist and can be called.** `crates/keyrack-core` defined
+  `WrappingContext`, the capability tuples and `WrappingCapabilities::require()`,
+  and storage and the creation journal handled `ParentWrapped` material, but
+  `CryptoProvider` had only `wrapping_capabilities()` — a complete contract with
+  no operation any caller could invoke, so no provider implemented one. The three
+  ADR-0005 operations `generate_wrapped_key`, `open_wrapped_key` and
+  `close_wrapped_key` are now on the trait, refusing by default so untouched
+  providers fail closed, and `WrappingCreationProvider` drives the existing
+  creation journal from them. Closure evidence comes from the provider's own
+  verifier and a provider without one cannot be installed, so no adapter turns a
+  successful call into proof that a creation object was cleaned up. Preflight
+  requires Generate, Open and Close together: a child that cannot be opened
+  again must not be created.
+- **The software provider implements them, which activates the path and is not
+  custody.** The mechanism is `software:aes-256-gcm:v1` — the name leads with
+  `software` so a capability dump reads as unqualified on sight — and it declares
+  the `SessionObject` lifetime because that is what is true: the child is
+  unwrapped into the same process heap that holds the parent, and stays there
+  until the lease is closed. A software-wrapped child is exactly as contained as
+  the parent wrapping it, which is not at all. No provider with a custody
+  boundary implements these operations yet, so the KEK-wrapping-hierarchy claim
+  stays down; it returns when one does, not because a mechanism exists.
+  Creating a wrapped child is still not reachable from the API.
+
 - **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
   parsed and then failed at startup with "KMIP provider not yet implemented",
   so no deployment could use the backend the operator guide documents. Both

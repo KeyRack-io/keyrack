@@ -27,16 +27,23 @@
 //! **Not for production HSM-grade security** — use `keyrack-pkcs11`
 //! or `keyrack-kmip` for that.
 
+use crate::creation::{invalid, A2ClosureClaim, A2ClosureFact, A2ClosureVerifier, CreationRequest};
 use crate::error::{KeyRackError, Result};
-use crate::key::KeySpec;
+use crate::key::{KeySpec, ProviderRef};
 use crate::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability, MacAlgorithm,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, EncryptOutput, GeneratedWrappedKey, KeyHandle,
+    KeySpecCapability, MacAlgorithm, ProviderCapabilities, SigningAlgorithm, WrappedKeyClosure,
+    WrappedKeyLease,
 };
 use crate::sensitive::Sensitive;
+use crate::wrapping::{
+    WrappedKeyFormat, WrappedKeyLifecycle, WrappingCapabilities, WrappingCapability,
+    WrappingContext, WrappingContextVersion, WrappingIdentifier, WrappingKeyPurpose,
+    WrappingOperation,
+};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -144,9 +151,104 @@ where
         })
 }
 
+/// Exact mechanism identity of the software wrapping profile.
+///
+/// The name leads with `software` on purpose. This mechanism wraps a child
+/// under an AES-256 parent that is itself held in this process's heap, and
+/// unwraps the child back into that heap for the life of a lease. It activates
+/// the hierarchy path; it contains nothing. A capability dump that shows this
+/// mechanism is showing an unqualified backend, not provider-contained custody.
+pub const SOFTWARE_WRAPPING_MECHANISM: &str = "software:aes-256-gcm:v1";
+
+/// Bound on remembered closure records. Exceeding it evicts the oldest, after
+/// which that object's closure can no longer be evidenced or re-closed.
+const MAX_RECORDED_CLOSURES: usize = 4096;
+
+/// Exact wrapped-child envelope length: 12-byte nonce, 32-byte child, 16-byte tag.
+const SOFTWARE_ENVELOPE_BYTES: usize = 12 + 32 + 16;
+
+/// Whether an object was created by generation or by opening stored material.
+/// Only a generation object can evidence the closure of a creation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectOrigin {
+    Generated,
+    Opened,
+}
+
+/// Bindings of one transient child object, held only in process memory.
+#[derive(Debug, Clone, Copy)]
+struct ObjectBinding {
+    context_sha256: [u8; 32],
+    envelope_blake3: [u8; 32],
+    origin: ObjectOrigin,
+}
+
+/// Open and closed child objects for this provider incarnation.
+#[derive(Debug, Default)]
+struct WrappingState {
+    open: HashMap<String, ObjectBinding>,
+    closed: HashMap<String, ObjectBinding>,
+    closed_order: VecDeque<String>,
+    issued: u64,
+}
+
+impl WrappingState {
+    fn record_closed(&mut self, object: String, binding: ObjectBinding) {
+        if self.closed_order.len() >= MAX_RECORDED_CLOSURES {
+            if let Some(evicted) = self.closed_order.pop_front() {
+                self.closed.remove(&evicted);
+            }
+        }
+        self.closed_order.push_back(object.clone());
+        self.closed.insert(object, binding);
+    }
+}
+
+/// Optional provider identity, so a context naming a different backend is
+/// refused rather than served. Unscoped providers rely on the caller having
+/// resolved them and on the context being authenticated as wrapping AAD.
+#[derive(Debug, Clone)]
+struct WrappingScope {
+    provider_ref: ProviderRef,
+    security_domain: WrappingIdentifier,
+}
+
+/// The wrapping profile this provider implements, one tuple per operation it
+/// can actually perform. `Rewrap` is absent because it is not implemented.
+fn software_wrapping_capabilities() -> WrappingCapabilities {
+    let mechanism = WrappingIdentifier::new(SOFTWARE_WRAPPING_MECHANISM)
+        .expect("software wrapping mechanism is a valid identifier");
+    let tuples = [
+        WrappingOperation::Generate,
+        WrappingOperation::Open,
+        WrappingOperation::Close,
+    ]
+    .into_iter()
+    .map(|operation| WrappingCapability {
+        parent_spec: KeySpec::Aes256,
+        child_spec: KeySpec::Aes256,
+        key_format: WrappedKeyFormat::RawSecret,
+        purpose: WrappingKeyPurpose::EncryptDecrypt,
+        mechanism: mechanism.clone(),
+        context_version: WrappingContextVersion::V1,
+        operation,
+        // The child is unwrapped into this process's memory and stays there
+        // until the lease is closed or the process exits. That is a session
+        // object; it is not a journaled temporary object in a backend.
+        lifecycle: WrappedKeyLifecycle::SessionObject,
+    })
+    .collect();
+    WrappingCapabilities::new(tuples).expect("software wrapping profile is structurally valid")
+}
+
 /// Pure-Rust software crypto provider.
 pub struct SoftwareProvider {
     keys: RwLock<HashMap<String, KeyMaterial>>,
+    /// Distinguishes this process's objects from any other incarnation's. A
+    /// restart invalidates every object and every closure record it issued.
+    incarnation: Uuid,
+    scope: Option<WrappingScope>,
+    wrapping: Arc<RwLock<WrappingState>>,
 }
 
 impl SoftwareProvider {
@@ -154,6 +256,23 @@ impl SoftwareProvider {
     pub fn new() -> Self {
         Self {
             keys: RwLock::new(HashMap::new()),
+            incarnation: Uuid::new_v4(),
+            scope: None,
+            wrapping: Arc::new(RwLock::new(WrappingState::default())),
+        }
+    }
+
+    /// Bind this provider to one exact provider ref and security domain, so a
+    /// wrapping context naming another backend is refused. This is an identity
+    /// check on metadata, not an isolation boundary.
+    #[must_use]
+    pub fn scoped(provider_ref: ProviderRef, security_domain: WrappingIdentifier) -> Self {
+        Self {
+            scope: Some(WrappingScope {
+                provider_ref,
+                security_domain,
+            }),
+            ..Self::new()
         }
     }
 
@@ -169,6 +288,164 @@ impl SoftwareProvider {
             .get(&handle.key_id)
             .ok_or_else(|| KeyRackError::Provider(format!("key not found: {}", handle.key_id)))?;
         extract(mat).ok_or_else(|| KeyRackError::Provider("key type mismatch".into()))
+    }
+
+    /// Refuse an undeclared tuple, a context that names another backend, or a
+    /// parent handle that is not the spec the context binds; otherwise return
+    /// the canonical context bytes to authenticate the wrapping with.
+    fn admit(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        operation: WrappingOperation,
+    ) -> Result<Vec<u8>> {
+        self.wrapping_capabilities()
+            .require(&WrappingCapability::requested(
+                context,
+                operation,
+                WrappedKeyLifecycle::SessionObject,
+            ))
+            .map_err(|e| KeyRackError::Provider(format!("software wrapping refused: {e}")))?;
+        if let Some(scope) = &self.scope {
+            if scope.provider_ref != context.provider_ref
+                || scope.security_domain != context.security_domain
+            {
+                return Err(KeyRackError::Provider(
+                    "software wrapping refused: context names another provider or security domain"
+                        .into(),
+                ));
+            }
+        }
+        if parent.key_spec != context.parent_spec {
+            return Err(KeyRackError::Provider(
+                "software wrapping refused: parent handle is not the spec bound by the context"
+                    .into(),
+            ));
+        }
+        context
+            .canonical_bytes()
+            .map_err(|e| KeyRackError::Provider(format!("software wrapping refused: {e}")))
+    }
+
+    fn seal_under_parent(&self, parent: &KeyHandle, child: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        let keys = self
+            .keys
+            .read()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+        Self::get_material(&keys, parent, |m| match m {
+            KeyMaterial::Aes256(k) => Some(gcm_encrypt::<Aes256Gcm>(k, child, aad)),
+            _ => None,
+        })?
+    }
+
+    fn open_under_parent(
+        &self,
+        parent: &KeyHandle,
+        envelope: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let keys = self
+            .keys
+            .read()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+        Self::get_material(&keys, parent, |m| match m {
+            KeyMaterial::Aes256(k) => Some(gcm_decrypt::<Aes256Gcm>(k, envelope, aad)),
+            _ => None,
+        })?
+    }
+
+    /// Hold an unwrapped child in process memory under a fresh object identity
+    /// and return the lease that owes a close.
+    fn retain_child(
+        &self,
+        context: &WrappingContext,
+        child: KeyMaterial,
+        envelope: &[u8],
+        origin: ObjectOrigin,
+    ) -> Result<WrappedKeyLease> {
+        let binding = ObjectBinding {
+            context_sha256: context
+                .context_sha256()
+                .map_err(|e| KeyRackError::Provider(format!("invalid wrapping context: {e}")))?,
+            envelope_blake3: *blake3::hash(envelope).as_bytes(),
+            origin,
+        };
+        // Lock order is wrapping state, then keys; every wrapping path keeps it.
+        let object = {
+            let mut state = self
+                .wrapping
+                .write()
+                .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+            state.issued = state
+                .issued
+                .checked_add(1)
+                .ok_or_else(|| KeyRackError::Provider("object identities exhausted".into()))?;
+            let object = format!("kr-sw-a2-{}-{}", self.incarnation, state.issued);
+            state.open.insert(object.clone(), binding);
+            object
+        };
+        self.keys
+            .write()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
+            .insert(object.clone(), child);
+        WrappedKeyLease::new(
+            KeyHandle {
+                key_id: object.clone(),
+                key_spec: context.child_spec.clone(),
+            },
+            WrappingIdentifier::new(object)
+                .map_err(|e| KeyRackError::Provider(format!("invalid object identity: {e}")))?,
+            context,
+        )
+    }
+}
+
+/// Verifies closure facts this provider incarnation actually recorded.
+///
+/// Evidence is a process-memory record of a destruction this incarnation
+/// performed. It is deliberately unable to speak for any other incarnation: a
+/// claim about an object from a previous process is refused rather than assumed
+/// from the fact that the process is gone, which leaves an interrupted creation
+/// to explicit reconciliation instead of inferring cleanup.
+struct SoftwareClosureVerifier {
+    incarnation: Uuid,
+    state: Arc<RwLock<WrappingState>>,
+}
+
+impl A2ClosureVerifier for SoftwareClosureVerifier {
+    fn verify(&self, request: &CreationRequest, claim: &A2ClosureClaim) -> Result<()> {
+        let A2ClosureFact::TemporaryObjectDestroyed { object } = &claim.fact else {
+            return Err(invalid("software closure must destroy a temporary object"));
+        };
+        if !object.starts_with(&format!("kr-sw-a2-{}-", self.incarnation)) {
+            return Err(invalid(
+                "closure names an object this provider incarnation did not issue",
+            ));
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| invalid("wrapping state lock poisoned"))?;
+        let binding = state
+            .closed
+            .get(object)
+            .ok_or(invalid("no recorded destruction for the closed object"))?;
+        if binding.origin != ObjectOrigin::Generated {
+            return Err(invalid(
+                "closure names an opened object, not a creation object",
+            ));
+        }
+        if binding.envelope_blake3 != claim.envelope_digest {
+            return Err(invalid("closure does not bind the staged envelope"));
+        }
+        let expected = request
+            .context()?
+            .context_sha256()
+            .map_err(|_| invalid("invalid creation context"))?;
+        if binding.context_sha256 != expected {
+            return Err(invalid("closure does not bind the creation context"));
+        }
+        Ok(())
     }
 }
 
@@ -857,6 +1134,113 @@ impl CryptoProvider for SoftwareProvider {
             supports_atomic_re_encrypt: false,
             supports_key_import: true,
         }
+    }
+
+    /// One profile, declared for the three operations it implements.
+    ///
+    /// Declaring these activates parent-wrapped child keys on this provider. It
+    /// asserts no containment: the parent, the envelope and the unwrapped child
+    /// all live in this process's memory, so a wrapped child here is exactly as
+    /// contained as the parent that wraps it, which is not at all. Nothing in
+    /// this declaration makes a software-wrapped child provider-contained.
+    fn wrapping_capabilities(&self) -> WrappingCapabilities {
+        software_wrapping_capabilities()
+    }
+
+    async fn generate_wrapped_key(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+    ) -> Result<GeneratedWrappedKey> {
+        let aad = self.admit(context, parent, WrappingOperation::Generate)?;
+        let mut child = vec![0u8; 32];
+        OsRng.fill_bytes(&mut child);
+        // Held as key material from here on, so it is zeroized however this
+        // function leaves, including the error paths below.
+        let child = KeyMaterial::Aes256(child);
+        let KeyMaterial::Aes256(bytes) = &child else {
+            return Err(KeyRackError::Provider("child material mismatch".into()));
+        };
+        let envelope = self.seal_under_parent(parent, bytes, &aad)?;
+        let lease = self.retain_child(context, child, &envelope, ObjectOrigin::Generated)?;
+        Ok(GeneratedWrappedKey { envelope, lease })
+    }
+
+    async fn open_wrapped_key(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        envelope: &[u8],
+    ) -> Result<WrappedKeyLease> {
+        let aad = self.admit(context, parent, WrappingOperation::Open)?;
+        if envelope.len() != SOFTWARE_ENVELOPE_BYTES {
+            return Err(KeyRackError::Provider(
+                "wrapped material is not a software AES-256-GCM envelope".into(),
+            ));
+        }
+        // AES-GCM authenticates the canonical context as AAD, so an envelope
+        // from another child version, parent or profile fails here rather than
+        // yielding a key under the requested bindings.
+        let child = KeyMaterial::Aes256(self.open_under_parent(parent, envelope, &aad)?);
+        let KeyMaterial::Aes256(bytes) = &child else {
+            return Err(KeyRackError::Provider("child material mismatch".into()));
+        };
+        if bytes.len() != 32 {
+            return Err(KeyRackError::Provider(
+                "unwrapped child is not an AES-256 key".into(),
+            ));
+        }
+        self.retain_child(context, child, envelope, ObjectOrigin::Opened)
+    }
+
+    async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
+        let object = lease.object().as_str().to_owned();
+        let binding = {
+            let mut state = self
+                .wrapping
+                .write()
+                .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+            if let Some(recorded) = state.closed.get(&object).copied() {
+                // Idempotent: a repeated close reports the same fact so that a
+                // lost response can be reconciled rather than retried as work.
+                if recorded.context_sha256 != lease.context_sha256() {
+                    return Err(KeyRackError::Provider(
+                        "wrapping lease does not match the closed object's context".into(),
+                    ));
+                }
+                recorded
+            } else {
+                let open = state
+                    .open
+                    .remove(&object)
+                    .ok_or_else(|| KeyRackError::Provider("unknown wrapping lease".into()))?;
+                if open.context_sha256 != lease.context_sha256() {
+                    // Leave the object open: a mismatched claim must not destroy
+                    // it, and cleanup stays owed to whoever holds the real lease.
+                    state.open.insert(object, open);
+                    return Err(KeyRackError::Provider(
+                        "wrapping lease does not match the open object's context".into(),
+                    ));
+                }
+                state.record_closed(object.clone(), open);
+                open
+            }
+        };
+        self.keys
+            .write()
+            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
+            .remove(&object);
+        Ok(WrappedKeyClosure {
+            fact: A2ClosureFact::TemporaryObjectDestroyed { object },
+            context_sha256: binding.context_sha256,
+        })
+    }
+
+    fn wrapping_closure_verifier(&self) -> Option<Arc<dyn A2ClosureVerifier>> {
+        Some(Arc::new(SoftwareClosureVerifier {
+            incarnation: self.incarnation,
+            state: Arc::clone(&self.wrapping),
+        }))
     }
 
     async fn export_key_material(&self, handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {

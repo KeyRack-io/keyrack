@@ -5,7 +5,9 @@
 //!
 //! No provider is qualified or registered by this module. In particular, the
 //! ordinary `CryptoProvider` Generate/Destroy methods are NOT an implementation
-//! of this adapter. Tests use a visibly scripted provider, not a software fallback.
+//! of this adapter: [`WrappingCreationProvider`] drives creation from the
+//! ADR-0005 wrapping operations and from the provider's own closure verifier,
+//! and a provider that has neither cannot be installed here.
 //! The legacy V1 creation journal is not silently a shared-custody-frame journal;
 //! no worker-memory result is accepted as an A2 object closure here.
 //!
@@ -22,9 +24,13 @@ use crate::creation::{
 };
 use crate::error::Result;
 use crate::key::KeyRecord;
+use crate::provider::{CryptoProvider, KeyHandle, WrappedKeyLease};
 use crate::storage::StorageBackend;
+use crate::wrapping::{
+    WrappedKeyLifecycle, WrappingCapability, WrappingContext, WrappingOperation,
+};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Trusted integration extension for a separately qualified exact provider tuple.
 /// There is deliberately no in-tree runtime implementation or default acceptance.
@@ -52,6 +58,142 @@ pub trait A2CreationProvider: A2ClosureVerifier {
     /// Must be safe even after Generate or staging failed, and MUST NOT generate,
     /// unwrap or rewrap to obtain a closure claim or replace lost envelope bytes.
     async fn close_creation(&self, request: &CreationRequest) -> Result<A2ClosureClaim>;
+}
+
+/// One attempt's transient state: what must be closed, and what it must bind to.
+struct WrappingAttempt {
+    lease: WrappedKeyLease,
+    envelope_digest: [u8; 32],
+}
+
+/// Drives journaled creation from a provider's ADR-0005 wrapping operations.
+///
+/// This adapter supplies no evidence of its own. It obtains a closure fact from
+/// the provider and then submits it to that provider's own verifier, so a
+/// provider without one cannot be installed here at all; an adapter that
+/// returned a claim because a call succeeded would be exactly the accept-all
+/// verifier this protocol refuses to have.
+///
+/// One instance drives one attempt in one process. Its record of what to close
+/// is process memory: a restart leaves the durable journal to reconciliation
+/// rather than inferring that cleanup happened.
+pub struct WrappingCreationProvider {
+    provider: Arc<dyn CryptoProvider>,
+    /// The parent's resident object, resolved by the caller from the exact
+    /// parent version that the request's material binds.
+    parent: KeyHandle,
+    lifecycle: WrappedKeyLifecycle,
+    verifier: Arc<dyn A2ClosureVerifier>,
+    attempt: Mutex<Option<WrappingAttempt>>,
+}
+
+impl WrappingCreationProvider {
+    /// Refuse a provider that cannot evidence its own closures.
+    pub fn new(
+        provider: Arc<dyn CryptoProvider>,
+        parent: KeyHandle,
+        lifecycle: WrappedKeyLifecycle,
+    ) -> Result<Self> {
+        let verifier = provider
+            .wrapping_closure_verifier()
+            .ok_or(invalid("provider cannot evidence wrapped-key closure"))?;
+        Ok(Self {
+            provider,
+            parent,
+            lifecycle,
+            verifier,
+            attempt: Mutex::new(None),
+        })
+    }
+
+    /// Refuse a tuple the provider does not declare for `operation`.
+    fn require(&self, context: &WrappingContext, operation: WrappingOperation) -> Result<()> {
+        self.provider
+            .wrapping_capabilities()
+            .require(&WrappingCapability::requested(
+                context,
+                operation,
+                self.lifecycle,
+            ))
+            .map_err(|e| {
+                crate::error::KeyRackError::Provider(format!(
+                    "provider does not support the requested wrapping tuple for {operation:?}: {e}"
+                ))
+            })
+    }
+}
+
+#[async_trait]
+impl A2CreationProvider for WrappingCreationProvider {
+    /// A child that cannot be opened and closed again must not be created, so
+    /// every operation the child's whole life needs is required up front.
+    async fn preflight(&self, request: &CreationRequest) -> Result<()> {
+        let context = request.context()?;
+        for operation in [
+            WrappingOperation::Generate,
+            WrappingOperation::Open,
+            WrappingOperation::Close,
+        ] {
+            self.require(&context, operation)?;
+        }
+        Ok(())
+    }
+
+    async fn generate_and_wrap(&self, request: &CreationRequest) -> Result<Vec<u8>> {
+        let context = request.context()?;
+        self.require(&context, WrappingOperation::Generate)?;
+        let generated = self
+            .provider
+            .generate_wrapped_key(&context, &self.parent)
+            .await?;
+        if generated.lease.context_sha256()
+            != context
+                .context_sha256()
+                .map_err(|_| invalid("invalid creation context"))?
+        {
+            return Err(invalid("provider lease does not bind the creation context"));
+        }
+        *self
+            .attempt
+            .lock()
+            .map_err(|_| invalid("attempt state lock poisoned"))? = Some(WrappingAttempt {
+            lease: generated.lease,
+            envelope_digest: *blake3::hash(&generated.envelope).as_bytes(),
+        });
+        Ok(generated.envelope)
+    }
+
+    async fn close_creation(&self, request: &CreationRequest) -> Result<A2ClosureClaim> {
+        let attempt = {
+            let guard = self
+                .attempt
+                .lock()
+                .map_err(|_| invalid("attempt state lock poisoned"))?;
+            let attempt = guard
+                .as_ref()
+                .ok_or(invalid("this process holds no creation object to close"))?;
+            (attempt.lease.clone(), attempt.envelope_digest)
+        };
+        let (lease, envelope_digest) = attempt;
+        let closure = self.provider.close_wrapped_key(&lease).await?;
+        if closure.context_sha256 != lease.context_sha256() {
+            return Err(invalid("closure does not bind the closed object's context"));
+        }
+        let claim = A2ClosureClaim {
+            intent_fingerprint: request.fingerprint()?,
+            envelope_digest,
+            fact: closure.fact,
+        };
+        // Verified before it leaves this adapter, by the provider that made it.
+        self.verifier.verify(request, &claim)?;
+        Ok(claim)
+    }
+}
+
+impl A2ClosureVerifier for WrappingCreationProvider {
+    fn verify(&self, request: &CreationRequest, claim: &A2ClosureClaim) -> Result<()> {
+        self.verifier.verify(request, claim)
+    }
 }
 
 /// No pending variant is permission to regenerate, proof of closure or revocation.
