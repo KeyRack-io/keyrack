@@ -17,7 +17,7 @@ use keyrack_core::creation_driver::{
     A2CreationDriver, CreationPendingReason as Pending, CreationProgress, WrappingCreationProvider,
 };
 use keyrack_core::error::Result;
-use keyrack_core::key::{KeyRecord, KeyState, KeySpec, ProviderRef};
+use keyrack_core::key::{KeyRecord, KeySpec, KeyState, ProviderRef};
 use keyrack_core::material::{KeyMaterial, ParentWrappedMaterial};
 use keyrack_core::provider::software::{SoftwareProvider, SOFTWARE_WRAPPING_MECHANISM};
 use keyrack_core::provider::{
@@ -110,14 +110,17 @@ fn driver(
     parent: KeyHandle,
 ) -> A2CreationDriver {
     let adapter =
-        WrappingCreationProvider::new(provider, parent, WrappedKeyLifecycle::SessionObject).unwrap();
+        WrappingCreationProvider::new(provider, parent, WrappedKeyLifecycle::SessionObject)
+            .unwrap();
     A2CreationDriver::new(store, Arc::new(adapter))
 }
 
 fn committed(progress: CreationProgress) -> KeyRecord {
     match progress {
         CreationProgress::Committed(record) => *record,
-        other => panic!("expected a committed creation, got {other:?}"),
+        other @ CreationProgress::Pending(_) => {
+            panic!("expected a committed creation, got {other:?}")
+        }
     }
 }
 
@@ -125,14 +128,10 @@ fn committed(progress: CreationProgress) -> KeyRecord {
 async fn a_journaled_creation_publishes_a_wrapped_child_that_still_opens() {
     let (store, provider, parent_handle, request) = setup().await;
     let record = committed(
-        driver(
-            store.clone(),
-            provider.clone(),
-            parent_handle.clone(),
-        )
-        .run(request.clone())
-        .await
-        .unwrap(),
+        driver(store.clone(), provider.clone(), parent_handle.clone())
+            .run(request.clone())
+            .await
+            .unwrap(),
     );
 
     // The published version is wrapped material, not a resident handle.
@@ -187,7 +186,10 @@ async fn a_provider_that_cannot_evidence_closure_cannot_be_installed() {
     .map(|_| ())
     .unwrap_err()
     .to_string();
-    assert!(error.contains("cannot evidence wrapped-key closure"), "{error}");
+    assert!(
+        error.contains("cannot evidence wrapped-key closure"),
+        "{error}"
+    );
 }
 
 /// One deviation from a fully working software provider, so that what a test
@@ -374,7 +376,12 @@ async fn a_restart_leaves_an_interrupted_creation_to_reconciliation() {
         .await
         .unwrap();
     store
-        .stage_creation(request.operation, request.owner, 1, b"envelope from a lost process")
+        .stage_creation(
+            request.operation,
+            request.owner,
+            1,
+            b"envelope from a lost process",
+        )
         .await
         .unwrap();
 
@@ -383,7 +390,10 @@ async fn a_restart_leaves_an_interrupted_creation_to_reconciliation() {
         .await
         .unwrap();
     assert!(
-        matches!(progress, CreationProgress::Pending(Pending::CleanupUnconfirmed)),
+        matches!(
+            progress,
+            CreationProgress::Pending(Pending::CleanupUnconfirmed)
+        ),
         "{progress:?}"
     );
     // Nothing was published, and nothing claimed the object was cleaned up.

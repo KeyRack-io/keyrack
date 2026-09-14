@@ -255,7 +255,10 @@ async fn the_authenticated_context_refuses_every_other_binding() {
         [envelope.clone(), vec![0]].concat(),
         Vec::new(),
     ] {
-        assert!(provider.open_wrapped_key(&ctx, &parent, &bad).await.is_err());
+        assert!(provider
+            .open_wrapped_key(&ctx, &parent, &bad)
+            .await
+            .is_err());
     }
 
     // The unaltered request still opens, so the refusals above are the bindings.
@@ -290,7 +293,10 @@ async fn a_scoped_provider_refuses_a_context_naming_another_backend() {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("another provider or security domain"), "{error}");
+        assert!(
+            error.contains("another provider or security domain"),
+            "{error}"
+        );
     }
 }
 
@@ -372,5 +378,7 @@ async fn a_provider_without_the_profile_refuses_all_three_operations() {
     // Nothing to close, and nothing that could evidence a closure: a provider
     // inheriting the defaults cannot drive journaled creation at all.
     assert!(provider.wrapping_closure_verifier().is_none());
-    assert!(SoftwareProvider::new().wrapping_closure_verifier().is_some());
+    assert!(SoftwareProvider::new()
+        .wrapping_closure_verifier()
+        .is_some());
 }

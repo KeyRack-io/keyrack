@@ -517,7 +517,9 @@ pub trait CryptoProvider: Send + Sync {
     /// `None`, the default, means this provider cannot evidence closure and so
     /// cannot drive journaled creation; there is deliberately no accept-all
     /// implementation to inherit.
-    fn wrapping_closure_verifier(&self) -> Option<std::sync::Arc<dyn crate::creation::A2ClosureVerifier>> {
+    fn wrapping_closure_verifier(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::creation::A2ClosureVerifier>> {
         None
     }
 
