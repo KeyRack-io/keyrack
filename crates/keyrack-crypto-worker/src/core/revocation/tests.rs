@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
 use crate::{
+    core::creation::authority_key,
     core::*,
     delivery::{Authority, Prepared, Sink, Writer},
     fixture,
@@ -16,6 +17,7 @@ use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use std::{
     io,
+    num::NonZeroU64,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -68,7 +70,7 @@ fn command(worker: &TestWorker) -> RevocationCommand {
         fence: Uuid::new_v4(),
         executor: worker.executor().unwrap(),
         authority: keyrack_core::custody::AuthorityIdentity {
-            issuer: authority_key(worker.verifier).issuer,
+            issuer: worker.trust.authority.issuer.clone(),
             scope: AuthorityScope::SecurityDomain {
                 provider_ref: worker.provider_ref.clone(),
                 security_domain: WrappingIdentifier::new(&worker.domain).unwrap(),
@@ -249,7 +251,7 @@ fn signed_wrong_scope_clock_generation_and_executor_leave_work_untouched() {
         }
         assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
         assert!(!worker.fenced);
-        assert_eq!(worker.generation, Some(1));
+        assert_eq!(worker.generation.get(), 1);
         assert_eq!(worker.resident.len(), 1);
         time.0.store(0, Ordering::SeqCst);
         let mut sink = Capture::default();
@@ -275,7 +277,7 @@ fn initial_generation_and_signature_are_not_bootstrapped_from_command() {
         .revoke(&signed(&other, command(&worker)), &delivery)
         .is_err());
     assert!(!worker.fenced);
-    assert!(worker.generation.is_none());
+    assert_eq!(worker.generation.get(), 1);
     assert!(worker.revoke(&bytes, &delivery).is_ok());
 }
 #[test]
@@ -331,7 +333,7 @@ fn indeterminate_capsule_yields_no_receipt_but_still_applies_core_containment() 
     let command = command(&worker);
     assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
     assert!(worker.fenced);
-    assert_eq!(worker.generation, Some(2));
+    assert_eq!(worker.generation.get(), 2);
     assert!(worker.resident.is_empty());
 }
 #[test]
@@ -353,7 +355,7 @@ fn receipt_binds_exact_command_and_rejects_reuse_as_authority() {
         assert!(result.check_command(&other).is_err());
     }
     let (mut restarted, _, _, restarted_delivery) = setup();
-    restarted.verifier = key.verifying_key();
+    restarted.trust.authority.key = key.verifying_key();
     assert!(restarted
         .revoke(&signed(&key, command), &restarted_delivery)
         .is_err());
@@ -461,7 +463,7 @@ fn receipt_queue_failure_does_not_undo_applied_fence() {
         .control(&json!({"revocation":STANDARD.encode(evidence.canonical_bytes().unwrap())}))
         .is_err());
     assert!(worker.fenced);
-    assert_eq!(worker.generation, Some(2));
+    assert_eq!(worker.generation.get(), 2);
     assert!(use_key(&mut worker, &key, 1, &fixture::context()).is_err());
     assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
 }

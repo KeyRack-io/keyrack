@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Private custody engine consuming canonical creation and revocation evidence.
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, num::NonZeroU64, time::Instant};
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -10,6 +10,7 @@ use aes_gcm::{
 };
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use keyrack_core::{
+    custody::LeaseIdentity,
     key::{KeySpec, ProviderRef},
     material::ParentWrappedMaterial,
     wrapping::{WrappedKeyFormat, WrappingContext, WrappingKeyPurpose},
@@ -21,6 +22,7 @@ use zeroize::Zeroizing;
 
 pub(crate) mod creation;
 mod revocation;
+pub(crate) mod trust;
 
 pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
@@ -144,7 +146,7 @@ pub(crate) fn match_descriptor(
 
 struct Resident {
     key: Secret,
-    lease: u64,
+    lease: LeaseIdentity,
     until: u64,
     uses: u64,
 }
@@ -179,12 +181,12 @@ pub(crate) struct Worker<S, C> {
     pub(crate) instance: String,
     provider_ref: ProviderRef,
     domain: String,
-    verifier: VerifyingKey,
+    trust: trust::TrustConfig,
     observer: SigningKey,
     source: S,
     clock: C,
     limits: Limits,
-    generation: Option<u64>,
+    generation: NonZeroU64,
     fenced: bool,
     sequence: u64,
     next_lease: u64,
@@ -221,6 +223,27 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         clock: C,
         limits: Limits,
     ) -> Result<Self, Error> {
+        Self::new_with_trust(
+            trust::TrustConfig::fixture(verifier),
+            provider_ref,
+            domain,
+            source,
+            clock,
+            limits,
+        )
+    }
+
+    /// Trust is supplied by the supervisor, including the initial generation.
+    /// Rotation/reinstatement requires a new incarnation; requests cannot change
+    /// the issuer, key identity, observer labels or generation baseline.
+    pub(crate) fn new_with_trust(
+        trust: trust::TrustConfig,
+        provider_ref: ProviderRef,
+        domain: String,
+        source: S,
+        clock: C,
+        limits: Limits,
+    ) -> Result<Self, Error> {
         keyrack_core::wrapping::WrappingIdentifier::new(provider_ref.as_str())
             .map_err(|_| Error::Context)?;
         keyrack_core::wrapping::WrappingIdentifier::new(&domain).map_err(|_| Error::Context)?;
@@ -228,6 +251,8 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             || limits.residence_ms == 0
             || limits.uses_per_residency == 0
             || limits.authority_horizon_ms == 0
+            // Keep at least one strictly newer generation available for fencing.
+            || trust.initial_generation.get() == u64::MAX
         {
             return Err(Error::Limit);
         }
@@ -239,12 +264,12 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             instance,
             provider_ref,
             domain,
-            verifier,
+            generation: trust.initial_generation,
+            trust,
             observer: SigningKey::generate(&mut OsRng),
             source,
             clock,
             limits,
-            generation: None,
             fenced: false,
             sequence: 0,
             next_lease: 0,
@@ -260,7 +285,9 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         let signature = Signature::from_slice(&signed.signature).map_err(|_| Error::Authority)?;
         let mut message = SIGNING_DOMAIN.to_vec();
         message.extend_from_slice(signed.body.as_bytes());
-        self.verifier
+        self.trust
+            .authority
+            .key
             .verify_strict(&message, &signature)
             .map_err(|_| Error::Authority)?;
         serde_json::from_str(&signed.body).map_err(|_| Error::Authority)
@@ -321,17 +348,13 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             return Err(Error::Material);
         }
         if self.fenced
-            || grant.generation == 0
+            || grant.generation != self.generation.get()
             || grant.sequence <= self.sequence
-            || self
-                .generation
-                .is_some_and(|generation| generation != grant.generation)
         {
             return Err(Error::Replay);
         }
         // Consume before materialization: failed attempts cannot replay an
         // operation whose outcome might be ambiguous to the coordinator.
-        self.generation = Some(grant.generation);
         self.sequence = grant.sequence;
         if !self.resident.contains_key(&binding) {
             if self.resident.len() >= self.limits.resident_keys {
@@ -344,11 +367,15 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             }
             self.check_time(&grant)?;
             self.next_lease = self.next_lease.checked_add(1).ok_or(Error::Limit)?;
+            let lease = LeaseIdentity {
+                executor: self.executor()?,
+                counter: NonZeroU64::new(self.next_lease).ok_or(Error::Limit)?,
+            };
             self.resident.insert(
                 binding,
                 Resident {
                     key,
-                    lease: self.next_lease,
+                    lease,
                     until: grant
                         .residency_until_ms
                         .min(now.saturating_add(self.limits.residence_ms)),
@@ -358,7 +385,8 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         }
         let resident = self.resident.get_mut(&binding).ok_or(Error::Material)?;
         if self.clock.millis() >= resident.until {
-            self.remove(binding);
+            let lease = resident.lease;
+            self.close_residency(lease, binding)?;
             return Err(Error::Expired);
         }
         if resident.uses >= self.limits.uses_per_residency {
@@ -407,7 +435,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         let output = Zeroizing::new(output);
         self.check_time(&grant)?;
         if self.clock.millis() >= self.resident[&binding].until {
-            self.remove(binding);
+            self.close_residency(self.resident[&binding].lease, binding)?;
             return Err(Error::Expired);
         }
         Ok(output.to_vec())
@@ -448,7 +476,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
 
     fn remove(&mut self, binding: [u8; 32]) -> Option<ResidencyCleanup> {
         self.resident.remove(&binding).map(|resident| {
-            let lease = resident.lease;
+            let lease = resident.lease.counter.get();
             drop(resident); // Zeroizing buffer destroyed before observation.
             ResidencyCleanup {
                 worker: self.instance.clone(),
@@ -457,6 +485,24 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
                 event: "local_secret_buffer_dropped",
             }
         })
+    }
+
+    /// Local ownership operation only, not an authenticated IPC command or a
+    /// canonical `LeaseCleanupResult`. Exact incarnation/counter and the original
+    /// private wrapping binding must match; an old close cannot evict a reopened
+    /// entry. A new service caller must apply its agreed cleanup authorization.
+    fn close_residency(
+        &mut self,
+        lease: LeaseIdentity,
+        wrapping_binding: [u8; 32],
+    ) -> Result<ResidencyCleanup, Error> {
+        if lease.executor != self.executor()?
+            || self.resident.get(&wrapping_binding).map(|r| r.lease) != Some(lease)
+        {
+            return Err(Error::Replay);
+        }
+        // remove drops/zeroizes the secret before constructing the observation.
+        self.remove(wrapping_binding).ok_or(Error::Replay)
     }
 
     pub(crate) fn expire(&mut self) -> Vec<ResidencyCleanup> {
@@ -484,10 +530,10 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         {
             return Err(Error::Authority);
         }
-        if fence.generation == 0 || self.generation.is_some_and(|g| fence.generation <= g) {
+        if fence.generation <= self.generation.get() {
             return Err(Error::Replay);
         }
-        self.generation = Some(fence.generation);
+        self.generation = NonZeroU64::new(fence.generation).ok_or(Error::Replay)?;
         self.fenced = true; // No reinstatement protocol is invented by this slice.
         let keys: Vec<_> = self.resident.keys().copied().collect();
         let purged = keys

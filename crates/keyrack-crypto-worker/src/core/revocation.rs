@@ -1,15 +1,14 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! One authenticated, whole-domain local observation. Never all-holder completion.
-use super::{creation::authority_key, Clock, Error, MaterialSource, Worker};
+use super::{Clock, Error, MaterialSource, Worker};
 use crate::delivery::Delivery;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::Signer;
 use keyrack_core::custody::{
     AuthorityScope, Canonical, ClockDomain, ClockReading, Evidence, ExecutorIncarnation,
-    LeaseIdentity, RevocationCommand, RevocationResult, WrappingIdentifier, MAX_RECEIPT_LEASES,
+    RevocationCommand, RevocationResult, WrappingIdentifier, MAX_RECEIPT_LEASES,
 };
-use std::num::NonZeroU64;
 
 impl<S: MaterialSource, C: Clock> Worker<S, C> {
     pub(crate) fn executor(&self) -> Result<ExecutorIncarnation, Error> {
@@ -32,7 +31,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         };
         let executor = self.executor()?;
         if command.executor != executor
-            || command.authority.issuer != authority_key(self.verifier).issuer
+            || command.authority.issuer != self.trust.authority.issuer
             || command.authority.scope != expected_scope
         {
             return Err(Error::Authority);
@@ -48,9 +47,9 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         if command.validity.not_after > now.saturating_add(self.limits.authority_horizon_ms) {
             return Err(Error::Expired);
         }
-        // Initial generation 1 is launcher policy, also used for native creation.
+        // The initial generation is trusted launcher policy, shared with use/creation.
         // A terminal incarnation cannot issue a second completion observation.
-        if self.fenced || command.authority.generation.get() <= self.generation.unwrap_or(1) {
+        if self.fenced || command.authority.generation <= self.generation {
             return Err(Error::Replay);
         }
         Ok(())
@@ -64,7 +63,7 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
         let evidence = Evidence::<RevocationCommand>::from_canonical_bytes(bytes)
             .map_err(|_| Error::Authority)?;
         let authenticated = evidence
-            .authenticate(&authority_key(self.verifier))
+            .authenticate(&self.trust.authority)
             .map_err(|_| Error::Authority)?;
         let command = authenticated.claims();
         let instance = self.instance.clone();
@@ -72,18 +71,14 @@ impl<S: MaterialSource, C: Clock> Worker<S, C> {
             delivery.fence(&instance, command.authority.generation.get(), || {
                 // Currentness/time are checked after obtaining the release lock.
                 self.check_revocation(command)?;
-                let executor = self.executor()?;
                 let mut leases: Vec<_> = self
                     .resident
                     .values()
-                    .map(|resident| LeaseIdentity {
-                        executor,
-                        counter: NonZeroU64::new(resident.lease).expect("nonzero allocated lease"),
-                    })
+                    .map(|resident| resident.lease)
                     .collect();
                 leases.sort_unstable_by_key(|lease| lease.counter);
                 leases.truncate(MAX_RECEIPT_LEASES);
-                self.generation = Some(command.authority.generation.get());
+                self.generation = command.authority.generation;
                 self.fenced = true;
                 // Purge the entire scope, never just the bounded diagnostic set.
                 self.resident.clear();
