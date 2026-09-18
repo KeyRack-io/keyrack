@@ -1,0 +1,39 @@
+name: Quickstart contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quickstart:
+    name: Documented Compose quickstart and reverted controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_PROJECT_NAME: quickstart-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run the documented command
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/proofs/quickstart
+          (docker compose up -d keyrack-service && ./examples/quickstart.sh) 2>&1 | tee target/proofs/quickstart/documented-command.log
+      - name: Prove field regressions and assertion removals fail
+        run: python3 scripts/test-quickstart-controls.py --service-evidence documented-compose --output-dir target/proofs/quickstart/controls
+      - name: Capture Compose logs
+        if: always()
+        run: docker compose logs --no-color > target/proofs/quickstart/compose.log 2>&1
+      - name: Remove only this job's Compose resources
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: quickstart-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/proofs/quickstart/
