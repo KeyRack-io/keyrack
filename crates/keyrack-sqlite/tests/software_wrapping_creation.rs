@@ -584,6 +584,34 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
         .to_string();
     assert!(error.contains("another creation"), "{error}");
 
+    // An object generated for this creation, but under a context that is not
+    // the one this creation describes. The binding says the right creation and
+    // the object is a generation object, so only the recorded context refuses
+    // it. Nothing the adapter drives can produce this pair, which is why it is
+    // built here directly against the provider.
+    let mut elsewhere = context.clone();
+    elsewhere.child = VersionedKeyId::new(elsewhere.child.lid, 9).unwrap();
+    let astray = provider
+        .generate_wrapped_key(
+            &elsewhere,
+            &parent_handle,
+            &CreationBinding::of(&request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let astray_closure = provider.close_wrapped_key(&astray.lease).await.unwrap();
+    let A2ClosureFact::TemporaryObjectDestroyed { object: strayed } = &astray_closure.fact else {
+        panic!("unexpected closure fact");
+    };
+    let error = verifier
+        .verify(
+            &request,
+            &claim(strayed, *blake3::hash(&astray.envelope).as_bytes()),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("bind the creation context"), "{error}");
+
     // And the same object bound to the envelope it actually produced.
     assert!(verifier.verify(&request, &claim(object, digest)).is_ok());
 }

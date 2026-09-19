@@ -169,24 +169,17 @@ const MAX_RECORDED_CLOSURES: usize = 4096;
 /// Exact wrapped-child envelope length: 12-byte nonce, 32-byte child, 16-byte tag.
 const SOFTWARE_ENVELOPE_BYTES: usize = 12 + 32 + 16;
 
-/// Whether an object was created by generation or by opening stored material.
-/// Only a generation object can evidence the closure of a creation attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectOrigin {
-    Generated,
-    Opened,
-}
-
 /// Bindings of one transient child object, held only in process memory.
 #[derive(Debug, Clone)]
 struct ObjectBinding {
     context_sha256: [u8; 32],
     envelope_blake3: [u8; 32],
-    origin: ObjectOrigin,
-    /// The creation this object was generated for, absent for an opened child.
-    /// Kept because context is identical across attempts at the same child: it
-    /// is what lets the verifier refuse a real closure presented for another
-    /// creation.
+    /// The creation this object was generated for, absent when it was opened
+    /// from stored material rather than generated.
+    ///
+    /// This is the object's whole provenance: whether it can evidence a
+    /// creation at all, and which one. Recording those as two fields would put
+    /// two gates over one fact, which leaves neither provable on its own.
     creation: Option<CreationBinding>,
 }
 
@@ -368,7 +361,6 @@ impl SoftwareProvider {
         context: &WrappingContext,
         child: KeyMaterial,
         envelope: &[u8],
-        origin: ObjectOrigin,
         creation: Option<CreationBinding>,
     ) -> Result<WrappedKeyLease> {
         let binding = ObjectBinding {
@@ -376,7 +368,6 @@ impl SoftwareProvider {
                 .context_sha256()
                 .map_err(|e| KeyRackError::Provider(format!("invalid wrapping context: {e}")))?,
             envelope_blake3: *blake3::hash(envelope).as_bytes(),
-            origin,
             creation,
         };
         // Lock order is wrapping state, then keys; every wrapping path keeps it.
@@ -439,19 +430,17 @@ impl A2ClosureVerifier for SoftwareClosureVerifier {
             .closed
             .get(object)
             .ok_or(invalid("no recorded destruction for the closed object"))?;
-        if binding.origin != ObjectOrigin::Generated {
-            return Err(invalid(
-                "closure names an opened object, not a creation object",
-            ));
-        }
         // The creation this object was generated for, compared before anything
-        // it has in common with other creations. Context, envelope and origin
-        // are all equal across two attempts at the same child, so without this
-        // a real closure of one attempt certifies another.
+        // it has in common with other creations. Context and envelope are
+        // equal across two attempts at the same child, and an opened object
+        // has them too, so without this a closure of one attempt, or of an
+        // ordinary use lease, certifies a creation it says nothing about.
         binding
             .creation
             .as_ref()
-            .ok_or(invalid("closure names an object with no creation binding"))?
+            .ok_or(invalid(
+                "closure names an opened object, not a creation object",
+            ))?
             .require(request)?;
         if binding.envelope_blake3 != claim.envelope_digest {
             return Err(invalid("closure does not bind the staged envelope"));
@@ -1181,13 +1170,7 @@ impl CryptoProvider for SoftwareProvider {
             return Err(KeyRackError::Provider("child material mismatch".into()));
         };
         let envelope = self.seal_under_parent(parent, bytes, &aad)?;
-        let lease = self.retain_child(
-            context,
-            child,
-            &envelope,
-            ObjectOrigin::Generated,
-            Some(creation.clone()),
-        )?;
+        let lease = self.retain_child(context, child, &envelope, Some(creation.clone()))?;
         Ok(GeneratedWrappedKey { envelope, lease })
     }
 
@@ -1215,7 +1198,7 @@ impl CryptoProvider for SoftwareProvider {
                 "unwrapped child is not an AES-256 key".into(),
             ));
         }
-        self.retain_child(context, child, envelope, ObjectOrigin::Opened, None)
+        self.retain_child(context, child, envelope, None)
     }
 
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {

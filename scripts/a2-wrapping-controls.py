@@ -133,15 +133,6 @@ CONTROLS = [
         test="closure_evidence_is_refused_for_anything_but_this_creation_object",
     ),
     Control(
-        name="verifier-origin",
-        guard="closing an opened object is not evidence about a creation object",
-        file=CORE,
-        before="""        if binding.origin != ObjectOrigin::Generated {""",
-        after="""        if false {""",
-        suite=SQLITE_TEST,
-        test="closure_evidence_is_refused_for_anything_but_this_creation_object",
-    ),
-    Control(
         name="verifier-envelope-digest",
         guard="closure evidence must bind the staged envelope",
         file=CORE,
