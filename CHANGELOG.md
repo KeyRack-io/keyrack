@@ -54,6 +54,16 @@ All notable changes to KeyRack will be documented in this file.
   support. Startup refuses to run if the named provider does not declare that
   mechanism for generate, open and close, or cannot evidence its own closures,
   and says plainly when a software mechanism means the hierarchy is shape only.
+- **The key cache no longer makes wrapped children uncreatable.** `CachingStorage`
+  wraps a `StorageBackend` and inherited the default creation-journal methods,
+  which refuse; with a `cache:` block configured — as in every demo and most
+  deployments — creating a child failed with "transactional creation
+  unsupported" from a backend that supports it perfectly well. The journal
+  methods are forwarded, nothing about a journal is cached, and a published
+  child lands in the cache as a created one does. No test caught this: the
+  service tests built state over bare storage, so the wrapper every deployment
+  has was the one configuration never exercised. Running demo 08 caught it, and
+  the test that should have now exists.
 
 - **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
   parsed and then failed at startup with "KMIP provider not yet implemented",

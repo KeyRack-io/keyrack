@@ -139,7 +139,7 @@ def main():
                     if 'All checks passed!' not in logs or 'DEMO08_ORACLE_SETUP_FAILURE' in logs:
                         raise AssertionError(f'{name}: setup/protocol failure does not prove a depth control')
                     if name == 'baseline':
-                        if 'DEMO08_DEPTH_OK: nodes=2 roots=1 edges=1 depth=1' not in logs or 'DEMO08_DEPTH_EXCEEDED' in logs:
+                        if 'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth=1' not in logs or 'DEMO08_DEPTH_EXCEEDED' in logs:
                             raise AssertionError('baseline: live graph oracle did not confirm depth one')
                         record['result'] = 'DEMO08_DEPTH_OK'
                     elif name == 'grandchild-restored':

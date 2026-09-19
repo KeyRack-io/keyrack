@@ -42,9 +42,9 @@ def check_graph(document):
         raise ValueError(f'DEMO08_DEPTH_EXCEEDED: depth={depth}; chain={json.dumps(deepest)}')
     roots = sum(parent is None for parent in parents.values())
     edges = len(parents) - roots
-    if (len(parents), roots, edges, depth) != (2, 1, 1, 1):
-        raise ValueError(f'DEMO08_GRAPH_SHAPE: nodes={len(parents)} roots={roots} edges={edges} depth={depth}; expected 2/1/1/1')
-    return f'DEMO08_DEPTH_OK: nodes=2 roots=1 edges=1 depth={depth}'
+    if (len(parents), roots, edges, depth) != (3, 1, 2, 1):
+        raise ValueError(f'DEMO08_GRAPH_SHAPE: nodes={len(parents)} roots={roots} edges={edges} depth={depth}; expected 3/1/2/1')
+    return f'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth={depth}'
 
 
 def main():
