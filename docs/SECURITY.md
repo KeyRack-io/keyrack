@@ -8,7 +8,17 @@ Threat model, security invariants, and vulnerability disclosure.
 
 ### Trust boundaries
 
-1. **Client ↔ Service** — TLS-encrypted gRPC/REST. Clients authenticate via bearer tokens. The service trusts the PDP for authorization decisions.
+Documented configuration defaults (transport and identity are separate):
+
+<!-- keyrack-service-defaults:start -->
+```yaml
+tls: null
+authn:
+  type: mtls
+```
+<!-- keyrack-service-defaults:end -->
+
+1. **Client ↔ Service** — TLS is opt-in: the `tls:` block enables gRPC TLS, and `tls.ca_cert` enables client-certificate verification. The REST listener serves plain HTTP; terminate HTTPS at a reverse proxy and protect the proxy-to-service connection. Authentication defaults to `mtls`, but that choice does not enable transport TLS. JWT bearer authentication and other credential types require explicit configuration; REST cannot use the gRPC peer-certificate identity. The service trusts the PDP for authorization decisions.
 2. **Service ↔ PDP** — The PDP is a trusted component. If the PDP is compromised, authorization is compromised. The service fails closed if the PDP is unreachable.
 3. **Service ↔ Storage** — Storage holds encrypted key handles and metadata. Key material lives in the provider (HSM or software provider), not in storage.
 4. **Service ↔ HSM** — The HSM is the root of trust for key material. PKCS#11 PIN is zeroized after session establishment.

@@ -31,7 +31,8 @@ and an embeddable library (`keyrack-core`).
 docker compose up -d keyrack-service
 
 # From your application, use gRPC or REST
-curl -s http://localhost:8080/v1/keys -X POST \
+curl -fsS http://localhost:8080/v1/keys -X POST \
+  -H 'Content-Type: application/json' \
   -d '{"key_spec": "AES_256", "description": "user-data-dek"}'
 ```
 
@@ -40,18 +41,31 @@ rotation, audit events, and HSM integration. You just call encrypt/decrypt.
 
 ### As a library
 
+The crate is not published on crates.io. Use the pinned git dependency below.
+
 ```toml
 [dependencies]
-keyrack-core = "0.3"
+keyrack-core = { git = "https://github.com/KeyRack-io/keyrack.git", rev = "70bf446def1cac32881e5e24d36f653551cdc25f" }
+tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
 ```rust
+use keyrack_core::key::KeySpec;
 use keyrack_core::provider::software::SoftwareProvider;
 use keyrack_core::provider::CryptoProvider;
 
-let provider = SoftwareProvider::new();
-let key = provider.generate_key(&KeySpec::Aes256).await?;
-let ct = provider.encrypt(&key, plaintext, aad).await?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> keyrack_core::error::Result<()> {
+    // Development only: this provider loses its keys when the process exits.
+    let provider = SoftwareProvider::new();
+    let key = provider.generate_key(&KeySpec::Aes256).await?;
+    let plaintext = b"secret data";
+    let aad = b"example context";
+    let ct = provider.encrypt(&key, plaintext, aad).await?;
+    let pt = provider.decrypt(&key, &ct.ciphertext, aad).await?;
+    assert_eq!(pt.expose().as_slice(), plaintext);
+    Ok(())
+}
 ```
 
 Embed key management directly in your binary. Swap in `Pkcs11Provider` or

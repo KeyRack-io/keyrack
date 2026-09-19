@@ -19,19 +19,21 @@ Browser crypto is hard:
 ## How KeyRack could help
 
 KeyRack has a `keyrack-wasm` crate that compiles to WebAssembly, exposing
-the same `CryptoProvider` interface that the Rust backend uses.
+a `WasmKeyRack` class backed by the Rust `SoftwareProvider`.
 
-### Current state (v0.1)
+### Local WASM bindings
 
 ```typescript
-// You would need to write this wrapper yourself today
-import init, { WasmProvider } from 'keyrack-wasm';
+// Import the wasm-bindgen output from your local build.
+import init, { WasmKeyRack } from './pkg/keyrack_wasm.js';
 await init();
 
-const provider = new WasmProvider();
-const key = provider.generateKey('AES_256');
-const ct = provider.encrypt(key, plaintext);
-const pt = provider.decrypt(key, ct);
+const provider = new WasmKeyRack();
+const plaintext = new TextEncoder().encode('hello');
+const aad = new Uint8Array();
+const key = await provider.generateKey('AES_256');
+const ct = await provider.encrypt(key, plaintext, aad);
+const pt = await provider.decrypt(key, ct, aad);
 ```
 
 ### What's actually shipped
@@ -49,7 +51,7 @@ The WASM crate exists and compiles, but:
 
 **Poor today. Medium-term potential.**
 
-The building blocks exist (WASM compilation, WebCrypto provider), but
+The building blocks exist (WASM compilation, software crypto provider), but
 there is no usable developer experience. A frontend engineer would need
 to write their own wrapper, handle key serialization, and build the
 service integration layer.

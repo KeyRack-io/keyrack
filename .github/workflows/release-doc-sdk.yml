@@ -1,0 +1,34 @@
+name: Release documentation and SDK contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-doc-sdk:
+    name: Release documentation and SDK contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Check documentation claims against source
+        run: cargo test --locked -p keyrack-core --test doc_claims -p keyrack-service --test doc_config_claims
+      - name: Reverse SDK deletions and require the specific compiler result
+        run: python3 scripts/test-sdk-removed-api.py --output-dir target/proofs/sdk-removed-api
+      - name: Reintroduce retired claims and reverse their guards
+        run: python3 scripts/test-release-doc-controls.py --output-dir target/proofs/release-docs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-doc-sdk-controls
+          path: target/proofs/

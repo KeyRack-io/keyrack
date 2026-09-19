@@ -239,7 +239,7 @@ PKCS#11 when requirements demand it.
 | Component | Software | PKCS#11 | KMIP |
 |-----------|----------|---------|------|
 | Key material location | Process memory | HSM hardware | Remote HSM |
-| KeyRack sees material? | Yes | No (handle only) | No (UID only) |
+| KeyRack sees material? | Yes | Opaque handles for non-exportable keys | Opaque UIDs for non-exportable keys |
 | Zeroization | Partial (AES, Ed25519) | HSM-managed | HSM-managed |
 | FIPS-compliant path? | No | Yes | Yes |
 
