@@ -215,8 +215,8 @@ CONTROLS = [
         name="provider-records-creation",
         guard="the provider keeps the creation its object was generated for",
         file=CORE,
-        before="""            Some(creation.clone()),""",
-        after="""            None,""",
+        before="""        let lease = self.retain_child(context, child, &envelope, Some(creation.clone()))?;""",
+        after="""        let lease = self.retain_child(context, child, &envelope, None)?;""",
         suite=SQLITE_TEST,
         test="a_journaled_creation_publishes_a_wrapped_child_that_still_opens",
     ),
@@ -227,7 +227,9 @@ CONTROLS = [
         before="""        binding
             .creation
             .as_ref()
-            .ok_or(invalid("closure names an object with no creation binding"))?
+            .ok_or(invalid(
+                "closure names an opened object, not a creation object",
+            ))?
             .require(request)?;""",
         after="""""",
         suite=SQLITE_TEST,
@@ -255,7 +257,9 @@ CONTROLS = [
                 """        binding
             .creation
             .as_ref()
-            .ok_or(invalid("closure names an object with no creation binding"))?
+            .ok_or(invalid(
+                "closure names an opened object, not a creation object",
+            ))?
             .require(request)?;""",
                 """""",
             ),

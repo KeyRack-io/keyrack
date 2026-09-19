@@ -18,7 +18,15 @@ All notable changes to KeyRack will be documented in this file.
   verifier and a provider without one cannot be installed, so no adapter turns a
   successful call into proof that a creation object was cleaned up. Preflight
   requires Generate, Open and Close together: a child that cannot be opened
-  again must not be created.
+  again must not be created. Generation carries a `CreationBinding` — operation,
+  attempt, owner, correlation and request fingerprint — which the provider keeps
+  with the object and its verifier compares, so a genuine closure of one attempt
+  is refused when presented for another; canonical context cannot make that
+  distinction, because two attempts at the same child have identical context.
+  The adapter reserves that owner before Generate rather than after it returns,
+  refuses a second generation, and keeps the reservation through failures,
+  wrong-context responses and caller cancellation, each of which can leave an
+  object only that attempt can close.
 - **The software provider implements them, which activates the path and is not
   custody.** The mechanism is `software:aes-256-gcm:v1` — the name leads with
   `software` so a capability dump reads as unqualified on sight — and it declares

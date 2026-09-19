@@ -81,12 +81,37 @@ downgraded. A lease is not durable, not portable between providers or processes,
 and never stored on a version: a wrapped version keeps its descriptor, and
 opening is repeated per use.
 
+Generation additionally takes a `CreationBinding`: the operation, attempt,
+owner, correlation and request fingerprint of the one creation it is allowed to
+have an effect for. It arrives before the call because the owner of a cleanup
+has to exist before there is anything to clean up, and the provider keeps it
+with the object, because context cannot tell two creations apart — two attempts
+at the same child under the same parent produce byte-identical canonical
+context. A verifier that matched on context alone would accept a genuine
+closure of one attempt as evidence for another. A binding is only obtainable
+from a validated `CreationRequest` in-process and cannot be deserialized, so
+nothing reconstructs one at close time. Opening an existing child takes no
+binding: ordinary use is not creation and closing a use lease certifies nothing
+about one.
+
+Closing is idempotent for as long as the provider can still account for the
+object, and no longer: past that bound a close is an error, never a success and
+never permission to create the child again. A closure fact may only follow an
+explicit close of the exact object in the session that produced it. An
+ambiguous error, a destructor, an expiry or an empty search from a new session
+is not closure.
+
 `WrappingCreationProvider` drives the existing creation journal from those
 operations. It contributes no evidence: a closure fact is verified by the
 provider's own `wrapping_closure_verifier()`, and a provider without one cannot
 be installed, so no adapter can turn a successful call into proof of cleanup.
 Preflight requires Generate, Open and Close together, because a child that
-cannot be opened again must not be created.
+cannot be opened again must not be created. It owns one creation, reserved
+before Generate and never displaced: a second generation is refused whichever
+request it carries, and errors, wrong-context responses and caller cancellation
+all leave the reservation standing, because each of them can leave an object
+that nothing else can close. Where it cannot close what it owns, it says the
+attempt is unresolved rather than producing a closure from the absence of one.
 
 **The software provider implements these, and that is not custody.** Its
 mechanism is named `software:aes-256-gcm:v1` so a capability dump says so on
