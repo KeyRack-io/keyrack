@@ -168,8 +168,18 @@ fn state(
     providers: Vec<(&str, Arc<dyn CryptoProvider>)>,
     wrapping: Vec<(&str, WrappingProfile)>,
 ) -> Arc<ServiceState> {
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite"));
+    state_over(
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite")),
+        providers,
+        wrapping,
+    )
+}
+
+fn state_over(
+    storage: Arc<dyn StorageBackend>,
+    providers: Vec<(&str, Arc<dyn CryptoProvider>)>,
+    wrapping: Vec<(&str, WrappingProfile)>,
+) -> Arc<ServiceState> {
     let registry: Arc<dyn ProviderRegistry> = Arc::new(
         StaticProviderRegistry::new(
             providers
@@ -266,6 +276,41 @@ async fn a_child_is_created_wrapped_under_its_parent() {
     ));
     assert!(!stored.has_legacy_parent_semantics());
     assert_eq!(stored.state, KeyState::Enabled);
+}
+
+/// The key cache is a `StorageBackend` wrapper, and a wrapper that does not
+/// forward the creation journal answers "this backend cannot journal a
+/// creation" for a backend that can. Every demo and most deployments enable
+/// the cache, so an unforwarded method is the difference between the feature
+/// working and the feature being unreachable in practice.
+#[tokio::test]
+async fn a_cached_deployment_can_still_create_a_wrapped_child() {
+    let state = state_over(
+        Arc::new(keyrack_service::cache::CachingStorage::new(
+            Arc::new(keyrack_sqlite::SqliteStorage::in_memory().expect("in-memory SQLite")),
+            1000,
+            std::time::Duration::from_secs(60),
+        )),
+        vec![(PARENT_PROVIDER, scoped(PARENT_PROVIDER))],
+        vec![(PARENT_PROVIDER, profile(SOFTWARE_WRAPPING_MECHANISM))],
+    );
+    let parent = parent_key(&state).await;
+
+    let child = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .expect("child creation through a cached backend");
+
+    assert!(matches!(
+        child.primary_version().unwrap().material,
+        KeyMaterial::ParentWrapped(_)
+    ));
+    // Published through the cache, so a read after creation sees the child as
+    // it was written rather than a miss or a stale absence.
+    let stored = state.storage.get_key(&child.lid).await.expect("stored");
+    assert!(matches!(
+        stored.primary_version().unwrap().material,
+        KeyMaterial::ParentWrapped(_)
+    ));
 }
 
 #[tokio::test]

@@ -45,8 +45,7 @@ use crate::state::ServiceState;
 use keyrack_core::creation::{creation_correlation, CreationOwner, CreationRequest};
 use keyrack_core::creation_driver::{A2CreationDriver, CreationProgress, WrappingCreationProvider};
 use keyrack_core::key::{
-    Exportability, KeyMaterial, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord,
-    ProviderRef,
+    Exportability, KeyMaterial, KeyRecord, KeySpec, KeyState, KeyVersionRecord, ProviderRef,
 };
 use keyrack_core::lid::Lid;
 use keyrack_core::material::ParentWrappedMaterial;
