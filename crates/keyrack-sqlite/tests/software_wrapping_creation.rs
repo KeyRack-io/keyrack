@@ -10,8 +10,8 @@
 
 use async_trait::async_trait;
 use keyrack_core::creation::{
-    creation_correlation, A2ClosureClaim, A2ClosureFact, CreationOwner, CreationPhase,
-    CreationRequest,
+    creation_correlation, A2ClosureClaim, A2ClosureFact, CreationBinding, CreationOwner,
+    CreationPhase, CreationRequest,
 };
 use keyrack_core::creation_driver::{
     A2CreationDriver, CreationPendingReason as Pending, CreationProgress, WrappingCreationProvider,
@@ -37,6 +37,74 @@ use uuid::Uuid;
 
 const PROVIDER: &str = "software-a2-test";
 const DOMAIN: &str = "software-a2-test-domain";
+
+#[tokio::test]
+async fn review_one_attempt_adapter_must_not_replace_cleanup_owner() {
+    use keyrack_core::creation_driver::A2CreationProvider;
+    let (_, provider, parent, original) = setup().await;
+    let adapter =
+        WrappingCreationProvider::new(provider, parent, WrappedKeyLifecycle::SessionObject)
+            .unwrap();
+    adapter.generate_and_wrap(&original).await.unwrap();
+    let mut other = original.clone();
+    other.operation = Uuid::new_v4();
+    other.attempt = Uuid::new_v4();
+    other.correlation = creation_correlation(other.operation, other.attempt);
+    other.record.lid = keyrack_core::lid::Lid::from_bytes([0x71; 32]);
+    other.context_bytes = other.context().unwrap().canonical_bytes().unwrap();
+    other.validate().unwrap();
+    assert_ne!(original.context_bytes, other.context_bytes);
+    assert!(
+        adapter.generate_and_wrap(&other).await.is_err(),
+        "a second attempt replaced the original cleanup owner"
+    );
+}
+
+#[tokio::test]
+async fn review_creation_closure_must_not_rebind_owner() {
+    use keyrack_core::creation_driver::A2CreationProvider;
+    let (_, provider, parent, original) = setup().await;
+    let adapter =
+        WrappingCreationProvider::new(provider, parent, WrappedKeyLifecycle::SessionObject)
+            .unwrap();
+    adapter.generate_and_wrap(&original).await.unwrap();
+    let mut other = original.clone();
+    other.owner.generation += 1;
+    other.validate().unwrap();
+    assert_eq!(original.context_bytes, other.context_bytes);
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        other.fingerprint().unwrap()
+    );
+    assert!(
+        adapter.close_creation(&other).await.is_err(),
+        "the original creation closure was accepted for a different owner"
+    );
+}
+
+#[tokio::test]
+async fn review_creation_closure_must_not_rebind_operation_and_attempt() {
+    use keyrack_core::creation_driver::A2CreationProvider;
+    let (_, provider, parent, original) = setup().await;
+    let adapter =
+        WrappingCreationProvider::new(provider, parent, WrappedKeyLifecycle::SessionObject)
+            .unwrap();
+    adapter.generate_and_wrap(&original).await.unwrap();
+    let mut other = original.clone();
+    other.operation = Uuid::new_v4();
+    other.attempt = Uuid::new_v4();
+    other.correlation = creation_correlation(other.operation, other.attempt);
+    other.validate().unwrap();
+    assert_eq!(original.context_bytes, other.context_bytes);
+    assert_ne!(
+        original.fingerprint().unwrap(),
+        other.fingerprint().unwrap()
+    );
+    assert!(
+        adapter.close_creation(&other).await.is_err(),
+        "the original creation closure was accepted for another operation/attempt"
+    );
+}
 
 fn name(value: &str) -> WrappingIdentifier {
     WrappingIdentifier::new(value).unwrap()
@@ -194,7 +262,7 @@ async fn a_provider_that_cannot_evidence_closure_cannot_be_installed() {
 
 /// One deviation from a fully working software provider, so that what a test
 /// observes is attributable to that deviation and nothing else.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deviation {
     /// Declares generation but not opening, while still implementing both.
     UndeclaredOpen,
@@ -202,6 +270,12 @@ enum Deviation {
     MisboundLease,
     /// Closes the right object but reports it under another context.
     MisreportedClosure,
+    /// Generates the object, then fails: the caller learns nothing about what
+    /// exists, which is what a lost response looks like from here.
+    LostGeneration,
+    /// Never answers, so the caller can only give up on a call that may have
+    /// had an effect.
+    SilentGeneration,
 }
 
 struct DeviantProvider(Arc<SoftwareProvider>, Deviation);
@@ -260,8 +334,20 @@ impl CryptoProvider for DeviantProvider {
         &self,
         context: &WrappingContext,
         parent: &KeyHandle,
+        creation: &CreationBinding,
     ) -> Result<GeneratedWrappedKey> {
-        let generated = self.0.generate_wrapped_key(context, parent).await?;
+        if self.1 == Deviation::SilentGeneration {
+            std::future::pending::<()>().await;
+        }
+        let generated = self
+            .0
+            .generate_wrapped_key(context, parent, creation)
+            .await?;
+        if self.1 == Deviation::LostGeneration {
+            return Err(keyrack_core::error::KeyRackError::Provider(
+                "generation response lost".into(),
+            ));
+        }
         if self.1 != Deviation::MisboundLease {
             return Ok(generated);
         }
@@ -434,7 +520,11 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
     // An object that was opened rather than generated: closing it is not
     // evidence that a creation attempt was cleaned up.
     let generated = provider
-        .generate_wrapped_key(&context, &parent_handle)
+        .generate_wrapped_key(
+            &context,
+            &parent_handle,
+            &CreationBinding::of(&request).unwrap(),
+        )
         .await
         .unwrap();
     let opened = provider
@@ -463,13 +553,105 @@ async fn closure_evidence_is_refused_for_anything_but_this_creation_object() {
         .to_string();
     assert!(error.contains("no recorded destruction"), "{error}");
 
-    // The right object and bytes, but presented for a different creation: the
-    // recorded context, not the object identity, is what ties them together.
+    // The right object and bytes, but presented for another child entirely.
     let (_, other_request) = fixture(&parent_handle);
     assert!(verifier
         .verify(&other_request, &claim(object, digest))
         .is_err());
 
+    // The right object and bytes, presented for another attempt at the same
+    // child. Context, envelope and origin are all equal here, so only the
+    // creation recorded with the object distinguishes them.
+    let mut second_attempt = request.clone();
+    second_attempt.operation = Uuid::new_v4();
+    second_attempt.attempt = Uuid::new_v4();
+    second_attempt.correlation =
+        creation_correlation(second_attempt.operation, second_attempt.attempt);
+    second_attempt.validate().unwrap();
+    assert_eq!(request.context_bytes, second_attempt.context_bytes);
+    let error = verifier
+        .verify(
+            &second_attempt,
+            &A2ClosureClaim {
+                intent_fingerprint: second_attempt.fingerprint().unwrap(),
+                envelope_digest: digest,
+                fact: A2ClosureFact::TemporaryObjectDestroyed {
+                    object: object.clone(),
+                },
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("another creation"), "{error}");
+
     // And the same object bound to the envelope it actually produced.
     assert!(verifier.verify(&request, &claim(object, digest)).is_ok());
+}
+
+/// The three ways a generation can leave an object with no usable answer, and
+/// the one thing that must be true after each: this attempt still owns whatever
+/// exists, and nothing else may generate over it.
+///
+/// Each case would pass trivially if the adapter simply refused everything, so
+/// each also asserts the refusal names the state it is in.
+#[tokio::test]
+async fn a_generation_that_answers_badly_keeps_its_cleanup_ownership() {
+    use keyrack_core::creation_driver::A2CreationProvider;
+    for deviation in [
+        Deviation::LostGeneration,
+        Deviation::SilentGeneration,
+        Deviation::MisboundLease,
+    ] {
+        let (_, provider, parent_handle, request) = setup().await;
+        let adapter = WrappingCreationProvider::new(
+            Arc::new(DeviantProvider(provider, deviation)),
+            parent_handle,
+            WrappedKeyLifecycle::SessionObject,
+        )
+        .unwrap();
+
+        if deviation == Deviation::SilentGeneration {
+            // A caller that gives up on a call that may already have had an
+            // effect. The reservation is what survives the cancellation.
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                adapter.generate_and_wrap(&request),
+            )
+            .await
+            .is_err());
+        } else {
+            assert!(adapter.generate_and_wrap(&request).await.is_err());
+        }
+
+        let again = adapter
+            .generate_and_wrap(&request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            again.contains("cannot generate again"),
+            "{deviation:?}: {again}"
+        );
+
+        let error = adapter
+            .close_creation(&request)
+            .await
+            .unwrap_err()
+            .to_string();
+        if deviation == Deviation::MisboundLease {
+            // A lease came back, so there is something to close: the object is
+            // still owned and the provider is asked about it. Refusing as
+            // unresolved here would mean the adapter had thrown the lease away
+            // with the refusal, leaving the object unreachable.
+            assert!(
+                !error.contains("unresolved"),
+                "the only lease for a live object was discarded: {error}"
+            );
+        } else {
+            // No lease came back. The attempt is unresolved, and saying so is
+            // the whole answer: a closure must not be manufactured from the
+            // absence of one.
+            assert!(error.contains("unresolved"), "{deviation:?}: {error}");
+        }
+    }
 }

@@ -33,6 +33,18 @@ class Control:
     after: str
     suite: tuple[str, str]
     test: str
+    # Further edits reverted together with the first. A layered check is only
+    # provable by removing every layer that covers the same fact.
+    also: tuple[tuple[str, str, str], ...] = ()
+    # "fails": the watched test must fail with this check gone.
+    # "layered": it must still pass, because a deeper check owns the outcome.
+    # Recording the second honestly is the point; a control that cannot fail
+    # is not evidence of a guard, and pretending otherwise is how eight green
+    # controls come to imply eight independent guards.
+    expect: str = "fails"
+
+    def edits(self) -> tuple[tuple[str, str, str], ...]:
+        return ((self.file, self.before, self.after),) + self.also
 
 
 CONTROLS = [
@@ -164,12 +176,11 @@ CONTROLS = [
         name="adapter-lease-binding",
         guard="a lease must bind the creation context it was generated for",
         file=DRIVER,
-        before="""        if generated.lease.context_sha256()
-            != context
+        before="""        let bound = generated.lease.context_sha256()
+            == context
                 .context_sha256()
-                .map_err(|_| invalid("invalid creation context"))?
-        {""",
-        after="""        if false {""",
+                .map_err(|_| invalid("invalid creation context"))?;""",
+        after="""        let bound = true;""",
         suite=SQLITE_TEST,
         test="a_lease_bound_to_another_context_never_reaches_publication",
     ),
@@ -181,6 +192,95 @@ CONTROLS = [
         after="""        if false {""",
         suite=SQLITE_TEST,
         test="a_closure_reported_under_another_context_never_reaches_publication",
+    ),
+    # The five below are the A2 review's two defects. Each watches the exact
+    # regression from that review, so what fails when a binding is removed is
+    # the reviewer's test rather than one of ours agreeing with itself.
+    Control(
+        name="adapter-reserves-owner-before-generate",
+        guard="the owner of a cleanup exists before there is anything to clean up",
+        file=DRIVER,
+        before="""        self.reserve(&binding)?;""",
+        after="""""",
+        suite=SQLITE_TEST,
+        test="review_one_attempt_adapter_must_not_replace_cleanup_owner",
+    ),
+    Control(
+        name="adapter-retains-unusable-lease",
+        guard="a lease for the wrong context is kept, because it is the only way to close that object",
+        file=DRIVER,
+        before="""        self.retain(&binding, generated.lease, &generated.envelope)?;
+        if !bound {
+            return Err(invalid("provider lease does not bind the creation context"));
+        }""",
+        after="""        if !bound {
+            return Err(invalid("provider lease does not bind the creation context"));
+        }
+        self.retain(&binding, generated.lease, &generated.envelope)?;""",
+        suite=SQLITE_TEST,
+        test="a_generation_that_answers_badly_keeps_its_cleanup_ownership",
+    ),
+    Control(
+        name="provider-records-creation",
+        guard="the provider keeps the creation its object was generated for",
+        file=CORE,
+        before="""            Some(creation.clone()),""",
+        after="""            None,""",
+        suite=SQLITE_TEST,
+        test="a_journaled_creation_publishes_a_wrapped_child_that_still_opens",
+    ),
+    Control(
+        name="verifier-creation-binding",
+        guard="a closure is evidence for the creation it came from and no other",
+        file=CORE,
+        before="""        binding
+            .creation
+            .as_ref()
+            .ok_or(invalid("closure names an object with no creation binding"))?
+            .require(request)?;""",
+        after="""""",
+        suite=SQLITE_TEST,
+        test="closure_evidence_is_refused_for_anything_but_this_creation_object",
+    ),
+    Control(
+        name="adapter-closure-owner",
+        guard="the adapter refuses to close for a creation other than the one it holds",
+        file=DRIVER,
+        before="""                Some(held) if held.binding() != &binding => {""",
+        after="""                Some(held) if held.binding() != &binding && false => {""",
+        suite=SQLITE_TEST,
+        test="review_creation_closure_must_not_rebind_owner",
+        expect="layered",
+    ),
+    Control(
+        name="adapter-and-provider-closure-owner",
+        guard="both layers of the same fact, removed together",
+        file=DRIVER,
+        before="""                Some(held) if held.binding() != &binding => {""",
+        after="""                Some(held) if held.binding() != &binding && false => {""",
+        also=(
+            (
+                CORE,
+                """        binding
+            .creation
+            .as_ref()
+            .ok_or(invalid("closure names an object with no creation binding"))?
+            .require(request)?;""",
+                """""",
+            ),
+        ),
+        suite=SQLITE_TEST,
+        test="review_creation_closure_must_not_rebind_owner",
+    ),
+    Control(
+        name="adapter-claim-fingerprint",
+        guard="the claim carries the fingerprint reserved before the effect",
+        file=DRIVER,
+        before="""            intent_fingerprint: binding.fingerprint(),""",
+        after="""            intent_fingerprint: request.fingerprint()?,""",
+        suite=SQLITE_TEST,
+        test="review_creation_closure_must_not_rebind_operation_and_attempt",
+        expect="layered",
     ),
     Control(
         name="adapter-requires-verifier",
@@ -231,16 +331,22 @@ def main() -> int:
     for control in CONTROLS:
         if args.filter and args.filter not in control.name:
             continue
-        path = ROOT / control.file
-        original = path.read_text()
-        if control.before not in original:
-            print(f"[{control.name}] PATTERN NOT FOUND — control cannot run")
+        edits = control.edits()
+        missing = [
+            file
+            for file, before, _ in edits
+            if before not in (ROOT / file).read_text()
+        ]
+        if missing:
+            print(f"[{control.name}] PATTERN NOT FOUND in {missing} — control cannot run")
             results.append((control, "pattern-not-found", ""))
             continue
-        patched = original.replace(control.before, control.after, 1)
-        if control.name == "adapter-requires-verifier":
-            patched += ACCEPT_ALL
-        path.write_text(patched)
+        for file, before, after in edits:
+            path = ROOT / file
+            patched = path.read_text().replace(before, after, 1)
+            if control.name == "adapter-requires-verifier":
+                patched += ACCEPT_ALL
+            path.write_text(patched)
         package, suite = control.suite
         outcome = run(
             [
@@ -248,11 +354,20 @@ def main() -> int:
                 "--target-dir", "./target", control.test, "--", "--exact",
             ]
         )
-        revert({control.file})
+        revert({file for file, _, _ in edits})
         stdout = outcome.stdout
-        if outcome.returncode == 0 and "1 passed" in stdout:
+        passed = outcome.returncode == 0 and "1 passed" in stdout
+        failed = "FAILED" in stdout or outcome.returncode != 0
+        if control.expect == "layered":
+            if passed:
+                verdict = "still passes as expected — a deeper check owns the outcome"
+            elif failed:
+                verdict = "FAILS — it owns the outcome after all; reclassify it"
+            else:
+                verdict = "inconclusive"
+        elif passed:
             verdict = "STILL PASSES — check is unproven"
-        elif "FAILED" in stdout or outcome.returncode != 0:
+        elif failed:
             verdict = "fails as expected"
         else:
             verdict = "inconclusive"
@@ -274,7 +389,7 @@ def main() -> int:
     print("\n=== controls ===")
     unproven = 0
     for control, verdict, detail in results:
-        if verdict != "fails as expected":
+        if not verdict.startswith(("fails as expected", "still passes as expected")):
             unproven += 1
         print(f"{control.name}: {verdict}")
         print(f"    guard: {control.guard}")

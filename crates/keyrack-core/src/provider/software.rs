@@ -27,7 +27,9 @@
 //! **Not for production HSM-grade security** — use `keyrack-pkcs11`
 //! or `keyrack-kmip` for that.
 
-use crate::creation::{invalid, A2ClosureClaim, A2ClosureFact, A2ClosureVerifier, CreationRequest};
+use crate::creation::{
+    invalid, A2ClosureClaim, A2ClosureFact, A2ClosureVerifier, CreationBinding, CreationRequest,
+};
 use crate::error::{KeyRackError, Result};
 use crate::key::{KeySpec, ProviderRef};
 use crate::provider::{
@@ -176,11 +178,16 @@ enum ObjectOrigin {
 }
 
 /// Bindings of one transient child object, held only in process memory.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ObjectBinding {
     context_sha256: [u8; 32],
     envelope_blake3: [u8; 32],
     origin: ObjectOrigin,
+    /// The creation this object was generated for, absent for an opened child.
+    /// Kept because context is identical across attempts at the same child: it
+    /// is what lets the verifier refuse a real closure presented for another
+    /// creation.
+    creation: Option<CreationBinding>,
 }
 
 /// Open and closed child objects for this provider incarnation.
@@ -362,6 +369,7 @@ impl SoftwareProvider {
         child: KeyMaterial,
         envelope: &[u8],
         origin: ObjectOrigin,
+        creation: Option<CreationBinding>,
     ) -> Result<WrappedKeyLease> {
         let binding = ObjectBinding {
             context_sha256: context
@@ -369,6 +377,7 @@ impl SoftwareProvider {
                 .map_err(|e| KeyRackError::Provider(format!("invalid wrapping context: {e}")))?,
             envelope_blake3: *blake3::hash(envelope).as_bytes(),
             origin,
+            creation,
         };
         // Lock order is wrapping state, then keys; every wrapping path keeps it.
         let object = {
@@ -435,6 +444,15 @@ impl A2ClosureVerifier for SoftwareClosureVerifier {
                 "closure names an opened object, not a creation object",
             ));
         }
+        // The creation this object was generated for, compared before anything
+        // it has in common with other creations. Context, envelope and origin
+        // are all equal across two attempts at the same child, so without this
+        // a real closure of one attempt certifies another.
+        binding
+            .creation
+            .as_ref()
+            .ok_or(invalid("closure names an object with no creation binding"))?
+            .require(request)?;
         if binding.envelope_blake3 != claim.envelope_digest {
             return Err(invalid("closure does not bind the staged envelope"));
         }
@@ -1151,6 +1169,7 @@ impl CryptoProvider for SoftwareProvider {
         &self,
         context: &WrappingContext,
         parent: &KeyHandle,
+        creation: &CreationBinding,
     ) -> Result<GeneratedWrappedKey> {
         let aad = self.admit(context, parent, WrappingOperation::Generate)?;
         let mut child = vec![0u8; 32];
@@ -1162,7 +1181,13 @@ impl CryptoProvider for SoftwareProvider {
             return Err(KeyRackError::Provider("child material mismatch".into()));
         };
         let envelope = self.seal_under_parent(parent, bytes, &aad)?;
-        let lease = self.retain_child(context, child, &envelope, ObjectOrigin::Generated)?;
+        let lease = self.retain_child(
+            context,
+            child,
+            &envelope,
+            ObjectOrigin::Generated,
+            Some(creation.clone()),
+        )?;
         Ok(GeneratedWrappedKey { envelope, lease })
     }
 
@@ -1190,7 +1215,7 @@ impl CryptoProvider for SoftwareProvider {
                 "unwrapped child is not an AES-256 key".into(),
             ));
         }
-        self.retain_child(context, child, envelope, ObjectOrigin::Opened)
+        self.retain_child(context, child, envelope, ObjectOrigin::Opened, None)
     }
 
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
@@ -1200,7 +1225,7 @@ impl CryptoProvider for SoftwareProvider {
                 .wrapping
                 .write()
                 .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
-            if let Some(recorded) = state.closed.get(&object).copied() {
+            if let Some(recorded) = state.closed.get(&object).cloned() {
                 // Idempotent: a repeated close reports the same fact so that a
                 // lost response can be reconciled rather than retried as work.
                 if recorded.context_sha256 != lease.context_sha256() {
@@ -1222,14 +1247,25 @@ impl CryptoProvider for SoftwareProvider {
                         "wrapping lease does not match the open object's context".into(),
                     ));
                 }
-                state.record_closed(object.clone(), open);
+                // Destroy first, record second, both under this lock. A closure
+                // record is a statement that the material is gone, so it must
+                // not be observable while the material is still there, and a
+                // failure here must leave the object open with cleanup owed
+                // rather than a positive record of a destruction that did not
+                // happen. Lock order stays wrapping state, then keys.
+                match self.keys.write() {
+                    Ok(mut keys) => {
+                        keys.remove(&object);
+                    }
+                    Err(e) => {
+                        state.open.insert(object, open);
+                        return Err(KeyRackError::Provider(format!("lock poisoned: {e}")));
+                    }
+                }
+                state.record_closed(object.clone(), open.clone());
                 open
             }
         };
-        self.keys
-            .write()
-            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
-            .remove(&object);
         Ok(WrappedKeyClosure {
             fact: A2ClosureFact::TemporaryObjectDestroyed { object },
             context_sha256: binding.context_sha256,

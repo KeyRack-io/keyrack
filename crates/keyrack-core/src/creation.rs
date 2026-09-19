@@ -252,6 +252,83 @@ impl CreationPhase {
 
 /// Provider creation-object closure only. Not operation-lease closure, authority
 /// fencing, or a boolean assertion that a worker is done.
+/// The exact creation one provider effect is allowed to belong to.
+///
+/// A provider is given this before it can have an effect, keeps it with the
+/// object, and answers with it when asked whether a closure belongs to a
+/// request. Wrapping context is not enough for that question: two different
+/// creations of the same child under the same parent have byte-identical
+/// canonical context and differ only in operation, attempt, owner and
+/// correlation, so a closure matched on context alone can be presented for a
+/// creation it did not come from.
+///
+/// It is deliberately not serializable. A binding exists only by being taken
+/// from a validated request in this process, so no coordinator field and no
+/// stored blob can assert one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationBinding {
+    operation: Uuid,
+    attempt: Uuid,
+    owner: CreationOwner,
+    correlation: String,
+    fingerprint: [u8; 32],
+}
+
+impl CreationBinding {
+    /// Take the binding of a request, which validates it: no binding exists for
+    /// an intent the journal would refuse.
+    pub fn of(request: &CreationRequest) -> Result<Self> {
+        Ok(Self {
+            operation: request.operation,
+            attempt: request.attempt,
+            owner: request.owner,
+            correlation: request.correlation.clone(),
+            fingerprint: request.fingerprint()?,
+        })
+    }
+
+    /// Refuse a request that is not the one this binding was taken for.
+    ///
+    /// Every field is compared, not only the fingerprint, so that a later change
+    /// to what the fingerprint covers cannot silently widen what one binding
+    /// will answer for.
+    pub fn require(&self, request: &CreationRequest) -> Result<()> {
+        if *self != Self::of(request)? {
+            return Err(invalid(
+                "this effect belongs to another creation operation, attempt or owner",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> Uuid {
+        self.operation
+    }
+
+    #[must_use]
+    pub fn attempt(&self) -> Uuid {
+        self.attempt
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> CreationOwner {
+        self.owner
+    }
+
+    /// The recovery identity a provider may encode natively to find the effect
+    /// again after a lost response.
+    #[must_use]
+    pub fn correlation(&self) -> &str {
+        &self.correlation
+    }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum A2ClosureFact {

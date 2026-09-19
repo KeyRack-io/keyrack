@@ -8,16 +8,26 @@
 //! child all live in this process's heap, so nothing in this file establishes
 //! that a software-wrapped child is provider-contained. It is not.
 
-use keyrack_core::key::{KeySpec, ProviderRef};
+use keyrack_core::canon::CanonicalizationVersion;
+use keyrack_core::creation::{
+    creation_correlation, CreationBinding, CreationOwner, CreationRequest,
+};
+use keyrack_core::key::{
+    Exportability, KeyOrigin, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord,
+    ProviderClass, ProviderRef,
+};
 use keyrack_core::lid::Lid;
+use keyrack_core::material::{KeyMaterial, ParentWrappedMaterial};
 use keyrack_core::provider::inmem::InMemoryProvider;
 use keyrack_core::provider::software::{SoftwareProvider, SOFTWARE_WRAPPING_MECHANISM};
 use keyrack_core::provider::{CryptoProvider, KeyHandle, WrappedKeyLease};
+use keyrack_core::tags::{IdentityTags, UserTags};
 use keyrack_core::wrapping::{
     VersionedKeyId, WrappedKeyFormat, WrappedKeyLifecycle, WrappingCapability, WrappingContext,
     WrappingContextVersion, WrappingError, WrappingIdentifier, WrappingKeyPurpose,
     WrappingOperation,
 };
+use uuid::Uuid;
 
 /// 12-byte nonce, 32-byte wrapped child, 16-byte tag.
 const ENVELOPE_BYTES: usize = 60;
@@ -42,6 +52,75 @@ fn context(parent: &KeyHandle) -> WrappingContext {
     }
 }
 
+/// A creation whose context is the one above, so a binding taken from it is a
+/// real one rather than a shape a test invented for the provider.
+fn creation(context: &WrappingContext) -> CreationRequest {
+    let material = ParentWrappedMaterial::new(
+        context.provider_ref.clone(),
+        context.security_domain.clone(),
+        context.parent,
+        context.version,
+        context.key_format.clone(),
+        context.mechanism.clone(),
+        name("kr-a2-envelope-software-test"),
+    )
+    .unwrap();
+    let record = KeyRecord {
+        lid: context.child.lid,
+        canonicalization_version: CanonicalizationVersion::V2,
+        parent_lid: Some(context.parent.lid),
+        occ_version: 1,
+        current_key_version: context.child.version.get(),
+        state: KeyState::Enabled,
+        was_compromised: false,
+        key_usage: KeyUsage::EncryptDecrypt,
+        key_spec: context.child_spec.clone(),
+        origin: KeyOrigin::KeyRack,
+        provider_class: ProviderClass::Software,
+        provider_ref: Some(context.provider_ref.clone()),
+        exportability: Exportability::NonExportable,
+        first_exported_at: None,
+        owner_principal_id: None,
+        identity_tags: IdentityTags::from_map(std::collections::BTreeMap::new()).unwrap(),
+        user_tags: UserTags::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        scheduled_deletion_at: None,
+        description: String::new(),
+        key_versions: vec![KeyVersionRecord {
+            version_number: context.child.version.get(),
+            material: KeyMaterial::ParentWrapped(material),
+            created_at: chrono::Utc::now(),
+            is_primary: true,
+        }],
+    };
+    let operation = Uuid::new_v4();
+    let attempt = Uuid::new_v4();
+    let mut request = CreationRequest {
+        operation,
+        attempt,
+        owner: CreationOwner {
+            instance: Uuid::new_v4(),
+            generation: 1,
+        },
+        correlation: creation_correlation(operation, attempt),
+        record,
+        expected_key_occ: None,
+        expected_parent_occ: 1,
+        parent_spec: context.parent_spec.clone(),
+        context_bytes: Vec::new(),
+    };
+    request.context_bytes = request.context().unwrap().canonical_bytes().unwrap();
+    request.validate().unwrap();
+    request
+}
+
+/// The binding of one creation of that child, for the operations that need to
+/// know which creation they are having an effect for.
+fn binding(context: &WrappingContext) -> CreationBinding {
+    CreationBinding::of(&creation(context)).unwrap()
+}
+
 async fn parented() -> (SoftwareProvider, KeyHandle, WrappingContext) {
     let provider = SoftwareProvider::new();
     let parent = provider.generate_key(&KeySpec::Aes256).await.unwrap();
@@ -53,7 +132,10 @@ async fn parented() -> (SoftwareProvider, KeyHandle, WrappingContext) {
 async fn a_wrapped_child_is_generated_opened_used_and_closed() {
     let (provider, parent, ctx) = parented().await;
 
-    let generated = provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
     assert_eq!(generated.envelope.len(), ENVELOPE_BYTES);
 
     // Encrypt under the creation lease, then decrypt under a separately opened
@@ -87,7 +169,10 @@ async fn a_wrapped_child_is_generated_opened_used_and_closed() {
 #[tokio::test]
 async fn a_closed_lease_stops_operating_and_closes_idempotently() {
     let (provider, parent, ctx) = parented().await;
-    let generated = provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
     let lease = generated.lease;
 
     let first = provider.close_wrapped_key(&lease).await.unwrap();
@@ -102,10 +187,47 @@ async fn a_closed_lease_stops_operating_and_closes_idempotently() {
     assert_eq!(first, second);
 }
 
+/// Idempotent close is bounded by what the provider still remembers, and the
+/// boundary is an error rather than a success. A caller that is told "closed"
+/// about an object nobody can account for would be entitled to conclude the
+/// creation was cleaned up, and to create the child again.
+#[tokio::test]
+async fn a_forgotten_closure_is_unresolved_rather_than_successful() {
+    let (provider, parent, ctx) = parented().await;
+    let creation = binding(&ctx);
+    let first = provider
+        .generate_wrapped_key(&ctx, &parent, &creation)
+        .await
+        .unwrap();
+    provider.close_wrapped_key(&first.lease).await.unwrap();
+    assert_eq!(
+        provider.close_wrapped_key(&first.lease).await.unwrap(),
+        provider.close_wrapped_key(&first.lease).await.unwrap()
+    );
+
+    // Enough closures after it to push the first one out of the bounded record.
+    for _ in 0..4096 {
+        let next = provider
+            .generate_wrapped_key(&ctx, &parent, &creation)
+            .await
+            .unwrap();
+        provider.close_wrapped_key(&next.lease).await.unwrap();
+    }
+    let error = provider
+        .close_wrapped_key(&first.lease)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown wrapping lease"), "{error}");
+}
+
 #[tokio::test]
 async fn closing_under_another_context_is_refused_and_destroys_nothing() {
     let (provider, parent, ctx) = parented().await;
-    let generated = provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
 
     // Same object identity, different bindings. Closing must refuse rather than
     // destroy an object on a claim that does not describe it.
@@ -133,7 +255,10 @@ async fn closing_under_another_context_is_refused_and_destroys_nothing() {
 #[tokio::test]
 async fn a_lease_from_another_provider_is_not_closeable_here() {
     let (provider, parent, ctx) = parented().await;
-    let generated = provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
 
     let (other, _, _) = parented().await;
     assert!(other.close_wrapped_key(&generated.lease).await.is_err());
@@ -145,7 +270,7 @@ async fn a_lease_from_another_provider_is_not_closeable_here() {
 async fn an_undeclared_tuple_is_refused_for_every_operation() {
     let (provider, parent, ctx) = parented().await;
     let envelope = provider
-        .generate_wrapped_key(&ctx, &parent)
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
         .await
         .unwrap()
         .envelope;
@@ -172,7 +297,7 @@ async fn an_undeclared_tuple_is_refused_for_every_operation() {
 
     for changed in refused {
         let generate = provider
-            .generate_wrapped_key(&changed, &parent)
+            .generate_wrapped_key(&changed, &parent, &binding(&ctx))
             .await
             .unwrap_err()
             .to_string();
@@ -191,21 +316,24 @@ async fn a_parent_handle_that_is_not_the_bound_spec_is_refused() {
     let (provider, parent, ctx) = parented().await;
     let smaller = provider.generate_key(&KeySpec::Aes128).await.unwrap();
     let error = provider
-        .generate_wrapped_key(&ctx, &smaller)
+        .generate_wrapped_key(&ctx, &smaller, &binding(&ctx))
         .await
         .unwrap_err()
         .to_string();
     assert!(error.contains("parent handle"), "{error}");
 
     // The bound parent still works, so the refusal is about this handle only.
-    provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn the_authenticated_context_refuses_every_other_binding() {
     let (provider, parent, ctx) = parented().await;
     let envelope = provider
-        .generate_wrapped_key(&ctx, &parent)
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
         .await
         .unwrap()
         .envelope;
@@ -276,7 +404,10 @@ async fn a_scoped_provider_refuses_a_context_naming_another_backend() {
     );
     let parent = provider.generate_key(&KeySpec::Aes256).await.unwrap();
     let ctx = context(&parent);
-    provider.generate_wrapped_key(&ctx, &parent).await.unwrap();
+    provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
 
     for changed in [
         WrappingContext {
@@ -289,7 +420,7 @@ async fn a_scoped_provider_refuses_a_context_naming_another_backend() {
         },
     ] {
         let error = provider
-            .generate_wrapped_key(&changed, &parent)
+            .generate_wrapped_key(&changed, &parent, &binding(&ctx))
             .await
             .unwrap_err()
             .to_string();
@@ -363,7 +494,7 @@ async fn a_provider_without_the_profile_refuses_all_three_operations() {
 
     assert!(provider.wrapping_capabilities().tuples().is_empty());
     let error = provider
-        .generate_wrapped_key(&ctx, &parent)
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
         .await
         .unwrap_err()
         .to_string();

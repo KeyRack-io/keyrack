@@ -457,6 +457,17 @@ pub trait CryptoProvider: Send + Sync {
     /// it does not declare, independently of the caller's
     /// [`require`](crate::wrapping::WrappingCapabilities::require) check.
     ///
+    /// `creation` arrives before the effect can exist and must be retained with
+    /// the object, because context does not identify a creation: two attempts
+    /// at the same child under the same parent have identical context bytes.
+    /// A provider that records it can later answer whether a closure belongs
+    /// to a given request; one that discards it can only answer that some
+    /// object of the right shape was closed, which is the question that lets a
+    /// closure be presented for a creation it did not come from. Where the
+    /// backend supports it, encode
+    /// [`correlation`](crate::creation::CreationBinding::correlation) natively
+    /// so the effect can be found again after a lost response.
+    ///
     /// The returned lease is open and owed a [`close_wrapped_key`] call. An
     /// error can mean effects occurred: implementations must not retry
     /// generation internally after an ambiguous response, because a lost
@@ -471,6 +482,7 @@ pub trait CryptoProvider: Send + Sync {
         &self,
         _context: &crate::wrapping::WrappingContext,
         _parent: &KeyHandle,
+        _creation: &crate::creation::CreationBinding,
     ) -> Result<GeneratedWrappedKey> {
         Err(crate::error::KeyRackError::Provider(
             "wrapped-key generation not supported by this provider".into(),
@@ -487,6 +499,10 @@ pub trait CryptoProvider: Send + Sync {
     ///
     /// Callers must close every returned lease, including on the error paths
     /// of whatever they do in between.
+    ///
+    /// There is deliberately no creation binding here. Opening an existing
+    /// child is ordinary use, and closing such a lease certifies nothing about
+    /// how that child was created.
     async fn open_wrapped_key(
         &self,
         _context: &crate::wrapping::WrappingContext,
@@ -501,9 +517,18 @@ pub trait CryptoProvider: Send + Sync {
     /// Close the exact object named by `lease`, idempotently.
     ///
     /// Repeating this for an already-closed lease must return the same fact
-    /// rather than fail, so that a lost response can be reconciled. Closing
-    /// must not generate, unwrap or rewrap anything to obtain a fact, and an
-    /// error leaves cleanup owed rather than completed.
+    /// rather than fail, so that a lost response can be reconciled, for as long
+    /// as the provider can still speak for that object. Idempotency is bounded
+    /// by that memory: once a provider no longer holds the record, the close
+    /// is unresolved and must be reported as an error, never as success and
+    /// never as permission to create the child again.
+    ///
+    /// A fact may be returned only after an explicit close of the exact object
+    /// in the session that produced it has succeeded. An ambiguous error, a
+    /// destructor, a lease expiry, or an empty search from a new session is not
+    /// a closure, and the record must not become observable before the material
+    /// is actually gone. Closing must not generate, unwrap or rewrap anything
+    /// to obtain a fact, and an error leaves cleanup owed rather than completed.
     async fn close_wrapped_key(&self, _lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
         Err(crate::error::KeyRackError::Provider(
             "closing wrapped keys not supported by this provider".into(),
@@ -517,6 +542,12 @@ pub trait CryptoProvider: Send + Sync {
     /// `None`, the default, means this provider cannot evidence closure and so
     /// cannot drive journaled creation; there is deliberately no accept-all
     /// implementation to inherit.
+    ///
+    /// A verifier answers for one creation, not for a shape: it must compare
+    /// the request against the
+    /// [`CreationBinding`](crate::creation::CreationBinding) recorded with the
+    /// object it generated, so that a genuine closure of one creation is
+    /// refused when presented for another.
     fn wrapping_closure_verifier(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::creation::A2ClosureVerifier>> {
