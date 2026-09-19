@@ -4,8 +4,9 @@
 
 KeyRack is an open-source key lifecycle coordination layer. It tracks key
 hierarchies, drives rotation, and delegates all cryptographic material to
-HSM backends (PKCS#11, KMIP, Vault Transit). When backed by an HSM or
-Vault provider, raw key material never leaves the backend; the software
+HSM backends (PKCS#11, KMIP, Vault Transit). For non-exportable keys in an HSM or
+Vault provider, raw key material remains in the backend. Exportable keys may
+intentionally leave it through authorized export operations. The software
 provider holds key bytes in process memory (dev/test only).
 
 - **Sovereign** — you control your keys. No cloud vendor lock-in.

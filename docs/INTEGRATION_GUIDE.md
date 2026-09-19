@@ -36,7 +36,13 @@ Identity is extracted from the client certificate:
 1. **SPIFFE ID** (SAN URI `spiffe://...`) — preferred
 2. **Subject CN** — fallback
 
-Requires TLS configuration on the server:
+Authentication defaults to `mtls`, but transport TLS is opt-in. The gRPC
+listener requires explicit TLS configuration and a client CA for this identity
+mode. The REST listener serves plain HTTP and cannot use the gRPC peer-certificate
+identity; terminate HTTPS at a reverse proxy, protect its connection to the
+service, and configure a REST-supported credential type such as JWT.
+
+Configure the gRPC server:
 
 ```yaml
 tls:
@@ -290,7 +296,8 @@ TTL means faster convergence at the cost of more backend lookups.
 
 ## 5. Production Checklist
 
-- [ ] TLS enabled (`tls:` with server cert + CA for mTLS)
+- [ ] gRPC TLS enabled (`tls:` with server cert + CA for mTLS)
+- [ ] REST HTTPS terminated at a reverse proxy with its service connection protected
 - [ ] AuthN configured (not `insecure` or `bootstrap_token` alone)
 - [ ] PDP configured (not `always_allow`; the startup log must not carry the
       `always_allow` warning)

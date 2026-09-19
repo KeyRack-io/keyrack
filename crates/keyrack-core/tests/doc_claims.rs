@@ -195,10 +195,16 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if !matches!(name.as_ref(), "target" | "node_modules" | ".git") {
+            if !matches!(
+                name.as_ref(),
+                "target" | "node_modules" | ".git" | ".cache" | "dist" | ".astro"
+            ) {
                 markdown_files(&path, out);
             }
-        } else if path.extension().is_some_and(|e| e == "md") {
+        } else if path
+            .extension()
+            .is_some_and(|e| e == "md" || e == "mdx" || e == "astro")
+        {
             out.push(path);
         }
     }
@@ -268,6 +274,19 @@ fn keyless_audit_claims_state_their_bounds() {
     let root = repo_root();
     let mut docs = Vec::new();
     markdown_files(&root, &mut docs);
+    if let Some(external) = std::env::var_os("KEYRACK_DOC_ROOT") {
+        let external = PathBuf::from(external);
+        assert!(
+            external.is_dir(),
+            "KEYRACK_DOC_ROOT must be a documentation directory"
+        );
+        let before = docs.len();
+        markdown_files(&external, &mut docs);
+        assert!(
+            docs.len() > before,
+            "KEYRACK_DOC_ROOT contains no documentation"
+        );
+    }
     assert!(
         !docs.is_empty(),
         "expected to find markdown files under the repo root"
@@ -336,5 +355,99 @@ fn keyless_audit_claims_state_their_bounds() {
         "expected the audit-detection claim in at least 8 places, found {scanned} — if it \
          was reworded, update KEYLESS_CLAIM_PHRASES so this stays a control rather than \
          lowering this floor"
+    );
+}
+
+/// Release copy is scanned in the public repo and, when requested, the actual
+/// website tree. These controls reject the retired assertions wherever they
+/// recur; they do not establish third-party certification or performance.
+#[test]
+fn release_claims_do_not_overstate_shipped_capabilities() {
+    let root = repo_root();
+    let mut docs = Vec::new();
+    markdown_files(&root, &mut docs);
+    if let Some(external) = std::env::var_os("KEYRACK_DOC_ROOT") {
+        let external = PathBuf::from(external);
+        assert!(
+            external.is_dir(),
+            "KEYRACK_DOC_ROOT must be a documentation directory"
+        );
+        let before = docs.len();
+        markdown_files(&external, &mut docs);
+        assert!(
+            docs.len() > before,
+            "KEYRACK_DOC_ROOT contains no documentation"
+        );
+    }
+    let mut violations = Vec::new();
+    for path in docs {
+        if path
+            .strip_prefix(&root)
+            .is_ok_and(|p| p == Path::new("CHANGELOG.md"))
+        {
+            continue;
+        }
+        let text = read(&path).to_lowercase().replace(['`', '*'], "");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (code, rejected) in [
+            (
+                "FIPS_ACHIEVEMENT",
+                flat.contains("fips 140-3 compliance is achieved"),
+            ),
+            (
+                "COMPETITOR_AUDIT",
+                flat.contains("no audit verifiability")
+                    || flat.contains("you cannot independently verify their integrity")
+                    || flat.contains("but cannot independently verify their integrity"),
+            ),
+            (
+                "COMMUNITY_GOVERNANCE",
+                flat.contains("core engine is community-driven"),
+            ),
+            ("WASM_EXPORT", flat.contains("wasmprovider")),
+            (
+                "BENCHMARK_METHODOLOGY",
+                flat.contains("methodology published") || flat.contains("methodology is published"),
+            ),
+        ] {
+            if rejected {
+                violations.push(format!("{code}: {}", path.display()));
+            }
+        }
+        for (line, value) in text.lines().enumerate() {
+            if (value.contains("ghz") || value.contains("k6"))
+                && !(value.contains("planned") || value.contains("proposed"))
+            {
+                violations.push(format!(
+                    "BENCHMARK_TOOLS: {}:{} must identify proposed tools as planned",
+                    path.display(),
+                    line + 1
+                ));
+            }
+        }
+        // A categorical backend-custody assertion needs its exportability
+        // bound in the same paragraph, not somewhere else on the page.
+        for paragraph in text.split("\n\n") {
+            let claim = paragraph.contains("raw key material")
+                && [
+                    "never leaves",
+                    "never sees",
+                    "stays in the hsm",
+                    "remains in the backend",
+                ]
+                .iter()
+                .any(|phrase| paragraph.contains(phrase));
+            if claim && !paragraph.contains("non-exportable") {
+                violations.push(format!(
+                    "KEY_EXPORT_BOUND: {} must scope custody to non-exportable keys",
+                    path.display()
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "release claim violation(s):\n{}",
+        violations.join("\n")
     );
 }

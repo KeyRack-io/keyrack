@@ -148,10 +148,16 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if !matches!(name.as_ref(), "target" | "node_modules" | ".git") {
+            if !matches!(
+                name.as_ref(),
+                "target" | "node_modules" | ".git" | ".cache" | "dist" | ".astro"
+            ) {
                 markdown_files(&path, out);
             }
-        } else if path.extension().is_some_and(|e| e == "md") {
+        } else if path
+            .extension()
+            .is_some_and(|e| e == "md" || e == "mdx" || e == "astro")
+        {
             out.push(path);
         }
     }
@@ -194,6 +200,19 @@ fn documented_config_defaults_match_config_rs() {
 
     let mut docs = Vec::new();
     markdown_files(&root, &mut docs);
+    if let Some(external) = std::env::var_os("KEYRACK_DOC_ROOT") {
+        let external = PathBuf::from(external);
+        assert!(
+            external.is_dir(),
+            "KEYRACK_DOC_ROOT must be a documentation directory"
+        );
+        let before = docs.len();
+        markdown_files(&external, &mut docs);
+        assert!(
+            docs.len() > before,
+            "KEYRACK_DOC_ROOT contains no documentation"
+        );
+    }
     let mut violations = Vec::new();
 
     for rule in RULES {
@@ -254,4 +273,49 @@ fn compromised_legacy_operator_example_matches_literal_and_yaml_defaults() {
     assert_eq!(yaml.legacy_compromised_key_decrypt.to_string(), *literal);
     let snippet = format!("```yaml\nlegacy_compromised_key_decrypt: {literal}\n```");
     assert!(read(&root.join("docs/OPERATOR.md")).contains(&snippet));
+}
+
+#[test]
+fn service_boundary_claims_match_real_defaults() {
+    let root = repo_root();
+    let config = serde_json::to_value(keyrack_service::config::ServiceConfig::default())
+        .expect("serializable defaults");
+    let tls = serde_yaml::to_string(&config["tls"]).expect("TLS default YAML");
+    let authn = config["authn"]["type"]
+        .as_str()
+        .expect("tagged authenticator");
+    let expected = format!("<!-- keyrack-service-defaults:start -->\n```yaml\ntls: {}\nauthn:\n  type: {authn}\n```\n<!-- keyrack-service-defaults:end -->", tls.trim());
+    let mut required = vec![root.join("docs/SECURITY.md")];
+    let mut docs = Vec::new();
+    markdown_files(&root, &mut docs);
+    if let Some(external) = std::env::var_os("KEYRACK_DOC_ROOT") {
+        let external = PathBuf::from(external);
+        required.push(external.join("src/content/docs/docs/security/index.md"));
+        markdown_files(&external, &mut docs);
+    }
+    for path in required {
+        assert!(
+            read(&path).contains(&expected),
+            "SERVICE_DEFAULTS: {} must contain the actual TLS/authentication defaults:\n{expected}",
+            path.display()
+        );
+    }
+    for path in docs {
+        if path
+            .strip_prefix(&root)
+            .is_ok_and(|p| p == Path::new("CHANGELOG.md"))
+        {
+            continue;
+        }
+        let flat = read(&path)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !flat.contains("tls-encrypted grpc/rest. clients authenticate via bearer tokens"),
+            "SERVICE_BOUNDARY: {} claims unconditional TLS and bearer authentication",
+            path.display()
+        );
+    }
 }

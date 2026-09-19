@@ -98,6 +98,10 @@ An attacker with process memory access can extract all key material. The softwar
 
 ### HSM provider boundary
 
+This boundary describes non-exportable keys generated and held by the HSM.
+Exportable keys and operations that return plaintext data keys have different
+material exposure; the guarantees below do not apply to those returned bytes.
+
 ```
 ┌────────────────────────┐     ┌───────────────────┐
 │    keyrack-service     │     │   HSM (PKCS#11)   │
@@ -110,7 +114,9 @@ An attacker with process memory access can extract all key material. The softwar
 └────────────────────────┘     └───────────────────┘
 ```
 
-KeyRack never sees raw key material. The HSM performs all cryptographic operations. An attacker who compromises `keyrack-service` gains:
+For these non-exportable HSM keys, KeyRack holds opaque handles rather than raw
+key material, and the HSM performs the key operations. An attacker who
+compromises `keyrack-service` gains:
 - Ability to invoke operations (encrypt/decrypt/sign) using existing keys through the HSM session
 - Access to key metadata, hierarchy, and LIDs
 - Access to plaintext data in flight (if crypto-endpoints feature is enabled)
