@@ -157,11 +157,6 @@ pub enum KeyRackError {
 // ── Stub Methods ────────────────────────────────────────────────────────────
 
 impl KeyRack {
-    pub async fn register_namespace(&self, _ns: Namespace) -> Result<(), KeyRackError> {
-        // TODO: wire to gRPC RegisterNamespace
-        Ok(())
-    }
-
     pub async fn resolve(&self, _attrs: &Attributes) -> Result<ResolvedKey, KeyRackError> {
         // TODO: wire to gRPC ResolveKey
         Err(KeyRackError::Service("not yet connected to service".into()))
@@ -182,13 +177,5 @@ impl KeyRack {
     ) -> Result<Vec<ReEncryptionEvent>, KeyRackError> {
         // TODO: wire to gRPC ListRotationJobs
         Ok(vec![])
-    }
-
-    pub async fn acknowledge_reencryption_job(&self, _job_id: &str) -> Result<(), KeyRackError> {
-        Ok(())
-    }
-
-    pub async fn complete_reencryption_job(&self, _job_id: &str) -> Result<(), KeyRackError> {
-        Ok(())
     }
 }

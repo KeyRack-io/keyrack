@@ -8,7 +8,7 @@ Running KeyRack in production.
 
 - Rust toolchain (1.80+) or a pre-built container image
 - A supported storage backend: SQLite (single-node) or PostgreSQL (recommended for production)
-- A TLS certificate for gRPC/REST endpoints
+- TLS certificates for the gRPC listener and the HTTPS reverse proxy in front of REST
 - An external PDP (bundled `keyrack-cedar-pdp`, OPA, or any HTTP/gRPC-shaped PDP)
 - Optional: PKCS#11 HSM or KMIP HYOK endpoint
 - Optional: NATS server for event distribution
@@ -593,6 +593,10 @@ audit:
 ## TLS configuration
 
 ### gRPC server TLS
+
+TLS is opt-in; `tls` defaults to `None`. The default `mtls` authentication
+mode does not enable transport TLS. The REST listener serves plain HTTP;
+terminate HTTPS at a reverse proxy and protect its connection to the service.
 
 Enable TLS (and optionally mTLS) on the gRPC endpoint:
 

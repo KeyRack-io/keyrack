@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-keyrack-core = { path = "../keyrack/crates/keyrack-core" }
+keyrack-core = { git = "https://github.com/KeyRack-io/keyrack.git", rev = "70bf446def1cac32881e5e24d36f653551cdc25f" }
 ```
 
 ### Resolving a key hierarchy

@@ -83,7 +83,7 @@ BLAKE3 is **not** a FIPS-approved hash algorithm. FIPS-approved hash functions a
 
 **Two-tier FIPS story:**
 
-1. **PKCS#11 provider path (production):** Key material lives in an HSM. If the HSM holds a FIPS 140-3 certificate (e.g., Thales Luna, AWS CloudHSM), then the cryptographic boundary for key generation, encryption, signing, and decryption is FIPS-validated. KeyRack acts as an orchestrator — raw key material stays in the HSM. This path is the strongest FIPS story.
+1. **PKCS#11 provider path (production):** Key material lives in an HSM. If the HSM holds a FIPS 140-3 certificate (e.g., Thales Luna, AWS CloudHSM), then the cryptographic boundary for key generation, encryption, signing, and decryption is FIPS-validated. For non-exportable keys, KeyRack acts as an orchestrator — raw key material stays in the HSM. This path is the strongest FIPS story.
 
 2. **Software provider path (dev/test):** Uses RustCrypto crates. No RustCrypto crate has undergone CMVP validation as of May 2026. The `aes-gcm` crate has received a security audit by NCC Group, but a security audit is not FIPS validation. This path is explicitly **not FIPS-compliant**.
 

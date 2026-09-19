@@ -1,8 +1,10 @@
 //! KeyRack: Rust consuming application example
 //!
 //! This file demonstrates the target API for an application using the KeyRack
-//! library. It is syntactically valid Rust but references the `keyrack` crate
-//! which does not exist yet — this is the API we intend to build.
+//! library. This is an uncompiled design sketch, not a usable SDK example.
+//! The `keyrack` crate is an API-shaped stub. Namespace registration and
+//! re-encryption job acknowledgement/completion are proposals, not SDK methods;
+//! their former no-op methods were removed because they falsely reported success.
 
 use keyrack::{attrs, KeyRack, Namespace, ResolvedKey, RoutingRule, UnwrapResult};
 
@@ -66,7 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This is where crypto agility lives — update these rules to upgrade
     // algorithms for all newly created keys, without touching application code.
 
-    kr.register_namespace(Namespace {
+    // Proposal only: a future transport-backed registration operation would
+    // submit this definition. The current SDK has no registration method.
+    let _proposed_namespace = Namespace {
         name: "docs-app".into(),
         attachment: attrs! { tenant: "acme" }, // attach to infrastructure hierarchy
         rules: vec![
@@ -86,8 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None, // parent resolved via attachment
             ),
         ],
-    })
-    .await?;
+    };
 
     // -----------------------------------------------------------------------
     // 3. ENCRYPT NEW DATA
@@ -211,7 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // event.attributes(): which key was rotated (e.g. kind=dek, tenant=acme, ...)
         // event.old_version(): the version being retired
         // event.new_version(): the new current version
-        kr.acknowledge_reencryption_job(&event.id()).await?;
+        // Proposal only: acknowledge this event through a future implemented
+        // service client. The current SDK exposes no acknowledgement method.
 
         // Find all your data encrypted with the old DEK version.
         // This query is YOUR responsibility — only you know your data model.
@@ -239,7 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             my_database::update(&doc.id, &new_ct, &new_nonce, new_key.version()).await?;
         }
 
-        kr.complete_reencryption_job(&event.id()).await?;
+        // Proposal only: report completion through a future implemented service
+        // client. The current SDK exposes no completion method.
     }
 
     println!("Processed {} re-encryption jobs", events.len());
