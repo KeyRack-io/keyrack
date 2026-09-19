@@ -25,12 +25,12 @@ pub(crate) fn grant<S: MaterialSource, C: Clock>(worker: &Worker<S, C>) -> Autho
     let context = crate::fixture::context();
     AuthorityGrant {
         authority: AuthorityIdentity {
-            issuer: authority_key(worker.verifier).issuer,
+            issuer: worker.trust.authority.issuer.clone(),
             scope: AuthorityScope::SecurityDomain {
                 provider_ref: context.provider_ref,
                 security_domain: context.security_domain,
             },
-            generation: NonZeroU64::new(1).unwrap(),
+            generation: worker.generation,
         },
         request: request.clone(),
         principal: WrappingIdentifier::new("alice").unwrap(),
@@ -88,6 +88,7 @@ fn limits() -> Limits {
         authority_horizon_ms: 10_000,
     }
 }
+#[derive(Clone)]
 struct TestClock(Rc<Cell<u64>>);
 impl Clock for TestClock {
     fn millis(&self) -> u64 {
@@ -143,6 +144,11 @@ impl NativeGeneration for Probe {
     }
 }
 fn setup() -> (Worker<Probe, TestClock>, SigningKey) {
+    setup_with_trust(|_| {})
+}
+fn setup_with_trust(
+    configure: impl FnOnce(&mut crate::core::trust::TrustConfig),
+) -> (Worker<Probe, TestClock>, SigningKey) {
     let key = SigningKey::generate(&mut OsRng);
     let now = Rc::new(Cell::new(0));
     let source = Probe {
@@ -155,8 +161,11 @@ fn setup() -> (Worker<Probe, TestClock>, SigningKey) {
         now: now.clone(),
         delay: 0,
     };
-    let mut worker = Worker::new(
-        key.verifying_key(),
+    let mut trust = crate::core::trust::TrustConfig::fixture(key.verifying_key());
+    configure(&mut trust);
+    let mut worker = Worker::new_with_trust(
+        trust,
+        crate::fixture::context().provider_ref,
         "development-only".into(),
         source,
         TestClock(now),
@@ -311,7 +320,7 @@ fn restart_rejects_previous_incarnation_even_with_same_reservation() {
     let signed = sign(grant(&old), &key);
     let reservation = old.creation.as_ref().unwrap();
     let (mut new, _) = setup();
-    new.verifier = key.verifying_key();
+    new.trust.authority.key = key.verifying_key();
     new.creation = None;
     new.reserve_creation(reservation.plan.clone(), reservation.context.clone())
         .unwrap();
@@ -383,4 +392,139 @@ fn authority_expiring_during_finalization_suppresses_signed_result_and_activatio
         worker.creation.as_ref().unwrap().state,
         AttemptState::Consumed
     ));
+}
+
+// These labels and generation are trusted startup policy. They do not qualify
+// the fixture profile or approve the private operation transcript for service use.
+fn configured() -> (Worker<Probe, TestClock>, SigningKey) {
+    setup_with_trust(|trust| {
+        trust.authority.issuer = WrappingIdentifier::new("configured-authority").unwrap();
+        trust.authority.key_id = WrappingIdentifier::new("configured-authority-key").unwrap();
+        trust.initial_generation = NonZeroU64::new(7).unwrap();
+        trust.observer_issuer = WrappingIdentifier::new("configured-observer").unwrap();
+        trust.observer_key_id = WrappingIdentifier::new("configured-observer-key").unwrap();
+    })
+}
+fn sign_configured<T: keyrack_core::custody::EvidenceClaims>(
+    claims: T,
+    key: &SigningKey,
+) -> Vec<u8> {
+    let mut evidence = Evidence {
+        issuer: WrappingIdentifier::new("configured-authority").unwrap(),
+        key_id: WrappingIdentifier::new("configured-authority-key").unwrap(),
+        claims,
+        signature: [0; 64],
+    };
+    evidence.signature = key.sign(&evidence.signing_bytes().unwrap()).to_bytes();
+    evidence.canonical_bytes().unwrap()
+}
+
+#[test]
+fn configured_authority_and_observer_cover_creation_use_and_fencing() {
+    use crate::{
+        core::{AuthorityMessage, Grant, Operation, Signed, SIGNING_DOMAIN},
+        delivery::Delivery,
+    };
+    use keyrack_core::custody::RevocationCommand;
+    let (mut worker, key) = configured();
+    let output = worker
+        .generate(&sign_configured(grant(&worker), &key))
+        .unwrap();
+    let observer = worker.observation_key();
+    assert_eq!(observer.issuer.as_str(), "configured-observer");
+    assert_eq!(observer.key_id.as_str(), "configured-observer-key");
+    output.result.authenticate(&observer).unwrap();
+    output.grant.authenticate(&worker.trust.authority).unwrap();
+    let context = crate::fixture::context();
+    let body = serde_json::to_string(&AuthorityMessage::Grant(Grant {
+        worker: worker.instance.clone(),
+        principal: "alice".into(),
+        context_sha256: crate::core::context_digest(&context).unwrap(),
+        operation: Operation::Encrypt,
+        input_sha256: digest(b"data"),
+        generation: 7,
+        sequence: 2,
+        not_before_ms: 0,
+        expires_ms: 500,
+        ancestor_expires_ms: 400,
+        residency_until_ms: 1000,
+    }))
+    .unwrap();
+    let mut bytes = SIGNING_DOMAIN.to_vec();
+    bytes.extend_from_slice(body.as_bytes());
+    let signed = Signed {
+        body,
+        signature: key.sign(&bytes).to_bytes().to_vec(),
+    };
+    worker
+        .execute(&signed, "alice", &context, Operation::Encrypt, b"data")
+        .unwrap();
+    let lease = worker.resident.values().next().unwrap().lease;
+    let delivery = Delivery::new(worker.instance.clone(), worker.clock.clone());
+    let mut command = RevocationCommand {
+        fence: Uuid::new_v4(),
+        executor: worker.executor().unwrap(),
+        authority: grant(&worker).authority,
+        validity: Validity {
+            clock: ClockDomain::ExecutorMonotonicMilliseconds(worker.executor().unwrap()),
+            not_before: 0,
+            not_after: 500,
+        },
+    };
+    // Even a valid issuer cannot fence the configured generation without advancing it.
+    assert!(worker
+        .revoke(&sign_configured(command.clone(), &key), &delivery)
+        .is_err());
+    assert_eq!(worker.resident.len(), 1);
+    command.authority.generation = NonZeroU64::new(8).unwrap();
+    let result = worker
+        .revoke(&sign_configured(command.clone(), &key), &delivery)
+        .unwrap();
+    let authenticated = result.authenticate(&observer).unwrap();
+    authenticated.claims().check_command(&command).unwrap();
+    assert_eq!(authenticated.claims().observed_leases, vec![lease]);
+    assert_eq!(worker.generation.get(), 8);
+    assert!(worker.resident.is_empty());
+    assert!(worker
+        .execute(&signed, "alice", &context, Operation::Encrypt, b"data")
+        .is_err());
+}
+
+#[test]
+fn configured_creation_refuses_wrong_labels_key_and_generation_before_provider_access() {
+    for case in 0..5 {
+        let (mut worker, key) = configured();
+        let mut g = grant(&worker);
+        if case == 3 {
+            g.authority.generation = NonZeroU64::new(1).unwrap();
+        }
+        if case == 4 {
+            g.authority.generation = NonZeroU64::new(8).unwrap();
+        }
+        let mut evidence =
+            Evidence::<AuthorityGrant>::from_canonical_bytes(&sign_configured(g, &key)).unwrap();
+        match case {
+            0 => {
+                evidence.issuer = WrappingIdentifier::new("development-authority").unwrap();
+                evidence.claims.authority.issuer = evidence.issuer.clone();
+            }
+            1 => evidence.key_id = WrappingIdentifier::new("another-key").unwrap(),
+            _ => {}
+        }
+        let other = SigningKey::generate(&mut OsRng);
+        let signer = if case == 2 { &other } else { &key };
+        evidence.signature = signer.sign(&evidence.signing_bytes().unwrap()).to_bytes();
+        assert!(worker
+            .generate(&evidence.canonical_bytes().unwrap())
+            .is_err());
+        assert_eq!(worker.source.prepared, 0);
+        assert_eq!(worker.source.calls, 0);
+        assert_eq!(worker.sequence, 0);
+        assert_eq!(worker.generation.get(), 7);
+        // Denied attempts neither poison the reservation nor consume a sequence.
+        worker
+            .generate(&sign_configured(grant(&worker), &key))
+            .unwrap();
+        assert_eq!(worker.source.calls, 1);
+    }
 }

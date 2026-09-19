@@ -422,7 +422,7 @@ fn warm_hit_avoids_provider_and_expiry_reopen_gets_new_lease_without_renewing_au
     clock.0.set(100);
     let cleanup = worker.expire();
     assert_eq!(cleanup.len(), 1);
-    assert_eq!(cleanup[0].lease, old_lease);
+    assert_eq!(cleanup[0].lease, old_lease.counter.get());
     assert_eq!(cleanup[0].context_sha256, binding);
     assert!(worker.expire().is_empty());
     let signed = sign(
@@ -478,7 +478,7 @@ fn rejected_fences_preserve_cache_and_authority_state_before_valid_fence() {
             );
         }
         assert!(worker.fence(&signed).is_err());
-        assert_eq!(worker.generation, Some(1));
+        assert_eq!(worker.generation.get(), 1);
         assert_eq!(worker.sequence, 1);
         assert!(!worker.fenced);
         assert_eq!(worker.resident.len(), 1);
@@ -545,7 +545,7 @@ fn domain_fence_purges_every_exact_context_and_lease_without_reopening() {
     let mut expected: Vec<_> = worker
         .resident
         .iter()
-        .map(|(binding, entry)| (*binding, entry.lease))
+        .map(|(binding, entry)| (*binding, entry.lease.counter.get()))
         .collect();
     expected.sort_unstable();
     let fence = sign(
@@ -601,8 +601,11 @@ fn restart_with_same_envelope_refuses_old_grants_and_fences_then_requires_fresh_
         }),
     );
     old.fence(&old_fence).unwrap();
-    let mut restarted = Worker::new(
-        key.verifying_key(),
+    let mut trust = trust::TrustConfig::fixture(key.verifying_key());
+    trust.initial_generation = NonZeroU64::new(3).unwrap();
+    let mut restarted = Worker::new_with_trust(
+        trust,
+        context().provider_ref,
         "development-only".into(),
         old.source,
         clock,
@@ -616,9 +619,9 @@ fn restart_with_same_envelope_refuses_old_grants_and_fences_then_requires_fresh_
     assert_eq!(restarted.fence(&old_fence).unwrap_err(), Error::Authority);
     assert_eq!(restarted.source.calls, 1); // No open in the new incarnation yet.
     assert!(restarted.resident.is_empty());
-    assert_eq!(restarted.generation, None);
+    assert_eq!(restarted.generation.get(), 3);
     let mut g = grant(&restarted, 1, Operation::Decrypt, &ciphertext);
-    g.generation = 3; // The external test authority explicitly authorizes this boot.
+    g.generation = 3; // Must match the generation provisioned for this boot.
     let fresh = sign(&key, &AuthorityMessage::Grant(g));
     assert_eq!(
         restarted
@@ -678,3 +681,127 @@ fn slow_open_exceeding_residency_limit_is_denied_even_with_valid_authority() {
 }
 
 mod properties;
+
+#[test]
+fn exact_lease_close_cannot_remove_a_reopened_residency() {
+    let (mut worker, key, _) = setup();
+    encrypt(&mut worker, &key, 1).unwrap();
+    let binding = context_digest(&context()).unwrap();
+    let old = worker.resident[&binding].lease;
+    let until = worker.resident[&binding].until;
+    encrypt(&mut worker, &key, 2).unwrap();
+    assert_eq!(worker.resident[&binding].lease, old);
+    assert_eq!(worker.resident[&binding].until, until);
+    let (other, _, _) = setup();
+    for (lease, candidate_binding) in [
+        (
+            LeaseIdentity {
+                executor: other.executor().unwrap(),
+                ..old
+            },
+            binding,
+        ),
+        (
+            LeaseIdentity {
+                counter: NonZeroU64::new(old.counter.get() + 1).unwrap(),
+                ..old
+            },
+            binding,
+        ),
+        (old, [0; 32]),
+    ] {
+        assert_eq!(
+            worker.close_residency(lease, candidate_binding),
+            Err(Error::Replay)
+        );
+        assert_eq!(worker.resident[&binding].lease, old);
+    }
+    let cleanup = worker.close_residency(old, binding).unwrap();
+    assert_eq!(cleanup.lease, old.counter.get());
+    assert!(worker.resident.is_empty());
+    assert_eq!(worker.close_residency(old, binding), Err(Error::Replay));
+    encrypt(&mut worker, &key, 3).unwrap();
+    let reopened = worker.resident[&binding].lease;
+    assert_eq!(reopened.executor, old.executor);
+    assert!(reopened.counter > old.counter);
+    assert_eq!(worker.close_residency(old, binding), Err(Error::Replay));
+    assert_eq!(worker.resident[&binding].lease, reopened);
+}
+
+#[test]
+fn restart_reuses_counter_but_never_lease_identity() {
+    let (mut worker, key, _) = setup();
+    encrypt(&mut worker, &key, 1).unwrap();
+    let binding = context_digest(&context()).unwrap();
+    let old = worker.resident[&binding].lease;
+    drop(worker);
+    let (mut restarted, key, _) = setup();
+    encrypt(&mut restarted, &key, 1).unwrap();
+    let new = restarted.resident[&binding].lease;
+    assert_eq!(old.counter, new.counter);
+    assert_ne!(old.executor, new.executor);
+    assert_eq!(restarted.close_residency(old, binding), Err(Error::Replay));
+    assert_eq!(restarted.resident[&binding].lease, new);
+    restarted.close_residency(new, binding).unwrap();
+}
+
+#[test]
+fn first_use_cannot_choose_the_configured_generation() {
+    struct CountOpens(usize);
+    impl MaterialSource for CountOpens {
+        fn open(&mut self, _: &WrappingContext) -> Result<Secret, Error> {
+            self.0 += 1;
+            Ok(Secret(Zeroizing::new(vec![7; 32])))
+        }
+    }
+    let (_, key, clock) = setup();
+    let mut worker = Worker::new(
+        key.verifying_key(),
+        "development-only".into(),
+        CountOpens(0),
+        clock,
+        Limits {
+            resident_keys: 1,
+            residence_ms: 1000,
+            uses_per_residency: 3,
+            authority_horizon_ms: 1000,
+        },
+    )
+    .unwrap();
+    for generation in [2, 3, u64::MAX] {
+        let mut g = grant(&worker, 1, Operation::Encrypt, b"message");
+        g.generation = generation;
+        let signed = sign(&key, &AuthorityMessage::Grant(g));
+        assert_eq!(
+            worker.execute(&signed, "alice", &context(), Operation::Encrypt, b"message"),
+            Err(Error::Replay)
+        );
+        assert_eq!(worker.source.0, 0);
+        assert_eq!(worker.sequence, 0);
+        assert_eq!(worker.generation.get(), 1);
+    }
+    let signed = sign(
+        &key,
+        &AuthorityMessage::Grant(grant(&worker, 1, Operation::Encrypt, b"message")),
+    );
+    worker
+        .execute(&signed, "alice", &context(), Operation::Encrypt, b"message")
+        .unwrap();
+    assert_eq!(worker.source.0, 1);
+}
+
+#[test]
+fn exhausted_launch_generation_is_refused_before_admission() {
+    let (worker, key, clock) = setup();
+    let mut trust = trust::TrustConfig::fixture(key.verifying_key());
+    trust.initial_generation = NonZeroU64::new(u64::MAX).unwrap();
+    let result = Worker::new_with_trust(
+        trust,
+        context().provider_ref,
+        "development-only".into(),
+        worker.source,
+        clock,
+        worker.limits,
+    );
+    assert!(matches!(result, Err(Error::Limit)));
+}
