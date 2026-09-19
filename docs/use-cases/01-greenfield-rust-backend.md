@@ -31,7 +31,8 @@ and an embeddable library (`keyrack-core`).
 docker compose up -d keyrack-service
 
 # From your application, use gRPC or REST
-curl -s http://localhost:8080/v1/keys -X POST \
+curl -fsS http://localhost:8080/v1/keys -X POST \
+  -H 'Content-Type: application/json' \
   -d '{"key_spec": "AES_256", "description": "user-data-dek"}'
 ```
 
