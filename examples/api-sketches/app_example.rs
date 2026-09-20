@@ -3,7 +3,7 @@
 //! This file demonstrates the target API for an application using the KeyRack
 //! library. This is an uncompiled design sketch, not a usable SDK example.
 //! The `keyrack` crate is an API-shaped stub. Namespace registration and
-//! re-encryption job acknowledgement/completion are proposals, not SDK methods;
+//! re-encryption job polling/acknowledgement/completion are proposals, not SDK methods;
 //! their former no-op methods were removed because they falsely reported success.
 
 use keyrack::{attrs, KeyRack, Namespace, ResolvedKey, RoutingRule, UnwrapResult};
@@ -208,46 +208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // version of a DEK, the app must re-encrypt its data with the new version.
     // This is typically run in a background worker, not the request path.
 
-    let events = kr.poll_data_reencryption_jobs("docs-app").await?;
-
-    for event in &events {
-        // event.attributes(): which key was rotated (e.g. kind=dek, tenant=acme, ...)
-        // event.old_version(): the version being retired
-        // event.new_version(): the new current version
-        // Proposal only: acknowledge this event through a future implemented
-        // service client. The current SDK exposes no acknowledgement method.
-
-        // Find all your data encrypted with the old DEK version.
-        // This query is YOUR responsibility — only you know your data model.
-        let affected = my_database::find_by_key_version(
-            event.attributes(),
-            event.old_version(),
-        )
-        .await?;
-
-        for doc in &affected {
-            // Decrypt with old version
-            let old_key = kr
-                .resolve_at_version(event.attributes(), doc.key_version)
-                .await?;
-            let old_dek = get_key_bytes(&old_key).await?;
-            let plaintext =
-                my_crypto::aes_gcm_decrypt(&old_dek, &doc.ciphertext, &doc.nonce)?;
-
-            // Re-encrypt with new version
-            let new_key = kr.resolve(event.attributes()).await?;
-            let new_dek = get_key_bytes(&new_key).await?;
-            let (new_ct, new_nonce) = my_crypto::aes_gcm_encrypt(&new_dek, &plaintext)?;
-
-            // Update stored data with new ciphertext and new version
-            my_database::update(&doc.id, &new_ct, &new_nonce, new_key.version()).await?;
-        }
-
-        // Proposal only: report completion through a future implemented service
-        // client. The current SDK exposes no completion method.
-    }
-
-    println!("Processed {} re-encryption jobs", events.len());
+    // Proposal only: a future implemented service client would supply events.
+    // The current SDK has no polling, acknowledgement, or completion method.
+    // For each event, the app would find data encrypted with the old version,
+    // decrypt it with that version, encrypt it with the new version, and persist
+    // both the updated ciphertext and version before reporting completion.
     Ok(())
 }
 

@@ -3,8 +3,8 @@
 > **These files predate the implementation.** They are design-time API sketches
 > written during the integration cycle to validate developer experience. They
 > describe proposed interfaces, not shipped client behavior. The `keyrack` Rust
-> crate exists as an API-shaped stub; the three former no-op namespace/job mutation
-> methods have been removed. Use the service APIs or `keyrack-core` directly for
+> crate exists as an API-shaped stub; the former no-op namespace/job methods, including
+> empty-result job polling, have been removed. Use the service APIs or `keyrack-core` directly for
 > implemented operations.
 >
 > They are **not runnable code** and are not compiled as part of the workspace.

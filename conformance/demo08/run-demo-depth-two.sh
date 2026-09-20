@@ -1,13 +1,13 @@
 #!/bin/sh
 # Demo 08: Hierarchical Cascade Rotation
 #
-# Shows that rotating a root key creates a rotation job for its single leaf
-# child (depth 1) and demonstrates the cooperative
+# Shows that rotating a root key cascades rotation jobs through a multi-level
+# hierarchy (root → child → grandchild) and demonstrates the cooperative
 # acknowledge/complete protocol over gRPC.
 set -e
 
-BASE="${BASE:-http://keyrack:8080}"
-GRPC="${GRPC:-keyrack:50051}"
+BASE="http://keyrack:8080"
+GRPC="keyrack:50051"
 PROTO_IMPORT="/proto"
 PROTO_FILE="keyrack/v1/key_service.proto"
 PASS=0
@@ -66,10 +66,10 @@ if [ $attempts -ge 30 ]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 1 — Build a depth-1 key hierarchy via REST
+#  PART 1 — Build a 3-level key hierarchy via REST
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 1: Build Root → Leaf Child hierarchy"
+banner "Part 1: Build Root → Child → Grandchild hierarchy"
 
 step "Creating root key..."
 ROOT_RESP=$(curl -sf -X POST "${BASE}/v1/keys" \
@@ -97,10 +97,27 @@ else
   exit 1
 fi
 
+step "Creating grandchild key under child..."
+GC_RESP=$(curl -sf -X POST "${BASE}/v1/keys" \
+  -H "Content-Type: application/json" \
+  -d "{\"key_spec\":\"AES_256\",\"description\":\"grandchild key\",\"parent_key_id\":\"${CHILD_LID}\"}")
+echo "  Response: ${GC_RESP}"
+GC_LID=$(json_field "$GC_RESP" lid)
+if [ -n "$GC_LID" ]; then
+  ok "Grandchild key created — LID: ${GC_LID}"
+else
+  fail "Grandchild key creation failed"
+  exit 1
+fi
+
 step "Verifying parent relationships via /describe..."
 CHILD_DESC=$(curl -sf "${BASE}/v1/keys/${CHILD_LID}/describe")
 CHILD_PARENT=$(json_field "$CHILD_DESC" parent_lid)
 assert_eq "$CHILD_PARENT" "$ROOT_LID" "Child's parent_lid matches root"
+
+GC_DESC=$(curl -sf "${BASE}/v1/keys/${GC_LID}/describe")
+GC_PARENT=$(json_field "$GC_DESC" parent_lid)
+assert_eq "$GC_PARENT" "$CHILD_LID" "Grandchild's parent_lid matches child"
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 2 — Inspect the hierarchy via gRPC GetKeyDependents
@@ -115,15 +132,15 @@ echo "  Response: ${DEPS_JSON}"
 
 DEPS_COUNT=$(echo "$DEPS_JSON" | jq 'if .dependents then (.dependents | length) else 0 end')
 echo "  Dependent count: ${DEPS_COUNT}"
-assert_eq "$DEPS_COUNT" "1" "Root has exactly 1 dependent (the leaf child)"
+assert_eq "$DEPS_COUNT" "2" "Root has exactly 2 recursive dependents (child + grandchild)"
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 3 — Rotate the root key and observe cascaded rotation jobs
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 3: Rotate root key via gRPC — cascade to one leaf child"
+banner "Part 3: Rotate root key via gRPC — cascade to descendants"
 
-step "Rotating the root key via gRPC RotateKey (creates a rotation job for the leaf child)..."
+step "Rotating the root key via gRPC RotateKey (creates descendant rotation jobs)..."
 ROT_JSON=$(grpc_call "RotateKey" "{\"keyId\": \"${ROOT_LID}\"}")
 echo "  Response: ${ROT_JSON}"
 NEW_VER=$(echo "$ROT_JSON" | jq -r '.newVersion // empty')
@@ -137,20 +154,20 @@ fi
 # Small pause to let the server record all rotation jobs
 sleep 1
 
-step "ListRotationJobs (all) — should show one pending job for the leaf child..."
+step "ListRotationJobs (all) — should show pending jobs for child + grandchild..."
 JOBS_JSON=$(grpc_call "ListRotationJobs" '{}')
 echo "  Response: ${JOBS_JSON}"
 
 PENDING_COUNT=$(echo "$JOBS_JSON" | jq '[.jobs[]? | select(.state == "PENDING")] | length')
 echo "  Pending rotation job count: ${PENDING_COUNT}"
-assert_eq "$PENDING_COUNT" "1" "Exactly 1 pending rotation job created for the leaf child"
+assert_eq "$PENDING_COUNT" "2" "Exactly 2 pending rotation jobs created (child + grandchild)"
 
-# The one job must target this child, not merely any key.
+# The jobs must target the two DISTINCT descendants, not just any 2 keys.
 # Each job carries dependent_key_id = the key that must re-wrap.
 DEP_IDS=$(echo "$JOBS_JSON" | jq -r '[.jobs[]? | select(.state == "PENDING") | .dependentKeyId] | sort | join(",")')
-EXPECTED_DEPS="$CHILD_LID"
+EXPECTED_DEPS=$(printf '%s\n%s\n' "$CHILD_LID" "$GC_LID" | sort | tr '\n' ',' | sed 's/,$//')
 echo "  Dependent keys with jobs: ${DEP_IDS}"
-assert_eq "$DEP_IDS" "$EXPECTED_DEPS" "The job targets the leaf child"
+assert_eq "$DEP_IDS" "$EXPECTED_DEPS" "Jobs target the distinct child + grandchild dependents"
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 4 — Cooperative ack/complete protocol
@@ -178,7 +195,7 @@ for JOB_ID in $JOB_IDS; do
   JOBS_PROCESSED=$((JOBS_PROCESSED + 1))
 done
 
-assert_eq "$JOBS_PROCESSED" "1" "Processed exactly 1 rotation job"
+assert_eq "$JOBS_PROCESSED" "2" "Processed exactly 2 rotation jobs"
 
 step "ListRotationJobs — verify all are now COMPLETED..."
 JOBS_AFTER=$(grpc_call "ListRotationJobs" '{}')
@@ -187,7 +204,7 @@ echo "  Response: ${JOBS_AFTER}"
 COMPLETED_COUNT=$(echo "$JOBS_AFTER" | jq '[.jobs[]? | select(.state == "COMPLETED")] | length')
 STILL_PENDING=$(echo "$JOBS_AFTER" | jq '[.jobs[]? | select(.state == "PENDING")] | length')
 echo "  Completed: ${COMPLETED_COUNT}, Still pending: ${STILL_PENDING}"
-assert_eq "$COMPLETED_COUNT" "1" "The child rotation job is COMPLETED"
+assert_eq "$COMPLETED_COUNT" "2" "Both rotation jobs are COMPLETED"
 assert_eq "$STILL_PENDING" "0" "Zero pending rotation jobs remain"
 
 # ══════════════════════════════════════════════════════════════════════
@@ -202,10 +219,6 @@ if [ "$FAIL" -gt 0 ]; then
   echo "  ⚠ ${FAIL} check(s) failed — review output above."
   exit 1
 else
-  echo "  All rotation-job protocol checks passed!"
-  # Independently inspect persisted topology, even if the fixture and its
-  # expected job counts are changed together.
-  python3 /scripts/check-depth.py "$BASE"
   echo "  All checks passed!"
   exit 0
 fi

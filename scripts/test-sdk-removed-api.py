@@ -30,6 +30,14 @@ ORIGINAL_METHODS = {
         Ok(())
     }
 ''',
+    'poll_data_reencryption_jobs': '''    pub async fn poll_data_reencryption_jobs(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<ReEncryptionEvent>, KeyRackError> {
+        // TODO: wire to gRPC ListRotationJobs
+        Ok(vec![])
+    }
+''',
 }
 
 
@@ -133,7 +141,7 @@ def main():
     receipt['status'] = 'passed'
     receipt['working_sources_unchanged'] = True
     save()
-    print('PASS three compiler-backed absence checks and three exact-method restoration controls')
+    print(f'PASS {len(ORIGINAL_METHODS)} compiler-backed absence checks and {len(ORIGINAL_METHODS)} exact-method restoration controls')
 
 
 if __name__ == '__main__':

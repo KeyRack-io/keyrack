@@ -1,0 +1,7 @@
+{
+  "source_commit": "cb14176f80bf64e2005be5323717cbd675418785",
+  "source_path": "demos/08-cascade-rotation/scripts/run-demo.sh",
+  "fixture": "run-demo-depth-two.sh",
+  "sha256": "0e41d4324a939619820d7974e9c8624371a22bd0b07924325172413c6bffe59e",
+  "purpose": "Intentional negative fixture: original depth-two demo, including its internally consistent two-job assertions."
+}
