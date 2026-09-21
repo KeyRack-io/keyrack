@@ -370,10 +370,16 @@ impl SoftwareProvider {
             envelope_blake3: *blake3::hash(envelope).as_bytes(),
             creation,
         };
-        // Lock order is wrapping state, then keys; every wrapping path keeps it.
+        // Lock order is wrapping state, then keys. Both maps are updated under
+        // both locks so a close of a predicted next identity cannot record
+        // closure while the material is still being inserted.
         let object = {
             let mut state = self
                 .wrapping
+                .write()
+                .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+            let mut keys = self
+                .keys
                 .write()
                 .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
             state.issued = state
@@ -382,12 +388,9 @@ impl SoftwareProvider {
                 .ok_or_else(|| KeyRackError::Provider("object identities exhausted".into()))?;
             let object = format!("kr-sw-a2-{}-{}", self.incarnation, state.issued);
             state.open.insert(object.clone(), binding);
+            keys.insert(object.clone(), child);
             object
         };
-        self.keys
-            .write()
-            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
-            .insert(object.clone(), child);
         WrappedKeyLease::new(
             KeyHandle {
                 key_id: object.clone(),

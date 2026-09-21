@@ -42,10 +42,13 @@ All notable changes to KeyRack will be documented in this file.
   the material did not have. A parent now means the material is wrapped under
   that parent, created through the crash-safe creation journal, with the exact
   parent version, mechanism and security domain written into the descriptor.
-  All three surfaces take the same branch. A created child is not yet usable:
-  the data plane still refuses wrapped versions, and the lease path is the next
-  increment — the two ship together, so no released version creates keys nothing
-  accepts.
+  All three surfaces take the same branch. Encrypt, decrypt, re-encrypt and
+  generate-data-key open a lease for the call and close it before return,
+  including on the operation's error. The handle is whatever the issuing
+  provider returned for that open: possessing it is not a grant. A planted
+  wrapped descriptor that does not name a journaled envelope is still refused
+  without talking to the provider. Export, rotation and destroy of wrapped
+  material stay refused — those are different lifecycles.
 - **Wrapping is activated per provider in configuration.** A new `wrapping:`
   block names the provider, the mechanism and the security domain. It is absent
   by default, and then creating a key with a parent is refused everywhere:
