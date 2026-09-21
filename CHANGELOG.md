@@ -64,6 +64,11 @@ All notable changes to KeyRack will be documented in this file.
   service tests built state over bare storage, so the wrapper every deployment
   has was the one configuration never exercised. Running demo 08 caught it, and
   the test that should have now exists.
+- **Demo 01 no longer sends `parent_key_id`.** Vault Transit does not implement
+  wrapping operations, and this deployment has no `wrapping:` profile. Creating
+  a child under the tenant key is therefore refused. The canary is the
+  no-parent path: two independent keys, encrypt and rotate on the DEK. The
+  wrapping-aware hierarchy lives in demo 08.
 
 - **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
   parsed and then failed at startup with "KMIP provider not yet implemented",
