@@ -1210,11 +1210,14 @@ fn finish_use<T>(
     result: Result<T, DomainError>,
     closed: Result<(), DomainError>,
 ) -> Result<T, DomainError> {
-    match (result, closed) {
-        (Err(error), _) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    result.and_then(|value| closed.map(|()| value))
+}
+
+/// One version and the provider that must open it.
+pub struct VersionUse<'a> {
+    pub record: &'a KeyRecord,
+    pub version: &'a KeyVersionRecord,
+    pub provider: &'a dyn CryptoProvider,
 }
 
 /// Run one provider operation against a version's usable handle.
@@ -1244,36 +1247,36 @@ where
 /// Open two versions for one operation (re-encrypt), then close both.
 pub async fn with_usable_handles<F, Fut, T>(
     state: &ServiceState,
-    source_record: &KeyRecord,
-    source_version: &KeyVersionRecord,
-    source_provider: &dyn CryptoProvider,
-    destination_record: &KeyRecord,
-    destination_version: &KeyVersionRecord,
-    destination_provider: &dyn CryptoProvider,
+    source: VersionUse<'_>,
+    destination: VersionUse<'_>,
     op: F,
 ) -> Result<T, DomainError>
 where
     F: FnOnce(KeyHandle, KeyHandle) -> Fut,
     Fut: std::future::Future<Output = Result<T, DomainError>>,
 {
-    let source = open_usable(state, source_record, source_version, source_provider).await?;
-    let destination = match open_usable(
+    let opened_source = open_usable(state, source.record, source.version, source.provider).await?;
+    let opened_destination = match open_usable(
         state,
-        destination_record,
-        destination_version,
-        destination_provider,
+        destination.record,
+        destination.version,
+        destination.provider,
     )
     .await
     {
         Ok(opened) => opened,
         Err(error) => {
-            let _ = close_usable(source_provider, source).await;
+            let _ = close_usable(source.provider, opened_source).await;
             return Err(error);
         }
     };
-    let result = op(source.handle.clone(), destination.handle.clone()).await;
-    let destination_closed = close_usable(destination_provider, destination).await;
-    let source_closed = close_usable(source_provider, source).await;
+    let result = op(
+        opened_source.handle.clone(),
+        opened_destination.handle.clone(),
+    )
+    .await;
+    let destination_closed = close_usable(destination.provider, opened_destination).await;
+    let source_closed = close_usable(source.provider, opened_source).await;
     finish_use(finish_use(result, destination_closed), source_closed)
 }
 
@@ -1780,12 +1783,16 @@ pub mod crypto {
         let same_provider = Arc::ptr_eq(&src_entry.provider, &dst_entry.provider);
         let output = super::with_usable_handles(
             state,
-            &src_record,
-            src_version,
-            src_entry.provider.as_ref(),
-            &dst_record,
-            dst_primary,
-            dst_entry.provider.as_ref(),
+            super::VersionUse {
+                record: &src_record,
+                version: src_version,
+                provider: src_entry.provider.as_ref(),
+            },
+            super::VersionUse {
+                record: &dst_record,
+                version: dst_primary,
+                provider: dst_entry.provider.as_ref(),
+            },
             |src_handle, dst_handle| {
                 let src_provider = Arc::clone(&src_entry.provider);
                 let dst_provider = Arc::clone(&dst_entry.provider);
