@@ -44,6 +44,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+#[cfg(feature = "native-a2-conformance")]
+pub(crate) mod native_a2;
+
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
 const P256_OID_DER: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
@@ -171,12 +174,7 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.gate.inner.lock() {
-            state.in_flight -= 1;
-            if state.in_flight == 0 {
-                self.gate.changed.notify_all();
-            }
-        }
+        self.gate.leave();
     }
 }
 
@@ -226,6 +224,12 @@ impl Gate {
     /// healthy — reinitializing is per library, not per token — so waiting for
     /// the window is the right answer and refusing is the wrong one.
     fn enter(&self) -> Result<InFlight<'_>> {
+        self.admit()?;
+        Ok(InFlight { gate: self })
+    }
+
+    /// Shared admission for borrowed calls and lifetime-owned native sessions.
+    fn admit(&self) -> Result<()> {
         let mut state = self
             .inner
             .lock()
@@ -245,7 +249,16 @@ impl Gate {
             state = guard;
         }
         state.in_flight += 1;
-        Ok(InFlight { gate: self })
+        Ok(())
+    }
+
+    fn leave(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.in_flight -= 1;
+            if state.in_flight == 0 {
+                self.changed.notify_all();
+            }
+        }
     }
 
     /// Close the gate and wait for the module to go quiet.

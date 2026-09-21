@@ -30,3 +30,9 @@ mod ecdsa_der;
 mod provider;
 
 pub use provider::{Pkcs11Provider, Pkcs11ProviderConfig};
+
+#[cfg(feature = "native-a2-conformance")]
+pub use provider::native_a2::{NativeA2Session, NativeEnvelope, NativeWrapMode};
+
+#[cfg(feature = "native-a2-conformance")]
+pub use provider::native_a2::adapter::NativeA2ConformanceAdapter;
