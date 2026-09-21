@@ -61,6 +61,44 @@ With `bootstrap_token` auth, set the token via the `KMS_BOOTSTRAP_TOKEN`
 environment variable. The token is hashed at startup — the plaintext is
 not retained in memory.
 
+### Child keys wrapped under a parent
+
+Creating a key with a `parent_key_id` means its material is wrapped under that
+parent. It is refused unless the provider that will hold it has been activated
+for wrapping:
+
+```yaml
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev-single-process
+```
+
+Both values are recorded in every child's durable descriptor, which is why they
+are stated here rather than derived from the provider name. Startup refuses to
+run if that provider does not declare the mechanism for generate, open and
+close, or cannot evidence its own closures. Omit the block — the default — and
+child creation is refused everywhere.
+
+`software:aes-256-gcm:v1` is a development and conformance mechanism, and
+startup says so: the child is unwrapped into the service process's memory for
+the length of a lease, which is exactly as contained as the parent wrapping it.
+It gives you the hierarchy's shape, not its custody. No provider with a custody
+boundary implements the operations yet.
+
+Parent and child must be on the same provider: a wrapped child in another
+security domain is refused, not deferred. A parent must be enabled,
+non-exportable and independently resident, so a wrapped key cannot itself wrap
+children yet.
+
+**Keys created before 0.5.0 that name a parent are refused.** In earlier
+versions a parent binding recorded lineage only, and the child had its own
+independent material; 0.5 cannot distinguish that from a wrapped child except
+by what the material is. Such keys are refused as wrapping parents with a
+message naming the change, and startup warns when any are present. Migration is
+required before using them under 0.5 semantics; there is no migration script
+yet.
+
 ### Compromised-key default denial and dangerous legacy opt-in
 
 Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.

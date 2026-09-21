@@ -65,43 +65,42 @@ if [ $attempts -ge 30 ]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-#  PART 1 — Key creation with hierarchy
+#  PART 1 — Key creation
+#
+#  Vault Transit does not implement wrapping operations. A parent_key_id
+#  means the new key's material is wrapped under that parent, so this
+#  demo creates independent keys and does not send one.
 # ══════════════════════════════════════════════════════════════════════
 
-banner "Part 1: Key Creation with Hierarchy"
+banner "Part 1: Key Creation"
 
-step "Creating tenant root key (AES-256)..."
+step "Creating tenant key (AES-256)..."
 ROOT_RESP=$(curl -sf -X POST "${BASE}/v1/keys" \
   -H "Content-Type: application/json" \
-  -d '{"key_spec":"AES_256","description":"demo tenant root key"}')
+  -d '{"key_spec":"AES_256","description":"demo tenant key"}')
 echo "  Response: ${ROOT_RESP}"
 ROOT_LID=$(json_field "$ROOT_RESP" lid)
 
 if [ -n "$ROOT_LID" ]; then
-  ok "Root key created — LID: ${ROOT_LID}"
+  ok "Tenant key created — LID: ${ROOT_LID}"
 else
-  fail "Root key creation failed"
+  fail "Tenant key creation failed"
   exit 1
 fi
 
-step "Creating child data-encryption key under the root..."
+step "Creating an independent data-encryption key..."
 CHILD_RESP=$(curl -sf -X POST "${BASE}/v1/keys" \
   -H "Content-Type: application/json" \
-  -d "{\"key_spec\":\"AES_256\",\"description\":\"child data-encryption key\",\"parent_key_id\":\"${ROOT_LID}\"}")
+  -d '{"key_spec":"AES_256","description":"data-encryption key"}')
 echo "  Response: ${CHILD_RESP}"
 CHILD_LID=$(json_field "$CHILD_RESP" lid)
 
 if [ -n "$CHILD_LID" ]; then
-  ok "Child key created — LID: ${CHILD_LID}"
+  ok "Data-encryption key created — LID: ${CHILD_LID}"
 else
-  fail "Child key creation failed"
+  fail "Data-encryption key creation failed"
   exit 1
 fi
-
-step "Verifying parent relationship..."
-CHILD_GET=$(curl -sf "${BASE}/v1/keys/${CHILD_LID}")
-CHILD_PARENT=$(json_field "$CHILD_GET" parent_lid)
-assert_eq "$CHILD_PARENT" "$ROOT_LID" "Child's parent_lid matches root key"
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 2 — Key lifecycle: encrypt / decrypt

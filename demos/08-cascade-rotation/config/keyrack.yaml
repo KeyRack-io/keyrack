@@ -8,6 +8,16 @@ storage:
 provider:
   type: software
 
+# Creating a key with a parent wraps that key's material under the parent, so
+# the provider has to be activated for it. This mechanism is software AES-GCM:
+# parent, envelope and unwrapped child all live in this process's memory, so
+# the hierarchy below is shape, not custody. A backend that contains keys would
+# name its own mechanism here.
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: demo-08-single-process
+
 # DEVELOPMENT ONLY: key material is lost at restart despite persisted metadata.
 dev_only_allow_ephemeral_provider_with_persistent_metadata: true
 

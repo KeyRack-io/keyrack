@@ -106,6 +106,95 @@ impl StorageBackend for CachingStorage {
         result
     }
 
+    // ── Journaled creation ───────────────────────────────────────
+    //
+    // Forwarded rather than defaulted. The default is a refusal, so a wrapper
+    // that did not forward would turn "this backend cannot journal a creation"
+    // into "this deployment has a cache", and parent-wrapped children would be
+    // uncreatable wherever one is configured. Nothing here is cached: a journal
+    // is a transactional protocol whose whole purpose is that its state is read
+    // inside the transaction that changes it.
+
+    async fn reserve_creation(
+        &self,
+        request: &keyrack_core::creation::CreationRequest,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.inner.reserve_creation(request).await
+    }
+
+    async fn get_creation(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.inner.get_creation(operation).await
+    }
+
+    async fn claim_creation_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationDispatch> {
+        self.inner.claim_creation_dispatch(operation, owner).await
+    }
+
+    async fn creation_snapshot(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+    ) -> Result<keyrack_core::creation::CreationSnapshot> {
+        self.inner.creation_snapshot(operation, owner).await
+    }
+
+    async fn stage_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        envelope: &[u8],
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.inner
+            .stage_creation(operation, owner, revision, envelope)
+            .await
+    }
+
+    async fn resolve_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+        closure: &keyrack_core::creation::VerifiedA2Closure,
+    ) -> Result<keyrack_core::creation::CreationJournal> {
+        self.inner
+            .resolve_creation(operation, owner, revision, closure)
+            .await
+    }
+
+    async fn publish_creation(
+        &self,
+        operation: uuid::Uuid,
+        owner: keyrack_core::creation::CreationOwner,
+        revision: u64,
+    ) -> Result<KeyRecord> {
+        let record = self
+            .inner
+            .publish_creation(operation, owner, revision)
+            .await?;
+        self.key_cache.insert(record.lid, record.clone()).await;
+        Ok(record)
+    }
+
+    async fn read_creation_envelope(&self, operation: uuid::Uuid) -> Result<Vec<u8>> {
+        self.inner.read_creation_envelope(operation).await
+    }
+
+    async fn recoverable_creations(
+        &self,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Result<keyrack_core::creation::CreationPage> {
+        self.inner.recoverable_creations(after, limit).await
+    }
+
     // ── Keys ──────────────────────────────────────────────────────
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {

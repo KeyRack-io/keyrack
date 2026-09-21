@@ -36,7 +36,42 @@ All notable changes to KeyRack will be documented in this file.
   the parent wrapping it, which is not at all. No provider with a custody
   boundary implements these operations yet, so the KEK-wrapping-hierarchy claim
   stays down; it returns when one does, not because a mechanism exists.
-  Creating a wrapped child is still not reachable from the API.
+- **`CreateKey` with a `parent_key_id` now creates a wrapped child.** The
+  operations above had no caller: a parent binding was recorded as lineage and
+  the child got its own independent key, so the record claimed a relationship
+  the material did not have. A parent now means the material is wrapped under
+  that parent, created through the crash-safe creation journal, with the exact
+  parent version, mechanism and security domain written into the descriptor.
+  All three surfaces take the same branch. Encrypt, decrypt, re-encrypt and
+  generate-data-key open a lease for the call and close it before return,
+  including on the operation's error. The handle is whatever the issuing
+  provider returned for that open: possessing it is not a grant. A planted
+  wrapped descriptor that does not name a journaled envelope is still refused
+  without talking to the provider. Export, rotation and destroy of wrapped
+  material stay refused — those are different lifecycles.
+- **Wrapping is activated per provider in configuration.** A new `wrapping:`
+  block names the provider, the mechanism and the security domain. It is absent
+  by default, and then creating a key with a parent is refused everywhere:
+  keys that exist only inside a hierarchy have their own recovery properties,
+  so this is stated rather than inferred from what a provider happens to
+  support. Startup refuses to run if the named provider does not declare that
+  mechanism for generate, open and close, or cannot evidence its own closures,
+  and says plainly when a software mechanism means the hierarchy is shape only.
+- **The key cache no longer makes wrapped children uncreatable.** `CachingStorage`
+  wraps a `StorageBackend` and inherited the default creation-journal methods,
+  which refuse; with a `cache:` block configured — as in every demo and most
+  deployments — creating a child failed with "transactional creation
+  unsupported" from a backend that supports it perfectly well. The journal
+  methods are forwarded, nothing about a journal is cached, and a published
+  child lands in the cache as a created one does. No test caught this: the
+  service tests built state over bare storage, so the wrapper every deployment
+  has was the one configuration never exercised. Running demo 08 caught it, and
+  the test that should have now exists.
+- **Demo 01 no longer sends `parent_key_id`.** Vault Transit does not implement
+  wrapping operations, and this deployment has no `wrapping:` profile. Creating
+  a child under the tenant key is therefore refused. The canary is the
+  no-parent path: two independent keys, encrypt and rotate on the DEK. The
+  wrapping-aware hierarchy lives in demo 08.
 
 - **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
   parsed and then failed at startup with "KMIP provider not yet implemented",
@@ -62,6 +97,26 @@ All notable changes to KeyRack will be documented in this file.
   the class that passes in-process tests and fails in deployment. The second
   token is held under continuous load for the whole window, which is how the
   crash described below was found.
+
+### Changed
+
+- **Breaking: `parent_key_id` means wrapping, not lineage.** Creating a key
+  under a parent now requires a provider with an activated wrapping profile, so
+  child creation stops working on PKCS#11 until it implements the operations,
+  and on Vault until its worker-mediated path lands (ADR-0007 D4). Splitting
+  lineage and wrapping into two fields was considered and rejected: one field
+  with one meaning is what makes a parent binding trustworthy on read. A child
+  must also be a non-exportable symmetric encryption key under an enabled,
+  non-exportable, independently resident parent in the same security domain,
+  and each of those is a refusal with its own test.
+- **Breaking: keys created before 0.5.0 that name a parent are refused.** Their
+  parent binding carries the earlier lineage-only meaning, which 0.5 cannot
+  tell apart from a wrapped child by intent — only by what the material is. Such
+  a key is refused as a wrapping parent, naming the semantics change, and
+  startup warns when any are present so an operator learns before traffic
+  arrives. There is no migration script until someone needs one. This is the
+  same posture taken for V1 canonicalization records, so `keyrack-core` has no
+  legacy tolerance left anywhere.
 
 ### Fixed
 
