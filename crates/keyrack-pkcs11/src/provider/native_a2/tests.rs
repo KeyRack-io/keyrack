@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::Pkcs11ProviderConfig;
+use keyrack_core::creation::CreationRequest;
 use keyrack_core::provider::CryptoProvider;
 use keyrack_test_support::creation_conformance::fixture;
 
@@ -107,19 +108,27 @@ fn native_a2_soft_hsm() {
     let good_parent = parent(&control, "native-a2-parent");
     let wrong_parent = parent(&control, "native-a2-wrong-parent");
     let (_, request) = fixture();
+    let context = request.context().unwrap();
+    let creation_binding = CreationBinding::of(&request).unwrap();
     let original_generation = provider.module.generation();
     journal_rejects_unqualified_provider(provider.clone());
     assert!(named(&control, &request.correlation).is_empty());
 
-    let acquire = |parent: &KeyHandle, mode| {
+    let acquire = |parent: &KeyHandle, mode, creation_owner: bool| {
         provider
-            .native_a2_conformance_session(parent.clone(), request.clone(), mode)
+            .native_a2_conformance_session(
+                parent.clone(),
+                context.clone(),
+                creation_owner.then(|| creation_binding.clone()),
+                mode,
+            )
             .unwrap()
     };
 
     // Unsupported native context wrapping is an exact refusal, no KW fallback.
-    let mut rejected = acquire(&good_parent, NativeWrapMode::GcmCandidate);
-    let Err(error) = rejected.generate_wrapped_key(&request) else {
+    let mut rejected = acquire(&good_parent, NativeWrapMode::GcmCandidate, true);
+    let Err(error) = rejected.generate_wrapped_key(&context, &good_parent, &creation_binding)
+    else {
         panic!("SoftHSM unexpectedly accepted GCM wrap; re-triage qualification");
     };
     let expected = map_pkcs11_error(
@@ -141,7 +150,9 @@ fn native_a2_soft_hsm() {
         "must reach the wrapping call: {error}"
     );
     assert_eq!(named(&control, &request.correlation).len(), 1);
-    assert!(rejected.generate_wrapped_key(&request).is_err());
+    assert!(rejected
+        .generate_wrapped_key(&context, &good_parent, &creation_binding)
+        .is_err());
     assert_eq!(
         named(&control, &request.correlation).len(),
         1,
@@ -152,14 +163,17 @@ fn native_a2_soft_hsm() {
     assert!(named(&control, &request.correlation).is_empty());
     // Synthetic bytes exercise native mechanism refusal only; they are not a
     // valid GCM envelope or evidence of successful context authentication.
-    let mut rejected_open = acquire(&good_parent, NativeWrapMode::GcmCandidate);
+    let mut rejected_open = acquire(&good_parent, NativeWrapMode::GcmCandidate, false);
     let gcm_input = NativeEnvelope {
         mode: NativeWrapMode::GcmCandidate,
         iv: [0; 12],
         ciphertext: vec![0x42; 48],
-        intent: request.fingerprint().unwrap(),
+        context_sha256: context.context_sha256().unwrap(),
     };
-    let Err(error) = rejected_open.open_wrapped_key(&request, &gcm_input) else {
+    assert!(rejected
+        .verify_closed_creation(&context, &good_parent, &creation_binding, &gcm_input)
+        .is_err());
+    let Err(error) = rejected_open.open_wrapped_key(&context, &good_parent, &gcm_input) else {
         panic!("SoftHSM unexpectedly accepted native GCM unwrap");
     };
     let expected = map_pkcs11_error(
@@ -171,19 +185,45 @@ fn native_a2_soft_hsm() {
     );
     assert_eq!(error.to_string(), expected.to_string());
     assert!(rejected_open
-        .open_wrapped_key(&request, &gcm_input)
+        .open_wrapped_key(&context, &good_parent, &gcm_input)
         .is_err());
     rejected_open.close_wrapped_key().unwrap();
-    assert!(named(&control, &request.correlation).is_empty());
+    assert!(named(&control, &rejected_open.correlation).is_empty());
     println!(
         "NATIVE_A2_PASS gcm_wrap_refused=true gcm_unwrap_refused=true fallback=false retry=false"
     );
 
     // Positive KW mechanism evidence is explicitly unqualified for context custody.
-    let mut creation = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
-    let envelope = creation.generate_wrapped_key(&request).unwrap();
+    let mut creation = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, true);
+    let mut other_request = request.clone();
+    other_request.expected_parent_occ += 1;
+    let other_binding = CreationBinding::of(&other_request).unwrap();
+    assert!(creation
+        .generate_wrapped_key(&context, &good_parent, &other_binding)
+        .is_err());
+    assert!(creation
+        .generate_wrapped_key(&context, &wrong_parent, &creation_binding)
+        .is_err());
+    let mut other_context = context.clone();
+    other_context.child_spec = KeySpec::Aes128;
+    assert!(creation
+        .generate_wrapped_key(&other_context, &good_parent, &creation_binding)
+        .is_err());
+    assert!(creation
+        .open_wrapped_key(&context, &good_parent, &gcm_input)
+        .is_err());
+    assert!(creation.phase == Phase::Ready);
+    assert!(named(&control, &request.correlation).is_empty());
+    let envelope = creation
+        .generate_wrapped_key(&context, &good_parent, &creation_binding)
+        .unwrap();
     assert_eq!(envelope.ciphertext().len(), 40);
-    assert!(creation.generate_wrapped_key(&request).is_err());
+    assert!(creation
+        .generate_wrapped_key(&context, &good_parent, &creation_binding)
+        .is_err());
+    assert!(creation
+        .verify_closed_creation(&context, &good_parent, &creation_binding, &envelope)
+        .is_err());
     assert!(creation
         .encrypt(b"must not use generation object", b"")
         .is_err());
@@ -191,14 +231,54 @@ fn native_a2_soft_hsm() {
     let held = provider.module.gate.inner.lock().unwrap().in_flight;
     assert_eq!(held, 2, "control + idle creation session retain admission");
     creation.close_wrapped_key().unwrap();
+    creation
+        .verify_closed_creation(&context, &good_parent, &creation_binding, &envelope)
+        .unwrap();
+    for (case, mut altered) in [envelope.clone(), envelope.clone(), envelope.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        match case {
+            0 => altered.ciphertext[0] ^= 1,
+            1 => altered.iv[0] ^= 1,
+            _ => altered.context_sha256[0] ^= 1,
+        }
+        assert!(creation
+            .verify_closed_creation(&context, &good_parent, &creation_binding, &altered)
+            .is_err());
+    }
+    assert!(creation
+        .verify_closed_creation(&context, &good_parent, &other_binding, &envelope)
+        .is_err());
+    assert!(creation
+        .verify_closed_creation(&other_context, &good_parent, &creation_binding, &envelope)
+        .is_err());
+    assert!(creation
+        .verify_closed_creation(&context, &wrong_parent, &creation_binding, &envelope)
+        .is_err());
     let closure = creation.closed_session().unwrap();
     creation.close_wrapped_key().unwrap();
     assert_eq!(creation.closed_session(), Some(closure));
     assert_eq!(provider.module.gate.inner.lock().unwrap().in_flight, 1);
     assert!(named(&control, &request.correlation).is_empty());
 
-    let mut opened = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
-    opened.open_wrapped_key(&request, &envelope).unwrap();
+    let mut empty = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, true);
+    empty.close_wrapped_key().unwrap();
+    assert!(empty.closed_session().is_some());
+    assert!(empty
+        .verify_closed_creation(&context, &good_parent, &creation_binding, &envelope)
+        .is_err());
+
+    let mut opened = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, false);
+    assert!(opened
+        .generate_wrapped_key(&context, &good_parent, &creation_binding)
+        .is_err());
+    assert!(opened.phase == Phase::Ready);
+    opened
+        .open_wrapped_key(&context, &good_parent, &envelope)
+        .unwrap();
+    assert_ne!(opened.correlation, request.correlation);
+    assert_eq!(named(&control, &opened.correlation).len(), 1);
     assert_eq!(
         opened
             .session()
@@ -215,13 +295,16 @@ fn native_a2_soft_hsm() {
         check_opened_policy(
             opened.session().unwrap(),
             opened.opened.unwrap(),
-            &request,
+            &context,
+            &opened.correlation,
             NativeWrapMode::GcmCandidate
         )
         .is_err(),
         "the mechanics exception must not weaken GCM policy"
     );
-    assert!(opened.open_wrapped_key(&request, &envelope).is_err());
+    assert!(opened
+        .open_wrapped_key(&context, &good_parent, &envelope)
+        .is_err());
     let encrypted = opened
         .encrypt(b"public native lease payload", b"caller-application-aad")
         .unwrap();
@@ -239,34 +322,45 @@ fn native_a2_soft_hsm() {
         "native refusals never invoke module recovery"
     );
     opened.close_wrapped_key().unwrap();
+    assert!(opened
+        .verify_closed_creation(&context, &good_parent, &creation_binding, &envelope)
+        .is_err());
     assert!(opened.encrypt(b"closed", b"").is_err());
     assert!(opened
         .decrypt(&encrypted.ciphertext, b"caller-application-aad")
         .is_err());
-    assert!(named(&control, &request.correlation).is_empty());
+    assert!(named(&control, &opened.correlation).is_empty());
     println!("NATIVE_A2_PASS kw_roundtrip=true explicit_original_close=true application_aad=true custody_qualified=false");
 
     let (_, mut aes128) = fixture();
     aes128.record.key_spec = KeySpec::Aes128;
     aes128.context_bytes = aes128.context().unwrap().canonical_bytes().unwrap();
+    let context128 = aes128.context().unwrap();
+    let binding128 = CreationBinding::of(&aes128).unwrap();
     let mut generated128 = provider
         .native_a2_conformance_session(
             good_parent.clone(),
-            aes128.clone(),
+            context128.clone(),
+            Some(binding128.clone()),
             NativeWrapMode::KwMechanicsOnly,
         )
         .unwrap();
-    let wrapped128 = generated128.generate_wrapped_key(&aes128).unwrap();
+    let wrapped128 = generated128
+        .generate_wrapped_key(&context128, &good_parent, &binding128)
+        .unwrap();
     assert_eq!(wrapped128.ciphertext().len(), 24);
     generated128.close_wrapped_key().unwrap();
     let mut opened128 = provider
         .native_a2_conformance_session(
             good_parent.clone(),
-            aes128.clone(),
+            context128.clone(),
+            None,
             NativeWrapMode::KwMechanicsOnly,
         )
         .unwrap();
-    opened128.open_wrapped_key(&aes128, &wrapped128).unwrap();
+    opened128
+        .open_wrapped_key(&context128, &good_parent, &wrapped128)
+        .unwrap();
     let cipher128 = opened128.encrypt(b"public AES128 payload", b"aad").unwrap();
     assert_eq!(
         opened128
@@ -277,32 +371,37 @@ fn native_a2_soft_hsm() {
     );
     opened128.close_wrapped_key().unwrap();
     assert!(named(&control, &aes128.correlation).is_empty());
+    assert!(named(&control, &opened128.correlation).is_empty());
 
-    // Changed intent, wrong wrapping parent, corrupted bytes and wrong mechanism
-    // never yield usable leases, and cannot retry the consumed native attempt.
-    let mut changed_request = request.clone();
-    changed_request.expected_parent_occ += 1;
-    let mut changed = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
+    // Changed context is refused before native effects. Wrong wrapping parent,
+    // corrupted bytes and wrong mechanism cannot retry a consumed native attempt.
+    let mut changed_context = context.clone();
+    changed_context.child_spec = KeySpec::Aes128;
+    let mut changed = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, false);
     assert!(changed
-        .open_wrapped_key(&changed_request, &envelope)
+        .open_wrapped_key(&changed_context, &good_parent, &envelope)
         .is_err());
-    assert!(named(&control, &request.correlation).is_empty());
+    assert!(named(&control, &changed.correlation).is_empty());
     changed.close_wrapped_key().unwrap();
     for (parent_handle, mode, corrupt) in [
         (&wrong_parent, NativeWrapMode::KwMechanicsOnly, false),
         (&good_parent, NativeWrapMode::GcmCandidate, false),
         (&good_parent, NativeWrapMode::KwMechanicsOnly, true),
     ] {
-        let mut candidate = acquire(parent_handle, mode);
+        let mut candidate = acquire(parent_handle, mode, false);
         let mut input = envelope.clone();
         if corrupt {
             input.ciphertext[0] ^= 1;
         }
-        assert!(candidate.open_wrapped_key(&request, &input).is_err());
-        assert!(candidate.open_wrapped_key(&request, &envelope).is_err());
+        assert!(candidate
+            .open_wrapped_key(&context, parent_handle, &input)
+            .is_err());
+        assert!(candidate
+            .open_wrapped_key(&context, parent_handle, &envelope)
+            .is_err());
         assert!(candidate.encrypt(b"refused", b"").is_err());
         candidate.close_wrapped_key().unwrap();
-        assert!(named(&control, &request.correlation).is_empty());
+        assert!(named(&control, &candidate.correlation).is_empty());
     }
     println!(
         "NATIVE_A2_PASS changed_intent=true wrong_parent=true corrupt_wrap=true wrong_mode=true"
@@ -310,24 +409,33 @@ fn native_a2_soft_hsm() {
 
     // Last session Drop closes before its module admission is released, but is
     // not observable closure evidence and cannot publish a creation journal.
+    let dropped_correlation;
     {
-        let mut dropped = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
-        dropped.open_wrapped_key(&request, &envelope).unwrap();
-        assert_eq!(named(&control, &request.correlation).len(), 1);
+        let mut dropped = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, false);
+        dropped
+            .open_wrapped_key(&context, &good_parent, &envelope)
+            .unwrap();
+        dropped_correlation = dropped.correlation.clone();
+        assert_eq!(named(&control, &dropped_correlation).len(), 1);
         assert_eq!(provider.module.gate.inner.lock().unwrap().in_flight, 2);
     }
-    assert!(named(&control, &request.correlation).is_empty());
+    assert!(named(&control, &dropped_correlation).is_empty());
     assert_eq!(provider.module.gate.inner.lock().unwrap().in_flight, 1);
+
+    adapter::tests::live(&provider, &good_parent, &request, &control);
 
     // Cold parent loss cannot open another lease. A previously opened child
     // continues to work until explicit closure: do not claim a stronger fence.
-    let mut warm = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
-    warm.open_wrapped_key(&request, &envelope).unwrap();
+    let mut warm = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, false);
+    warm.open_wrapped_key(&context, &good_parent, &envelope)
+        .unwrap();
     control
         .destroy_object(named(&control, &good_parent.key_id)[0])
         .unwrap();
-    let mut cold = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly);
-    assert!(cold.open_wrapped_key(&request, &envelope).is_err());
+    let mut cold = acquire(&good_parent, NativeWrapMode::KwMechanicsOnly, false);
+    assert!(cold
+        .open_wrapped_key(&context, &good_parent, &envelope)
+        .is_err());
     cold.close_wrapped_key().unwrap();
     control
         .destroy_object(named(&control, &wrong_parent.key_id)[0])

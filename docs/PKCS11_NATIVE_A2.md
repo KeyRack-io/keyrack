@@ -4,9 +4,9 @@ Status: **unqualified, conformance-only internals**, not an enabled service
 provider. The `native-a2-conformance` feature compiles native Generate/Wrap,
 Unwrap/use and original-session Close in `keyrack-pkcs11`. Default builds omit
 this developer entry point. `wrapping_capabilities()` remains empty, including
-when the feature is enabled. The shared wrapping-trait/creation-journal adapter
-is not implemented by this slice; its incoming signatures must be consumed, not
-replaced by these synchronous internal methods.
+when the feature is enabled. The native engine and async conformance adapter now
+consume `CreationBinding` from the shared contract. No qualified production
+`CryptoProvider` wrapping adapter or creation-journal verifier is enabled.
 
 ## What the engine establishes
 
@@ -23,10 +23,51 @@ replaced by these synchronous internal methods.
   a destructor's possible cleanup is not evidence. This is not a creation closure,
   lease-cleanup attestation or revocation receipt.
 
-The owner is synchronous, Send and not Sync. Async serialization, cancellation
-ownership, opaque lease dispatch and durable restart reconciliation belong in the
-pending shared adapter. A fresh owner is not permission to repeat an uncertain
-journal attempt. The in-process `NativeEnvelope` is not a persisted wire format.
+The primitive owner is synchronous, Send and not Sync. Generation binds exact
+context, parent and immutable `CreationBinding` before native effects. Ordinary
+Open has no creation binding and uses a fresh correlation; a use owner cannot
+certify creation. Matching retained output and explicit original-session close
+are necessary even for the local conformance observation. Closing an empty or
+failed owner does not verify generation.
+
+### Shared-contract-shaped conformance adapter
+
+`NativeA2ConformanceAdapter` uses the shared `CreationBinding`,
+`GeneratedWrappedKey`, `WrappedKeyLease` and `WrappedKeyClosure` types. Its
+Generate signature is `(context, parent, creation: &CreationBinding)`; Open is
+`(context, parent, envelope)` with no invented creation request.
+
+It deliberately does **not** implement `CryptoProvider`: that trait requires
+authenticated canonical context and declared qualified capabilities, which the
+KW mechanics path cannot deliver. Production wrapping calls remain unsupported,
+and `wrapping_closure_verifier()` returns `None`. A successful local close report
+cannot satisfy `VerifiedA2Closure` or enable journal publication. The real SQLite
+creation-driver refusal test still exercises that fail-closed boundary.
+
+One blocking owner lock serializes reservation, native effects, lease issuance,
+use and close. The original session is retained before Generate can act; a lease
+becomes addressable only after successful creation/opening under that same lock.
+Unknown, unissued, altered and foreign leases refuse without token lookup or
+numeric-handle fallback. Byte-identical clones of an issued lease are valid local
+references, not new authority. Generation objects remain non-operational leaves.
+
+Cancelled Generate retains its owner and can be closed using its exact creation
+binding. Cancelled Open may lose its returned lease; the runner must call
+`close_all()` to fence new admission and close every retained original session,
+including such orphaned use owners. This cleanup attempts every owner, reports
+any unconfirmed close, and creates no custody evidence. A dropped future does not
+prove cleanup. Capacity is 256 retained entries per conformance adapter; failed
+and closed entries are never evicted to allow replay. This conservative serialized
+runner is not a production caching, TTL or throughput design.
+
+The bounded `KRTEST01` byte frame retains explicit mode, IV, context digest and
+ciphertext solely for these conformance calls. It is **not a durable product
+envelope**, shared custody-v1 change, or authentication of adjacent metadata.
+Malformed lengths, mode changes and mismatched context refuse before Unwrap;
+GCM never falls back to KW. Future qualified production integration still needs
+approved envelope/profile encoding, durable restart reconciliation, trusted parent
+resolution and an evidence verifier. A fresh adapter is not permission to repeat
+an uncertain durable journal attempt.
 
 ## Mechanism versus custody
 
@@ -80,3 +121,10 @@ no use after close, destructor cleanup without claiming evidence, and idle-sessi
 admission blocking quiescence. Cold parent loss prevents opening; an already-open
 child remains usable until closed. This warm-copy limit is intentional evidence,
 not a revocation or erasure success. Successful completion checks an empty token.
+
+The same live test also exercises the shared-shaped adapter: immutable binding
+and lease refusals, retained-output checks, errored Generate cleanup, and real
+native sessions paused before/after Generate to race Close against issuance.
+Cancellation tests cover both Generate and Open. These validate the local owner
+mechanism and cleanup path, not custody qualification or a service deployment.
+The 0.5.0 child template remains leaf-only: `Wrap(false)` and `Unwrap(false)`.

@@ -21,13 +21,16 @@ use cryptoki::mechanism::aead::GcmParams;
 use cryptoki::mechanism::Mechanism;
 use cryptoki::object::{Attribute, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
-use keyrack_core::creation::CreationRequest;
+use keyrack_core::creation::CreationBinding;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{EncryptOutput, KeyHandle};
 use keyrack_core::sensitive::Sensitive;
+use keyrack_core::wrapping::{WrappedKeyFormat, WrappingContext, WrappingKeyPurpose};
 use std::sync::Arc;
 use uuid::Uuid;
+
+pub mod adapter;
 
 fn refused(message: &str) -> KeyRackError {
     KeyRackError::Provider(format!("unqualified native A2 candidate: {message}"))
@@ -46,12 +49,12 @@ pub enum NativeWrapMode {
 
 /// In-process primitive output, NOT a new persisted/shared envelope encoding.
 /// No key bytes, numeric object handle, Debug or serde implementation is exposed.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NativeEnvelope {
     mode: NativeWrapMode,
     iv: [u8; 12],
     ciphertext: Vec<u8>,
-    intent: [u8; 32],
+    context_sha256: [u8; 32],
 }
 
 impl NativeEnvelope {
@@ -88,41 +91,50 @@ enum Phase {
 
 /// One original native session and at most one Generate OR Unwrap attempt.
 ///
-/// This synchronous owner is Send but not Sync. Its eventual async adapter must
-/// serialize use/close in a blocking owner, retain it through caller cancellation,
-/// and rely on the journal for durable dispatch. A fresh instance is not proof
-/// that an earlier attempt had no effects. Cleanup does not require fresh crypto
-/// authority. No Clone or serializable lease handle is supplied here.
+/// This synchronous owner is Send but not Sync. The conformance adapter serializes
+/// use/close in a blocking owner and retains it through caller cancellation.
+/// Durable dispatch/restart reconciliation is not supplied here: a fresh instance
+/// is not proof that an earlier attempt had no effects. Cleanup does not require
+/// fresh crypto authority. No Clone or serializable lease handle is supplied here.
 pub struct NativeA2Session {
     // Drop order matters: cryptoki's destructor may call C_CloseSession again.
     // It must run before admission is released, even if explicit close failed.
     session: Option<Session>,
     admission: Option<LifetimeAdmission>,
     identity: Uuid,
-    intent: [u8; 32],
-    request: CreationRequest,
+    context: WrappingContext,
+    context_bytes: Vec<u8>,
+    context_sha256: [u8; 32],
+    creation: Option<CreationBinding>,
+    correlation: String,
     parent: KeyHandle,
     mode: NativeWrapMode,
     phase: Phase,
     opened: Option<ObjectHandle>,
+    generated: Option<NativeEnvelope>,
 }
 
 impl Pkcs11Provider {
     /// Blocking conformance-only owner acquisition; never service admission.
     /// Session acquisition and later native effects are deliberately not retried.
+    /// `Some(creation)` selects a generation owner; `None` selects an ordinary
+    /// open owner with a fresh use-only correlation. The roles are immutable.
     pub fn native_a2_conformance_session(
         &self,
         parent: KeyHandle,
-        request: CreationRequest,
+        context: WrappingContext,
+        creation: Option<CreationBinding>,
         mode: NativeWrapMode,
     ) -> Result<NativeA2Session> {
-        let intent = request.fingerprint()?;
-        if parent.key_spec != request.parent_spec
-            || parent.key_id.is_empty()
-            || parent.key_id.len() > 256
-        {
-            return Err(refused("invalid exact parent handle/spec"));
-        }
+        let context_bytes = validate_inputs(&context, &parent)?;
+        let context_sha256 = context
+            .context_sha256()
+            .map_err(|_| refused("invalid wrapping context"))?;
+        let identity = Uuid::new_v4();
+        let correlation = creation.as_ref().map_or_else(
+            || format!("kr-native-a2-use-{identity}"),
+            |binding| binding.correlation().to_owned(),
+        );
         let admission = LifetimeAdmission::acquire(Arc::clone(&self.module))?;
         let session = self
             .module
@@ -140,13 +152,17 @@ impl Pkcs11Provider {
         Ok(NativeA2Session {
             session: Some(session),
             admission: Some(admission),
-            identity: Uuid::new_v4(),
-            intent,
-            request,
+            identity,
+            context,
+            context_bytes,
+            context_sha256,
+            creation,
+            correlation,
             parent,
             mode,
             phase: Phase::Ready,
             opened: None,
+            generated: None,
         })
     }
 }
@@ -158,10 +174,28 @@ impl NativeA2Session {
             .ok_or_else(|| refused("original session unavailable"))
     }
 
-    fn begin(&mut self, request: &CreationRequest) -> Result<()> {
-        if request.fingerprint()? != self.intent {
-            return Err(refused("attempt intent changed"));
+    fn check_binding(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        creation: Option<&CreationBinding>,
+    ) -> Result<()> {
+        if context != &self.context || parent != &self.parent {
+            return Err(refused("attempt context or exact parent changed"));
         }
+        if self.creation.as_ref() != creation {
+            return Err(refused("attempt creation binding or owner role changed"));
+        }
+        Ok(())
+    }
+
+    fn begin(
+        &mut self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        creation: Option<&CreationBinding>,
+    ) -> Result<()> {
+        self.check_binding(context, parent, creation)?;
         if self.phase != Phase::Ready {
             return Err(refused("native attempt already consumed or closed"));
         }
@@ -207,11 +241,16 @@ impl NativeA2Session {
     /// Native Generate -> Wrap. The caller must explicitly close the original
     /// creation owner before any legitimate journal publication. No closure proof
     /// or qualified envelope is returned by this candidate-only method.
-    pub fn generate_wrapped_key(&mut self, request: &CreationRequest) -> Result<NativeEnvelope> {
-        self.begin(request)?;
+    pub fn generate_wrapped_key(
+        &mut self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        creation: &CreationBinding,
+    ) -> Result<NativeEnvelope> {
+        self.begin(context, parent, Some(creation))?;
         let parent = self.parent()?;
         let session = self.session()?;
-        let template = child_template(request, true)?;
+        let template = child_template(context, &self.correlation, true)?;
         let child = session
             .generate_key(&Mechanism::AesKeyGen, &template)
             .map_err(|e| map_pkcs11_error("native child generate (not retried)", &e))?;
@@ -222,7 +261,7 @@ impl NativeA2Session {
                 session
                     .generate_random_slice(&mut iv)
                     .map_err(|e| map_pkcs11_error("candidate wrap nonce", &e))?;
-                let params = GcmParams::new(&mut iv, &request.context_bytes, 128.into())
+                let params = GcmParams::new(&mut iv, &self.context_bytes, 128.into())
                     .map_err(|e| map_pkcs11_error("candidate GCM params", &e))?;
                 // cryptoki makes a size query and an output C_WrapKey call.
                 // Nonce/use accounting and returned-IV behavior need qualification.
@@ -238,29 +277,34 @@ impl NativeA2Session {
         } else {
             8
         };
-        if ciphertext.len() != key_length(&request.record.key_spec)? + overhead {
+        if ciphertext.len() != key_length(&context.child_spec)? + overhead {
             return Err(refused("unexpected native wrapped length"));
         }
-        Ok(NativeEnvelope {
+        let envelope = NativeEnvelope {
             mode: self.mode,
             iv,
             ciphertext,
-            intent: self.intent,
-        })
+            context_sha256: self.context_sha256,
+        };
+        self.generated = Some(envelope.clone());
+        Ok(envelope)
     }
 
     /// Unwrap into this original session only; never return an operable handle.
+    /// Requires an ordinary-use owner. The stored envelope binds wrapping context,
+    /// while creation provenance stays with the owner that originally generated it.
     /// Host-side equality here is not authentication for the KW mechanics path.
     pub fn open_wrapped_key(
         &mut self,
-        request: &CreationRequest,
+        context: &WrappingContext,
+        parent: &KeyHandle,
         envelope: &NativeEnvelope,
     ) -> Result<()> {
-        self.begin(request)?;
-        if envelope.intent != self.intent || envelope.mode != self.mode {
-            return Err(refused("envelope intent/mechanism mismatch"));
+        self.begin(context, parent, None)?;
+        if envelope.context_sha256 != self.context_sha256 || envelope.mode != self.mode {
+            return Err(refused("envelope context/mechanism mismatch"));
         }
-        let expected = key_length(&request.record.key_spec)?
+        let expected = key_length(&context.child_spec)?
             + if self.mode == NativeWrapMode::GcmCandidate {
                 16
             } else {
@@ -271,7 +315,7 @@ impl NativeA2Session {
         }
         let parent = self.parent()?;
         let session = self.session()?;
-        let mut template = child_template(request, false)?;
+        let mut template = child_template(context, &self.correlation, false)?;
         // Unwrap infers secret length from the wrapped bytes. GCM readback below
         // requires exact AES size; the explicitly unqualified KW profile also
         // records SoftHSM's zero-length metadata behavior (see check_opened_policy).
@@ -279,7 +323,7 @@ impl NativeA2Session {
         let mut iv = envelope.iv;
         let opened = match self.mode {
             NativeWrapMode::GcmCandidate => {
-                let params = GcmParams::new(&mut iv, &request.context_bytes, 128.into())
+                let params = GcmParams::new(&mut iv, &self.context_bytes, 128.into())
                     .map_err(|e| map_pkcs11_error("candidate GCM params", &e))?;
                 session.unwrap_key(
                     &Mechanism::AesGcm(params),
@@ -298,7 +342,7 @@ impl NativeA2Session {
         .map_err(|e| map_pkcs11_error("native child unwrap (not retried)", &e))?;
         // No attribute repair. Even a returned handle remains unusable until all
         // exact scalar checks pass; on error explicit original-session close is owed.
-        check_opened_policy(session, opened, request, self.mode)?;
+        check_opened_policy(session, opened, context, &self.correlation, self.mode)?;
         self.opened = Some(opened);
         self.phase = Phase::Open;
         Ok(())
@@ -312,7 +356,7 @@ impl NativeA2Session {
             .opened
             .ok_or_else(|| refused("lease lost its original object"))?;
         let session = self.session()?;
-        check_opened_policy(session, key, &self.request, self.mode)?;
+        check_opened_policy(session, key, &self.context, &self.correlation, self.mode)?;
         Ok((session, key))
     }
 
@@ -375,6 +419,44 @@ impl NativeA2Session {
     pub fn closed_session(&self) -> Option<Uuid> {
         (self.phase == Phase::Closed).then_some(self.identity)
     }
+
+    /// Match a successful generation's retained output after explicit original
+    /// close. This local observation is not qualified creation-journal evidence.
+    /// An empty, failed or ordinary-use owner cannot certify a creation here.
+    pub fn verify_closed_creation(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        creation: &CreationBinding,
+        envelope: &NativeEnvelope,
+    ) -> Result<()> {
+        self.check_binding(context, parent, Some(creation))?;
+        if self.phase != Phase::Closed || self.generated.as_ref() != Some(envelope) {
+            return Err(refused("no matching explicitly closed native generation"));
+        }
+        Ok(())
+    }
+}
+
+fn validate_inputs(context: &WrappingContext, parent: &KeyHandle) -> Result<Vec<u8>> {
+    if parent.key_spec != context.parent_spec
+        || parent.key_id.is_empty()
+        || parent.key_id.len() > 256
+    {
+        return Err(refused("invalid exact parent handle/spec"));
+    }
+    if context.purpose != WrappingKeyPurpose::EncryptDecrypt
+        || context.key_format != WrappedKeyFormat::RawSecret
+        || context.child.lid == context.parent.lid
+    {
+        return Err(refused(
+            "candidate supports raw AES encrypt/decrypt leaves only",
+        ));
+    }
+    key_length(&context.child_spec)?;
+    context
+        .canonical_bytes()
+        .map_err(|_| refused("invalid wrapping context"))
 }
 
 fn key_length(spec: &KeySpec) -> Result<usize> {
@@ -385,12 +467,16 @@ fn key_length(spec: &KeySpec) -> Result<usize> {
     }
 }
 
-fn child_template(request: &CreationRequest, creation: bool) -> Result<Vec<Attribute>> {
+fn child_template(
+    context: &WrappingContext,
+    correlation: &str,
+    creation: bool,
+) -> Result<Vec<Attribute>> {
     Ok(vec![
         Attribute::Class(ObjectClass::SECRET_KEY),
         Attribute::KeyType(KeyType::AES),
         Attribute::ValueLen(
-            key_length(&request.record.key_spec)?
+            key_length(&context.child_spec)?
                 .try_into()
                 .map_err(|_| refused("AES size"))?,
         ),
@@ -407,8 +493,8 @@ fn child_template(request: &CreationRequest, creation: bool) -> Result<Vec<Attri
         Attribute::Wrap(false),
         Attribute::Unwrap(false),
         Attribute::Derive(false),
-        Attribute::Label(request.correlation.as_bytes().to_vec()),
-        Attribute::Id(request.correlation.as_bytes().to_vec()),
+        Attribute::Label(correlation.as_bytes().to_vec()),
+        Attribute::Id(correlation.as_bytes().to_vec()),
         // SoftHSM 2.6.1 applies the template in caller order and forbids further
         // unwrap attributes after immutability. Set it last in the SAME native
         // call; never omit it, repair afterward, or retry a weaker template.
@@ -436,10 +522,11 @@ fn check_attributes(session: &Session, key: ObjectHandle, expected: &[Attribute]
 fn check_opened_policy(
     session: &Session,
     key: ObjectHandle,
-    request: &CreationRequest,
+    context: &WrappingContext,
+    correlation: &str,
     mode: NativeWrapMode,
 ) -> Result<()> {
-    let mut expected = child_template(request, false)?;
+    let mut expected = child_template(context, correlation, false)?;
     if mode == NativeWrapMode::KwMechanicsOnly {
         // SoftHSM 2.7.0 C_UnwrapKey stores CKA_VALUE without updating VALUE_LEN.
         // This MECHANICS-ONLY profile checks the originally generated AES length
@@ -452,7 +539,7 @@ fn check_opened_policy(
             .get_attributes(key, &[cryptoki::object::AttributeType::ValueLen])
             .map_err(|e| map_pkcs11_error("KW mechanics size observation", &e))?;
         let wanted = Attribute::ValueLen(
-            key_length(&request.record.key_spec)?
+            key_length(&context.child_spec)?
                 .try_into()
                 .map_err(|_| refused("AES size"))?,
         );
@@ -474,8 +561,9 @@ mod policy_tests {
     #[test]
     fn immutability_is_last_without_omitting_any_policy() {
         let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        let context = request.context().unwrap();
         for creation in [true, false] {
-            let template = child_template(&request, creation).unwrap();
+            let template = child_template(&context, &request.correlation, creation).unwrap();
             assert_eq!(template.last(), Some(&Attribute::Modifiable(false)));
             assert_eq!(
                 template
@@ -536,7 +624,8 @@ mod policy_tests {
         let (_, mut request) = keyrack_test_support::creation_conformance::fixture();
         for (spec, size) in [(KeySpec::Aes128, 16), (KeySpec::Aes256, 32)] {
             request.record.key_spec = spec;
-            let generated = child_template(&request, true).unwrap();
+            let context = request.context().unwrap();
+            let generated = child_template(&context, &request.correlation, true).unwrap();
             assert!(generated.contains(&Attribute::ValueLen(size.into())));
             assert!(!generated.contains(&Attribute::ValueLen(0.into())));
             for policy in [
@@ -549,10 +638,174 @@ mod policy_tests {
             ] {
                 assert!(generated.contains(&policy));
             }
-            let opened = child_template(&request, false).unwrap();
+            let opened = child_template(&context, "kr-native-a2-use-policy-test", false).unwrap();
             assert!(opened.contains(&Attribute::Extractable(false)));
             assert!(opened.contains(&Attribute::ValueLen(size.into())));
+            assert!(generated.contains(&Attribute::Id(request.correlation.as_bytes().to_vec())));
+            assert!(opened.contains(&Attribute::Id(b"kr-native-a2-use-policy-test".to_vec())));
         }
+    }
+
+    // No native session exists in this negative-test owner. Every invalid input
+    // must be rejected while Ready, before the first native policy read/effect.
+    fn owner(creation: Option<CreationBinding>) -> NativeA2Session {
+        let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        let context = request.context().unwrap();
+        let identity = Uuid::new_v4();
+        let correlation = creation.as_ref().map_or_else(
+            || format!("kr-native-a2-use-{identity}"),
+            |binding| binding.correlation().to_owned(),
+        );
+        NativeA2Session {
+            session: None,
+            admission: None,
+            identity,
+            context_bytes: context.canonical_bytes().unwrap(),
+            context_sha256: context.context_sha256().unwrap(),
+            context,
+            creation,
+            correlation,
+            parent: KeyHandle {
+                key_id: "native-parent".into(),
+                key_spec: KeySpec::Aes256,
+            },
+            mode: NativeWrapMode::GcmCandidate,
+            phase: Phase::Ready,
+            opened: None,
+            generated: None,
+        }
+    }
+
+    #[test]
+    fn changed_creation_context_and_exact_parent_are_refused_before_effects() {
+        let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        let creation = CreationBinding::of(&request).unwrap();
+        let mut owner = owner(Some(creation.clone()));
+        let context = owner.context.clone();
+        let parent = owner.parent.clone();
+        for (case, mut changed) in [
+            request.clone(),
+            request.clone(),
+            request.clone(),
+            request.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Every new attempt, including one with identical wrapping context,
+            // has independent provenance and cannot take over this owner.
+            match case {
+                0 => changed.operation = Uuid::new_v4(),
+                1 => changed.attempt = Uuid::new_v4(),
+                2 => changed.owner.instance = Uuid::new_v4(),
+                _ => changed.expected_parent_occ += 1,
+            }
+            changed.correlation =
+                keyrack_core::creation::creation_correlation(changed.operation, changed.attempt);
+            let changed = CreationBinding::of(&changed).unwrap();
+            assert!(owner
+                .generate_wrapped_key(&context, &parent, &changed)
+                .is_err());
+            assert!(owner.phase == Phase::Ready);
+        }
+        let mut changed = request;
+        changed.owner.generation += 1;
+        let changed = CreationBinding::of(&changed).unwrap();
+        assert!(owner
+            .generate_wrapped_key(&context, &parent, &changed)
+            .is_err());
+        let mut changed_context = context.clone();
+        changed_context.child_spec = KeySpec::Aes128;
+        assert!(owner
+            .generate_wrapped_key(&changed_context, &parent, &creation)
+            .is_err());
+        let mut changed_parent = parent.clone();
+        changed_parent.key_id.push_str("-other");
+        assert!(owner
+            .generate_wrapped_key(&context, &changed_parent, &creation)
+            .is_err());
+        changed_parent = parent;
+        changed_parent.key_spec = KeySpec::Aes128;
+        assert!(owner
+            .generate_wrapped_key(&context, &changed_parent, &creation)
+            .is_err());
+        assert!(owner.phase == Phase::Ready);
+        assert!(owner.generated.is_none());
+    }
+
+    #[test]
+    fn creation_and_use_roles_cannot_be_interchanged() {
+        let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        let creation = CreationBinding::of(&request).unwrap();
+        let mut generated = owner(Some(creation.clone()));
+        let mut opened = owner(None);
+        let context = generated.context.clone();
+        let parent = generated.parent.clone();
+        let envelope = NativeEnvelope {
+            mode: NativeWrapMode::GcmCandidate,
+            iv: [0; 12],
+            ciphertext: vec![0; 48],
+            context_sha256: generated.context_sha256,
+        };
+        assert!(generated
+            .open_wrapped_key(&context, &parent, &envelope)
+            .is_err());
+        assert!(opened
+            .generate_wrapped_key(&context, &parent, &creation)
+            .is_err());
+        assert!(generated.phase == Phase::Ready);
+        assert!(opened.phase == Phase::Ready);
+        assert_eq!(generated.correlation, creation.correlation());
+        assert!(opened.correlation.starts_with("kr-native-a2-use-"));
+        assert_ne!(opened.correlation, creation.correlation());
+    }
+
+    #[test]
+    fn empty_failed_or_use_owner_cannot_verify_a_closed_creation() {
+        let (_, request) = keyrack_test_support::creation_conformance::fixture();
+        let creation = CreationBinding::of(&request).unwrap();
+        let mut generated = owner(Some(creation.clone()));
+        let context = generated.context.clone();
+        let parent = generated.parent.clone();
+        let envelope = NativeEnvelope {
+            mode: NativeWrapMode::GcmCandidate,
+            iv: [0; 12],
+            ciphertext: vec![0; 48],
+            context_sha256: generated.context_sha256,
+        };
+        for phase in [
+            Phase::Ready,
+            Phase::Attempted,
+            Phase::CloseUnconfirmed,
+            Phase::Closed,
+        ] {
+            generated.phase = phase;
+            assert!(generated
+                .verify_closed_creation(&context, &parent, &creation, &envelope)
+                .is_err());
+        }
+        let mut opened = owner(None);
+        opened.phase = Phase::Closed;
+        assert!(opened
+            .verify_closed_creation(&context, &parent, &creation, &envelope)
+            .is_err());
+    }
+
+    #[test]
+    fn unsupported_leaf_profiles_are_refused_before_session_acquisition() {
+        let owner = owner(None);
+        let mut context = owner.context.clone();
+        assert!(validate_inputs(&context, &owner.parent).is_ok());
+        context.purpose = WrappingKeyPurpose::WrapUnwrap;
+        assert!(validate_inputs(&context, &owner.parent).is_err());
+        context = owner.context.clone();
+        context.key_format = WrappedKeyFormat::ProviderNative(
+            keyrack_core::wrapping::WrappingIdentifier::new("other-format").unwrap(),
+        );
+        assert!(validate_inputs(&context, &owner.parent).is_err());
+        context = owner.context;
+        context.child = context.parent;
+        assert!(validate_inputs(&context, &owner.parent).is_err());
     }
 }
 
