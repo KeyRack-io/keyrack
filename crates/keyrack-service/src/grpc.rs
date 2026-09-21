@@ -173,17 +173,25 @@ impl KeyService for KeyServiceImpl {
                     .providers
                     .resolve_for_primary(&record)
                     .map_err(convert::error_to_status)?;
-                let output = enc_entry
-                    .provider
-                    .encrypt(
-                        primary_version
-                            .resident_handle()
-                            .map_err(convert::error_to_status)?,
-                        &req.plaintext,
-                        &aad,
-                    )
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let output = crate::domain::with_usable_handle(
+                    &state,
+                    &record,
+                    primary_version,
+                    enc_entry.provider.as_ref(),
+                    |handle| {
+                        let provider = Arc::clone(&enc_entry.provider);
+                        let plaintext = req.plaintext.clone();
+                        let aad = aad.clone();
+                        async move {
+                            provider
+                                .encrypt(&handle, &plaintext, &aad)
+                                .await
+                                .map_err(crate::domain::DomainError::from)
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 let ciphertext_blob = header.wrap_payload(&output.ciphertext);
 
@@ -291,17 +299,25 @@ impl KeyService for KeyServiceImpl {
                 decrypt_permission
                     .record_use(&state, &record, &legacy_audit_context)
                     .await;
-                let plaintext = dec_entry
-                    .provider
-                    .decrypt(
-                        version_record
-                            .resident_handle()
-                            .map_err(convert::error_to_status)?,
-                        ciphertext,
-                        &aad,
-                    )
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let plaintext = crate::domain::with_usable_handle(
+                    &state,
+                    &record,
+                    version_record,
+                    dec_entry.provider.as_ref(),
+                    |handle| {
+                        let provider = Arc::clone(&dec_entry.provider);
+                        let ciphertext = ciphertext.to_vec();
+                        let aad = aad.clone();
+                        async move {
+                            provider
+                                .decrypt(&handle, &ciphertext, &aad)
+                                .await
+                                .map_err(crate::domain::DomainError::from)
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 Ok(Response::new(proto::DecryptResponse {
                     plaintext: plaintext.expose().clone(),
@@ -446,36 +462,52 @@ impl KeyService for KeyServiceImpl {
                     .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
                     .unwrap_or_default();
                 let dst_aad = new_header.build_aad(&dst_ec_aad);
-                // Validate both representations before invoking either provider.
-                let src_handle = src_version
-                    .resident_handle()
-                    .map_err(convert::error_to_status)?;
-                let dst_handle = dst_primary
-                    .resident_handle()
-                    .map_err(convert::error_to_status)?;
-
                 decrypt_permission
                     .record_use(&state, &src_record, &legacy_audit_context)
                     .await;
-                let output =
-                    if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
-                        src_re_entry
-                            .provider
-                            .re_encrypt(src_handle, ciphertext, &src_aad, dst_handle, &dst_aad)
-                            .await
-                            .map_err(convert::error_to_status)?
-                    } else {
-                        let plaintext = src_re_entry
-                            .provider
-                            .decrypt(src_handle, ciphertext, &src_aad)
-                            .await
-                            .map_err(convert::error_to_status)?;
-                        dst_re_entry
-                            .provider
-                            .encrypt(dst_handle, plaintext.expose(), &dst_aad)
-                            .await
-                            .map_err(convert::error_to_status)?
-                    };
+                let same_provider =
+                    std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider);
+                let output = crate::domain::with_usable_handles(
+                    &state,
+                    &src_record,
+                    src_version,
+                    src_re_entry.provider.as_ref(),
+                    &dst_record,
+                    dst_primary,
+                    dst_re_entry.provider.as_ref(),
+                    |src_handle, dst_handle| {
+                        let src_provider = Arc::clone(&src_re_entry.provider);
+                        let dst_provider = Arc::clone(&dst_re_entry.provider);
+                        let ciphertext = ciphertext.to_vec();
+                        let src_aad = src_aad.clone();
+                        let dst_aad = dst_aad.clone();
+                        async move {
+                            if same_provider {
+                                src_provider
+                                    .re_encrypt(
+                                        &src_handle,
+                                        &ciphertext,
+                                        &src_aad,
+                                        &dst_handle,
+                                        &dst_aad,
+                                    )
+                                    .await
+                                    .map_err(crate::domain::DomainError::from)
+                            } else {
+                                let plaintext = src_provider
+                                    .decrypt(&src_handle, &ciphertext, &src_aad)
+                                    .await
+                                    .map_err(crate::domain::DomainError::from)?;
+                                dst_provider
+                                    .encrypt(&dst_handle, plaintext.expose(), &dst_aad)
+                                    .await
+                                    .map_err(crate::domain::DomainError::from)
+                            }
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 Ok(Response::new(proto::ReEncryptResponse {
                     ciphertext_blob: new_header.wrap_payload(&output.ciphertext),
@@ -573,17 +605,24 @@ impl KeyService for KeyServiceImpl {
                     .providers
                     .resolve_for_primary(&record)
                     .map_err(convert::error_to_status)?;
-                let output = gdek_entry
-                    .provider
-                    .generate_data_key(
-                        primary
-                            .resident_handle()
-                            .map_err(convert::error_to_status)?,
-                        dek_len,
-                        &aad,
-                    )
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let output = crate::domain::with_usable_handle(
+                    &state,
+                    &record,
+                    primary,
+                    gdek_entry.provider.as_ref(),
+                    |handle| {
+                        let provider = Arc::clone(&gdek_entry.provider);
+                        let aad = aad.clone();
+                        async move {
+                            provider
+                                .generate_data_key(&handle, dek_len, &aad)
+                                .await
+                                .map_err(crate::domain::DomainError::from)
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
 
                 Ok(Response::new(proto::GenerateDataKeyResponse {
                     plaintext_data_key: output.plaintext_key.into_inner(),
@@ -661,17 +700,24 @@ impl KeyService for KeyServiceImpl {
                     .providers
                     .resolve_for_primary(&record)
                     .map_err(convert::error_to_status)?;
-                let output = gdkwp_entry
-                    .provider
-                    .generate_data_key(
-                        primary
-                            .resident_handle()
-                            .map_err(convert::error_to_status)?,
-                        dek_len,
-                        &aad,
-                    )
-                    .await
-                    .map_err(convert::error_to_status)?;
+                let output = crate::domain::with_usable_handle(
+                    &state,
+                    &record,
+                    primary,
+                    gdkwp_entry.provider.as_ref(),
+                    |handle| {
+                        let provider = Arc::clone(&gdkwp_entry.provider);
+                        let aad = aad.clone();
+                        async move {
+                            provider
+                                .generate_data_key(&handle, dek_len, &aad)
+                                .await
+                                .map_err(crate::domain::DomainError::from)
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_grpc_status())?;
                 Ok(Response::new(
                     proto::GenerateDataKeyWithoutPlaintextResponse {
                         encrypted_data_key: header.wrap_payload(&output.encrypted_key),

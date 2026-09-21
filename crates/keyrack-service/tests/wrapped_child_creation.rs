@@ -278,6 +278,77 @@ async fn a_child_is_created_wrapped_under_its_parent() {
     assert_eq!(stored.state, KeyState::Enabled);
 }
 
+#[tokio::test]
+async fn a_created_child_encrypts_and_decrypts_through_a_lease() {
+    let state = activated();
+    let parent = parent_key(&state).await;
+    let child = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .expect("child creation");
+    let version = child.primary_version().expect("primary version");
+    let entry = state
+        .providers
+        .resolve_for_primary(&child)
+        .expect("child provider");
+
+    let ciphertext =
+        domain::with_usable_handle(&state, &child, version, entry.provider.as_ref(), |handle| {
+            let provider = Arc::clone(&entry.provider);
+            async move {
+                provider
+                    .encrypt(&handle, b"wrapped-child", b"aad")
+                    .await
+                    .map(|output| output.ciphertext)
+                    .map_err(DomainError::from)
+            }
+        })
+        .await
+        .expect("a created child must encrypt");
+
+    let plaintext =
+        domain::with_usable_handle(&state, &child, version, entry.provider.as_ref(), |handle| {
+            let provider = Arc::clone(&entry.provider);
+            let ciphertext = ciphertext.clone();
+            async move {
+                provider
+                    .decrypt(&handle, &ciphertext, b"aad")
+                    .await
+                    .map(|sensitive| sensitive.expose().clone())
+                    .map_err(DomainError::from)
+            }
+        })
+        .await
+        .expect("a created child must decrypt");
+    assert_eq!(plaintext, b"wrapped-child");
+
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let blob = keyrack_service::proto::key_service_server::KeyService::encrypt(
+        &svc,
+        tonic::Request::new(keyrack_service::proto::EncryptRequest {
+            key_id: child.lid.to_string(),
+            plaintext: b"through grpc".to_vec(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("gRPC encrypt of a wrapped child")
+    .into_inner()
+    .ciphertext_blob;
+    let recovered = keyrack_service::proto::key_service_server::KeyService::decrypt(
+        &svc,
+        tonic::Request::new(keyrack_service::proto::DecryptRequest {
+            key_id: child.lid.to_string(),
+            ciphertext_blob: blob,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("gRPC decrypt of a wrapped child")
+    .into_inner()
+    .plaintext;
+    assert_eq!(recovered, b"through grpc");
+}
+
 /// The key cache is a `StorageBackend` wrapper, and a wrapper that does not
 /// forward the creation journal answers "this backend cannot journal a
 /// creation" for a backend that can. Every demo and most deployments enable
