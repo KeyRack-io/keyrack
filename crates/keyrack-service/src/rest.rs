@@ -1845,12 +1845,16 @@ async fn re_encrypt(
         let same_provider = std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider);
         let output = crate::domain::with_usable_handles(
             &state,
-            &src_record,
-            src_version,
-            src_re_entry.provider.as_ref(),
-            &dst_record,
-            dst_primary,
-            dst_re_entry.provider.as_ref(),
+            crate::domain::VersionUse {
+                record: &src_record,
+                version: src_version,
+                provider: src_re_entry.provider.as_ref(),
+            },
+            crate::domain::VersionUse {
+                record: &dst_record,
+                version: dst_primary,
+                provider: dst_re_entry.provider.as_ref(),
+            },
             |src_handle, dst_handle| {
                 let src_provider = Arc::clone(&src_re_entry.provider);
                 let dst_provider = Arc::clone(&dst_re_entry.provider);

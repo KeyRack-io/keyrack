@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # Copyright 2026 KeyRack Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Run demo 08 and its depth-two restoration against disposable real services.
+"""Run demo 08 and prove the depth-one oracle independently of API create.
 
-The archived original demo agrees with itself about two descendants. Its own
-assertions must pass before the independent live-record graph oracle rejects
-it. Removing only that oracle call must let the forbidden demo pass again.
+The service refuses a grandchild at create, so the archived three-level
+script cannot finish its protocol. That archive is retained as provenance.
+The independent oracle is proven against a reparented-sibling graph that
+keeps 3/1/2 cardinality and is depth 2. Removing only the depth gate from
+that oracle must accept the forbidden graph.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -20,11 +23,48 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 DEMO = ROOT / 'demos/08-cascade-rotation'
 FIXTURES = ROOT / 'conformance/demo08'
+ORACLE = DEMO / 'scripts/check-depth.py'
 ORACLE_CALL = '  python3 /scripts/check-depth.py "$BASE"\n'
+DEPTH_GATE = (
+    '    if depth > 1:\n'
+    '        raise ValueError(f\'DEMO08_DEPTH_EXCEEDED: depth={depth}; chain={json.dumps(deepest)}\')\n'
+)
+GRANDCHILD_STATUS = 'HTTP status: 409'
+GRANDCHILD_KIND = 'FailedPrecondition'
+GRANDCHILD_REASON = 'a wrapped key cannot itself wrap children'
 
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_check_graph(source):
+    spec = importlib.util.spec_from_loader('check_depth', loader=None)
+    module = importlib.util.module_from_spec(spec)
+    exec(compile(source, str(ORACLE), 'exec'), module.__dict__)
+    return module.check_graph
+
+
+def reparented_sibling_graph():
+    """One root, two children, then one child reparented under the other."""
+    root, first, second = ('root-lid', 'child-lid', 'sibling-lid')
+    siblings = {
+        'items': [
+            {'lid': root, 'parent_lid': None},
+            {'lid': first, 'parent_lid': root},
+            {'lid': second, 'parent_lid': root},
+        ],
+        'next_cursor': None,
+    }
+    reparented = {
+        'items': [
+            {'lid': root, 'parent_lid': None},
+            {'lid': first, 'parent_lid': root},
+            {'lid': second, 'parent_lid': first},
+        ],
+        'next_cursor': None,
+    }
+    return siblings, reparented
 
 
 def main():
@@ -60,21 +100,38 @@ def main():
     provenance = json.loads((FIXTURES / 'provenance.json').read_text())
     if sha(FIXTURES / 'run-demo-depth-two.sh') != provenance['sha256']:
         raise AssertionError('negative fixture differs from its archived original')
-    final_branch = 'else\n  echo "  All checks passed!"\n  exit 0\nfi\n'
-    if original.count(final_branch) != 1:
-        raise AssertionError('archived demo final success branch is ambiguous')
-    restored = original.replace(final_branch, final_branch.replace('  exit 0\n', ORACLE_CALL + '  exit 0\n'))
+    if 'parent_key_id' not in original or 'grandchild' not in original:
+        raise AssertionError('archived fixture must still be the three-level create script')
     baseline = (DEMO / 'scripts/run-demo.sh').read_text()
     if baseline.count(ORACLE_CALL) != 1:
         raise AssertionError('actual demo must call its independent graph oracle exactly once')
-    bypassed = restored.replace(ORACLE_CALL, '', 1)
-    if bypassed != original:
-        raise AssertionError('guard reversal must remove only the oracle call')
+    oracle_source = ORACLE.read_text()
+    if oracle_source.count(DEPTH_GATE) != 1:
+        raise AssertionError('oracle must contain exactly one depth gate')
+    check_graph = load_check_graph(oracle_source)
+    siblings, reparented = reparented_sibling_graph()
+    if check_graph(siblings) != 'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth=1':
+        raise AssertionError('oracle must accept the sibling graph before compose runs')
+    try:
+        check_graph(reparented)
+    except ValueError as error:
+        if 'DEMO08_DEPTH_EXCEEDED: depth=2;' not in str(error):
+            raise AssertionError(f'reparented siblings must fail at depth two, got {error}') from error
+    else:
+        raise AssertionError('reparented siblings must fail at computed depth two')
+    ungated = load_check_graph(oracle_source.replace(DEPTH_GATE, '', 1))
+    if ungated(reparented) != 'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth=2':
+        raise AssertionError('removing only the depth gate must expose the reparented graph')
+    receipt['oracle'] = {
+        'sibling_graph': 'DEMO08_DEPTH_OK',
+        'reparented_control': 'DEMO08_DEPTH_EXCEEDED: depth=2',
+        'depth_gate_removed': 'DEMO08_DEPTH_CONTROL_REMOVED: forbidden depth-two graph accepted',
+    }
+    save()
     token = uuid.uuid4().hex[:12]
     project_prefix = f'keyrack-demo08-{token}'
     service_image = f'keyrack-demo08-service:{token}'
     demo_image = f'keyrack-demo08-runner:{token}'
-    save()
     try:
         with tempfile.TemporaryDirectory(prefix='keyrack-demo08-depth-') as temp:
             temp_root = Path(temp)
@@ -99,65 +156,58 @@ def main():
                 raise AssertionError('DEMO08_SETUP_FAILURE: could not identify built images')
             receipt['built_image_ids'] = dict(zip(['service', 'demo'], image_state.splitlines()))
             save()
-            for name, source, expected in [
-                ('baseline', baseline, 0),
-                ('grandchild-restored', restored, 1),
-                ('depth-guard-removed', bypassed, 0),
-            ]:
-                scripts = temp_root / name
-                shutil.copytree(DEMO / 'scripts', scripts, ignore=shutil.ignore_patterns('__pycache__'))
-                (scripts / 'run-demo.sh').write_text(source)
-                override = temp_root / f'{name}.json'
-                override.write_text(json.dumps({'services': {'demo': {'volumes': [{
-                    'type': 'bind', 'source': str(scripts), 'target': '/scripts', 'read_only': True}]}}}))
-                project = project_prefix + '-' + name
-                command = compose(project, override)
-                record = {'name': name, 'project': project,
-                          'demo_source_sha256': hashlib.sha256(source.encode()).hexdigest()}
-                receipt['cases'].append(record)
+            name = 'baseline'
+            scripts = temp_root / name
+            shutil.copytree(DEMO / 'scripts', scripts, ignore=shutil.ignore_patterns('__pycache__'))
+            (scripts / 'run-demo.sh').write_text(baseline)
+            override = temp_root / f'{name}.json'
+            override.write_text(json.dumps({'services': {'demo': {'volumes': [{
+                'type': 'bind', 'source': str(scripts), 'target': '/scripts', 'read_only': True}]}}}))
+            project = project_prefix + '-' + name
+            command = compose(project, override)
+            record = {'name': name, 'project': project,
+                      'demo_source_sha256': hashlib.sha256(baseline.encode()).hexdigest()}
+            receipt['cases'].append(record)
+            save()
+            try:
+                code, _ = run(name + '-up', command + ['up', '--no-build', '--abort-on-container-exit',
+                                                      '--exit-code-from', 'demo'], timeout=900)
+                logs_code, logs = run(name + '-demo', command + ['logs', '--no-color', '--no-log-prefix', 'demo'])
+                state_code, state = run(name + '-state', command + ['ps', '--all', '--format', 'json', 'demo'])
+                if state_code or logs_code:
+                    raise AssertionError(f'DEMO08_SETUP_FAILURE: could not inspect {name}')
+                states = json.loads(state) if state.lstrip().startswith('[') else [json.loads(line) for line in state.splitlines() if line.startswith('{')]
+                if len(states) != 1 or states[0].get('State') != 'exited':
+                    raise AssertionError(f'DEMO08_SETUP_FAILURE: {name} has no exited demo container')
+                exit_code = states[0].get('ExitCode')
+                record.update({'compose_exit_code': code, 'demo_exit_code': exit_code,
+                               'demo_log_sha256': sha(output / f'{name}-demo.log')})
+                if code != 0 or exit_code != 0:
+                    raise AssertionError(f'{name}: expected demo and compose exit 0, got {exit_code}/{code}')
+                summaries = re.findall(r'Results: (\d+)/(\d+) checks passed', logs)
+                if len(summaries) != 1 or summaries[0][0] != summaries[0][1] or int(summaries[0][0]) == 0:
+                    raise AssertionError(f'{name}: demo protocol assertions must all pass')
+                if 'All checks passed!' not in logs or 'DEMO08_ORACLE_SETUP_FAILURE' in logs:
+                    raise AssertionError(f'{name}: setup/protocol failure does not prove a depth control')
+                if 'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth=1' not in logs or 'DEMO08_DEPTH_EXCEEDED' in logs:
+                    raise AssertionError('baseline: live graph oracle did not confirm depth one')
+                if GRANDCHILD_STATUS not in logs or GRANDCHILD_KIND not in logs or GRANDCHILD_REASON not in logs:
+                    raise AssertionError(
+                        'baseline: grandchild create must be HTTP 409 FailedPrecondition '
+                        'because a wrapped key cannot itself wrap children'
+                    )
+                record['result'] = 'DEMO08_DEPTH_OK'
+                record['grandchild_refusal'] = '409 FailedPrecondition: a wrapped key cannot itself wrap children'
+                record['status'] = 'passed'
                 save()
-                try:
-                    code, _ = run(name + '-up', command + ['up', '--no-build', '--abort-on-container-exit',
-                                                          '--exit-code-from', 'demo'], timeout=900)
-                    logs_code, logs = run(name + '-demo', command + ['logs', '--no-color', '--no-log-prefix', 'demo'])
-                    state_code, state = run(name + '-state', command + ['ps', '--all', '--format', 'json', 'demo'])
-                    if state_code or logs_code:
-                        raise AssertionError(f'DEMO08_SETUP_FAILURE: could not inspect {name}')
-                    # Compose v2 emits one JSON object per container; versions
-                    # that return an array are accepted without relaxing checks.
-                    states = json.loads(state) if state.lstrip().startswith('[') else [json.loads(line) for line in state.splitlines() if line.startswith('{')]
-                    if len(states) != 1 or states[0].get('State') != 'exited':
-                        raise AssertionError(f'DEMO08_SETUP_FAILURE: {name} has no exited demo container')
-                    exit_code = states[0].get('ExitCode')
-                    record.update({'compose_exit_code': code, 'demo_exit_code': exit_code,
-                                   'demo_log_sha256': sha(output / f'{name}-demo.log')})
-                    if code != expected or exit_code != expected:
-                        raise AssertionError(f'{name}: expected demo and compose exit {expected}, got {exit_code}/{code}')
-                    summaries = re.findall(r'Results: (\d+)/(\d+) checks passed', logs)
-                    if len(summaries) != 1 or summaries[0][0] != summaries[0][1] or int(summaries[0][0]) == 0:
-                        raise AssertionError(f'{name}: original demo protocol assertions must all pass')
-                    if 'All checks passed!' not in logs or 'DEMO08_ORACLE_SETUP_FAILURE' in logs:
-                        raise AssertionError(f'{name}: setup/protocol failure does not prove a depth control')
-                    if name == 'baseline':
-                        if 'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth=1' not in logs or 'DEMO08_DEPTH_EXCEEDED' in logs:
-                            raise AssertionError('baseline: live graph oracle did not confirm depth one')
-                        record['result'] = 'DEMO08_DEPTH_OK'
-                    elif name == 'grandchild-restored':
-                        if 'DEMO08_DEPTH_EXCEEDED: depth=2;' not in logs or 'DEMO08_DEPTH_OK' in logs:
-                            raise AssertionError('restored grandchild must fail specifically at computed depth two')
-                        record['control_failure'] = 'DEMO08_DEPTH_EXCEEDED: depth=2'
-                    else:
-                        if 'DEMO08_DEPTH_' in logs or 'DEMO08_GRAPH_' in logs:
-                            raise AssertionError('guard reversal must bypass only the independent oracle')
-                        record['control_failure'] = 'DEMO08_DEPTH_CONTROL_REMOVED: forbidden depth-two demo passed'
-                    record['status'] = 'passed'
-                    save()
-                    print(f'PASS {name}: {record.get("control_failure", record.get("result"))}', flush=True)
-                finally:
-                    run(name + '-service', command + ['logs', '--no-color', 'keyrack'])
-                    cleanup, _ = run(name + '-cleanup', command + ['down', '--volumes', '--remove-orphans'])
-                    if cleanup:
-                        raise AssertionError(f'DEMO08_SETUP_FAILURE: cleanup failed for own project {project}')
+                print(f'PASS {name}: {record["result"]}', flush=True)
+                print('PASS reparented-sibling: DEMO08_DEPTH_EXCEEDED: depth=2', flush=True)
+                print('PASS depth-guard-removed: forbidden depth-two graph accepted', flush=True)
+            finally:
+                run(name + '-service', command + ['logs', '--no-color', 'keyrack'])
+                cleanup, _ = run(name + '-cleanup', command + ['down', '--volumes', '--remove-orphans'])
+                if cleanup:
+                    raise AssertionError(f'DEMO08_SETUP_FAILURE: cleanup failed for own project {project}')
     except Exception as error:
         receipt['status'] = 'failed'
         receipt['error'] = str(error)
@@ -169,7 +219,7 @@ def main():
         raise AssertionError('working sources changed during demo proof')
     receipt.update({'status': 'passed', 'working_sources_unchanged': True})
     save()
-    print('PASS actual depth-one demo, restored grandchild, and reversed depth guard')
+    print('PASS actual depth-one demo, reparented-sibling depth gate, and reversed depth guard')
 
 
 if __name__ == '__main__':

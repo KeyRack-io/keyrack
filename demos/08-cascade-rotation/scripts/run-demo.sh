@@ -124,14 +124,26 @@ SIB_PARENT=$(json_field "$SIB_DESC" parent_lid)
 assert_eq "$SIB_PARENT" "$ROOT_LID" "Second child's parent_lid matches root"
 
 step "A grandchild is refused: a wrapped key cannot yet wrap another..."
-GC_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/v1/keys" \
+GC_BODY=$(curl -s -w '\n%{http_code}' -X POST "${BASE}/v1/keys" \
   -H "Content-Type: application/json" \
   -d "{\"key_spec\":\"AES_256\",\"description\":\"grandchild key\",\"parent_key_id\":\"${CHILD_LID}\"}")
-if [ "$GC_CODE" = "200" ] || [ "$GC_CODE" = "201" ]; then
-  fail "A key was created under a wrapped parent (HTTP ${GC_CODE})"
-  exit 1
-fi
-ok "Refused with HTTP ${GC_CODE} — multi-level hierarchies are a later capability"
+GC_CODE=$(printf '%s\n' "$GC_BODY" | tail -n 1)
+GC_JSON=$(printf '%s\n' "$GC_BODY" | sed '$d')
+echo "  Response: ${GC_JSON}"
+echo "  HTTP status: ${GC_CODE}"
+GC_ERROR=$(json_field "$GC_JSON" error)
+GC_MESSAGE=$(json_field "$GC_JSON" message)
+assert_eq "$GC_CODE" "409" "Grandchild create is HTTP 409 FailedPrecondition"
+assert_eq "$GC_ERROR" "FailedPrecondition" "Grandchild create names FailedPrecondition"
+case "$GC_MESSAGE" in
+  *"a wrapped key cannot itself wrap children"*)
+    ok "Grandchild refused because a wrapped key cannot itself wrap children"
+    ;;
+  *)
+    fail "Grandchild refusal reason (got '${GC_MESSAGE}')"
+    exit 1
+    ;;
+esac
 
 # ══════════════════════════════════════════════════════════════════════
 #  PART 2 — Inspect the hierarchy via gRPC GetKeyDependents

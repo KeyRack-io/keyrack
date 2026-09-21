@@ -71,11 +71,16 @@ expected topology from the demo's key-creation commands or job-count assertions.
 ## CI and reversion controls
 
 The unconditional `Demo 08 depth-one contract` PR check builds and runs this
-Compose fixture, then restores the former three-level script together with its
-matching two-job assertions. That internally consistent fixture must fail the
-independent graph check with `DEMO08_DEPTH_EXCEEDED`. Removing the graph check
-from that same forbidden fixture demonstrates the control's specific failure.
-These are isolated test fixtures; the shipped demo remains depth 1.
+Compose fixture. The ordinary demo must refuse a grandchild create with HTTP
+409 `FailedPrecondition` because a wrapped key cannot itself wrap children,
+then pass the independent 3/1/2/1 graph oracle.
+
+The archived three-level script is retained as provenance. The service now
+refuses that grandchild at create, so the harness does not require the archive
+to finish its protocol. Instead it reparents one sibling under the other: same
+3/1/2 cardinality, depth 2. That graph must fail specifically with
+`DEMO08_DEPTH_EXCEEDED`. Removing only the depth gate from the oracle accepts
+the same graph. These are isolated proofs; the shipped demo remains depth 1.
 
 Run the same checks locally from the repository root:
 

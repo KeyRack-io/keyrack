@@ -36,14 +36,15 @@ def check_graph(document):
         if len(chain) > len(deepest):
             deepest = chain
     depth = len(deepest) - 1
-    # Depth comes before cardinality: restoring the original three-key demo
-    # must fail for its forbidden edge, not merely because its count changed.
+    # Depth comes before cardinality. Reparenting one sibling under the other
+    # keeps 3/1/2 and must fail here, not as a shape change. Removing only this
+    # gate must accept that same graph.
     if depth > 1:
         raise ValueError(f'DEMO08_DEPTH_EXCEEDED: depth={depth}; chain={json.dumps(deepest)}')
     roots = sum(parent is None for parent in parents.values())
     edges = len(parents) - roots
-    if (len(parents), roots, edges, depth) != (3, 1, 2, 1):
-        raise ValueError(f'DEMO08_GRAPH_SHAPE: nodes={len(parents)} roots={roots} edges={edges} depth={depth}; expected 3/1/2/1')
+    if (len(parents), roots, edges) != (3, 1, 2):
+        raise ValueError(f'DEMO08_GRAPH_SHAPE: nodes={len(parents)} roots={roots} edges={edges} depth={depth}; expected 3/1/2')
     return f'DEMO08_DEPTH_OK: nodes=3 roots=1 edges=2 depth={depth}'
 
 
