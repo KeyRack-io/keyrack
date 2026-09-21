@@ -170,12 +170,4 @@ impl KeyRack {
         // TODO: wire to gRPC ResolveKeyAtVersion
         Err(KeyRackError::Service("not yet connected to service".into()))
     }
-
-    pub async fn poll_data_reencryption_jobs(
-        &self,
-        _namespace: &str,
-    ) -> Result<Vec<ReEncryptionEvent>, KeyRackError> {
-        // TODO: wire to gRPC ListRotationJobs
-        Ok(vec![])
-    }
 }
