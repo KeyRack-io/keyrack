@@ -8,7 +8,7 @@ This document explains the problems KeyRack solves and why it exists.
 
 ## The Problem with Cloud KMS
 
-Every major cloud provider ships a KMS: AWS KMS, Azure Key Vault, GCP Cloud KMS. They work well — until they don't. Five structural problems affect all of them.
+Every major cloud provider ships a KMS: AWS KMS, Azure Key Vault, GCP Cloud KMS. They work well — until they don't. The following concerns motivate KeyRack.
 
 ### 1. Vendor lock-in
 
@@ -20,15 +20,11 @@ Cloud providers manage the HSMs. You can configure policies, but you cannot hold
 
 For regulated industries under DORA, NIS2, or national sovereignty requirements, delegation is not always acceptable.
 
-### 3. No audit verifiability
-
-Cloud KMS providers generate audit logs. You receive them. But you cannot independently verify their integrity. There is no cryptographic proof that the log you received is the same log the provider recorded. You trust the provider's logging pipeline end-to-end.
-
-### 4. No instant revocation
+### 3. No instant revocation
 
 When a tenant needs to cut off platform access to their data — during an incident, a contract termination, or a compliance event — there is no guaranteed mechanism for immediate key revocation. Keys may be cached in memory, replicated across regions, or subject to eventual-consistency delays. The gap between "revoke" and "actually unusable" is undefined and provider-controlled.
 
-### 5. API fragmentation
+### 4. API fragmentation
 
 Each cloud KMS has its own API. Applications written for AWS KMS cannot use Azure Key Vault without code changes. There is no portable KMS interface. Multi-cloud architectures end up with per-provider encryption code, per-provider key management, and per-provider audit trails.
 
@@ -164,8 +160,6 @@ External Cedar Policy Decision Point (PDP) for fine-grained, policy-as-code acce
 | Internal hashing | BLAKE3 | — |
 | Wire-boundary hashing | SHA-256 | FIPS 180-4 |
 
-FIPS 140-3 compliance is achieved through the HSM provider path. The HSM's certificate defines the cryptographic boundary; KeyRack acts as an orchestrator.
-
 ---
 
 ## Who Should Use KeyRack
@@ -186,7 +180,6 @@ FIPS 140-3 compliance is achieved through the HSM provider path. The HSM's certi
 |---------|-----------|---------|
 | Key sovereignty | Provider-controlled HSM | Customer-controlled (any PKCS#11/KMIP device) |
 | HSM choice | Provider's hardware only | Bring any certified HSM |
-| Audit verifiability | Provider-generated logs | BLAKE3 hash chain (Ed25519 signing opt-in); strong interior integrity; truncation needs external anchor |
 | Instant revocation | No guarantee; provider-dependent | Immediate on the local node; cross-node staleness bounded by configurable TTL (commercial HA) |
 | Multi-cloud portable | No (proprietary APIs) | Yes (single KMS across all environments) |
 | HYOK | Limited (CloudHSM-only in AWS) | Full: tenant-managed HSM with unilateral revocation |

@@ -62,12 +62,19 @@ The gate owns all pending transport keys. The writer owns ciphertext only.
 Release serialization borrows a zeroizing base64 key string and uses a zeroizing
 byte buffer; it does not create an ordinary owned JSON key string.
 
-The writer requires Unix stdout to be a pipe/FIFO, sets `O_NONBLOCK`, and writes
+The private runtime writer owns a write-only Unix pipe/FIFO descriptor, sets
+`O_NONBLOCK` and close-on-exec, and writes
 one complete newline record of at most 512 bytes per syscall. There is no buffered
 `flush`, `write_all`, regular-file fallback or blocking release write. This uses
 the [POSIX atomic pipe-write rule](https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html).
-Other platforms and stdout types fail closed. All output comes from this single
-writer. The trusted launcher must not replace or change its descriptors.
+Other platforms and descriptor types fail closed, including stream sockets,
+regular files, read ends and read/write FIFOs. The sink also rejects empty or
+oversized records before a syscall. The existing harness supplies a close-on-exec
+duplicate of stdout; a future supervisor runtime can supply its owned pipe through
+the same private seam. This does not enable a service consumer or approve a new
+IPC contract. All output comes from this single writer. The trusted launcher
+must not retain another writer or replace/change the pipe's open-file-description
+flags. A descriptor duplicate shares `O_NONBLOCK` state with its original.
 
 At most four jobs queue and three result permits exist, including a writer-held
 result. A separate ledger retains authority metadata and terminal phases for at

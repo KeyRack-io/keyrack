@@ -1,0 +1,28 @@
+name: Demo 08 depth-one contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  demo08-depth:
+    name: Demo 08 depth-one contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: docker/setup-buildx-action@v4
+      - name: Run depth-one demo and restore the forbidden topology
+        run: python3 scripts/test-demo08-depth.py --output-dir target/proofs/demo08-depth
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo08-depth-controls
+          path: target/proofs/demo08-depth/

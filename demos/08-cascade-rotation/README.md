@@ -1,108 +1,79 @@
-# Demo 08 — Hierarchical Cascade Rotation
+# Demo 08 — Depth-1 Cascade Rotation
 
-Shows that rotating a **root key** automatically creates cooperative rotation
-jobs for every descendant in the key hierarchy (recursive BFS), and walks
-through the **acknowledge → complete** protocol over gRPC.
+Rotating a root key creates a cooperative rotation job for its **single leaf
+child**. The demo verifies that job's target and walks through
+**acknowledge → complete** over gRPC.
 
-## Key concepts
+## Release topology
 
-### Key hierarchy
+This demo uses the 0.5.0 leaf-only hierarchy: one root and one child, at depth 1.
 
 ```
 root (AES-256)
-└── child (AES-256)
-    └── grandchild (AES-256)
+└── leaf child (AES-256)
 ```
 
-Each key is created with `parent_key_id` pointing to its parent.
+The child is created with `parent_key_id` pointing to the root. The checks here
+cover the parent graph and cooperative job protocol. Provider wrapping is
+qualified separately; acknowledging a job does not re-encrypt application data.
 
-### Cascade rotation
+## Cascade rotation
 
-When a root key is rotated (via gRPC `RotateKey`):
+When the root is rotated using gRPC `RotateKey`:
 
-1. KeyRack generates a new key version for the root.
-2. A **RotationJob** is created for every **direct and recursive descendant**
-   (BFS order).  Each job is initially in `PENDING` state.
-3. External orchestration code (a cron job, sidecar, or operator) polls
-   `ListRotationJobs`, re-encrypts data under the new key material, then
-   calls `AcknowledgeRotationJob` → `CompleteRotationJob`.
-4. Rotation jobs that are neither acknowledged nor completed within their TTL
-   transition to `EXPIRED`.
+1. KeyRack creates a new root key version.
+2. One `PENDING` rotation job targets the leaf child's `dependent_key_id`.
+3. An external consumer can poll `ListRotationJobs` and acknowledge the job.
+   In an application, the consumer performs its data re-encryption work before
+   reporting completion. This demo checks the API state transitions.
+4. `CompleteRotationJob` moves the acknowledged job to `COMPLETED`.
 
-> **Note:** The REST `POST /v1/keys/:id/actions-rotate` endpoint also rotates
-> a key's material but does **not** create descendant rotation jobs — it is
-> intended for single-key rotations.  Use the gRPC `RotateKey` RPC when you
-> need the cooperative cascade protocol.
-
-### Cooperative protocol
-
-The cooperative model lets external consumers control _when_ re-encryption
-happens — critical for bulk datastores where re-encryption is expensive:
-
-```
-Orchestrator               KeyRack
-     │  ListRotationJobs        │
-     │─────────────────────────▶│  PENDING jobs
-     │◀─────────────────────────│
-     │                          │
-     │  AcknowledgeRotationJob  │
-     │─────────────────────────▶│  PENDING → ACKNOWLEDGED
-     │◀─────────────────────────│
-     │                          │
-     │  (re-encrypt data ...)   │
-     │                          │
-     │  CompleteRotationJob     │
-     │─────────────────────────▶│  ACKNOWLEDGED → COMPLETED
-     │◀─────────────────────────│
-```
+REST and gRPC rotation use the same domain rotation implementation. The
+cooperative job inspection and acknowledgement/completion APIs used here are
+gRPC operations.
 
 ## Quick start
 
 ```bash
 cd demos/08-cascade-rotation
 docker compose up --build
-# The `demo` container exits 0 on success.
+# The demo container exits 0 when the protocol and independent graph checks pass.
 docker compose down -v
 ```
+
+The software provider stores key material in process memory. This disposable
+demo explicitly acknowledges that SQLite metadata alone does not preserve keys
+across a service restart.
 
 ## What the demo verifies
 
 | Check | API |
 |-------|-----|
-| Root → child → grandchild hierarchy | REST `POST /v1/keys` + `GET /describe` |
-| Root has 2 recursive dependents | gRPC `GetKeyDependents(recursive=true)` |
-| Rotating root creates 2 pending jobs targeting the distinct child + grandchild (`dependent_key_id`) | gRPC `RotateKey` + gRPC `ListRotationJobs` |
-| Each job transitions PENDING→ACKNOWLEDGED→COMPLETED | gRPC `AcknowledgeRotationJob` + `CompleteRotationJob` |
-| Zero pending jobs remain after completion | gRPC `ListRotationJobs` |
+| Root → one leaf child | REST `POST /v1/keys` + `GET /describe` |
+| Exactly one root dependent | gRPC `GetKeyDependents(recursive=true)` |
+| Exactly one pending job targeting the child | gRPC `RotateKey` + `ListRotationJobs` |
+| Job transitions PENDING → ACKNOWLEDGED → COMPLETED | gRPC `AcknowledgeRotationJob` + `CompleteRotationJob` |
+| One completed job and zero pending jobs | gRPC `ListRotationJobs` |
+| Independently computed parent graph has two keys, one root, one edge and maximum depth 1 | REST `GET /v1/keys` |
 
-## Services
+The final graph check reads actual stored key records. It does not derive its
+expected topology from the demo's key-creation commands or job-count assertions.
 
-| Service | Role |
-|---------|------|
-| `keyrack` | KeyRack service (software provider, SQLite storage) |
-| `demo` | Alpine + curl + jq + grpcurl; runs `scripts/run-demo.sh` |
+## CI and reversion controls
 
-## gRPC calls
+The unconditional `Demo 08 depth-one contract` PR check builds and runs this
+Compose fixture, then restores the former three-level script together with its
+matching two-job assertions. That internally consistent fixture must fail the
+independent graph check with `DEMO08_DEPTH_EXCEEDED`. Removing the graph check
+from that same forbidden fixture demonstrates the control's specific failure.
+These are isolated test fixtures; the shipped demo remains depth 1.
 
-The demo uses [grpcurl](https://github.com/fullstorydev/grpcurl) with the
-repository's proto files mounted at `/proto`:
+Run the same checks locally from the repository root:
 
 ```bash
-# List all rotation jobs
-grpcurl -plaintext \
-  -import-path /proto -proto keyrack/v1/key_service.proto \
-  -d '{}' \
-  localhost:50051 keyrack.v1.KeyService/ListRotationJobs
-
-# Acknowledge a job
-grpcurl -plaintext \
-  -import-path /proto -proto keyrack/v1/key_service.proto \
-  -d '{"jobId": "<JOB_ID>"}' \
-  localhost:50051 keyrack.v1.KeyService/AcknowledgeRotationJob
-
-# Complete a job
-grpcurl -plaintext \
-  -import-path /proto -proto keyrack/v1/key_service.proto \
-  -d '{"jobId": "<JOB_ID>"}' \
-  localhost:50051 keyrack.v1.KeyService/CompleteRotationJob
+python3 scripts/test-demo08-depth.py --output-dir target/proofs/demo08-depth
 ```
+
+Each case uses a fresh, uniquely named Compose project. The harness retains
+logs and a machine-readable receipt and removes only its own containers and
+volumes.

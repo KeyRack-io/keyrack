@@ -45,7 +45,15 @@ The property test executes the real Worker against an independent residency mode
 for 192 generated sequences of up to 95 actions, with 1–3 cache slots and five
 contexts. It checks cache capacity, exact lease/deadline/use-count state, provider
 call counts, warm-cache non-renewal, source failure, replay, valid/invalid fences,
-and rejection of old-incarnation grants after restart. Idle sweeps are generated
+and rejection of old-incarnation grants after restart. The reference model retains
+issued lease identities across removal and restart, using an independent logical
+epoch to distinguish counter reuse. Generated exact/duplicate closes, historical
+lease closes, wrong bindings (including another live entry) and unissued counters
+must match that model without provider calls or changes to unrelated residents.
+Closes must preserve authority sequence, generation and fenced state. Every live lease must belong to
+the current executor; fencing never enables reuse of an old lease. These are tests
+of private residency cleanup, not canonical creation-closure or lease evidence.
+Idle sweeps are generated
 immediately before, at and after deadlines and must report each removed lease once.
 This verifies the sweep operation; it is not a hard wall-clock scheduling proof.
 

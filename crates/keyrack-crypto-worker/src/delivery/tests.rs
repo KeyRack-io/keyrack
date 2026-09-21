@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+mod pipe;
 struct Preempt {
     time: Arc<Time>,
     capture: Capture,

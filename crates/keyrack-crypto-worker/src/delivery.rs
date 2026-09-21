@@ -442,25 +442,37 @@ impl Writer {
     }
 }
 #[cfg(unix)]
-struct Pipe(std::io::Stdout);
+struct Pipe(std::os::fd::OwnedFd);
 #[cfg(unix)]
 impl Pipe {
-    fn new() -> Result<Self, Error> {
+    // The trusted supervisor owns descriptor provisioning. Accepting a stream
+    // socket here would invalidate the atomic capsule-release guarantee.
+    fn new(output: std::os::fd::OwnedFd) -> Result<Self, Error> {
         use rustix::fs::{fcntl_getfl, fcntl_setfl, fstat, FileType, OFlags};
-        let stdout = std::io::stdout();
-        if FileType::from_raw_mode(fstat(&stdout).map_err(|_| Error::Material)?.st_mode)
+        use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+        if FileType::from_raw_mode(fstat(&output).map_err(|_| Error::Material)?.st_mode)
             != FileType::Fifo
         {
             return Err(Error::Context);
         }
-        let flags = fcntl_getfl(&stdout).map_err(|_| Error::Material)?;
-        fcntl_setfl(&stdout, flags | OFlags::NONBLOCK).map_err(|_| Error::Material)?;
-        Ok(Self(stdout))
+        let flags = fcntl_getfl(&output).map_err(|_| Error::Material)?;
+        // A read end fails at admission, not after a result has been staged.
+        // A read/write FIFO would also mask reader loss, so refuse that mode.
+        if flags & OFlags::RWMODE != OFlags::WRONLY {
+            return Err(Error::Context);
+        }
+        let fd_flags = fcntl_getfd(&output).map_err(|_| Error::Material)?;
+        fcntl_setfd(&output, fd_flags | FdFlags::CLOEXEC).map_err(|_| Error::Material)?;
+        fcntl_setfl(&output, flags | OFlags::NONBLOCK).map_err(|_| Error::Material)?;
+        Ok(Self(output))
     }
 }
 #[cfg(unix)]
 impl Sink for Pipe {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() || bytes.len() > ATOMIC {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         rustix::io::write(&self.0, bytes).map_err(Into::into)
     }
 }
@@ -469,23 +481,36 @@ pub(crate) fn spawn<C: Clock + Send + Sync + 'static>(
 ) -> Result<std::thread::JoinHandle<()>, Error> {
     #[cfg(unix)]
     {
-        let mut sink = Pipe::new()?;
-        Ok(std::thread::spawn(move || {
-            let mut writer = Writer::new();
-            while !delivery.stopped() {
-                if writer.step(&delivery, &mut sink).is_err() {
-                    delivery.stop();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }))
+        let output =
+            rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 0).map_err(|_| Error::Material)?;
+        spawn_on_pipe(delivery, output)
     }
     #[cfg(not(unix))]
     {
         let _ = delivery;
         Err(Error::Context)
     }
+}
+
+/// Private runtime seam for a supervisor-provisioned pipe. This does not add an
+/// IPC format, authenticate a worker peer, or enable a service consumer. The
+/// caller must ensure a single trusted writer and retain no replacement path.
+#[cfg(unix)]
+pub(crate) fn spawn_on_pipe<C: Clock + Send + Sync + 'static>(
+    delivery: Arc<Delivery<C>>,
+    output: std::os::fd::OwnedFd,
+) -> Result<std::thread::JoinHandle<()>, Error> {
+    let mut sink = Pipe::new(output)?;
+    Ok(std::thread::spawn(move || {
+        let mut writer = Writer::new();
+        while !delivery.stopped() {
+            if writer.step(&delivery, &mut sink).is_err() {
+                delivery.stop();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }))
 }
 
 #[cfg(test)]

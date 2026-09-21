@@ -80,7 +80,13 @@ fi
 
 # ── List keys ─────────────────────────────────────────────────────
 step "Listing keys..."
-KEY_COUNT=$(curl -sf "$BASE_URL/v1/keys" | jq '.keys | length')
+LIST_RESPONSE=$(curl -sf "$BASE_URL/v1/keys")
+# Assertion: list membership, not merely a printable length (null has length zero).
+if ! echo "$LIST_RESPONSE" | jq -e '.items | type == "array"' >/dev/null ||
+    ! echo "$LIST_RESPONSE" | jq -e --arg lid "$KEY_ID" '.items | any(.lid == $lid)' >/dev/null; then
+    fail "List response must contain an items array including the created key"
+fi
+KEY_COUNT=$(echo "$LIST_RESPONSE" | jq '.items | length')
 ok "$KEY_COUNT key(s) in the system"
 
 # ── Describe key ──────────────────────────────────────────────────
@@ -88,6 +94,10 @@ step "Describing key..."
 DESCRIBE=$(curl -sf "$BASE_URL/v1/keys/$KEY_ID/describe")
 STATE=$(echo "$DESCRIBE" | jq -r '.state')
 SPEC=$(echo "$DESCRIBE" | jq -r '.key_spec')
+# Assertion: describe must identify the enabled AES key that was just created.
+if [ "$STATE" != "enabled" ] || [ "$SPEC" != "AES256" ]; then
+    fail "Describe response must report enabled AES256 key; got state=$STATE spec=$SPEC"
+fi
 ok "State: $STATE, Spec: $SPEC"
 
 # ── Sign / Verify (Ed25519) ──────────────────────────────────────
@@ -96,25 +106,31 @@ SIGN_KEY_ID=$(curl -sf "$BASE_URL/v1/keys" -X POST \
     -H 'Content-Type: application/json' \
     -d '{"key_spec": "ED25519", "description": "quickstart signing key"}' \
     | jq -r '.lid')
+if [ -z "$SIGN_KEY_ID" ] || [ "$SIGN_KEY_ID" = "null" ]; then
+    fail "Signing-key creation returned no lid"
+fi
 ok "Signing key: $SIGN_KEY_ID"
 
 step "Signing a message..."
 MSG_B64=$(echo -n "sign this document" | base64)
-SIG_RESPONSE=$(curl -sf "$BASE_URL/v1/keys/$SIGN_KEY_ID/actions-sign" -X POST \
+SIG_RESPONSE=$(curl --fail-with-body -sS "$BASE_URL/v1/keys/$SIGN_KEY_ID/actions-sign" -X POST \
     -H 'Content-Type: application/json' \
-    -d "{\"message\": \"$MSG_B64\", \"algorithm\": \"ED25519\"}")
+    -d "{\"message\": \"$MSG_B64\", \"signing_algorithm\": \"ED25519\"}") || fail "Signing request failed: $SIG_RESPONSE"
 SIGNATURE=$(echo "$SIG_RESPONSE" | jq -r '.signature')
+if [ -z "$SIGNATURE" ] || [ "$SIGNATURE" = "null" ]; then
+    fail "Signing response returned no signature"
+fi
 ok "Signature: ${SIGNATURE:0:40}..."
 
 step "Verifying signature..."
-VERIFY_RESPONSE=$(curl -sf "$BASE_URL/v1/keys/$SIGN_KEY_ID/actions-verify" -X POST \
+VERIFY_RESPONSE=$(curl --fail-with-body -sS "$BASE_URL/v1/keys/$SIGN_KEY_ID/actions-verify" -X POST \
     -H 'Content-Type: application/json' \
-    -d "{\"message\": \"$MSG_B64\", \"signature\": \"$SIGNATURE\", \"algorithm\": \"ED25519\"}")
-VALID=$(echo "$VERIFY_RESPONSE" | jq -r '.valid')
+    -d "{\"message\": \"$MSG_B64\", \"signature\": \"$SIGNATURE\", \"signing_algorithm\": \"ED25519\"}") || fail "Verification request failed: $VERIFY_RESPONSE"
+VALID=$(echo "$VERIFY_RESPONSE" | jq -r '.signature_valid')
 if [ "$VALID" = "true" ]; then
     ok "Signature valid"
 else
-    fail "Signature verification failed"
+    fail "Signature verification response must report signature_valid=true"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────

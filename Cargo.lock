@@ -2920,6 +2920,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyrack-surface-contract"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "quote",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "syn",
+ "tempfile",
+]
+
+[[package]]
 name = "keyrack-test-support"
 version = "0.4.0"
 dependencies = [

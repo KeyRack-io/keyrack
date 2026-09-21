@@ -39,7 +39,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(192))]
     #[test]
     fn cache_residency_fence_restart_sequences(capacity in 1usize..4,
-        operations in prop::collection::vec((0u8..9, 0u8..5, 0u16..60), 1..96)) {
+        operations in prop::collection::vec((0u8..13, 0u8..5, 0u16..60), 1..96)) {
         let key = SigningKey::from_bytes(&[31;32]);
         let clock = TestClock(Rc::new(Cell::new(0)));
         let mut worker = new_worker(&key, &clock, capacity);
@@ -48,6 +48,11 @@ proptest! {
         let mut sequence = 0u64;
         let mut lease = 0u64;
         let mut calls = 0usize;
+        // Keep old identities across eviction and restart. The reference model
+        // uses a logical epoch, independently of the runtime incarnation check.
+        let mut epoch = 0u64;
+        let mut executor = worker.executor().unwrap();
+        let mut issued = Vec::<([u8; 32], LeaseIdentity, u64)>::new();
         let mut fenced = false;
         let mut previous: Option<(Signed, WrappingContext)> = None;
         for (action, child, delta) in operations {
@@ -55,6 +60,7 @@ proptest! {
             ctx.child = keyrack_core::wrapping::VersionedKeyId::new(keyrack_core::lid::Lid::from_bytes([child+1;32]),1).unwrap();
             let binding = context_digest(&ctx).unwrap();
             let now = clock.millis();
+            let authority_before = (worker.sequence, worker.generation, worker.fenced);
             match action {
                 0 | 1 | 7 => {
                     // Fresh permission does not refresh an existing residency.
@@ -79,6 +85,9 @@ proptest! {
                                 else {
                                     lease += 1;
                                     model.insert(binding, (now + (u64::from(delta)+1).min(30), lease, 0));
+                                    issued.push((binding, LeaseIdentity {
+                                        executor, counter: NonZeroU64::new(lease).unwrap(),
+                                    }, epoch));
                                     Ok(())
                                 }
                             };
@@ -129,6 +138,8 @@ proptest! {
                     worker=new_worker(&key,&clock,capacity);
                     prop_assert_ne!(&worker.instance,&old_instance);
                     model.clear(); sequence=0; lease=0; calls=0; fenced=false;
+                    epoch += 1;
+                    executor = worker.executor().unwrap();
                     if let Some((ref signed,ref old_ctx))=previous {
                         prop_assert!(worker.execute(signed,"alice",old_ctx,Operation::Encrypt,b"message").is_err());
                         prop_assert_eq!(worker.source.calls,0);
@@ -136,17 +147,63 @@ proptest! {
                     previous=None;
                 },
                 6 => { worker.source.fail = child % 2 == 0; },
-                _ => {
+                8 => {
                     if let Some((ref signed,ref old_ctx))=previous {
                         model.retain(|_,v|v.0 > now);
                         prop_assert!(worker.execute(signed,"alice",old_ctx,Operation::Encrypt,b"message").is_err());
                     }
                 },
+                9 => {
+                    // Exact close succeeds once. It does not touch provider state
+                    // or mint permission; duplicate closes cannot report success.
+                    if let Some((_, counter, _)) = model.remove(&binding) {
+                        let identity = LeaseIdentity { executor,
+                            counter: NonZeroU64::new(counter).unwrap() };
+                        let result = worker.close_residency(identity, binding).unwrap();
+                        prop_assert_eq!(result.lease, counter);
+                        prop_assert_eq!(result.context_sha256, binding);
+                        prop_assert_eq!(&result.worker, &worker.instance);
+                        prop_assert_eq!(worker.close_residency(identity, binding), Err(Error::Replay));
+                    }
+                },
+                10..=12 => {
+                    // A saved identity may be live, expired, closed, fenced, or
+                    // from an older process whose counter has since been reused.
+                    if !issued.is_empty() {
+                        let (mut close_binding, identity, issued_epoch) = issued[usize::from(delta) % issued.len()];
+                        let mut close_identity = identity;
+                        if action == 11 {
+                            // Prefer a different live entry: a close must not
+                            // target another key merely by supplying its binding.
+                            close_binding = model.keys().find(|candidate| **candidate != close_binding)
+                                .copied().unwrap_or([0; 32]);
+                        }
+                        if action == 12 {
+                            close_identity.counter = NonZeroU64::new(lease + 1).unwrap();
+                        }
+                        let expected = action == 10 && issued_epoch == epoch &&
+                            model.get(&close_binding).is_some_and(|v| v.1 == identity.counter.get());
+                        let result = worker.close_residency(close_identity, close_binding);
+                        if expected {
+                            let result = result.unwrap();
+                            prop_assert_eq!(result.lease, identity.counter.get());
+                            prop_assert_eq!(result.context_sha256, close_binding);
+                            model.remove(&close_binding);
+                        } else {
+                            prop_assert_eq!(result, Err(Error::Replay));
+                        }
+                    }
+                },
+                _ => unreachable!(),
+            }
+            if action >= 9 {
+                prop_assert_eq!((worker.sequence, worker.generation, worker.fenced), authority_before);
             }
             prop_assert_eq!(worker.source.calls,calls);
             prop_assert_eq!(worker.next_lease,lease);
             prop_assert!(worker.resident.len() <= capacity);
-            let actual: BTreeMap<_,_> = worker.resident.iter().map(|(k,v)|(*k,(v.until,v.lease,v.uses))).collect();
+            prop_assert!(worker.resident.values().all(|v| v.lease.executor == executor));
+            let actual: BTreeMap<_,_> = worker.resident.iter().map(|(k,v)|(*k,(v.until,v.lease.counter.get(),v.uses))).collect();
             prop_assert_eq!(&actual,&model);
             prop_assert!(actual.values().all(|v|v.2 <= 3));
         }

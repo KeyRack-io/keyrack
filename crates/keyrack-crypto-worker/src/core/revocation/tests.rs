@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use super::*;
 use crate::{
+    core::creation::authority_key,
     core::*,
     delivery::{Authority, Prepared, Sink, Writer},
     fixture,
@@ -16,6 +17,7 @@ use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use std::{
     io,
+    num::NonZeroU64,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -38,11 +40,18 @@ impl MaterialSource for Source {
 }
 type TestWorker = Worker<Source, Arc<Time>>;
 fn setup() -> (TestWorker, SigningKey, Arc<Time>, Delivery<Arc<Time>>) {
+    setup_scoped(fixture::context().provider_ref, "development-only")
+}
+fn setup_scoped(
+    provider_ref: ProviderRef,
+    domain: &str,
+) -> (TestWorker, SigningKey, Arc<Time>, Delivery<Arc<Time>>) {
     let key = SigningKey::generate(&mut OsRng);
     let time = Arc::new(Time(AtomicU64::new(0)));
-    let worker = Worker::new(
+    let worker = Worker::new_scoped(
         key.verifying_key(),
-        "development-only".into(),
+        provider_ref,
+        domain.into(),
         Source,
         time.clone(),
         Limits {
@@ -61,10 +70,10 @@ fn command(worker: &TestWorker) -> RevocationCommand {
         fence: Uuid::new_v4(),
         executor: worker.executor().unwrap(),
         authority: keyrack_core::custody::AuthorityIdentity {
-            issuer: authority_key(worker.verifier).issuer,
+            issuer: worker.trust.authority.issuer.clone(),
             scope: AuthorityScope::SecurityDomain {
-                provider_ref: fixture::context().provider_ref,
-                security_domain: WrappingIdentifier::new("development-only").unwrap(),
+                provider_ref: worker.provider_ref.clone(),
+                security_domain: WrappingIdentifier::new(&worker.domain).unwrap(),
             },
             generation: NonZeroU64::new(2).unwrap(),
         },
@@ -242,7 +251,7 @@ fn signed_wrong_scope_clock_generation_and_executor_leave_work_untouched() {
         }
         assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
         assert!(!worker.fenced);
-        assert_eq!(worker.generation, Some(1));
+        assert_eq!(worker.generation.get(), 1);
         assert_eq!(worker.resident.len(), 1);
         time.0.store(0, Ordering::SeqCst);
         let mut sink = Capture::default();
@@ -268,7 +277,7 @@ fn initial_generation_and_signature_are_not_bootstrapped_from_command() {
         .revoke(&signed(&other, command(&worker)), &delivery)
         .is_err());
     assert!(!worker.fenced);
-    assert!(worker.generation.is_none());
+    assert_eq!(worker.generation.get(), 1);
     assert!(worker.revoke(&bytes, &delivery).is_ok());
 }
 #[test]
@@ -324,7 +333,7 @@ fn indeterminate_capsule_yields_no_receipt_but_still_applies_core_containment() 
     let command = command(&worker);
     assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
     assert!(worker.fenced);
-    assert_eq!(worker.generation, Some(2));
+    assert_eq!(worker.generation.get(), 2);
     assert!(worker.resident.is_empty());
 }
 #[test]
@@ -346,7 +355,7 @@ fn receipt_binds_exact_command_and_rejects_reuse_as_authority() {
         assert!(result.check_command(&other).is_err());
     }
     let (mut restarted, _, _, restarted_delivery) = setup();
-    restarted.verifier = key.verifying_key();
+    restarted.trust.authority.key = key.verifying_key();
     assert!(restarted
         .revoke(&signed(&key, command), &restarted_delivery)
         .is_err());
@@ -370,6 +379,75 @@ fn grants_cannot_admit_another_provider_into_the_fenced_domain() {
 }
 
 #[test]
+fn configured_scope_does_not_trust_a_signed_fixture_scope_or_fence() {
+    let (mut worker, key, _, delivery) =
+        setup_scoped(ProviderRef::new("configured-vault"), "configured-domain");
+    let mut context = fixture::context();
+    context.provider_ref = worker.provider_ref.clone();
+    context.security_domain = WrappingIdentifier::new(&worker.domain).unwrap();
+    use_key(&mut worker, &key, 1, &context).unwrap();
+    let mut second = context.clone();
+    second.child.version = NonZeroU64::new(2).unwrap();
+    use_key(&mut worker, &key, 2, &second).unwrap();
+    for wrong in [
+        fixture::context(),
+        {
+            let mut wrong = context.clone();
+            wrong.provider_ref = ProviderRef::new("other-provider");
+            wrong
+        },
+        {
+            let mut wrong = context.clone();
+            wrong.security_domain = WrappingIdentifier::new("other-domain").unwrap();
+            wrong
+        },
+    ] {
+        assert!(use_key(&mut worker, &key, 3, &wrong).is_err());
+        assert_eq!(worker.sequence, 2);
+        assert_eq!(worker.resident.len(), 2);
+    }
+    let mut wrong = command(&worker);
+    wrong.authority.scope = AuthorityScope::SecurityDomain {
+        provider_ref: fixture::context().provider_ref,
+        security_domain: WrappingIdentifier::new("development-only").unwrap(),
+    };
+    assert!(worker.revoke(&signed(&key, wrong), &delivery).is_err());
+    assert!(!worker.fenced);
+    assert_eq!(worker.resident.len(), 2);
+    let command = command(&worker);
+    let receipt = worker
+        .revoke(&signed(&key, command.clone()), &delivery)
+        .unwrap();
+    let result = verify(&worker, &receipt, &command);
+    assert_eq!(result.authority.scope, command.authority.scope);
+    assert_eq!(result.observed_leases.len(), 2);
+    assert!(worker.resident.is_empty());
+    assert!(use_key(&mut worker, &key, 3, &context).is_err());
+}
+
+#[test]
+fn configured_scope_cannot_install_the_unrelated_fixture_creation_plan() {
+    let (mut worker, _, _, _) =
+        setup_scoped(ProviderRef::new("configured-vault"), "development-only");
+    assert!(worker
+        .reserve_creation(
+            crate::core::creation::CreationPlan {
+                operation: Uuid::new_v4(),
+                attempt: Uuid::new_v4(),
+                owner: keyrack_core::creation::CreationOwner {
+                    instance: Uuid::new_v4(),
+                    generation: 1,
+                },
+                envelope_ref: "reserved-envelope".into(),
+                principal: "alice".into(),
+            },
+            fixture::custody_context(&fixture::context()),
+        )
+        .is_err());
+    assert!(worker.creation_request().is_none());
+}
+
+#[test]
 fn receipt_queue_failure_does_not_undo_applied_fence() {
     let (mut worker, key, _, delivery) = setup();
     for _ in 0..4 {
@@ -385,7 +463,7 @@ fn receipt_queue_failure_does_not_undo_applied_fence() {
         .control(&json!({"revocation":STANDARD.encode(evidence.canonical_bytes().unwrap())}))
         .is_err());
     assert!(worker.fenced);
-    assert_eq!(worker.generation, Some(2));
+    assert_eq!(worker.generation.get(), 2);
     assert!(use_key(&mut worker, &key, 1, &fixture::context()).is_err());
     assert!(worker.revoke(&signed(&key, command), &delivery).is_err());
 }
