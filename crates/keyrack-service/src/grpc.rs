@@ -1657,7 +1657,7 @@ impl KeyService for KeyServiceImpl {
         let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
-        let mut op_ctx = OpContext::key(AuditAction::GetKeyVersion, principal, &key_id);
+        let mut op_ctx = OpContext::key_version(principal, &key_id, req.version);
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
