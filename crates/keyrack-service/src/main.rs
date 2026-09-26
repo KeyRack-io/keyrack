@@ -61,14 +61,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_recorder()
         .expect("failed to install Prometheus metrics recorder");
 
-    let state = Arc::new(build_state(&config, metrics_handle).await?);
+    let (state, custody_readiness) = build_state(&config, metrics_handle).await?;
+    let state = Arc::new(state);
 
     let grpc_addr = config.grpc_addr.parse()?;
     let rest_addr: std::net::SocketAddr = config.rest_addr.parse()?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let rest_router = keyrack_service::rest::router(Arc::clone(&state));
+    let rest_router =
+        keyrack_service::rest::router(Arc::clone(&state)).layer(axum::Extension(custody_readiness));
     let grpc_service = KeyServiceServer::new(KeyServiceImpl::new(Arc::clone(&state)));
 
     tracing::info!(%grpc_addr, %rest_addr, "starting KeyRack gRPC + REST service");
@@ -552,7 +554,8 @@ async fn build_audit_sink(
 async fn build_state(
     config: &ServiceConfig,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-) -> Result<ServiceState, Box<dyn std::error::Error>> {
+) -> Result<(ServiceState, keyrack_service::readiness::CustodyReadiness), Box<dyn std::error::Error>>
+{
     use keyrack_core::authn::AuthenticatorChain;
     use keyrack_core::key::ProviderRef;
     use keyrack_core::registry::{DynamicProviderRegistry, ProviderEntry, ProviderRegistry};
@@ -601,8 +604,28 @@ async fn build_state(
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let mut entries: Vec<(ProviderRef, ProviderEntry)> = Vec::new();
+    let mut custody_readiness = keyrack_service::readiness::CustodyReadiness::default();
     for np in &named_providers {
-        let (provider, class) = build_provider(&np.name, &np.provider, &audit).await?;
+        let (provider, class) =
+            if np.custody == keyrack_service::readiness::ProviderCustody::Customer {
+                if let Some(deferred) = keyrack_service::provider_startup::defer_remote_provider(
+                    &np.name,
+                    &np.provider,
+                    &audit,
+                )
+                .await?
+                {
+                    deferred
+                } else {
+                    let (provider, class) = build_provider(&np.name, &np.provider, &audit).await?;
+                    (
+                        keyrack_service::provider_startup::defer_ready_provider(&np.name, provider),
+                        class,
+                    )
+                }
+            } else {
+                build_provider(&np.name, &np.provider, &audit).await?
+            };
         let class_str = provider_class_str(class);
         if config.provider_deny.iter().any(|d| d == class_str) {
             return Err(format!(
@@ -611,6 +634,11 @@ async fn build_state(
             )
             .into());
         }
+        custody_readiness.configure(
+            ProviderRef::new(np.name.clone()),
+            provider.clone(),
+            np.custody,
+        );
         tracing::info!(name = %np.name, class = class_str, "registered provider");
         entries.push((
             ProviderRef::new(np.name.clone()),
@@ -768,18 +796,21 @@ async fn build_state(
         None
     };
 
-    Ok(ServiceState {
-        storage,
-        providers,
-        provider_router,
-        pdp,
-        audit,
-        authn,
-        metrics_handle,
-        max_plaintext_bytes: config.max_plaintext_bytes,
-        legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
-        nats_publisher,
-    })
+    Ok((
+        ServiceState {
+            storage,
+            providers,
+            provider_router,
+            pdp,
+            audit,
+            authn,
+            metrics_handle,
+            max_plaintext_bytes: config.max_plaintext_bytes,
+            legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
+            nats_publisher,
+        },
+        custody_readiness,
+    ))
 }
 
 async fn shutdown_signal() {

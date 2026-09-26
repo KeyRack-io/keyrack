@@ -350,3 +350,58 @@ async fn backend_permission_failure_is_unavailable_without_replaying_operations(
     assert_eq!(provider.generate_random(8).await.unwrap().expose().len(), 8);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn native_constructor_retries_start_at_thirty_seconds_and_remain_bounded() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let factory: ProviderFactory = {
+        let attempts = attempts.clone();
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(KeyRackError::Provider("unreachable".into())) })
+        })
+    };
+    let provider = DeferredProvider::with_retry_schedule(
+        "external".into(),
+        SoftwareProvider::new().capabilities(),
+        factory,
+        None,
+        keyrack_service::provider_startup::PKCS11_FIRST_RETRY,
+        keyrack_service::provider_startup::PKCS11_MAX_RETRY,
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    for (index, seconds) in [30, 60, 120, 120, 120, 120, 120, 120]
+        .into_iter()
+        .enumerate()
+    {
+        tokio::time::advance(
+            Duration::from_secs(seconds)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            index + 1,
+            "backoff must not retry early"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            index + 2,
+            "backoff must retry and remain capped"
+        );
+    }
+    drop(provider);
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        9,
+        "dropping wrapper must stop constructor task"
+    );
+}

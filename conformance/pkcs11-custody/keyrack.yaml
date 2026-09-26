@@ -9,6 +9,7 @@ storage:
 # that recovering the first does not disturb it.
 providers:
   - name: hsm-custody
+    custody: customer
     type: pkcs11
     lib_path: /usr/lib/softhsm/libsofthsm2.so
     token_label: custody

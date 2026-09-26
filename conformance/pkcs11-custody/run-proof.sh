@@ -18,4 +18,14 @@ docker build -f conformance/pkcs11-custody/Dockerfile -t "$IMAGE" .
 
 echo
 echo "Running the proof..."
-docker run --rm "$IMAGE"
+container="keyrack-custody-proof-$(date +%s)-$$"
+mkdir -p conformance/pkcs11-custody/run
+cleanup() {
+    result=$?
+    trap - EXIT
+    docker cp "$container:/tmp/evidence/." conformance/pkcs11-custody/run/ || result=1
+    docker rm -f "$container" >/dev/null || result=1
+    exit "$result"
+}
+trap cleanup EXIT
+docker run --name "$container" "$IMAGE"

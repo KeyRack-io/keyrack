@@ -24,7 +24,7 @@ RUN cargo build --release -p keyrack-service --bin keyrack-service
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl jq softhsm2 \
+        ca-certificates curl jq softhsm2 python3 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /usr/lib/softhsm \
     && ln -sf "$(find /usr/lib -name 'libsofthsm2.so' -path '*/softhsm/*' | head -1)" \
@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/keyrack-service /usr/local/bin/
 COPY conformance/pkcs11-custody/keyrack.yaml /config/keyrack.yaml
+COPY conformance/pkcs11-custody/latency.py /usr/local/bin/latency.py
 COPY conformance/pkcs11-custody/proof.sh /usr/local/bin/proof.sh
 RUN chmod +x /usr/local/bin/proof.sh
 

@@ -69,10 +69,29 @@ impl DeferredProvider {
         factory: ProviderFactory,
         probe: Option<AvailabilityProbe>,
     ) -> Self {
+        Self::with_retry_schedule(
+            name,
+            capabilities,
+            factory,
+            probe,
+            INITIAL_BACKOFF,
+            MAX_BACKOFF,
+        )
+    }
+
+    pub fn with_retry_schedule(
+        name: String,
+        capabilities: ProviderCapabilities,
+        factory: ProviderFactory,
+        probe: Option<AvailabilityProbe>,
+        first_retry: Duration,
+        max_retry: Duration,
+    ) -> Self {
+        assert!(!first_retry.is_zero() && max_retry >= first_retry);
         let provider = Arc::new(OnceLock::new());
         let target = Arc::clone(&provider);
         let task = tokio::spawn(async move {
-            let mut backoff = INITIAL_BACKOFF;
+            let mut backoff = first_retry;
             loop {
                 if let Ok(Ok(ready)) = tokio::time::timeout(ATTEMPT_TIMEOUT, factory()).await {
                     let _ = target.set(ready);
@@ -81,7 +100,7 @@ impl DeferredProvider {
                 // Authentication refusal is also unavailability. Revocation
                 // can be reversed without replacing the service process.
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff * 2).min(max_retry);
             }
         });
         Self {

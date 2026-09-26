@@ -151,6 +151,8 @@ pub struct ServiceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedProvider {
     pub name: String,
+    #[serde(default)]
+    pub custody: crate::readiness::ProviderCustody,
     #[serde(flatten)]
     pub provider: ProviderConfig,
 }
@@ -258,6 +260,11 @@ impl ServiceConfig {
         self.resolved_pdp()?;
         self.validate_audit_signing()?;
         self.validate_provider_durability()?;
+        for entry in self.resolved_providers()?.0 {
+            if entry.custody == crate::readiness::ProviderCustody::Customer {
+                crate::provider_startup::validate_remote_config(&entry.provider)?;
+            }
+        }
         Ok(())
     }
 
@@ -346,6 +353,7 @@ impl ServiceConfig {
         if self.providers.is_empty() {
             let synthetic = NamedProvider {
                 name: "default".into(),
+                custody: crate::readiness::ProviderCustody::Platform,
                 provider: self.provider.clone(),
             };
             return Ok((vec![synthetic], "default".into()));

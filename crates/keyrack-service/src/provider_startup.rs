@@ -14,6 +14,9 @@ use keyrack_core::provider::{
 };
 use std::sync::Arc;
 
+pub const PKCS11_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+pub const PKCS11_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Validate local inputs before allowing a remote failure to be deferred.
 /// Backend authentication is deliberately not part of this validation.
 pub fn validate_remote_config(config: &ProviderConfig) -> Result<(), String> {
@@ -70,7 +73,8 @@ pub fn validate_remote_config(config: &ProviderConfig) -> Result<(), String> {
             // A module's own error is not a local path/configuration failure.
             if let Err(
                 cryptoki::error::Error::LibraryLoading(_)
-                | cryptoki::error::Error::NullFunctionPointer,
+                | cryptoki::error::Error::NullFunctionPointer
+                | cryptoki::error::Error::MissingSymbol(_),
             ) = cryptoki::context::Pkcs11::new(lib_path)
             {
                 return Err("invalid PKCS#11 library: cannot load module/function table".into());
@@ -211,15 +215,19 @@ pub async fn defer_remote_provider(
             }
             _ => return Ok(None),
         };
-    Ok(Some((
-        Arc::new(DeferredProvider::new(
+    let provider = if class == ProviderClass::Pkcs11 {
+        DeferredProvider::with_retry_schedule(
             name.to_owned(),
             remote_capabilities(class),
             factory,
             probe,
-        )),
-        class,
-    )))
+            PKCS11_FIRST_RETRY,
+            PKCS11_MAX_RETRY,
+        )
+    } else {
+        DeferredProvider::new(name.to_owned(), remote_capabilities(class), factory, probe)
+    };
+    Ok(Some((Arc::new(provider), class)))
 }
 
 pub fn defer_ready_provider(

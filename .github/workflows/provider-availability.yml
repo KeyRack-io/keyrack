@@ -1,0 +1,31 @@
+name: Provider availability
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  controls:
+    name: Provider availability reversion controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler softhsm2
+      - name: Check startup through the service binary
+        run: cargo test --locked -p keyrack-service --test provider_service_availability
+      - name: Revert readiness and deferred-construction controls
+        run: python3 scripts/test-provider-availability-controls.py --native-library /usr/lib/softhsm/libsofthsm2.so
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: provider-availability-controls
+          path: target/proofs/provider-availability
+          if-no-files-found: error
