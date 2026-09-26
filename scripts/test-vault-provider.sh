@@ -54,6 +54,19 @@ for test_name in "${required_tests[@]}"; do
         exit 1
     fi
 done
+service_test=(cargo test --locked -p keyrack-service --test vault_ciphertext_binding)
+available_service_tests="$("${service_test[@]}" -- --ignored --list --color never)"
+required_service_tests=(
+    tampered_header_lid_is_refused
+    swapped_encryption_context_is_refused
+    spliced_header_and_payload_are_refused
+)
+for test_name in "${required_service_tests[@]}"; do
+    if ! grep -Fxq "$test_name: test" <<< "$available_service_tests"; then
+        echo "Required ignored Vault service test missing: $test_name" >&2
+        exit 1
+    fi
+done
 
 # mktemp provides a per-run ownership namespace; no checkout or host token/data
 # directories are mounted. Cleanup removes only this unique Compose project and
@@ -128,6 +141,8 @@ cargo test --locked -p keyrack-vault --lib -- --ignored --nocapture --test-threa
 unset KEYRACK_VAULT_TEST_UNSEAL_KEY
 # Confirm the same instance is usable before invoking additional assertions.
 "${compose[@]}" exec --no-TTY vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' >/dev/null
+echo "Running mandatory Vault ciphertext-binding tests through the service binary"
+"${service_test[@]}" -- --ignored --nocapture --test-threads=1
 
 # A future integration suite can use the same live fixture without replacing the
 # provider gate, adding a second Vault stack, or passing deployment credentials.
