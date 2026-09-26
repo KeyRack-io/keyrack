@@ -65,6 +65,7 @@ required_service_tests=(
     tampered_header_lid_is_refused
     swapped_encryption_context_is_refused
     spliced_header_and_payload_are_refused
+    customer_custody_splice_preserves_authentication_refusal
 )
 for test_name in "${required_service_tests[@]}"; do
     if ! grep -Fxq "$test_name: test" <<< "$available_service_tests"; then

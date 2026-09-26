@@ -72,7 +72,10 @@ enum Outcome {
 
 impl Outcome {
     fn is_aead_refusal(&self) -> bool {
-        matches!(self, Self::Refused { message, .. } if message.contains(AEAD_REFUSAL))
+        matches!(self, Self::Refused { code, message }
+            if message.contains(AEAD_REFUSAL)
+                && code != "Unavailable"
+                && !code.starts_with("503 "))
     }
 }
 
@@ -97,6 +100,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_custody(None).await
+    }
+
+    async fn start_with_custody(custody: Option<&str>) -> Self {
         let vault_addr = std::env::var("VAULT_ADDR")
             .expect("VAULT_ADDR must point at a Vault with Transit mounted; refusing to skip");
         let vault_token = std::env::var("VAULT_TOKEN").expect("VAULT_TOKEN for the Vault fixture");
@@ -107,17 +114,27 @@ impl Fixture {
         let grpc_listener = TcpListener::bind("127.0.0.1:0").expect("gRPC port");
         let rest_port = rest_listener.local_addr().unwrap().port();
         let grpc_port = grpc_listener.local_addr().unwrap().port();
-        let config = format!(
-            "grpc_addr: '127.0.0.1:{grpc_port}'\n\
-             rest_addr: '127.0.0.1:{rest_port}'\n\
-             storage:\n  type: memory\n\
-             provider:\n  type: vault_transit\n  vault_addr: '{vault_addr}'\n  vault_token: '{vault_token}'\n\
-             pdp:\n  type: always_allow\n\
-             audit:\n  type: file\n  path: '{}'\n\
-             authn:\n  type: insecure\n",
-            dir.join("audit.jsonl").display(),
-        );
-        std::fs::write(dir.join("config.yaml"), config).expect("write fixture config");
+        let provider = json!({
+            "type": "vault_transit", "vault_addr": vault_addr, "vault_token": vault_token
+        });
+        let mut config = json!({
+            "grpc_addr": format!("127.0.0.1:{grpc_port}"),
+            "rest_addr": format!("127.0.0.1:{rest_port}"),
+            "storage": {"type": "memory"},
+            "pdp": {"type": "always_allow"},
+            "audit": {"type": "file", "path": dir.join("audit.jsonl")},
+            "authn": {"type": "insecure"}
+        });
+        if let Some(custody) = custody {
+            let mut provider = provider;
+            provider["name"] = json!("external");
+            provider["custody"] = json!(custody);
+            config["providers"] = json!([provider]);
+            config["default_provider"] = json!("external");
+        } else {
+            config["provider"] = provider;
+        }
+        std::fs::write(dir.join("config.yaml"), config.to_string()).expect("write fixture config");
         let stdout = std::fs::File::create(dir.join("stdout")).expect("capture stdout");
         let stderr = std::fs::File::create(dir.join("stderr")).expect("capture stderr");
         let mut fixture = Self {
@@ -143,6 +160,32 @@ impl Fixture {
                 .expect("start real service binary"),
         );
         fixture.await_healthy().await;
+        if let Some(custody) = custody {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let response = fixture
+                    .client
+                    .get(format!("{}/readyz", fixture.rest))
+                    .send()
+                    .await
+                    .expect("readiness response");
+                assert!(response.status().is_success());
+                let body: Value = response.json().await.unwrap();
+                let state = &body["provider_states"]["external"];
+                assert_eq!(
+                    state["custody"], custody,
+                    "named provider custody must be exercised"
+                );
+                if state["status"] == "available" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "deferred Vault must finish construction: {body}"
+                );
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
         fixture
     }
 
@@ -363,7 +406,16 @@ async fn swapped_encryption_context_is_refused() {
 #[tokio::test]
 #[ignore = "needs a live Vault Transit fixture; run by scripts/test-vault-provider.sh"]
 async fn spliced_header_and_payload_are_refused() {
-    let fixture = Fixture::start().await;
+    assert_splice_refused(Fixture::start().await).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Vault Transit fixture; run by scripts/test-vault-provider.sh"]
+async fn customer_custody_splice_preserves_authentication_refusal() {
+    assert_splice_refused(Fixture::start_with_custody(Some("customer")).await).await;
+}
+
+async fn assert_splice_refused(fixture: Fixture) {
     let key = fixture.create_key().await;
     let plaintext_a = b"tenant alpha record";
     let plaintext_b = b"tenant bravo record";

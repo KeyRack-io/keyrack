@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 KeyRack Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Revert deferred TLS controls against the runner's owned Vault fixture."""
+"""Revert deferred Vault controls against the runner's owned fixture."""
 import hashlib
 import json
 import os
@@ -16,7 +16,11 @@ SUITE = 'provider_service_availability'
 TRUST = 'optional_vault_uses_configured_ca_for_construction_and_readiness'
 REFUSAL = 'optional_vault_tls_verification_failure_is_reported_without_gating'
 LOCAL = 'missing_or_invalid_optional_vault_ca_fails_startup'
+SPLICE = 'customer_custody_splice_preserves_authentication_refusal'
+TESTS = [TRUST, REFUSAL, LOCAL, SPLICE]
 MUTATIONS = [
+    ('rewrite_splice_refusal', 'deferred_provider.rs', 'self.get()?.decrypt(handle, ciphertext, aad).await', 'self.get()?.decrypt(handle, ciphertext, aad).await.map_err(|_| self.unavailable())', SPLICE, 'splice via gRPC: expected refusal by the provider'),
+    ('rewrite_splice_status_only', 'deferred_provider.rs', 'self.get()?.decrypt(handle, ciphertext, aad).await', 'self.get()?.decrypt(handle, ciphertext, aad).await.map_err(|error| KeyRackError::ProviderUnavailable(error.to_string()))', SPLICE, 'splice via gRPC: expected refusal by the provider'),
     ('omit_ca_pass_through', 'provider_startup.rs', '                            ca.as_deref(),', '                            { let _ = &ca; None },', TRUST, 'deferred Vault must use configured CA for construction and probes'),
     ('omit_ca_preflight', 'provider_startup.rs', 'validate_vault_ca(ca_cert.as_deref())?;', 'if false { validate_vault_ca(ca_cert.as_deref())?; }', LOCAL, 'missing or invalid CA must fail startup instead of retrying: missing.pem'),
     ('allow_empty_ca_bundle', 'provider_startup.rs', 'if certificates.is_empty() {', 'if false && certificates.is_empty() {', LOCAL, 'missing or invalid CA must fail startup instead of retrying: invalid.pem'),
@@ -32,7 +36,7 @@ def main():
     output = ROOT / 'target/proofs/vault-availability'
     output.mkdir(parents=True, exist_ok=True)
     target = ROOT / 'target'
-    paths = {SERVICE+item[1] for item in MUTATIONS} | {'crates/keyrack-service/tests/'+SUITE+'.rs', 'scripts/test-vault-availability-controls.py', 'Cargo.lock'}
+    paths = {SERVICE+item[1] for item in MUTATIONS} | {'crates/keyrack-service/tests/'+SUITE+'.rs', 'crates/keyrack-service/tests/vault_ciphertext_binding.rs', 'scripts/test-vault-availability-controls.py', 'Cargo.lock'}
     hashes = {p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in sorted(paths)}
     receipt = {'status':'running', 'source_sha256':hashes, 'controls':[]}
     def save():
@@ -43,14 +47,15 @@ def main():
         copy = Path(temp)/'source'
         shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns('.git','target','run','__pycache__'))
         def run(name, test):
-            command = ['cargo','test','--locked','-p','keyrack-service','--target-dir',str(target),'--test',SUITE,test,'--','--ignored','--exact','--nocapture']
+            suite = 'vault_ciphertext_binding' if test == SPLICE else SUITE
+            command = ['cargo','test','--locked','-p','keyrack-service','--target-dir',str(target),'--test',suite,test,'--','--ignored','--exact','--nocapture']
             with (output/(name+'.log')).open('w') as log:
                 result = subprocess.run(command,cwd=copy,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=180)
             text = (output/(name+'.log')).read_text()
             assert 'error: could not compile' not in text and 'running 1 test' in text, f'{name}: compilation or discovery failure is not control evidence'
             return result.returncode, text
         try:
-            for test in [TRUST,REFUSAL,LOCAL]:
+            for test in TESTS:
                 code,text = run('baseline-'+test,test)
                 assert code == 0 and '1 passed' in text, f'baseline failed: {test}'
             for name,file,old,new,test,diagnostic in MUTATIONS:
@@ -61,12 +66,14 @@ def main():
                 try:
                     code,text = run(name,test)
                     assert code!=0 and '1 failed' in text and diagnostic in text, f'{name}: missing specific failure'
+                    if test == SPLICE:
+                        assert 'splice via gRPC: refused (Unavailable)' in text and 'splice via REST: refused (503 ' in text, 'both surfaces must expose the reverted unavailable classification'
                     receipt['controls'].append({'name':name,'failure':diagnostic,'exit_code':code})
                     save()
                     print(f'PASS {name}: {diagnostic}',flush=True)
                 finally:
                     path.write_text(original)
-            for test in [TRUST,REFUSAL,LOCAL]:
+            for test in TESTS:
                 code,text = run('restored-'+test,test)
                 assert code==0 and '1 passed' in text, f'restored baseline failed: {test}'
             assert hashes=={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in hashes}, 'working source changed'
