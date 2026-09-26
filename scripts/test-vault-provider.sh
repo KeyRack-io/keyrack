@@ -65,6 +65,7 @@ required_service_tests=(
     tampered_header_lid_is_refused
     swapped_encryption_context_is_refused
     spliced_header_and_payload_are_refused
+    customer_custody_splice_preserves_authentication_refusal
 )
 for test_name in "${required_service_tests[@]}"; do
     if ! grep -Fxq "$test_name: test" <<< "$available_service_tests"; then
@@ -164,6 +165,17 @@ fi
 export KEYRACK_VAULT_TEST_UNSEAL_KEY
 echo "Running mandatory Vault provider tests on disposable fixture $project_name"
 cargo test --locked -p keyrack-vault --lib -- --ignored --nocapture --test-threads=1
+availability_test=(cargo test --locked -p keyrack-service --test provider_service_availability)
+available_availability_tests="$("${availability_test[@]}" -- --ignored --list --color never)"
+for test_name in \
+    sealed_optional_vault_boots_and_recovers_existing_ciphertext_without_restart \
+    optional_vault_uses_configured_ca_for_construction_and_readiness \
+    optional_vault_tls_verification_failure_is_reported_without_gating \
+    missing_or_invalid_optional_vault_ca_fails_startup; do
+    grep -Fxq "$test_name: test" <<< "$available_availability_tests"
+done
+"${availability_test[@]}" -- --ignored --nocapture --test-threads=1
+python3 scripts/test-vault-availability-controls.py
 unset KEYRACK_VAULT_TEST_UNSEAL_KEY
 # Confirm the same instance is usable before invoking additional assertions.
 "${compose[@]}" exec --no-TTY vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' >/dev/null

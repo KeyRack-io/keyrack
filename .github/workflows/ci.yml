@@ -98,6 +98,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: bash scripts/test-vault-provider.sh -- bash scripts/test-worker-vault-contribution.sh --from-vault-provider-fixture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vault-availability-controls
+          path: target/proofs/vault-availability/
+          if-no-files-found: error
 
   postgres-compromise-history:
     name: PostgreSQL compromise history

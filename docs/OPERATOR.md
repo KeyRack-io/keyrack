@@ -314,6 +314,58 @@ provider:
   type: in_memory
 ```
 
+### Provider custody and startup availability
+
+Named `providers:` entries accept `custody: platform | customer`. Omission
+means `platform`, including the legacy single `provider:` configuration.
+Platform providers retain their startup and readiness requirements.
+
+```yaml
+providers:
+  - name: external-transit
+    custody: customer
+    type: vault_transit
+    vault_addr: "https://vault.example.com:8200"
+    vault_token: "replace-with-a-mounted-credential"
+    ca_cert: "/etc/keyrack/tls/vault-ca.pem"  # optional private CA bundle
+default_provider: external-transit
+```
+
+With `custody: customer`, backend unavailability does not prevent startup or
+make `/readyz` fail. Vault Transit and PKCS#11 construction runs through a
+shared deferred-provider wrapper. Before construction succeeds, operations
+return `ProviderUnavailable`. Construction failures, including revoked permissions,
+remain unavailable and are logged with the provider name, cause and next retry
+delay. After construction, operations and their errors pass through unchanged;
+operations are never automatically replayed. Malformed
+addresses, invalid configuration, missing local libraries and unreadable local
+secret references still fail startup. A configured Vault `ca_cert` is read and
+validated before deferral; missing files, empty bundles, malformed PEM and invalid
+DER fail startup with the CA path. The same CA is used for construction and live
+readiness probes. It replaces built-in trust roots while preserving certificate
+chain and hostname checks. A certificate verification refusal during construction
+leaves the provider unavailable with `reason: tls_verification_failed`; the
+certificate cause is logged. This does not gate readiness for `custody: customer`.
+
+The first construction attempt starts immediately. Failed Vault construction
+retries after 1 second, doubling to a 30-second maximum. PKCS#11 retries start
+at 30 seconds and double to a 120-second maximum, using the existing shared
+library recovery gate. The two-second minimum library re-initialization
+interval is unchanged. Each asynchronous construction wait is bounded to five
+seconds; a native call still running retains its construction permit so retries
+cannot overlap it. Once constructed, the wrapper delegates to the provider;
+PKCS#11 retains its existing recovery mechanism and Vault uses bounded HTTP
+requests. Static PKCS#11 capabilities do not require an available token.
+
+Stored HSM connections have separate ownership in `scope_owner`. Connections
+with a nonblank `tenant:<id>` owner do not gate readiness. Platform-owned
+connections, including legacy records with no owner and whitespace-only tenant owners, still
+gate readiness.
+A connection that fails startup rehydration is marked `Degraded`, logged once
+with its failure reason, and reported unavailable. **Known limitation:** its
+keys remain unavailable until a restart successfully loads the connection.
+There is no background retry of stored-connection rehydration.
+
 ### Multiple providers and routing
 
 The single `provider:` block above is shorthand for one provider named
@@ -699,13 +751,45 @@ unverifiable.
 | `GET /readyz` | Bounded storage and registered-provider readiness checks; PKCS#11 opens and authenticates fresh token sessions |
 | `GET /metrics` | Prometheus-format metrics |
 
-Use `/readyz` for readiness probes. It returns 503 when a configured PKCS#11
-token cannot open and authenticate a session, including a nondefault token or
-a persisted connection that failed startup rehydration. The provider probe
-has a two-second total budget; a timeout fails readiness. Other provider
-implementations currently inherit a no-op readiness method, so a successful
-response does not prove KMIP or Vault connectivity. `/healthz` capability
-metadata is likewise not evidence that a token can be opened.
+Use `/readyz` for readiness probes. It returns HTTP 503 when storage or a
+platform-custody provider is unavailable. A configured platform PKCS#11 token
+must open and authenticate a fresh session, including nondefault tokens.
+Provider probes share a two-second budget. A timeout is reported unavailable;
+it fails readiness only for platform custody. Missing stored platform HSM
+connections also fail readiness.
+
+The response keeps the aggregate `status`, `storage` and `providers` fields
+and adds `provider_states` for registered providers and `connection_states`
+for stored PKCS#11 connections. Each entry has `custody` and a `status` of
+`available` or `unavailable`. Failed probes also include a classified `reason`:
+`construction_pending`, `construction_timed_out`, `backend_unavailable`,
+`tls_verification_failed` or `probe_timed_out`. Available entries omit `reason`.
+Raw backend text is excluded from this response. For example,
+with an unavailable optional provider and healthy required dependencies,
+HTTP 200 returns:
+
+```json
+{
+  "status": "ready",
+  "storage": "ok",
+  "providers": "ok",
+  "provider_states": {
+    "platform": {"custody": "platform", "status": "available"},
+    "external": {"custody": "customer", "status": "unavailable", "reason": "tls_verification_failed"}
+  },
+  "connection_states": {}
+}
+```
+
+A failed stored tenant connection appears in `connection_states` as
+`{"custody":"customer","status":"unavailable"}` even when no provider was
+registered for it. Aggregate `providers: ok` means the providers required for
+instance readiness passed, not that every backend is available.
+
+Deferred Vault providers use an authenticated mount probe. Other providers
+retain their existing readiness methods; a successful platform Vault or KMIP
+probe currently does not establish backend connectivity. `/healthz` capability
+metadata likewise does not establish live availability.
 
 ### Key metrics
 
