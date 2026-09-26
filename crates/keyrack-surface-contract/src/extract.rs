@@ -857,11 +857,27 @@ fn verify_main(file: &syn::File) -> Result<(), String> {
         return Err("REST listener is not bound".into());
     }
 
-    if !call(
-        local(main, "rest_router")?,
-        "keyrack_service::rest::router",
-        1,
-    ) {
+    let router = local(main, "rest_router")?;
+    // This one data-only extension carries readiness policy. Keep rejecting
+    // arbitrary middleware and route composition at the listener boundary.
+    let router = if let Expr::MethodCall(layer) = router {
+        if layer.method != "layer"
+            || layer.args.len() != 1
+            || !call(&layer.args[0], "axum::Extension", 1)
+        {
+            return Err("unsupported REST listener middleware".into());
+        }
+        let Expr::Call(extension) = &layer.args[0] else {
+            unreachable!()
+        };
+        if !ident(&extension.args[0], "custody_readiness") {
+            return Err("unexpected REST listener extension".into());
+        }
+        layer.receiver.as_ref()
+    } else {
+        router
+    };
+    if !call(router, "keyrack_service::rest::router", 1) {
         return Err("main no longer constructs the inventoried rest::router".into());
     }
     let grpc = local(main, "grpc_service")?;
@@ -1012,6 +1028,31 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../keyrack-service/src/main.rs");
         let original = std::fs::read_to_string(path).unwrap();
         verify_main(&syn::parse_file(&original).unwrap()).unwrap();
+        for (old, new) in [
+            (
+                "axum::Extension(custody_readiness)",
+                "other::Extension(custody_readiness)",
+            ),
+            (
+                "axum::Extension(custody_readiness)",
+                "axum::Extension(other_policy)",
+            ),
+            (
+                ".layer(axum::Extension(custody_readiness))",
+                ".merge(other_router)",
+            ),
+            (
+                "keyrack_service::rest::router(Arc::clone(&state))",
+                "other::router(Arc::clone(&state))",
+            ),
+        ] {
+            assert!(original.contains(old), "mutation anchor missing: {old}");
+            let changed = original.replace(old, new);
+            assert!(
+                verify_main(&syn::parse_file(&changed).unwrap()).is_err(),
+                "listener mutation accepted: {new}"
+            );
+        }
         let shadowed = original.replace(
             "axum::serve(rest_listener, rest_router)",
             "{ let rest_router = Router::new(); axum::serve(rest_listener, rest_router) }",
