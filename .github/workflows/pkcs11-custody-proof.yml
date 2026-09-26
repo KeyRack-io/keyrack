@@ -40,6 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check latency evidence admission and arithmetic
+        run: python3 conformance/pkcs11-custody/latency_controls.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -73,8 +76,8 @@ jobs:
           floor=$(grep -oP '^MIN_EXPECTED_PASSES=\K[0-9]+' \
             conformance/pkcs11-custody/proof.sh)
           echo "harness floor is $floor"
-          if [ "$floor" -lt 21 ]; then
-            echo "the harness floor was lowered to $floor; it must stay at 21 or above"
+          if [ "$floor" -lt 27 ]; then
+            echo "the harness floor was lowered to $floor; it must stay at 27 or above"
             exit 1
           fi
           if [ "$passes" -lt "$floor" ]; then
@@ -92,10 +95,14 @@ jobs:
           grep -q 'sibling served all' "$log" \
             || { echo "the unrelated provider was not held under load"; exit 1; }
 
+          grep -q 'startup sibling served all' "$log"
+          grep -q 'late token initialization recovered' "$log"
+          grep -q 'sustained outage sibling latency:' "$log"
+
       - name: Upload the transcript
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pkcs11-custody-proof
-          path: conformance/pkcs11-custody/run/proof-output.txt
+          path: conformance/pkcs11-custody/run/
           if-no-files-found: warn

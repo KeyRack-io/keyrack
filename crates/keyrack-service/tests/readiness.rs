@@ -385,7 +385,183 @@ async fn wrong_class_cannot_hide_a_missing_persisted_connection() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        body["provider_states"]["persisted"]["status"], "missing",
+        body["connection_states"]["persisted"]["status"], "unavailable",
         "a healthy wrong-class provider must not hide the missing connection"
+    );
+}
+
+#[tokio::test]
+async fn stored_tenant_connection_that_fails_boot_does_not_gate_readiness() {
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [(
+                ProviderRef::new("default"),
+                entry(TokenProbe::new(true, false)),
+            )],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    let connection = HsmConnection::new("offline", HsmProviderType::Hsm, "/missing/lib.so", "")
+        .with_pkcs11("absent", "file:absent.pin")
+        .with_scope_owner("tenant:one");
+    app.storage
+        .create_hsm_connection(&connection)
+        .await
+        .unwrap();
+    let loaded = keyrack_service::hsm_registration::rehydrate_hsm_connections(
+        &app.storage,
+        &app.providers,
+        &app.audit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded, 0);
+    assert_eq!(
+        app.storage
+            .get_hsm_connection("offline")
+            .await
+            .unwrap()
+            .status,
+        keyrack_core::hsm::HsmConnectionStatus::Degraded
+    );
+    assert!(
+        app.providers.resolve(&ProviderRef::new("offline")).is_err(),
+        "failed boot load must stay unroutable"
+    );
+    let (status, body) = ready(app).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stored tenant boot failure must not gate readiness"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["connection_states"]["offline"],
+        serde_json::json!({"custody":"customer","status":"unavailable"})
+    );
+}
+
+#[tokio::test]
+async fn stored_platform_owner_preserves_readiness_guard() {
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [(
+                ProviderRef::new("default"),
+                entry(TokenProbe::new(true, false)),
+            )],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    app.storage
+        .create_hsm_connection(
+            &HsmConnection::new("offline", HsmProviderType::Hsm, "/missing/lib.so", "")
+                .with_pkcs11("absent", "file:absent.pin")
+                .with_scope_owner("platform"),
+        )
+        .await
+        .unwrap();
+    let (status, body) = ready(app).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "stored platform owner must still gate readiness"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["connection_states"]["offline"]["custody"], "platform");
+}
+
+#[tokio::test]
+async fn stored_tenant_outage_does_not_exempt_configured_platform_instance() {
+    for configured in [false, true] {
+        let token: Arc<dyn CryptoProvider> = TokenProbe::new(false, false);
+        let app = state(Arc::new(
+            StaticProviderRegistry::new(
+                [
+                    (
+                        ProviderRef::new("default"),
+                        entry(TokenProbe::new(true, false)),
+                    ),
+                    (
+                        ProviderRef::new("stored"),
+                        ProviderEntry {
+                            provider: token.clone(),
+                            class: ProviderClass::Pkcs11,
+                        },
+                    ),
+                ],
+                ProviderRef::new("default"),
+            )
+            .unwrap(),
+        ));
+        app.storage
+            .create_hsm_connection(
+                &HsmConnection::new("stored", HsmProviderType::Hsm, "/missing/lib.so", "test")
+                    .with_pkcs11("token", "file:token.pin")
+                    .with_scope_owner("tenant:one"),
+            )
+            .await
+            .unwrap();
+        let mut custody = keyrack_service::readiness::CustodyReadiness::default();
+        if configured {
+            custody.configure(
+                ProviderRef::new("stored"),
+                token,
+                keyrack_service::readiness::ProviderCustody::Platform,
+            );
+        }
+        let (status, body) = ready_with_custody(app, custody).await;
+        assert_eq!(
+            status,
+            if configured {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            },
+            "stored tenant ownership must not exempt configured platform provider: {body}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["connection_states"]["stored"]["status"], "unavailable");
+    }
+}
+
+#[tokio::test]
+async fn configured_name_collision_cannot_hide_failed_platform_connection() {
+    let token: Arc<dyn CryptoProvider> = TokenProbe::new(true, false);
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("default"),
+                    entry(TokenProbe::new(true, false)),
+                ),
+                (
+                    ProviderRef::new("stored"),
+                    ProviderEntry {
+                        provider: token.clone(),
+                        class: ProviderClass::Pkcs11,
+                    },
+                ),
+            ],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    app.storage
+        .create_hsm_connection(
+            &HsmConnection::new("stored", HsmProviderType::Hsm, "/missing/lib.so", "test")
+                .with_pkcs11("token", "file:token.pin")
+                .with_scope_owner("platform"),
+        )
+        .await
+        .unwrap();
+    let mut custody = keyrack_service::readiness::CustodyReadiness::default();
+    custody.insert(ProviderRef::new("stored"), token);
+    let (status, body) = ready_with_custody(app, custody).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "configured name collision must not hide failed persisted platform connection: {body}"
     );
 }

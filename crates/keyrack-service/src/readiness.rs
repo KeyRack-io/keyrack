@@ -28,11 +28,33 @@ pub enum ProviderCustody {
 #[derive(Clone, Default)]
 pub struct CustodyReadiness {
     optional: HashMap<ProviderRef, Arc<dyn CryptoProvider>>,
+    required: HashMap<ProviderRef, Arc<dyn CryptoProvider>>,
 }
 
 impl CustodyReadiness {
     pub fn insert(&mut self, name: ProviderRef, provider: Arc<dyn CryptoProvider>) {
         self.optional.insert(name, provider);
+    }
+
+    pub fn configure(
+        &mut self,
+        name: ProviderRef,
+        provider: Arc<dyn CryptoProvider>,
+        custody: ProviderCustody,
+    ) {
+        match custody {
+            ProviderCustody::Customer => self.insert(name, provider),
+            ProviderCustody::Platform => {
+                self.required.insert(name, provider);
+            }
+        }
+    }
+
+    fn is_configured(&self, name: &ProviderRef, provider: &Arc<dyn CryptoProvider>) -> bool {
+        self.optional
+            .get(name)
+            .or_else(|| self.required.get(name))
+            .is_some_and(|configured| Arc::ptr_eq(configured, provider))
     }
 
     fn custody(&self, name: &ProviderRef, provider: &Arc<dyn CryptoProvider>) -> ProviderCustody {
@@ -58,6 +80,7 @@ pub struct ProviderState {
 pub struct ProviderReadiness {
     pub ready: bool,
     pub states: BTreeMap<String, ProviderState>,
+    pub connections: BTreeMap<String, ProviderState>,
 }
 
 /// Probe every registered backend, retaining the persisted PKCS#11 connection
@@ -94,37 +117,55 @@ pub async fn provider_readiness(
         });
     }
     let connections = tokio::time::timeout_at(deadline, storage.list_hsm_connections()).await;
-    let metadata_ok = if let Ok(Ok(connections)) = connections {
-        let mut complete = true;
-        for connection in connections {
-            if connection.pkcs11_params().is_some()
-                && !entries.iter().any(|(name, entry)| {
-                    *name == ProviderRef::new(&connection.connection_id)
-                        && entry.class == ProviderClass::Pkcs11
-                })
-            {
-                complete = false;
-                report.states.insert(
-                    connection.connection_id,
-                    ProviderState {
-                        custody: ProviderCustody::Platform,
-                        status: "missing",
-                    },
-                );
+    let metadata_ok = connections.as_ref().is_ok_and(Result::is_ok);
+    let connections = connections.ok().and_then(Result::ok).unwrap_or_default();
+    for connection in &connections {
+        if connection.pkcs11_params().is_some() {
+            let name = ProviderRef::new(&connection.connection_id);
+            let owner = if connection.scope_owner.as_deref().is_some_and(|owner| {
+                owner
+                    .strip_prefix("tenant:")
+                    .is_some_and(|tenant| !tenant.is_empty())
+            }) {
+                ProviderCustody::Customer
+            } else {
+                ProviderCustody::Platform
+            };
+            report.connections.insert(
+                connection.connection_id.clone(),
+                ProviderState {
+                    custody: owner,
+                    status: "unavailable",
+                },
+            );
+            if let Some((_, entry)) = entries.iter().find(|(entry_name, entry)| {
+                *entry_name == name && entry.class == ProviderClass::Pkcs11
+            }) {
+                if !custody.is_configured(&name, &entry.provider) {
+                    if let Some(state) = report.states.get_mut(&connection.connection_id) {
+                        state.custody = owner;
+                    }
+                }
             }
         }
-        complete
-    } else {
-        false
-    };
+    }
     while let Some(result) = probes.join_next().await {
         if let Ok((name, ready)) = result {
             if ready {
                 if let Some(state) = report.states.get_mut(&name.to_string()) {
-                    if state.status != "missing" {
-                        state.status = "available";
-                    }
+                    state.status = "available";
                 }
+            }
+        }
+    }
+    for (name, state) in &mut report.connections {
+        if entries.iter().any(|(entry_name, entry)| {
+            entry_name.as_str() == name
+                && entry.class == ProviderClass::Pkcs11
+                && !custody.is_configured(entry_name, &entry.provider)
+        }) {
+            if let Some(provider) = report.states.get(name) {
+                state.status = provider.status;
             }
         }
     }
@@ -132,6 +173,7 @@ pub async fn provider_readiness(
         && report
             .states
             .values()
+            .chain(report.connections.values())
             .all(|state| state.custody == ProviderCustody::Customer || state.status == "available");
     report
 }

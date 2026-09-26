@@ -7,7 +7,7 @@ use keyrack_service::provider_startup::{defer_remote_provider, remote_capabiliti
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Requires a disposable SOFTHSM2_CONF with an empty token directory.
+/// Requires a disposable `SOFTHSM2_CONF` with an empty token directory.
 #[tokio::test]
 #[ignore = "requires an isolated native-token fixture"]
 async fn deferred_native_constructor_discovers_a_token_initialized_after_start() {

@@ -2088,6 +2088,7 @@ async fn readyz(
             "storage": if storage_ok { "ok" } else { "error" },
             "providers": if providers_ok { "ok" } else { "error" },
             "provider_states": provider_report.states,
+            "connection_states": provider_report.connections,
         })),
     )
 }

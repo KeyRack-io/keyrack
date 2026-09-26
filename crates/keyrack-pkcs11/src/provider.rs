@@ -578,29 +578,36 @@ impl Pkcs11Provider {
         // (e.g. one per tenant token) can be backed by the same `.so` without
         // a second `C_Initialize` failing with ALREADY_INITIALIZED.
         let module = shared_module(&config.lib_path)?;
-        let ctx = &module.ctx;
+        let generation = module.generation();
+        let open = || -> Result<cryptoki::slot::Slot> {
+            // Release admission, sessions and native handles before recovery
+            // tries to drain the same per-library gate.
+            let _in_flight = module.gate.enter()?;
+            let slot = find_slot_by_label(&module.ctx, &config.token_label)?;
+            let session = module
+                .ctx
+                .open_rw_session(slot)
+                .map_err(|e| map_pkcs11_error("open session", &e))?;
+            session
+                .login(UserType::User, Some(&make_auth_pin(&config.pin)))
+                .map_err(|e| map_pkcs11_error("login", &e))?;
+            Ok(slot)
+        };
+        let slot = match open() {
+            Ok(slot) => slot,
+            Err(error) => {
+                // A failed constructor has no instance through which `run`
+                // could refresh a stale token list. Use exactly the same
+                // guarded, rate-limited recovery path before one more lookup.
+                let outcome = module.recover(generation);
+                if !outcome.permits_retry() {
+                    return Err(recovery_pending_error(outcome, &error));
+                }
+                open()?
+            }
+        };
+        tracing::info!(token_label = %config.token_label, "PKCS#11 provider initialized");
 
-        // Construction touches the library like any other call, so it waits
-        // out a reinitialization rather than racing one.
-        let in_flight = module.gate.enter()?;
-
-        let slot = find_slot_by_label(ctx, &config.token_label)?;
-
-        // Verify we can actually log in
-        let session = ctx
-            .open_rw_session(slot)
-            .map_err(|e| KeyRackError::Provider(format!("open session: {e}")))?;
-        session
-            .login(UserType::User, Some(&make_auth_pin(&config.pin)))
-            .map_err(|e| KeyRackError::Provider(format!("login: {e}")))?;
-        drop(session);
-
-        tracing::info!(
-            token_label = %config.token_label,
-            "PKCS#11 provider initialized"
-        );
-
-        drop(in_flight);
         Ok(Self {
             module,
             token_label: config.token_label.clone(),

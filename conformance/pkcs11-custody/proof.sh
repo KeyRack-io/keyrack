@@ -17,7 +17,7 @@ export SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf
 
 # Number of assertions below. Raising or lowering it is a deliberate edit and
 # the CI job checks this value, so a quiet suite cannot pass.
-MIN_EXPECTED_PASSES=21
+MIN_EXPECTED_PASSES=27
 
 # How long service may take to come back after custody returns. Recovery is
 # attempted at most once every MIN_REINIT_INTERVAL (2s in the provider), and
@@ -32,6 +32,8 @@ fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 step() { printf '\n== %s\n' "$1"; }
 
 cleanup() {
+    [[ -n "${HAMMER_STOP:-}" ]] && : >"$HAMMER_STOP"
+    [[ -f "$LOG" ]] && cp "$LOG" /tmp/evidence/service.log
     if [[ -n "${SVC_PID:-}" ]] && kill -0 "$SVC_PID" 2>/dev/null; then
         kill "$SVC_PID" 2>/dev/null
         wait "$SVC_PID" 2>/dev/null
@@ -40,18 +42,10 @@ cleanup() {
 trap cleanup EXIT
 
 # ── tokens ───────────────────────────────────────────────────────────────
-step "Two SoftHSM tokens on one library"
-mkdir -p "$TOKENS" "$AWAY"
-softhsm2-util --init-token --free --label custody --pin 1234 --so-pin 0000 >/dev/null
-# Exactly one token directory exists at this point, so it is the custody one.
-CUSTODY_DIR=$(ls "$TOKENS")
+step "Start with only the sibling token"
+mkdir -p "$TOKENS" "$AWAY" /tmp/evidence
 softhsm2-util --init-token --free --label sibling --pin 5678 --so-pin 0000 >/dev/null
-echo "  custody token directory: $CUSTODY_DIR"
-if [[ $(ls "$TOKENS" | wc -l) -eq 2 ]]; then
-    pass "two tokens initialized on one library"
-else
-    fail "expected two token directories, found: $(ls "$TOKENS" | tr '\n' ' ')"
-fi
+SIBLING_DIR=$(ls "$TOKENS")
 
 # ── the real binary ──────────────────────────────────────────────────────
 step "Start the real keyrack-service binary"
@@ -59,10 +53,10 @@ RUST_LOG=info KEYRACK_CONFIG=/config/keyrack.yaml keyrack-service >"$LOG" 2>&1 &
 SVC_PID=$!
 
 for _ in $(seq 1 60); do
-    if curl -sf "$BASE/healthz" >/dev/null 2>&1; then break; fi
+    if curl -sf --connect-timeout 2 --max-time 15 "$BASE/healthz" >/dev/null 2>&1; then break; fi
     sleep 1
 done
-if curl -sf "$BASE/healthz" >/dev/null 2>&1; then
+if curl -sf --connect-timeout 2 --max-time 15 "$BASE/healthz" >/dev/null 2>&1; then
     pass "service is up (pid $SVC_PID)"
 else
     fail "service never became healthy; log follows"
@@ -72,37 +66,16 @@ fi
 
 # ── helpers ──────────────────────────────────────────────────────────────
 create_key() {
-    curl -s "$BASE/v1/keys" -H 'Content-Type: application/json' \
+    curl -s --connect-timeout 2 --max-time 15 "$BASE/v1/keys" -H 'Content-Type: application/json' \
         -d "{\"key_spec\":\"AES_256\",\"description\":\"custody proof\",\"attributes\":{\"token\":\"$1\"}}"
 }
 
 # encrypt_code <key_id> → HTTP status of an encrypt call
 encrypt_code() {
-    curl -s -o /tmp/enc-body -w '%{http_code}' \
+    curl -s --connect-timeout 2 --max-time 15 -o /tmp/enc-body -w '%{http_code}' \
         "$BASE/v1/keys/$1/actions-encrypt" -H 'Content-Type: application/json' \
         -d '{"plaintext":"Y3VzdG9keSBwcm9vZg=="}'
 }
-
-step "A key in each token"
-custody_resp=$(create_key custody)
-sibling_resp=$(create_key sibling)
-CUSTODY_KEY=$(jq -r '.lid' <<<"$custody_resp")
-SIBLING_KEY=$(jq -r '.lid' <<<"$sibling_resp")
-CUSTODY_PROVIDER=$(jq -r '.provider_ref' <<<"$custody_resp")
-SIBLING_PROVIDER=$(jq -r '.provider_ref' <<<"$sibling_resp")
-echo "  custody key $CUSTODY_KEY on $CUSTODY_PROVIDER"
-echo "  sibling key $SIBLING_KEY on $SIBLING_PROVIDER"
-if [[ "$CUSTODY_PROVIDER" == "hsm-custody" && "$SIBLING_PROVIDER" == "hsm-sibling" ]]; then
-    pass "the two keys live in different tokens"
-else
-    fail "keys did not route to separate providers ($CUSTODY_PROVIDER / $SIBLING_PROVIDER)"
-fi
-
-step "Baseline: both tokens serve"
-code=$(encrypt_code "$CUSTODY_KEY")
-[[ "$code" == "200" ]] && pass "custody token encrypts (200)" || fail "custody baseline returned $code"
-code=$(encrypt_code "$SIBLING_KEY")
-[[ "$code" == "200" ]] && pass "sibling token encrypts (200)" || fail "sibling baseline returned $code"
 
 # ── custody loss ─────────────────────────────────────────────────────────
 # The sibling shares the initialized module with the token that is about to
@@ -124,11 +97,11 @@ HAMMER_PIDS=()
 hammer_worker() {
     local id="$1"
     while [[ ! -e "$HAMMER_STOP" ]]; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' \
+        code=$(curl -s --connect-timeout 2 --max-time 15 -o /dev/null -w '%{http_code} %{time_total}' \
             "$BASE/v1/keys/$SIBLING_KEY/actions-encrypt" \
             -H 'Content-Type: application/json' \
             -d '{"plaintext":"Y3VzdG9keSBwcm9vZg=="}')
-        printf '%s\n' "$code" >>"$HAMMER_DIR/$id"
+        printf '%s %s\n' "$(cut -d ' ' -f1 /proc/uptime)" "$code" >>"$HAMMER_DIR/$id"
     done
 }
 
@@ -155,6 +128,64 @@ stop_hammer() {
 # Every request is recorded, not just the failures, so that a load generator
 # that never ran reads as an unproven claim rather than as zero failures.
 MIN_SIBLING_REQUESTS=40
+step "An absent optional token does not prevent startup"
+code=$(curl -s --connect-timeout 2 --max-time 15 -o /tmp/evidence/startup-readiness.json -w '%{http_code}' "$BASE/readyz")
+if [[ "$code" == 200 ]] && jq -e '.status == "ready" and .provider_states["hsm-custody"] == {custody:"customer",status:"unavailable"} and .provider_states["hsm-sibling"].status == "available"' /tmp/evidence/startup-readiness.json >/dev/null; then
+    pass "absent optional token is unavailable while readiness stays ready"
+else
+    fail "absent optional token blocked readiness or was not reported"
+fi
+code=$(curl -s --connect-timeout 2 --max-time 15 -o /tmp/startup-create -w '%{http_code}' "$BASE/v1/keys" -H 'Content-Type: application/json' -d '{"key_spec":"AES_256","attributes":{"token":"custody"}}')
+[[ "$code" == 503 ]] && pass "absent token refuses creation with 503" || fail "absent token creation returned $code"
+sibling_resp=$(create_key sibling)
+SIBLING_KEY=$(jq -r '.lid' <<<"$sibling_resp")
+start_hammer
+sleep 1
+softhsm2-util --init-token --free --label custody --pin 1234 --so-pin 0000 >/dev/null
+CUSTODY_DIR=$(ls "$TOKENS" | grep -Fxv "$SIBLING_DIR")
+[[ $(ls "$TOKENS" | wc -l) -eq 2 ]] && pass "two tokens initialized on one library" || fail "token initialization failed"
+started=$SECONDS
+custody_resp='{}'
+while (( SECONDS - started < 180 )); do
+    custody_resp=$(create_key custody)
+    if jq -e '.lid != null' <<<"$custody_resp" >/dev/null; then break; fi
+    sleep 1
+done
+if jq -e '.lid != null' <<<"$custody_resp" >/dev/null && kill -0 "$SVC_PID"; then
+    pass "late token initialization recovered in the original process"
+else
+    fail "late token initialization did not recover without restart"
+fi
+stop_hammer
+cp -R "$HAMMER_DIR" /tmp/evidence/startup-requests
+startup_total=$(cat "$HAMMER_DIR"/* | wc -l)
+startup_bad=$(cat "$HAMMER_DIR"/* | awk '$2 != 200 {n++} END {print n+0}')
+if (( startup_total >= MIN_SIBLING_REQUESTS && startup_bad == 0 )) && [[ $(ls "$HAMMER_DIR" | wc -l) -eq $SIBLING_WORKERS ]]; then
+    pass "startup sibling served all $startup_total requests with zero failures"
+else
+    fail "startup sibling failed $startup_bad of $startup_total requests"
+fi
+
+step "A key in each token"
+CUSTODY_KEY=$(jq -r '.lid' <<<"$custody_resp")
+SIBLING_KEY=$(jq -r '.lid' <<<"$sibling_resp")
+CUSTODY_PROVIDER=$(jq -r '.provider_ref' <<<"$custody_resp")
+SIBLING_PROVIDER=$(jq -r '.provider_ref' <<<"$sibling_resp")
+echo "  custody key $CUSTODY_KEY on $CUSTODY_PROVIDER"
+echo "  sibling key $SIBLING_KEY on $SIBLING_PROVIDER"
+if [[ "$CUSTODY_PROVIDER" == "hsm-custody" && "$SIBLING_PROVIDER" == "hsm-sibling" ]]; then
+    pass "the two keys live in different tokens"
+else
+    fail "keys did not route to separate providers ($CUSTODY_PROVIDER / $SIBLING_PROVIDER)"
+fi
+
+step "Baseline: both tokens serve"
+code=$(encrypt_code "$CUSTODY_KEY")
+[[ "$code" == "200" ]] && pass "custody token encrypts (200)" || fail "custody baseline returned $code"
+code=$(encrypt_code "$SIBLING_KEY")
+[[ "$code" == "200" ]] && pass "sibling token encrypts (200)" || fail "sibling baseline returned $code"
+
+
 start_hammer
 
 step "Custody lost: the token is taken away from the running process"
@@ -167,15 +198,29 @@ else
     fail "expected 503 while custody is absent, got $code: $(cat /tmp/enc-body)"
 fi
 
-# The sibling shares the initialized module with the token that just vanished.
-sibling_ok=true
-for _ in 1 2 3; do
-    code=$(encrypt_code "$SIBLING_KEY")
-    [[ "$code" == "200" ]] || { sibling_ok=false; echo "  sibling returned $code during the outage"; }
-    sleep 1
+# Steady unavailable-token traffic for at least 60 monotonic seconds while
+# all eight sibling workers remain active. Keep raw samples for the report.
+outage_start=$(cut -d ' ' -f1 /proc/uptime)
+outage_calls=0
+outage_bad=0
+while awk -v start="$outage_start" '{exit !(($1-start)<60)}' /proc/uptime; do
+    code=$(encrypt_code "$CUSTODY_KEY")
+    outage_calls=$((outage_calls + 1))
+    [[ "$code" == 503 ]] || outage_bad=$((outage_bad + 1))
+    sleep 0.1
 done
-$sibling_ok && pass "sibling token keeps serving throughout the outage" \
-             || fail "the outage took the sibling token down with it"
+outage_end=$(cut -d ' ' -f1 /proc/uptime)
+if (( outage_calls >= 40 && outage_bad == 0 )); then
+    pass "sustained outage issued $outage_calls custody requests, all unavailable"
+else
+    fail "sustained outage traffic: $outage_bad unexpected responses in $outage_calls requests"
+fi
+code=$(curl -s --connect-timeout 2 --max-time 15 -o /tmp/evidence/outage-readiness.json -w '%{http_code}' "$BASE/readyz")
+if [[ "$code" == 200 ]] && jq -e '.status == "ready" and .provider_states["hsm-custody"].status == "unavailable"' /tmp/evidence/outage-readiness.json >/dev/null; then
+    pass "readiness stays ready during sustained optional-token outage"
+else
+    fail "sustained optional-token outage blocked readiness"
+fi
 
 # ── custody restored, no restart ─────────────────────────────────────────
 step "Custody restored — the process is NOT restarted"
@@ -205,8 +250,15 @@ else
 fi
 
 stop_hammer
+cp -R "$HAMMER_DIR" /tmp/evidence/outage-requests
+python3 /usr/local/bin/latency.py "$HAMMER_DIR" "$outage_start" "$outage_end" > /tmp/evidence/latency.json
+if [[ $? == 0 ]]; then
+    pass "sustained outage sibling latency: $(cat /tmp/evidence/latency.json)"
+else
+    fail "latency evidence is incomplete or contains sibling failures"
+fi
 sibling_total=$(cat "$HAMMER_DIR"/* 2>/dev/null | wc -l | tr -d ' ')
-sibling_bad=$(cat "$HAMMER_DIR"/* 2>/dev/null | grep -cv '^200$')
+sibling_bad=$(cat "$HAMMER_DIR"/* 2>/dev/null | awk '$2 != 200 {n++} END {print n+0}')
 sibling_active=$(ls "$HAMMER_DIR" | wc -l | tr -d ' ')
 
 # A load that collapsed to one worker would drain instantly and prove nothing
@@ -230,10 +282,10 @@ code=$(encrypt_code "$SIBLING_KEY")
                        || fail "recovery disturbed the sibling token ($code)"
 
 step "The recovered token does real crypto, not just a 200"
-ct=$(curl -s "$BASE/v1/keys/$CUSTODY_KEY/actions-encrypt" \
+ct=$(curl -s --connect-timeout 2 --max-time 15 "$BASE/v1/keys/$CUSTODY_KEY/actions-encrypt" \
     -H 'Content-Type: application/json' \
     -d '{"plaintext":"Y3VzdG9keSBwcm9vZg=="}' | jq -r '.ciphertext_blob')
-pt=$(curl -s "$BASE/v1/keys/$CUSTODY_KEY/actions-decrypt" \
+pt=$(curl -s --connect-timeout 2 --max-time 15 "$BASE/v1/keys/$CUSTODY_KEY/actions-decrypt" \
     -H 'Content-Type: application/json' \
     -d "{\"ciphertext_blob\":\"$ct\"}" | jq -r '.plaintext')
 if [[ "$pt" == "Y3VzdG9keSBwcm9vZg==" ]]; then
@@ -249,6 +301,9 @@ fi
 # was left untested by the first version of this proof, which only ever
 # encrypted and decrypted.
 step "Custody lost again, and rotation is the FIRST call after it returns"
+PRE_ROTATION_CT=$(curl -s --connect-timeout 2 --max-time 15 "$BASE/v1/keys/$CUSTODY_KEY/actions-encrypt" \
+    -H 'Content-Type: application/json' \
+    -d '{"plaintext":"Y3VzdG9keSBwcm9vZg=="}' | jq -r '.ciphertext_blob // empty')
 start_hammer
 mv "$TOKENS/$CUSTODY_DIR" "$AWAY/"
 
@@ -259,15 +314,13 @@ else
     fail "expected 503 while custody is absent the second time, got $code"
 fi
 
-PRE_ROTATION_CT=$(curl -s "$BASE/v1/keys/$CUSTODY_KEY/actions-encrypt" \
-    -H 'Content-Type: application/json' \
-    -d '{"plaintext":"Y3VzdG9keSBwcm9vZg=="}' | jq -r '.ciphertext_blob // empty')
+
 
 mv "$AWAY/$CUSTODY_DIR" "$TOKENS/"
 
 # Nothing may touch this token before the rotation does.
 rotate_code() {
-    curl -s -o /tmp/rot-body -w '%{http_code}' \
+    curl -s --connect-timeout 2 --max-time 15 -o /tmp/rot-body -w '%{http_code}' \
         "$BASE/v1/keys/$1/actions-rotate" -H 'Content-Type: application/json' -d '{}'
 }
 
@@ -309,17 +362,14 @@ code=$(encrypt_code "$CUSTODY_KEY")
                        || fail "encrypt after rotation returned $code"
 
 if [[ -n "$PRE_ROTATION_CT" ]]; then
-    pt=$(curl -s "$BASE/v1/keys/$CUSTODY_KEY/actions-decrypt" \
+    pt=$(curl -s --connect-timeout 2 --max-time 15 "$BASE/v1/keys/$CUSTODY_KEY/actions-decrypt" \
         -H 'Content-Type: application/json' \
         -d "{\"ciphertext_blob\":\"$PRE_ROTATION_CT\"}" | jq -r '.plaintext // empty')
     [[ "$pt" == "Y3VzdG9keSBwcm9vZg==" ]] \
         && pass "ciphertext from before the rotation still decrypts" \
         || fail "rotation cost us the retained version (got '$pt')"
 else
-    # Encrypting during the outage is expected to fail, so this is not a
-    # defect; say so rather than reporting a pass that tested nothing.
-    echo "  (no pre-rotation ciphertext captured during the outage; skipped)"
-    pass "no pre-rotation ciphertext to check (encrypt during outage refused, as designed)"
+    fail "pre-rotation ciphertext missing; retained-version check did not run"
 fi
 
 if kill -0 "$SVC_PID" 2>/dev/null; then
@@ -329,8 +379,9 @@ else
 fi
 
 stop_hammer
+cp -R "$HAMMER_DIR" /tmp/evidence/rotation-requests
 cycle2_total=$(cat "$HAMMER_DIR"/* 2>/dev/null | wc -l | tr -d ' ')
-cycle2_bad=$(cat "$HAMMER_DIR"/* 2>/dev/null | grep -cv '^200$')
+cycle2_bad=$(cat "$HAMMER_DIR"/* 2>/dev/null | awk '$2 != 200 {n++} END {print n+0}')
 if (( cycle2_total < MIN_SIBLING_REQUESTS )); then
     fail "only $cycle2_total sibling requests during the second cycle"
 elif (( cycle2_bad == 0 )); then
