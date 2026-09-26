@@ -14,7 +14,7 @@ use keyrack_core::provider::{
 use keyrack_core::sensitive::Sensitive;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 pub type ProviderFactory = Arc<
@@ -52,7 +52,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DeferredProvider {
-    name: String,
+    construction_reason: Arc<RwLock<&'static str>>,
     provider: Arc<OnceLock<Arc<dyn CryptoProvider>>>,
     capabilities: ProviderCapabilities,
     probe: Option<AvailabilityProbe>,
@@ -90,12 +90,31 @@ impl DeferredProvider {
         assert!(!first_retry.is_zero() && max_retry >= first_retry);
         let provider = Arc::new(OnceLock::new());
         let target = Arc::clone(&provider);
+        let construction_reason = Arc::new(RwLock::new("construction_pending"));
+        let task_reason = construction_reason.clone();
         let task = tokio::spawn(async move {
             let mut backoff = first_retry;
             loop {
-                if let Ok(Ok(ready)) = tokio::time::timeout(ATTEMPT_TIMEOUT, factory()).await {
-                    let _ = target.set(ready);
-                    break;
+                match tokio::time::timeout(ATTEMPT_TIMEOUT, factory()).await {
+                    Ok(Ok(ready)) => {
+                        let _ = target.set(ready);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        *task_reason
+                            .write()
+                            .expect("construction reason lock poisoned") =
+                            availability_reason(&error);
+                        tracing::warn!(provider = %name, error = %error,
+                            retry_after_seconds = backoff.as_secs(), "provider construction failed; retrying");
+                    }
+                    Err(_) => {
+                        *task_reason
+                            .write()
+                            .expect("construction reason lock poisoned") = "construction_timed_out";
+                        tracing::warn!(provider = %name, retry_after_seconds = backoff.as_secs(),
+                            "provider construction timed out; retrying");
+                    }
                 }
                 // Authentication refusal is also unavailability. Revocation
                 // can be reversed without replacing the service process.
@@ -104,7 +123,7 @@ impl DeferredProvider {
             }
         });
         Self {
-            name,
+            construction_reason,
             provider,
             capabilities,
             probe,
@@ -113,18 +132,36 @@ impl DeferredProvider {
     }
 
     fn unavailable(&self) -> KeyRackError {
-        KeyRackError::ProviderUnavailable(format!("provider '{}' is unavailable", self.name))
+        KeyRackError::ProviderUnavailable(
+            self.construction_reason
+                .read()
+                .expect("construction reason lock poisoned")
+                .to_string(),
+        )
     }
 
     fn get(&self) -> Result<&Arc<dyn CryptoProvider>> {
         self.provider.get().ok_or_else(|| self.unavailable())
     }
+}
 
-    fn backend_result<T>(&self, result: Result<T>) -> Result<T> {
-        // These errors came from the selected backend, not service policy or
-        // local configuration. Never infer permanent availability from an
-        // error class chosen by a remote server or native module.
-        result.map_err(|_| self.unavailable())
+/// Only provider-authored TLS prefixes qualify; HTTP response bodies and raw
+/// URLs never become public readiness reasons.
+pub(crate) fn availability_reason(error: &KeyRackError) -> &'static str {
+    match error {
+        KeyRackError::Provider(message)
+            if message.starts_with("vault health check failed: TLS verification failed:")
+                || message.starts_with("vault request failed: TLS verification failed:") =>
+        {
+            "tls_verification_failed"
+        }
+        KeyRackError::ProviderUnavailable(message) => match message.as_str() {
+            "tls_verification_failed" => "tls_verification_failed",
+            "construction_pending" => "construction_pending",
+            "construction_timed_out" => "construction_timed_out",
+            _ => "backend_unavailable",
+        },
+        _ => "backend_unavailable",
     }
 }
 
@@ -138,12 +175,11 @@ impl Drop for DeferredProvider {
 impl CryptoProvider for DeferredProvider {
     async fn check_readiness(&self) -> Result<()> {
         let provider = self.get()?;
-        let result = if let Some(probe) = &self.probe {
+        if let Some(probe) = &self.probe {
             probe().await
         } else {
             provider.check_readiness().await
-        };
-        self.backend_result(result)
+        }
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -170,7 +206,7 @@ impl CryptoProvider for DeferredProvider {
     }
 
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
-        self.backend_result(self.get()?.generate_key(spec).await)
+        self.get()?.generate_key(spec).await
     }
 
     async fn encrypt(
@@ -179,7 +215,7 @@ impl CryptoProvider for DeferredProvider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<EncryptOutput> {
-        self.backend_result(self.get()?.encrypt(handle, plaintext, aad).await)
+        self.get()?.encrypt(handle, plaintext, aad).await
     }
 
     async fn decrypt(
@@ -188,7 +224,7 @@ impl CryptoProvider for DeferredProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
-        self.backend_result(self.get()?.decrypt(handle, ciphertext, aad).await)
+        self.get()?.decrypt(handle, ciphertext, aad).await
     }
 
     async fn sign(
@@ -197,7 +233,7 @@ impl CryptoProvider for DeferredProvider {
         algorithm: SigningAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>> {
-        self.backend_result(self.get()?.sign(handle, algorithm, message).await)
+        self.get()?.sign(handle, algorithm, message).await
     }
 
     async fn verify(
@@ -207,11 +243,9 @@ impl CryptoProvider for DeferredProvider {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
-        self.backend_result(
-            self.get()?
-                .verify(handle, algorithm, message, signature)
-                .await,
-        )
+        self.get()?
+            .verify(handle, algorithm, message, signature)
+            .await
     }
 
     async fn sign_digest(
@@ -220,7 +254,7 @@ impl CryptoProvider for DeferredProvider {
         algorithm: SigningAlgorithm,
         digest: &[u8],
     ) -> Result<Vec<u8>> {
-        self.backend_result(self.get()?.sign_digest(handle, algorithm, digest).await)
+        self.get()?.sign_digest(handle, algorithm, digest).await
     }
 
     async fn verify_digest(
@@ -230,11 +264,9 @@ impl CryptoProvider for DeferredProvider {
         digest: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
-        self.backend_result(
-            self.get()?
-                .verify_digest(handle, algorithm, digest, signature)
-                .await,
-        )
+        self.get()?
+            .verify_digest(handle, algorithm, digest, signature)
+            .await
     }
 
     async fn generate_mac(
@@ -243,7 +275,7 @@ impl CryptoProvider for DeferredProvider {
         algorithm: MacAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>> {
-        self.backend_result(self.get()?.generate_mac(handle, algorithm, message).await)
+        self.get()?.generate_mac(handle, algorithm, message).await
     }
 
     async fn verify_mac(
@@ -253,15 +285,13 @@ impl CryptoProvider for DeferredProvider {
         message: &[u8],
         mac: &[u8],
     ) -> Result<bool> {
-        self.backend_result(
-            self.get()?
-                .verify_mac(handle, algorithm, message, mac)
-                .await,
-        )
+        self.get()?
+            .verify_mac(handle, algorithm, message, mac)
+            .await
     }
 
     async fn generate_random(&self, length: usize) -> Result<Sensitive<Vec<u8>>> {
-        self.backend_result(self.get()?.generate_random(length).await)
+        self.get()?.generate_random(length).await
     }
 
     async fn generate_data_key(
@@ -270,11 +300,9 @@ impl CryptoProvider for DeferredProvider {
         dek_length: usize,
         aad: &[u8],
     ) -> Result<GenerateDataKeyOutput> {
-        self.backend_result(
-            self.get()?
-                .generate_data_key(wrapping_handle, dek_length, aad)
-                .await,
-        )
+        self.get()?
+            .generate_data_key(wrapping_handle, dek_length, aad)
+            .await
     }
 
     async fn re_encrypt(
@@ -285,15 +313,13 @@ impl CryptoProvider for DeferredProvider {
         dest_handle: &KeyHandle,
         dest_aad: &[u8],
     ) -> Result<EncryptOutput> {
-        self.backend_result(
-            self.get()?
-                .re_encrypt(source_handle, ciphertext, source_aad, dest_handle, dest_aad)
-                .await,
-        )
+        self.get()?
+            .re_encrypt(source_handle, ciphertext, source_aad, dest_handle, dest_aad)
+            .await
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
-        self.backend_result(self.get()?.destroy_key(handle).await)
+        self.get()?.destroy_key(handle).await
     }
 
     async fn generate_wrapped_key(
@@ -302,11 +328,9 @@ impl CryptoProvider for DeferredProvider {
         parent: &KeyHandle,
         creation: &keyrack_core::creation::CreationBinding,
     ) -> Result<GeneratedWrappedKey> {
-        self.backend_result(
-            self.get()?
-                .generate_wrapped_key(context, parent, creation)
-                .await,
-        )
+        self.get()?
+            .generate_wrapped_key(context, parent, creation)
+            .await
     }
 
     async fn open_wrapped_key(
@@ -315,27 +339,25 @@ impl CryptoProvider for DeferredProvider {
         parent: &KeyHandle,
         envelope: &[u8],
     ) -> Result<WrappedKeyLease> {
-        self.backend_result(
-            self.get()?
-                .open_wrapped_key(context, parent, envelope)
-                .await,
-        )
+        self.get()?
+            .open_wrapped_key(context, parent, envelope)
+            .await
     }
 
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
-        self.backend_result(self.get()?.close_wrapped_key(lease).await)
+        self.get()?.close_wrapped_key(lease).await
     }
 
     async fn export_key_material(&self, handle: &KeyHandle) -> Result<Sensitive<Vec<u8>>> {
-        self.backend_result(self.get()?.export_key_material(handle).await)
+        self.get()?.export_key_material(handle).await
     }
 
     async fn make_key_exportable(&self, handle: &KeyHandle) -> Result<()> {
-        self.backend_result(self.get()?.make_key_exportable(handle).await)
+        self.get()?.make_key_exportable(handle).await
     }
 
     async fn revoke_key_exportability(&self, handle: &KeyHandle) -> Result<Option<KeyHandle>> {
-        self.backend_result(self.get()?.revoke_key_exportability(handle).await)
+        self.get()?.revoke_key_exportability(handle).await
     }
 
     async fn import_key_material(
@@ -343,6 +365,6 @@ impl CryptoProvider for DeferredProvider {
         spec: &KeySpec,
         material: Sensitive<Vec<u8>>,
     ) -> Result<KeyHandle> {
-        self.backend_result(self.get()?.import_key_material(spec, material).await)
+        self.get()?.import_key_material(spec, material).await
     }
 }

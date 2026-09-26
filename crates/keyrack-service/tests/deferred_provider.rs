@@ -77,6 +77,14 @@ async fn deferred_construction_retries_permission_refusal_and_delegates_after_re
         .await
         .unwrap();
     assert_eq!(clear.expose(), b"payload");
+    let error = provider
+        .decrypt(&handle, &encrypted.ciphertext, b"wrong context")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, KeyRackError::Provider(_)),
+        "cryptographic refusal must not become unavailable"
+    );
     provider.destroy_key(&handle).await.unwrap();
 }
 
@@ -114,10 +122,9 @@ async fn live_probe_overrides_noop_readiness_and_recovers() {
     available.store(false, Ordering::SeqCst);
     let error = provider.check_readiness().await.unwrap_err();
     assert!(
-        matches!(error, KeyRackError::ProviderUnavailable(_)),
-        "backend denial must mean unavailable"
+        matches!(&error, KeyRackError::AuthorizationDenied { reason } if reason == "private backend detail"),
+        "constructed probe errors must pass through"
     );
-    assert!(!error.to_string().contains("private backend detail"));
     available.store(true, Ordering::SeqCst);
     assert!(provider.check_readiness().await.is_ok());
 }
@@ -320,7 +327,7 @@ impl CryptoProvider for RevocableBackend {
 }
 
 #[tokio::test]
-async fn backend_permission_failure_is_unavailable_without_replaying_operations() {
+async fn backend_errors_pass_through_without_replaying_operations() {
     let backend = Arc::new(RevocableBackend {
         allowed: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
@@ -337,9 +344,9 @@ async fn backend_permission_failure_is_unavailable_without_replaying_operations(
     assert!(
         matches!(
             provider.generate_random(8).await,
-            Err(KeyRackError::ProviderUnavailable(_))
+            Err(KeyRackError::AuthorizationDenied { reason }) if reason == "access revoked"
         ),
-        "backend permission refusal must map to unavailable"
+        "constructed backend errors must pass through unchanged"
     );
     assert_eq!(
         backend.calls.load(Ordering::SeqCst),
@@ -404,4 +411,19 @@ async fn native_constructor_retries_start_at_thirty_seconds_and_remain_bounded()
         9,
         "dropping wrapper must stop constructor task"
     );
+}
+
+#[tokio::test]
+async fn constructor_reason_is_retained_and_response_text_cannot_impersonate_tls() {
+    for (message, reason) in [
+        ("vault health check failed: TLS verification failed: UnknownIssuer", "tls_verification_failed"),
+        ("vault request failed: TLS verification failed: UnknownIssuer", "tls_verification_failed"),
+        ("vault health check returned 403: vault health check failed: TLS verification failed: secret", "backend_unavailable"),
+    ] {
+        let factory: ProviderFactory = Arc::new(move || Box::pin(async move { Err(KeyRackError::Provider(message.into())) }));
+        let provider = DeferredProvider::new("external".into(), SoftwareProvider::new().capabilities(), factory, None);
+        tokio::task::yield_now().await;
+        let error = provider.check_readiness().await.unwrap_err();
+        assert!(matches!(error, KeyRackError::ProviderUnavailable(ref actual) if actual == reason), "constructor reason must be classified without exposing backend text: {error}");
+    }
 }

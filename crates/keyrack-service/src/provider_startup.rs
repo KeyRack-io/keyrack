@@ -25,7 +25,9 @@ pub fn validate_remote_config(config: &ProviderConfig) -> Result<(), String> {
             vault_addr,
             vault_token,
             mount_path,
+            ca_cert,
         } => {
+            validate_vault_ca(ca_cert.as_deref())?;
             let url = reqwest::Url::parse(vault_addr).map_err(|_| "invalid Vault address")?;
             if !matches!(url.scheme(), "http" | "https")
                 || url.host_str().is_none()
@@ -81,6 +83,28 @@ pub fn validate_remote_config(config: &ProviderConfig) -> Result<(), String> {
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Load trust material and build a client without connecting. Building also
+/// rejects invalid DER inside an otherwise syntactically valid PEM envelope.
+fn validate_vault_ca(ca_cert: Option<&str>) -> Result<(), String> {
+    if let Some(path) = ca_cert {
+        let invalid = |reason: String| format!("Vault Transit CA file {path}: {reason}");
+        let pem = std::fs::read(path).map_err(|error| invalid(format!("cannot read: {error}")))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|error| invalid(format!("invalid PEM: {error}")))?;
+        if certificates.is_empty() {
+            return Err(invalid("no certificates in PEM file".into()));
+        }
+        let mut builder = reqwest::Client::builder().tls_built_in_root_certs(false);
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+        builder
+            .build()
+            .map_err(|error| invalid(format!("cannot build TLS client: {error}")))?;
     }
     Ok(())
 }
@@ -147,19 +171,23 @@ pub async fn defer_remote_provider(
                 vault_addr,
                 vault_token,
                 mount_path,
+                ca_cert,
             } => {
                 let addr = vault_addr.clone();
                 let token = keyrack_core::secret::SecretString::new(vault_token.clone());
                 let mount = mount_path.clone();
+                let ca = ca_cert.clone();
                 let factory: ProviderFactory = Arc::new(move || {
                     let addr = addr.clone();
                     let token = token.clone();
                     let mount = mount.clone();
+                    let ca = ca.clone();
                     Box::pin(async move {
-                        let provider = keyrack_vault::VaultTransitProvider::new(
+                        let provider = keyrack_vault::VaultTransitProvider::new_with_ca_cert(
                             &addr,
                             token.expose(),
                             mount.as_deref(),
+                            ca.as_deref(),
                         )
                         .await?;
                         Ok(Arc::new(provider) as Arc<dyn CryptoProvider>)

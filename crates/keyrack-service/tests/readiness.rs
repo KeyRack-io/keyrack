@@ -266,7 +266,7 @@ async fn optional_backend_outage_is_reported_without_gating_readiness() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         body["provider_states"]["external"],
-        serde_json::json!({"custody":"customer", "status":"unavailable"})
+        serde_json::json!({"custody":"customer", "status":"unavailable", "reason":"backend_unavailable"})
     );
     assert_eq!(body["provider_states"]["default"]["status"], "available");
     assert!(!body.to_string().contains("private backend detail"));
@@ -564,4 +564,36 @@ async fn configured_name_collision_cannot_hide_failed_platform_connection() {
         StatusCode::SERVICE_UNAVAILABLE,
         "configured name collision must not hide failed persisted platform connection: {body}"
     );
+}
+
+#[tokio::test]
+async fn whitespace_tenant_owner_keeps_platform_readiness_guard() {
+    for owner in ["tenant:", "tenant: ", "tenant:\t\n", "tenant:\u{2003}"] {
+        let app = state(Arc::new(
+            StaticProviderRegistry::new(
+                [(
+                    ProviderRef::new("default"),
+                    entry(TokenProbe::new(true, false)),
+                )],
+                ProviderRef::new("default"),
+            )
+            .unwrap(),
+        ));
+        app.storage
+            .create_hsm_connection(
+                &HsmConnection::new("stored", HsmProviderType::Hsm, "/missing/lib.so", "test")
+                    .with_pkcs11("token", "file:token.pin")
+                    .with_scope_owner(owner),
+            )
+            .await
+            .unwrap();
+        let (status, body) = ready(app).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blank tenant owner must not bypass platform readiness: {body}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["connection_states"]["stored"]["custody"], "platform");
+    }
 }

@@ -38,6 +38,8 @@ impl Service {
         drop((rest, grpc));
         let child = Command::new(env!("CARGO_BIN_EXE_keyrack-service"))
             .env("KEYRACK_CONFIG", dir.join("config.json"))
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .spawn()
@@ -55,7 +57,7 @@ impl Service {
     fn logs(&self) -> String {
         std::fs::read_to_string(self.dir.join("output")).unwrap()
     }
-    async fn readiness(&mut self, expected: &str) {
+    async fn readiness(&mut self, expected: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(40);
         loop {
             assert!(
@@ -79,7 +81,7 @@ impl Service {
                 assert_eq!(body["provider_states"]["platform"]["status"], "available");
                 assert_eq!(body["provider_states"]["external"]["custody"], "customer");
                 if body["provider_states"]["external"]["status"] == expected {
-                    return;
+                    return body;
                 }
             }
             assert!(
@@ -283,4 +285,136 @@ async fn sealed_optional_vault_boots_and_recovers_existing_ciphertext_without_re
         pid,
         "recovery must use the original process"
     );
+}
+
+#[tokio::test]
+async fn failed_optional_construction_logs_provider_error_and_retry() {
+    let mut service = Service::start(&vault("http://127.0.0.1:0", "private-token-sentinel"));
+    service.readiness("unavailable").await;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let logs = service.logs();
+        if logs.contains("provider construction failed; retrying") {
+            assert!(
+                logs.contains("external")
+                    && logs.contains("vault health check failed")
+                    && logs.contains("retry_after_seconds"),
+                "failed construction log must carry provider, cause and retry: {logs}"
+            );
+            assert!(
+                !logs.contains("private-token-sentinel"),
+                "constructor log must not print credentials"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failed construction must be logged with retry context: {logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated TLS Vault fixture from scripts/test-vault-provider.sh"]
+async fn optional_vault_uses_configured_ca_for_construction_and_readiness() {
+    let addr = std::env::var("KEYRACK_VAULT_TLS_ADDR").unwrap();
+    let token = std::env::var("VAULT_TOKEN").unwrap();
+    for variable in ["KEYRACK_VAULT_CA_CERT", "KEYRACK_VAULT_CA_BUNDLE"] {
+        let mut config = vault(&addr, &token);
+        config["ca_cert"] = json!(std::env::var(variable).unwrap());
+        let mut service = Service::start(&config);
+        let body = tokio::time::timeout(Duration::from_secs(8), service.readiness("available"))
+            .await
+            .expect("deferred Vault must use configured CA for construction and probes");
+        assert!(
+            body["provider_states"]["external"].get("reason").is_none(),
+            "available provider must not retain a failure reason"
+        );
+        let (status, body) = service
+            .post("/v1/keys", json!({"key_spec":"AES_256"}))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "trusted private CA must permit Vault operations: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated TLS Vault fixture from scripts/test-vault-provider.sh"]
+async fn optional_vault_tls_verification_failure_is_reported_without_gating() {
+    let addr = std::env::var("KEYRACK_VAULT_TLS_ADDR").unwrap();
+    let token = std::env::var("VAULT_TOKEN").unwrap();
+    for ca in [
+        None,
+        Some(std::env::var("KEYRACK_VAULT_OTHER_CA_CERT").unwrap()),
+    ] {
+        let mut config = vault(&addr, &token);
+        if let Some(ca) = ca {
+            config["ca_cert"] = json!(ca);
+        }
+        let mut service = Service::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let body = service.readiness("unavailable").await;
+            if body["provider_states"]["external"]["reason"] == "tls_verification_failed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TLS verification failure must be reported as readiness reason: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let logs = service.logs();
+        assert!(
+            logs.contains("provider construction failed; retrying")
+                && logs.contains("UnknownIssuer"),
+            "TLS refusal must be logged with its certificate cause: {logs}"
+        );
+        let (status, body) = service
+            .post("/v1/keys", json!({"key_spec":"AES_256"}))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TLS refusal before construction must be unavailable: {body}"
+        );
+        assert!(
+            body.to_string().contains("tls_verification_failed"),
+            "unavailable operation must retain classified TLS reason: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated TLS Vault fixture from scripts/test-vault-provider.sh"]
+async fn missing_or_invalid_optional_vault_ca_fails_startup() {
+    let ca = std::env::var("KEYRACK_VAULT_CA_CERT").unwrap();
+    let directory = std::path::Path::new(&ca).parent().unwrap();
+    for filename in ["missing.pem", "invalid.pem", "empty.pem", "invalid-der.pem"] {
+        let path = directory.join(filename);
+        let mut config = vault("https://127.0.0.1:0", "token");
+        config["ca_cert"] = json!(path);
+        let mut service = Service::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = service.child.try_wait().unwrap() {
+                assert!(!status.success(), "invalid CA must fail startup");
+                let logs = service.logs();
+                assert!(
+                    logs.contains("Vault Transit CA file") && logs.contains(path.to_str().unwrap()),
+                    "local CA failure must report its path: {logs}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing or invalid CA must fail startup instead of retrying: {filename}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }

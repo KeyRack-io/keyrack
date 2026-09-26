@@ -327,16 +327,25 @@ providers:
     type: vault_transit
     vault_addr: "https://vault.example.com:8200"
     vault_token: "replace-with-a-mounted-credential"
+    ca_cert: "/etc/keyrack/tls/vault-ca.pem"  # optional private CA bundle
 default_provider: external-transit
 ```
 
 With `custody: customer`, backend unavailability does not prevent startup or
 make `/readyz` fail. Vault Transit and PKCS#11 construction runs through a
 shared deferred-provider wrapper. Before construction succeeds, operations
-return `ProviderUnavailable`. Backend failures, including revoked permissions,
-remain unavailable; operations are never automatically replayed. Malformed
+return `ProviderUnavailable`. Construction failures, including revoked permissions,
+remain unavailable and are logged with the provider name, cause and next retry
+delay. After construction, operations and their errors pass through unchanged;
+operations are never automatically replayed. Malformed
 addresses, invalid configuration, missing local libraries and unreadable local
-secret references still fail startup.
+secret references still fail startup. A configured Vault `ca_cert` is read and
+validated before deferral; missing files, empty bundles, malformed PEM and invalid
+DER fail startup with the CA path. The same CA is used for construction and live
+readiness probes. It replaces built-in trust roots while preserving certificate
+chain and hostname checks. A certificate verification refusal during construction
+leaves the provider unavailable with `reason: tls_verification_failed`; the
+certificate cause is logged. This does not gate readiness for `custody: customer`.
 
 The first construction attempt starts immediately. Failed Vault construction
 retries after 1 second, doubling to a 30-second maximum. PKCS#11 retries start
@@ -349,8 +358,9 @@ PKCS#11 retains its existing recovery mechanism and Vault uses bounded HTTP
 requests. Static PKCS#11 capabilities do not require an available token.
 
 Stored HSM connections have separate ownership in `scope_owner`. Connections
-with a nonempty `tenant:<id>` owner do not gate readiness. Platform-owned
-connections, including legacy records with no owner, still gate readiness.
+with a nonblank `tenant:<id>` owner do not gate readiness. Platform-owned
+connections, including legacy records with no owner and whitespace-only tenant owners, still
+gate readiness.
 A connection that fails startup rehydration is marked `Degraded`, logged once
 with its failure reason, and reported unavailable. **Known limitation:** its
 keys remain unavailable until a restart successfully loads the connection.
@@ -751,7 +761,10 @@ connections also fail readiness.
 The response keeps the aggregate `status`, `storage` and `providers` fields
 and adds `provider_states` for registered providers and `connection_states`
 for stored PKCS#11 connections. Each entry has `custody` and a `status` of
-`available` or `unavailable`. Backend error details are excluded. For example,
+`available` or `unavailable`. Failed probes also include a classified `reason`:
+`construction_pending`, `construction_timed_out`, `backend_unavailable`,
+`tls_verification_failed` or `probe_timed_out`. Available entries omit `reason`.
+Raw backend text is excluded from this response. For example,
 with an unavailable optional provider and healthy required dependencies,
 HTTP 200 returns:
 
@@ -762,7 +775,7 @@ HTTP 200 returns:
   "providers": "ok",
   "provider_states": {
     "platform": {"custody": "platform", "status": "available"},
-    "external": {"custody": "customer", "status": "unavailable"}
+    "external": {"custody": "customer", "status": "unavailable", "reason": "tls_verification_failed"}
   },
   "connection_states": {}
 }

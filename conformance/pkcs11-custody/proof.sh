@@ -130,7 +130,7 @@ stop_hammer() {
 MIN_SIBLING_REQUESTS=40
 step "An absent optional token does not prevent startup"
 code=$(curl -s --connect-timeout 2 --max-time 15 -o /tmp/evidence/startup-readiness.json -w '%{http_code}' "$BASE/readyz")
-if [[ "$code" == 200 ]] && jq -e '.status == "ready" and .provider_states["hsm-custody"] == {custody:"customer",status:"unavailable"} and .provider_states["hsm-sibling"].status == "available"' /tmp/evidence/startup-readiness.json >/dev/null; then
+if [[ "$code" == 200 ]] && jq -e '.status == "ready" and .provider_states["hsm-custody"].custody == "customer" and .provider_states["hsm-custody"].status == "unavailable" and .provider_states["hsm-sibling"].status == "available"' /tmp/evidence/startup-readiness.json >/dev/null; then
     pass "absent optional token is unavailable while readiness stays ready"
 else
     fail "absent optional token blocked readiness or was not reported"

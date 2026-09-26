@@ -18,6 +18,7 @@ fn malformed_remote_configuration_is_not_deferred() {
             vault_addr: address.into(),
             vault_token: "token".into(),
             mount_path: None,
+            ca_cert: None,
         };
         assert!(
             validate_remote_config(&config).is_err(),
@@ -36,6 +37,7 @@ fn malformed_remote_configuration_is_not_deferred() {
             vault_addr: "http://127.0.0.1:1".into(),
             vault_token: token.into(),
             mount_path: Some(mount.into()),
+            ca_cert: None,
         };
         assert!(
             validate_remote_config(&config).is_err(),
@@ -46,6 +48,7 @@ fn malformed_remote_configuration_is_not_deferred() {
         vault_addr: "http://127.0.0.1:1".into(),
         vault_token: "revoked-but-syntactically-valid".into(),
         mount_path: Some("nested/transit".into()),
+        ca_cert: None,
     };
     assert!(
         validate_remote_config(&valid).is_ok(),

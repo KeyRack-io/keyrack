@@ -74,6 +74,8 @@ impl CustodyReadiness {
 pub struct ProviderState {
     pub custody: ProviderCustody,
     pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -106,14 +108,17 @@ pub async fn provider_readiness(
             ProviderState {
                 custody: custody.custody(&name, &entry.provider),
                 status: "unavailable",
+                reason: None,
             },
         );
         probes.spawn(async move {
-            let ready = matches!(
-                tokio::time::timeout_at(deadline, entry.provider.check_readiness()).await,
-                Ok(Ok(()))
-            );
-            (name, ready)
+            let reason =
+                match tokio::time::timeout_at(deadline, entry.provider.check_readiness()).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(crate::deferred_provider::availability_reason(&error)),
+                    Err(_) => Some("probe_timed_out"),
+                };
+            (name, reason)
         });
     }
     let connections = tokio::time::timeout_at(deadline, storage.list_hsm_connections()).await;
@@ -125,7 +130,7 @@ pub async fn provider_readiness(
             let owner = if connection.scope_owner.as_deref().is_some_and(|owner| {
                 owner
                     .strip_prefix("tenant:")
-                    .is_some_and(|tenant| !tenant.is_empty())
+                    .is_some_and(|tenant| !tenant.trim().is_empty())
             }) {
                 ProviderCustody::Customer
             } else {
@@ -136,6 +141,7 @@ pub async fn provider_readiness(
                 ProviderState {
                     custody: owner,
                     status: "unavailable",
+                    reason: None,
                 },
             );
             if let Some((_, entry)) = entries.iter().find(|(entry_name, entry)| {
@@ -150,14 +156,16 @@ pub async fn provider_readiness(
         }
     }
     while let Some(result) = probes.join_next().await {
-        if let Ok((name, ready)) = result {
-            if ready {
-                if let Some(state) = report.states.get_mut(&name.to_string()) {
+        if let Ok((name, reason)) = result {
+            if let Some(state) = report.states.get_mut(&name.to_string()) {
+                state.reason = reason;
+                if reason.is_none() {
                     state.status = "available";
                 }
             }
         }
     }
+
     for (name, state) in &mut report.connections {
         if entries.iter().any(|(entry_name, entry)| {
             entry_name.as_str() == name
@@ -166,6 +174,7 @@ pub async fn provider_readiness(
         }) {
             if let Some(provider) = report.states.get(name) {
                 state.status = provider.status;
+                state.reason = provider.reason;
             }
         }
     }

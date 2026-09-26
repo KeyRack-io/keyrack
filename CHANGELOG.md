@@ -22,11 +22,16 @@ All notable changes to KeyRack will be documented in this file.
   TLS verification failures are `Provider` errors instead of availability errors.
 - Named providers accept `custody: platform | customer` (default `platform`).
   Optional Vault Transit and PKCS#11 backends construct with bounded retries;
-  backend failures return `ProviderUnavailable` while local configuration
-  errors still fail startup. PKCS#11 construction retries begin at 30 seconds.
+  construction failures return `ProviderUnavailable` and are logged with retry
+  context, while local configuration errors still fail startup. After construction,
+  backend errors pass through unchanged. PKCS#11 construction retries begin at
+  30 seconds. Deferred Vault construction and readiness honor `ca_cert`; invalid
+  local CA material fails startup, while TLS verification refusal is reported as
+  `tls_verification_failed` without gating optional-provider readiness.
 - `/readyz` reports `provider_states` and `connection_states`; optional provider
   outages and failed tenant-owned stored connections do not gate readiness.
-  Platform-owned and ownerless stored connections retain the readiness guard.
+  Platform-owned, ownerless and blank tenant-owned stored connections retain
+  the readiness guard.
   Known limitation: a stored connection that fails boot rehydration stays
   unavailable until a restart successfully loads it.
 
