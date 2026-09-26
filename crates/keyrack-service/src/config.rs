@@ -572,7 +572,7 @@ pub enum AuthnConfig {
         #[serde(default)]
         required_san: Option<String>,
         /// Exact SAN alternatives for multiple delegators sharing this CA.
-        /// Mutually exclusive with required_san; 1..=32 unique non-empty values.
+        /// Mutually exclusive with `required_san`; 1..=32 unique non-empty values.
         #[serde(default)]
         required_sans: Option<Vec<String>>,
         #[serde(default)]
