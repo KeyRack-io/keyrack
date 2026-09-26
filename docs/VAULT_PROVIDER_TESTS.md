@@ -1,13 +1,13 @@
 # Live Vault provider tests
 
-Run from a checkout with Rust, Docker, and a Docker Compose version supporting
+Run from a checkout with Rust, OpenSSL, Docker, and a Docker Compose version supporting
 `up --wait --wait-timeout`:
 
 ```bash
 bash scripts/test-vault-provider.sh
 ```
 
-The runner reuses the `vault` and `vault-init` services from
+The runner uses the `vault`, `vault-init`, and opt-in `vault-tls` services from
 `demos/01-foss-vault/docker-compose.yml`. It starts only those services, with a
 unique Compose project, an ephemeral loopback-only port, disposable development
 credentials, and no host data mounts. It ignores caller Vault credentials and
@@ -15,7 +15,7 @@ refuses remote Docker endpoints. Its exit/signal cleanup tears down only its own
 project, including anonymous volumes. A force-killed runner or failed Docker
 daemon can prevent cleanup; the project name is printed in the run output.
 
-The CI job **Vault provider export tests** verifies that all ten required ignored tests are
+The CI job **Vault provider export tests** verifies that all fourteen required ignored tests are
 discoverable and runs them serially, plus any additional ignored tests in the
 provider library. The four original export-policy tests remain required:
 
@@ -34,6 +34,23 @@ Six additional required tests cover authenticated encryption and availability:
 | `legacy_ciphertext_without_associated_data_is_authentication_failure` | Both absent-AAD and old context-only ciphertext are valid without AAD, but fail authentication with the required AAD; the key is non-derived. |
 | `sealed_vault_is_unavailable_and_restores_existing_ciphertext` | Sealed Vault returns HTTP 503; both decrypt and the construction-time health check report `ProviderUnavailable` with `Vault is sealed`. The same instance is unsealed and its pre-seal ciphertext decrypts. |
 | `unreachable_vault_is_unavailable_within_timeout` | A refused loopback connection reports `ProviderUnavailable` with a connection-failure cause within the request deadline, including during construction. |
+
+Four TLS tests (under `tls_tests::`) are also required:
+
+- `tls_private_ca_and_bundle_round_trip`: constructor health check and AAD round-trip
+  succeed with the correct CA and with a multi-certificate bundle.
+- `tls_default_and_unrelated_roots_are_refused`: built-in roots and an unrelated
+  private CA each produce a TLS verification error with `UnknownIssuer`.
+- `tls_private_ca_does_not_bypass_hostname_verification`: the correct CA with a
+  mismatched hostname reports that the certificate is not valid for that name; only DNS resolution is overridden.
+- `tls_ca_file_errors_fail_construction`: missing, empty, invalid PEM and invalid
+  certificate DER fail construction with the provider name and configured path.
+
+The TLS instance uses the same digest-pinned Vault 1.17.6 image with `-dev-tls`.
+Its generated CA is copied into the runner's temporary directory. OpenSSL creates
+an unrelated CA for the negative control; its private key is removed immediately.
+The runner deletes its certificate files during cleanup. Existing HTTP provider,
+service and worker assertions continue to use the plain-HTTP instance.
 
 The seal test requires `KEYRACK_VAULT_TEST_UNSEAL_KEY`, obtained by the runner from
 its own disposable instance. It refuses to seal without that capability. Do not
@@ -111,7 +128,8 @@ construction-time mount health check remains in place.
 
 | Failure | Error class |
 | --- | --- |
-| Connection failure | `KeyRackError::ProviderUnavailable` |
+| TLS certificate or hostname verification failure | `KeyRackError::Provider`, naming TLS verification |
+| Other connection failure | `KeyRackError::ProviderUnavailable` |
 | Connection or request/body timeout | `KeyRackError::ProviderUnavailable` |
 | HTTP 503, including sealed Vault | `KeyRackError::ProviderUnavailable` |
 | Every other HTTP failure, including AAD authentication failure (400) | Existing `KeyRackError::Provider` |
@@ -120,3 +138,28 @@ construction-time mount health check remains in place.
 Same-provider re-encryption uses Core's decrypt-then-encrypt path because this
 provider advertises `supports_atomic_re_encrypt: false`, so it receives the same
 AAD handling.
+
+
+## Private CA configuration
+
+```yaml
+provider:
+  type: vault_transit
+  vault_addr: "https://vault.internal:8200"
+  vault_token: "<vault-token>"
+  mount_path: "transit"
+  ca_cert: "/etc/keyrack/vault-ca.pem"
+```
+
+`ca_cert` is optional and names a PEM file containing one or more certificates.
+When set, this client trusts **only those certificates**: built-in roots are
+turned off. Certificate-chain and hostname verification remain enabled. A missing,
+unreadable, empty or invalid certificate file fails construction and identifies
+Vault Transit and the path in the error. Certificate and hostname verification
+failures are `Provider` errors naming TLS verification, rather than transport
+unavailability. Other connection failures retain `ProviderUnavailable`.
+
+When omitted, the existing built-in WebPKI roots remain unchanged. The OS trust
+store and `SSL_CERT_FILE` do not configure this client. The existing `new`
+constructor remains compatible; Rust callers can use `new_with_ca_cert` to supply
+the optional path. Both paths use the same client builder and fixed timeouts.

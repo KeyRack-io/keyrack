@@ -16,6 +16,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 command -v docker >/dev/null
 command -v cargo >/dev/null
+command -v openssl >/dev/null
 docker compose version
 
 # The fixture is local-only. Never start it on a caller's remote Docker context.
@@ -47,6 +48,10 @@ required_tests=(
     live_tests::legacy_ciphertext_without_associated_data_is_authentication_failure
     live_tests::sealed_vault_is_unavailable_and_restores_existing_ciphertext
     live_tests::unreachable_vault_is_unavailable_within_timeout
+    tls_tests::tls_private_ca_and_bundle_round_trip
+    tls_tests::tls_default_and_unrelated_roots_are_refused
+    tls_tests::tls_private_ca_does_not_bypass_hostname_verification
+    tls_tests::tls_ca_file_errors_fail_construction
 )
 for test_name in "${required_tests[@]}"; do
     if ! grep -Fxq "$test_name: test" <<< "$available_tests"; then
@@ -73,7 +78,7 @@ done
 # its own empty temporary directory, never another demo/deployment's resources.
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/keyrack-vault-ci.XXXXXXXX")"
 project_name="$(basename "$fixture_dir" | tr '[:upper:].' '[:lower:]-')"
-compose=(docker compose --env-file /dev/null --project-name "$project_name"
+compose=(docker compose --env-file /dev/null --project-name "$project_name" --profile provider-tls
     --file "$repo_root/demos/01-foss-vault/docker-compose.yml")
 fixture_started=0
 cleanup() {
@@ -81,13 +86,15 @@ cleanup() {
     trap - EXIT INT TERM
     if [[ "$fixture_started" == 1 ]]; then
         if [[ "$result" != 0 ]]; then
-            "${compose[@]}" logs --no-color vault | sed -E 's/(Unseal Key:|Root Token:).*/\1 [redacted]/' >&2 || true
+            "${compose[@]}" logs --no-color vault vault-tls | sed -E 's/(Unseal Key:|Root Token:).*/\1 [redacted]/' >&2 || true
         fi
         if ! "${compose[@]}" down --volumes --timeout 10; then
             echo "Failed to clean owned Vault fixture: $project_name" >&2
             result=1
         fi
     fi
+    rm -f -- "$fixture_dir/ca.pem" "$fixture_dir/other.pem" "$fixture_dir/other.key" \
+        "$fixture_dir/bundle.pem" "$fixture_dir/invalid.pem" "$fixture_dir/empty.pem" "$fixture_dir/invalid-der.pem"
     if ! rmdir -- "$fixture_dir"; then
         echo "Failed to remove owned empty fixture directory: $fixture_dir" >&2
         result=1
@@ -120,7 +127,7 @@ export no_proxy="$NO_PROXY"
 unset VAULT_NAMESPACE
 
 fixture_started=1
-"${compose[@]}" up --detach --wait --wait-timeout 60 vault
+"${compose[@]}" up --detach --wait --wait-timeout 60 vault vault-tls
 "${compose[@]}" run --rm --no-deps vault-init
 published_address="$("${compose[@]}" port vault 8200)"
 if [[ ! "$published_address" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
@@ -128,6 +135,25 @@ if [[ ! "$published_address" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
     exit 1
 fi
 export VAULT_ADDR="http://$published_address"
+tls_address="$("${compose[@]}" port vault-tls 8200)"
+if [[ ! "$tls_address" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
+    echo "Expected one loopback-only TLS Vault port" >&2
+    exit 1
+fi
+export KEYRACK_VAULT_TLS_ADDR="https://$tls_address"
+"${compose[@]}" exec --no-TTY vault-tls sh -c 'VAULT_TOKEN="$VAULT_DEV_ROOT_TOKEN_ID" vault secrets enable transit'
+"${compose[@]}" cp vault-tls:/tmp/vault-ca.pem "$fixture_dir/ca.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=UnrelatedRoot \
+    -keyout "$fixture_dir/other.key" -out "$fixture_dir/other.pem" >/dev/null 2>&1
+rm -- "$fixture_dir/other.key"
+cat "$fixture_dir/other.pem" "$fixture_dir/ca.pem" > "$fixture_dir/bundle.pem"
+printf '%s\n' 'not a PEM certificate' > "$fixture_dir/invalid.pem"
+: > "$fixture_dir/empty.pem"
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'AA==' '-----END CERTIFICATE-----' > "$fixture_dir/invalid-der.pem"
+export KEYRACK_VAULT_CA_CERT="$fixture_dir/ca.pem"
+export KEYRACK_VAULT_OTHER_CA_CERT="$fixture_dir/other.pem"
+export KEYRACK_VAULT_CA_BUNDLE="$fixture_dir/bundle.pem"
+
 # Only this runner's newly provisioned instance may be sealed by the live test.
 # Do not print the unseal capability or inherit one from the caller.
 KEYRACK_VAULT_TEST_UNSEAL_KEY="$("${compose[@]}" logs --no-color --no-log-prefix vault | sed -n 's/^Unseal Key: //p' | tr -d '\r')"

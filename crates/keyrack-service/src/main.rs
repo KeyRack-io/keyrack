@@ -437,12 +437,14 @@ async fn build_provider(
             vault_addr,
             vault_token,
             mount_path,
+            ca_cert,
         } => (
             Arc::new(
-                keyrack_vault::VaultTransitProvider::new(
+                keyrack_vault::VaultTransitProvider::new_with_ca_cert(
                     vault_addr,
                     vault_token,
                     mount_path.as_deref(),
+                    ca_cert.as_deref(),
                 )
                 .await?,
             ),

@@ -46,7 +46,58 @@ fn http_client_builder() -> reqwest::ClientBuilder {
         .timeout(REQUEST_TIMEOUT)
 }
 
+fn configured_client(
+    ca_cert: Option<&str>,
+    customize: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<Client> {
+    let mut builder = http_client_builder();
+    if let Some(path) = ca_cert {
+        let invalid =
+            |reason| KeyRackError::Provider(format!("Vault Transit CA file {path}: {reason}"));
+        let pem = std::fs::read(path).map_err(|error| invalid(format!("cannot read: {error}")))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|error| invalid(format!("invalid PEM: {error}")))?;
+        if certificates.is_empty() {
+            return Err(invalid("no certificates in PEM file".into()));
+        }
+        builder = builder.tls_built_in_root_certs(false);
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    customize(builder).build().map_err(|error| {
+        KeyRackError::Provider(match ca_cert {
+            Some(path) => format!("Vault Transit CA file {path}: cannot build TLS client: {error}"),
+            None => format!("failed to build HTTP client: {error}"),
+        })
+    })
+}
+
+fn tls_verification_failure(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(cause) = source {
+        match cause.downcast_ref::<rustls::Error>() {
+            Some(rustls::Error::InvalidCertificate(reason)) => return Some(reason.to_string()),
+            Some(rustls::Error::NoCertificatesPresented) => {
+                return Some("no certificates presented".into())
+            }
+            _ => {}
+        }
+        // io::Error::source delegates to its payload's source, skipping the
+        // payload itself. Inspect get_ref() so InvalidCertificate is not lost.
+        source = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| cause.source());
+    }
+    None
+}
+
 fn transport_error(context: &str, error: &reqwest::Error) -> KeyRackError {
+    if let Some(reason) = tls_verification_failure(error) {
+        return KeyRackError::Provider(format!("{context}: TLS verification failed: {reason}"));
+    }
     let message = format!("{context}: {error}");
     if error.is_timeout() {
         KeyRackError::ProviderUnavailable(format!("{context}: request timed out: {error}"))
@@ -100,11 +151,30 @@ impl VaultTransitProvider {
         vault_token: &str,
         mount_path: Option<&str>,
     ) -> Result<Self> {
-        let addr = vault_addr.trim_end_matches('/').to_owned();
-        let client = http_client_builder()
-            .build()
-            .map_err(|e| KeyRackError::Provider(format!("failed to build HTTP client: {e}")))?;
+        Self::new_with_ca_cert(vault_addr, vault_token, mount_path, None).await
+    }
 
+    /// Connect using only the certificates in `ca_cert` when supplied.
+    ///
+    /// The file must contain one or more PEM certificates. Built-in roots are
+    /// disabled for this client; hostname and chain verification remain enabled.
+    pub async fn new_with_ca_cert(
+        vault_addr: &str,
+        vault_token: &str,
+        mount_path: Option<&str>,
+        ca_cert: Option<&str>,
+    ) -> Result<Self> {
+        let client = configured_client(ca_cert, std::convert::identity)?;
+        Self::with_client(vault_addr, vault_token, mount_path, client).await
+    }
+
+    async fn with_client(
+        vault_addr: &str,
+        vault_token: &str,
+        mount_path: Option<&str>,
+        client: Client,
+    ) -> Result<Self> {
+        let addr = vault_addr.trim_end_matches('/').to_owned();
         let provider = Self {
             client,
             vault_addr: addr,
@@ -910,3 +980,6 @@ mod transport_tests;
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod tls_tests;
