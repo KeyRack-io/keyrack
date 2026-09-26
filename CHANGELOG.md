@@ -4,6 +4,16 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Vault Transit now authenticates encryption AAD using `associated_data` instead
+  of the ignored `context` field on non-derived keys. Vault ciphertext created
+  before this fix no longer decrypts with the required header and encryption
+  context; create fresh keys. There is no unauthenticated-decryption fallback.
+- Vault HTTP operations now have a 5-second connection timeout and a 15-second
+  request timeout. Connection failures, timeouts and HTTP 503 return
+  `ProviderUnavailable`; other error classes are unchanged.
+
 ### Added
 
 - **Wrapping operations exist and can be called.** `crates/keyrack-core` defined

@@ -15,14 +15,38 @@ refuses remote Docker endpoints. Its exit/signal cleanup tears down only its own
 project, including anonymous volumes. A force-killed runner or failed Docker
 daemon can prevent cleanup; the project name is printed in the run output.
 
-The CI job **Vault provider export tests** verifies that these four original
-ignored tests are discoverable and runs them, plus any additional ignored tests
-in the provider library:
+The CI job **Vault provider export tests** verifies that all ten required ignored tests are
+discoverable and runs them serially, plus any additional ignored tests in the
+provider library. The four original export-policy tests remain required:
 
 - `exportable_round_trip`
 - `loosen_then_export`
 - `tighten_soft_revoke_preserves_data`
 - `non_exportable_has_no_export_path`
+
+Six additional required tests cover authenticated encryption and availability:
+
+| Test (under `live_tests::`) | Assertion |
+| --- | --- |
+| `matching_associated_data_round_trips` | Matching binary AAD decrypts to the original plaintext. |
+| `tampered_associated_data_is_authentication_failure` | Changed AAD returns HTTP 400 and `cipher: message authentication failed`. |
+| `omitted_associated_data_is_authentication_failure` | Missing AAD on bound ciphertext returns the same authentication failure. |
+| `legacy_ciphertext_without_associated_data_is_authentication_failure` | Both absent-AAD and old context-only ciphertext are valid without AAD, but fail authentication with the required AAD; the key is non-derived. |
+| `sealed_vault_is_unavailable_and_restores_existing_ciphertext` | Sealed Vault returns HTTP 503; both decrypt and the construction-time health check report `ProviderUnavailable` with `Vault is sealed`. The same instance is unsealed and its pre-seal ciphertext decrypts. |
+| `unreachable_vault_is_unavailable_within_timeout` | A refused loopback connection reports `ProviderUnavailable` with a connection-failure cause within the request deadline, including during construction. |
+
+The seal test requires `KEYRACK_VAULT_TEST_UNSEAL_KEY`, obtained by the runner from
+its own disposable instance. It refuses to seal without that capability. Do not
+run it concurrently with any Vault tests. It attempts unseal before asserting the
+observations collected while sealed. The runner also checks that Vault is
+unsealed before invoking an additional test runner, and does not pass the unseal
+key to that command. Restarting Vault is not a substitute for unsealing: the
+existing ciphertext must remain decryptable.
+
+Ordinary provider unit tests capture encrypt/decrypt HTTP requests to verify
+base64 `associated_data` and absence of `context`. They also exercise stalled
+headers and bodies with shorter test-only deadlines, HTTP error classification
+across all request helpers, and malformed JSON responses.
 
 Missing tests, an unavailable Vault, initialization failures, failed assertions,
 and cleanup failures fail the lane. Ordinary `cargo test --workspace` still leaves
@@ -60,5 +84,33 @@ These tests exercise real Vault export and soft-revoke semantics. In particular,
 soft revocation does not unset Vault's one-way exportable flag: the KeyRack
 service remains responsible for its own export-policy gate. Passing this lane
 does not qualify parent-wrapped hierarchy, a trusted worker, or custody-preserving
-cross-provider transport. The fixture follows demo-01's Vault image version and
-is not a production Vault configuration.
+cross-provider transport. Both fixture services pin Vault 1.17.6 by image digest:
+`sha256:74a4ab138ab5d64725e89cd9a9c73f7040c7fe49e98b71697b275ca9a69919df`.
+This is not a production Vault configuration.
+
+## AAD compatibility and HTTP failures
+
+Encrypt and decrypt send AAD as base64 `associated_data`. Non-derived Vault keys
+ignore `context`, so the previous requests did not authenticate KeyRack's header
+or encryption context. **Breaking change:** Vault ciphertext created before this
+fix no longer decrypts with the required header and encryption context; create
+fresh keys. There is no retry without AAD, compatibility switch, or change to
+derived keys. An explicitly empty AAD still means empty AAD; this does not bypass
+authentication for ciphertext created with nonempty AAD.
+
+The HTTP client has a fixed 5-second connection timeout and 15-second total
+request timeout, including response-body reads. Only tests override them; there
+is no configuration field or constructor signature change. The existing
+construction-time mount health check remains in place.
+
+| Failure | Error class |
+| --- | --- |
+| Connection failure | `KeyRackError::ProviderUnavailable` |
+| Connection or request/body timeout | `KeyRackError::ProviderUnavailable` |
+| HTTP 503, including sealed Vault | `KeyRackError::ProviderUnavailable` |
+| Every other HTTP failure, including AAD authentication failure (400) | Existing `KeyRackError::Provider` |
+| Other transport, JSON, and response-decoding failures | Existing error behavior preserved |
+
+Same-provider re-encryption uses Core's decrypt-then-encrypt path because this
+provider advertises `supports_atomic_re_encrypt: false`, so it receives the same
+AAD handling.
