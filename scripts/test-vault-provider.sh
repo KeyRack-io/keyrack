@@ -138,6 +138,10 @@ fi
 export KEYRACK_VAULT_TEST_UNSEAL_KEY
 echo "Running mandatory Vault provider tests on disposable fixture $project_name"
 cargo test --locked -p keyrack-vault --lib -- --ignored --nocapture --test-threads=1
+availability_test=(cargo test --locked -p keyrack-service --test provider_service_availability)
+available_availability_tests="$("${availability_test[@]}" -- --ignored --list --color never)"
+grep -Fxq 'sealed_optional_vault_boots_and_recovers_existing_ciphertext_without_restart: test' <<< "$available_availability_tests"
+"${availability_test[@]}" -- --ignored --nocapture --test-threads=1
 unset KEYRACK_VAULT_TEST_UNSEAL_KEY
 # Confirm the same instance is usable before invoking additional assertions.
 "${compose[@]}" exec --no-TTY vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' >/dev/null
