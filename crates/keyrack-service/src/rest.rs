@@ -2061,12 +2061,21 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    let (storage, providers_ok) = tokio::join!(
+async fn readyz(
+    State(state): State<AppState>,
+    custody: Option<axum::Extension<crate::readiness::CustodyReadiness>>,
+) -> impl IntoResponse {
+    let custody = custody.map(|extension| extension.0).unwrap_or_default();
+    let (storage, provider_report) = tokio::join!(
         tokio::time::timeout(crate::readiness::PROBE_TIMEOUT, state.storage.ping()),
-        crate::readiness::providers_ready(Arc::clone(&state.providers), Arc::clone(&state.storage)),
+        crate::readiness::provider_readiness(
+            Arc::clone(&state.providers),
+            Arc::clone(&state.storage),
+            &custody
+        ),
     );
     let storage_ok = matches!(storage, Ok(Ok(())));
+    let providers_ok = provider_report.ready;
     let ready = storage_ok && providers_ok;
     (
         if ready {
@@ -2078,6 +2087,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             "status": if ready { "ready" } else { "not_ready" },
             "storage": if storage_ok { "ok" } else { "error" },
             "providers": if providers_ok { "ok" } else { "error" },
+            "provider_states": provider_report.states,
         })),
     )
 }

@@ -104,7 +104,19 @@ fn state(providers: Arc<dyn ProviderRegistry>) -> Arc<ServiceState> {
 }
 
 async fn ready(state: Arc<ServiceState>) -> (StatusCode, String) {
+    ready_with_custody(
+        state,
+        keyrack_service::readiness::CustodyReadiness::default(),
+    )
+    .await
+}
+
+async fn ready_with_custody(
+    state: Arc<ServiceState>,
+    custody: keyrack_service::readiness::CustodyReadiness,
+) -> (StatusCode, String) {
     let response = keyrack_service::rest::router(state)
+        .layer(axum::Extension(custody))
         .oneshot(
             Request::builder()
                 .uri("/readyz")
@@ -223,4 +235,157 @@ async fn hung_token_is_bounded_and_does_not_starve_the_async_executor() {
         .expect("readiness must finish within its 2-second budget")
         .unwrap();
     assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn optional_backend_outage_is_reported_without_gating_readiness() {
+    let platform = TokenProbe::new(true, false);
+    let external = TokenProbe::new(false, false);
+    let external_entry = entry(external.clone());
+    let mut custody = keyrack_service::readiness::CustodyReadiness::default();
+    custody.insert(
+        ProviderRef::new("external"),
+        external_entry.provider.clone(),
+    );
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [
+                (ProviderRef::new("default"), entry(platform.clone())),
+                (ProviderRef::new("external"), external_entry),
+            ],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    let (status, body) = ready_with_custody(app.clone(), custody.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "optional provider must not gate readiness"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["provider_states"]["external"],
+        serde_json::json!({"custody":"customer", "status":"unavailable"})
+    );
+    assert_eq!(body["provider_states"]["default"]["status"], "available");
+    assert!(!body.to_string().contains("private backend detail"));
+    external.available.store(true, Ordering::SeqCst);
+    let (_, body) = ready_with_custody(app.clone(), custody.clone()).await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["provider_states"]["external"]["status"], "available");
+    platform.available.store(false, Ordering::SeqCst);
+    assert_eq!(
+        ready_with_custody(app, custody).await.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "platform probe must remain mandatory"
+    );
+}
+
+#[tokio::test]
+async fn hung_optional_backend_is_bounded_without_gating_readiness() {
+    let external_entry = entry(TokenProbe::new(false, true));
+    let mut custody = keyrack_service::readiness::CustodyReadiness::default();
+    custody.insert(
+        ProviderRef::new("external"),
+        external_entry.provider.clone(),
+    );
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("default"),
+                    entry(TokenProbe::new(true, false)),
+                ),
+                (ProviderRef::new("external"), external_entry),
+            ],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_millis(2500),
+        ready_with_custody(app, custody),
+    )
+    .await
+    .expect("optional probe must be bounded");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "optional timeout must not gate readiness"
+    );
+    assert!(body.contains("unavailable"));
+}
+
+#[tokio::test]
+async fn runtime_replacement_cannot_inherit_a_readiness_exemption() {
+    let original = entry(TokenProbe::new(false, false));
+    let mut custody = keyrack_service::readiness::CustodyReadiness::default();
+    custody.insert(ProviderRef::new("external"), original.provider.clone());
+    let registry = Arc::new(
+        DynamicProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("default"),
+                    entry(TokenProbe::new(true, false)),
+                ),
+                (ProviderRef::new("external"), original),
+            ],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    );
+    let app = state(registry.clone());
+    assert_eq!(
+        ready_with_custody(app.clone(), custody.clone()).await.0,
+        StatusCode::OK
+    );
+    registry
+        .register(
+            ProviderRef::new("external"),
+            entry(TokenProbe::new(false, false)),
+        )
+        .unwrap();
+    assert_eq!(
+        ready_with_custody(app, custody).await.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a replacement provider must default to platform custody"
+    );
+}
+
+#[tokio::test]
+async fn wrong_class_cannot_hide_a_missing_persisted_connection() {
+    let app = state(Arc::new(
+        StaticProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("default"),
+                    entry(TokenProbe::new(true, false)),
+                ),
+                (
+                    ProviderRef::new("persisted"),
+                    ProviderEntry {
+                        provider: TokenProbe::new(true, false),
+                        class: ProviderClass::Software,
+                    },
+                ),
+            ],
+            ProviderRef::new("default"),
+        )
+        .unwrap(),
+    ));
+    app.storage
+        .create_hsm_connection(
+            &HsmConnection::new("persisted", HsmProviderType::Hsm, "/missing/lib.so", "test")
+                .with_pkcs11("token", "file:token.pin"),
+        )
+        .await
+        .unwrap();
+    let (status, body) = ready(app).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["provider_states"]["persisted"]["status"], "missing",
+        "a healthy wrong-class provider must not hide the missing connection"
+    );
 }
