@@ -41,6 +41,12 @@ required_tests=(
     tests::loosen_then_export
     tests::tighten_soft_revoke_preserves_data
     tests::non_exportable_has_no_export_path
+    live_tests::matching_associated_data_round_trips
+    live_tests::tampered_associated_data_is_authentication_failure
+    live_tests::omitted_associated_data_is_authentication_failure
+    live_tests::legacy_ciphertext_without_associated_data_is_authentication_failure
+    live_tests::sealed_vault_is_unavailable_and_restores_existing_ciphertext
+    live_tests::unreachable_vault_is_unavailable_within_timeout
 )
 for test_name in "${required_tests[@]}"; do
     if ! grep -Fxq "$test_name: test" <<< "$available_tests"; then
@@ -62,7 +68,7 @@ cleanup() {
     trap - EXIT INT TERM
     if [[ "$fixture_started" == 1 ]]; then
         if [[ "$result" != 0 ]]; then
-            "${compose[@]}" logs --no-color vault >&2 || true
+            "${compose[@]}" logs --no-color vault | sed -E 's/(Unseal Key:|Root Token:).*/\1 [redacted]/' >&2 || true
         fi
         if ! "${compose[@]}" down --volumes --timeout 10; then
             echo "Failed to clean owned Vault fixture: $project_name" >&2
@@ -109,8 +115,19 @@ if [[ ! "$published_address" =~ ^127\.0\.0\.1:([0-9]+)$ ]]; then
     exit 1
 fi
 export VAULT_ADDR="http://$published_address"
+# Only this runner's newly provisioned instance may be sealed by the live test.
+# Do not print the unseal capability or inherit one from the caller.
+KEYRACK_VAULT_TEST_UNSEAL_KEY="$("${compose[@]}" logs --no-color --no-log-prefix vault | sed -n 's/^Unseal Key: //p' | tr -d '\r')"
+if [[ -z "$KEYRACK_VAULT_TEST_UNSEAL_KEY" || "$KEYRACK_VAULT_TEST_UNSEAL_KEY" == *$'\n'* ]]; then
+    echo "Expected one unseal key from the owned Vault instance" >&2
+    exit 1
+fi
+export KEYRACK_VAULT_TEST_UNSEAL_KEY
 echo "Running mandatory Vault provider tests on disposable fixture $project_name"
 cargo test --locked -p keyrack-vault --lib -- --ignored --nocapture --test-threads=1
+unset KEYRACK_VAULT_TEST_UNSEAL_KEY
+# Confirm the same instance is usable before invoking additional assertions.
+"${compose[@]}" exec --no-TTY vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault status' >/dev/null
 
 # A future integration suite can use the same live fixture without replacing the
 # provider gate, adding a second Vault stack, or passing deployment credentials.

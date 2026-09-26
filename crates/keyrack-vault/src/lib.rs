@@ -35,6 +35,53 @@ use keyrack_core::provider::{
 use keyrack_core::sensitive::Sensitive;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn http_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+}
+
+fn transport_error(context: &str, error: &reqwest::Error) -> KeyRackError {
+    let message = format!("{context}: {error}");
+    if error.is_timeout() {
+        KeyRackError::ProviderUnavailable(format!("{context}: request timed out: {error}"))
+    } else if error.is_connect() {
+        KeyRackError::ProviderUnavailable(format!("{context}: connection failed: {error}"))
+    } else {
+        KeyRackError::Provider(message)
+    }
+}
+
+fn status_error(status: reqwest::StatusCode, message: String) -> KeyRackError {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        KeyRackError::ProviderUnavailable(message)
+    } else {
+        KeyRackError::Provider(message)
+    }
+}
+
+async fn response_text(response: reqwest::Response, allow_empty_on_error: bool) -> Result<String> {
+    let status = response.status();
+    match response.text().await {
+        Ok(text) => Ok(text),
+        Err(error) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => Err(status_error(
+            status,
+            format!(
+                "vault returned {status}: {}",
+                transport_error("failed to read vault response", &error)
+            ),
+        )),
+        Err(error) if error.is_connect() || error.is_timeout() || !allow_empty_on_error => {
+            Err(transport_error("failed to read vault response", &error))
+        }
+        Err(_) => Ok(String::new()),
+    }
+}
 
 /// Crypto provider backed by `HashiCorp` Vault's Transit secrets engine.
 pub struct VaultTransitProvider {
@@ -54,7 +101,7 @@ impl VaultTransitProvider {
         mount_path: Option<&str>,
     ) -> Result<Self> {
         let addr = vault_addr.trim_end_matches('/').to_owned();
-        let client = Client::builder()
+        let client = http_client_builder()
             .build()
             .map_err(|e| KeyRackError::Provider(format!("failed to build HTTP client: {e}")))?;
 
@@ -79,14 +126,15 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| KeyRackError::Provider(format!("vault health check failed: {e}")))?;
+            .map_err(|e| transport_error("vault health check failed", &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KeyRackError::Provider(format!(
-                "vault health check returned {status}: {body}"
-            )));
+            let body = response_text(resp, true).await?;
+            return Err(status_error(
+                status,
+                format!("vault health check returned {status}: {body}"),
+            ));
         }
         Ok(())
     }
@@ -108,19 +156,17 @@ impl VaultTransitProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| KeyRackError::Provider(format!("vault request failed: {e}")))?;
+            .map_err(|e| transport_error("vault request failed", &e))?;
 
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("failed to read vault response: {e}")))?;
+        let text = response_text(resp, false).await?;
 
         if !status.is_success() {
             let msg = parse_vault_errors(&text).unwrap_or(text);
-            return Err(KeyRackError::Provider(format!(
-                "vault {path} returned {status}: {msg}"
-            )));
+            return Err(status_error(
+                status,
+                format!("vault {path} returned {status}: {msg}"),
+            ));
         }
 
         serde_json::from_str(&text)
@@ -136,15 +182,16 @@ impl VaultTransitProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| KeyRackError::Provider(format!("vault request failed: {e}")))?;
+            .map_err(|e| transport_error("vault request failed", &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = response_text(resp, true).await?;
             let msg = parse_vault_errors(&text).unwrap_or(text);
-            return Err(KeyRackError::Provider(format!(
-                "vault {path} returned {status}: {msg}"
-            )));
+            return Err(status_error(
+                status,
+                format!("vault {path} returned {status}: {msg}"),
+            ));
         }
         Ok(())
     }
@@ -157,15 +204,16 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| KeyRackError::Provider(format!("vault delete failed: {e}")))?;
+            .map_err(|e| transport_error("vault delete failed", &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = response_text(resp, true).await?;
             let msg = parse_vault_errors(&body).unwrap_or(body);
-            return Err(KeyRackError::Provider(format!(
-                "vault DELETE {path} returned {status}: {msg}"
-            )));
+            return Err(status_error(
+                status,
+                format!("vault DELETE {path} returned {status}: {msg}"),
+            ));
         }
         Ok(())
     }
@@ -178,19 +226,17 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| KeyRackError::Provider(format!("vault GET failed: {e}")))?;
+            .map_err(|e| transport_error("vault GET failed", &e))?;
 
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| KeyRackError::Provider(format!("failed to read vault response: {e}")))?;
+        let text = response_text(resp, false).await?;
 
         if !status.is_success() {
             let msg = parse_vault_errors(&text).unwrap_or(text);
-            return Err(KeyRackError::Provider(format!(
-                "vault GET {path} returned {status}: {msg}"
-            )));
+            return Err(status_error(
+                status,
+                format!("vault GET {path} returned {status}: {msg}"),
+            ));
         }
 
         serde_json::from_str(&text)
@@ -264,7 +310,7 @@ struct CreateKeyRequest {
 struct EncryptRequest {
     plaintext: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
+    associated_data: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -281,7 +327,7 @@ struct EncryptData {
 struct DecryptRequest {
     ciphertext: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
+    associated_data: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -401,7 +447,7 @@ impl CryptoProvider for VaultTransitProvider {
     ) -> Result<EncryptOutput> {
         let body = EncryptRequest {
             plaintext: B64.encode(plaintext),
-            context: if aad.is_empty() {
+            associated_data: if aad.is_empty() {
                 None
             } else {
                 Some(B64.encode(aad))
@@ -429,7 +475,7 @@ impl CryptoProvider for VaultTransitProvider {
 
         let body = DecryptRequest {
             ciphertext: ct_str.to_owned(),
-            context: if aad.is_empty() {
+            associated_data: if aad.is_empty() {
                 None
             } else {
                 Some(B64.encode(aad))
@@ -858,3 +904,9 @@ mod tests {
         provider.destroy_key(&handle).await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod transport_tests;
+
+#[cfg(test)]
+mod live_tests;
