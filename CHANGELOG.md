@@ -16,6 +16,11 @@ All notable changes to KeyRack will be documented in this file.
 
 ### Added
 
+- Vault Transit accepts an optional `ca_cert` PEM bundle. Configuring it replaces
+  built-in trust roots for that client while retaining chain and hostname
+  verification. Invalid CA files fail construction with the provider and path;
+  TLS verification failures are `Provider` errors instead of availability errors.
+
 - **Wrapping operations exist and can be called.** `crates/keyrack-core` defined
   `WrappingContext`, the capability tuples and `WrappingCapabilities::require()`,
   and storage and the creation journal handled `ParentWrapped` material, but

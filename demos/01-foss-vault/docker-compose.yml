@@ -31,6 +31,24 @@ services:
         vault secrets enable transit
         echo "Transit engine enabled"
 
+  vault-tls:
+    profiles: [provider-tls]
+    image: hashicorp/vault:1.17.6@sha256:74a4ab138ab5d64725e89cd9a9c73f7040c7fe49e98b71697b275ca9a69919df
+    command: ["server", "-dev", "-dev-tls", "-dev-tls-cert-dir=/tmp", "-dev-listen-address=0.0.0.0:8200"]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: demo-root-token
+      VAULT_ADDR: https://127.0.0.1:8200
+      VAULT_CACERT: /tmp/vault-ca.pem
+    ports:
+      - "127.0.0.1::8200"
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    cap_add:
+      - IPC_LOCK
+
   keyrack:
     build:
       context: ../..

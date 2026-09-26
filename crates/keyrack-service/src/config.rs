@@ -461,6 +461,9 @@ pub enum ProviderConfig {
         vault_addr: String,
         vault_token: String,
         mount_path: Option<String>,
+        /// PEM CA bundle; when set, replaces this client's built-in trust roots.
+        #[serde(default)]
+        ca_cert: Option<String>,
     },
 }
 
