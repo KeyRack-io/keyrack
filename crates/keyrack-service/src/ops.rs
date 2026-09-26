@@ -81,6 +81,8 @@ pub struct OpContext {
     // A second key is mandatory for ReEncrypt. Keep the binding private so a
     // generic single-resource context cannot accidentally authorize the pair.
     re_encrypt_destination: Option<String>,
+    // Bound only from a decoded version request, never caller metadata.
+    requested_version: Option<u32>,
 }
 
 impl OpContext {
@@ -93,7 +95,41 @@ impl OpContext {
             encryption_context_hash: None,
             request_id: new_request_id(),
             re_encrypt_destination: None,
+            requested_version: None,
         }
+    }
+
+    /// Bind `GetKeyVersion` authorization to the exact decoded version.
+    /// Missing or zero versions are rejected before the operation executes.
+    pub fn key_version(principal: Principal, key_id: &str, version: u32) -> Self {
+        let mut ctx = Self::key(AuditAction::GetKeyVersion, principal, key_id);
+        ctx.requested_version = Some(version);
+        ctx
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorization_context(&self) -> Result<RequestContext, tonic::Status> {
+        let mut context = RequestContext::default();
+        match (&self.action, self.requested_version) {
+            (AuditAction::GetKeyVersion, Some(version)) if self.resource_type == "Key" => {
+                if version == 0 {
+                    return Err(tonic::Status::invalid_argument(
+                        "key version must be positive",
+                    ));
+                }
+                context.entries.insert(
+                    "key_version".into(),
+                    keyrack_core::pdp::AttributeValue::Integer(i64::from(version)),
+                );
+            }
+            (AuditAction::GetKeyVersion, _) | (_, Some(_)) => {
+                return Err(tonic::Status::internal(
+                    "invalid key-version authorization context",
+                ));
+            }
+            (_, None) => {}
+        }
+        Ok(context)
     }
 
     /// Requires `kms:ReEncryptFrom` on the source and `kms:ReEncryptTo` on the destination;
@@ -113,6 +149,7 @@ impl OpContext {
             encryption_context_hash: None,
             request_id: new_request_id(),
             re_encrypt_destination: None,
+            requested_version: None,
         }
     }
 
@@ -130,6 +167,7 @@ impl OpContext {
             encryption_context_hash: None,
             request_id: new_request_id(),
             re_encrypt_destination: None,
+            requested_version: None,
         }
     }
 
@@ -142,6 +180,7 @@ impl OpContext {
             encryption_context_hash: None,
             request_id: new_request_id(),
             re_encrypt_destination: None,
+            requested_version: None,
         }
     }
 }
@@ -283,7 +322,7 @@ fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::S
             resource_type: ctx.resource_type.clone(),
             attributes: std::collections::BTreeMap::default(),
         },
-        context: RequestContext::default(),
+        context: ctx.authorization_context()?,
     };
     if ctx.action != AuditAction::ReEncryptFrom {
         if ctx.re_encrypt_destination.is_some() || ctx.action == AuditAction::ReEncryptTo {
@@ -560,7 +599,7 @@ pub async fn authorize_with_resource_attrs(
             resource_type: ctx.resource_type.clone(),
             attributes: resource_attrs,
         },
-        context: RequestContext::default(),
+        context: ctx.authorization_context()?,
     };
     authorize_request(state, &request).await
 }

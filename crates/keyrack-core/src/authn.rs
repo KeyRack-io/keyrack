@@ -487,6 +487,14 @@ impl MtlsBoundForwardedIdentityAuthenticator {
         self
     }
 
+    /// Require one exact SAN from the configured delegating workload allowlist.
+    /// An empty list matches no certificate. Other peer requirements still apply.
+    #[must_use]
+    pub fn with_required_sans(mut self, sans: Vec<String>) -> Self {
+        self.trusted_peer.required_sans = Some(sans);
+        self
+    }
+
     /// Require the delegating workload certificate to carry this exact OU.
     #[must_use]
     pub fn with_required_ou(mut self, ou: String) -> Self {
@@ -624,9 +632,9 @@ pub struct TrustedMtlsPeerAuthenticator {
     /// DER-encoded Subject DN of the trusted CA. The leaf cert's Issuer
     /// must match this exactly (byte equality).
     trusted_ca_subject_der: Vec<u8>,
-    /// Optional: require the leaf cert to contain a SAN matching this value
-    /// (exact match on DNS name or URI).
-    required_san: Option<String>,
+    /// Optional: require the leaf cert to contain one of these exact SANs
+    /// (DNS name or URI). An explicit empty list matches no certificate.
+    required_sans: Option<Vec<String>>,
     /// Optional: require the leaf cert's Subject to contain this OU.
     required_ou: Option<String>,
 }
@@ -644,7 +652,7 @@ impl TrustedMtlsPeerAuthenticator {
             .map_err(|e| AuthnError::Internal(format!("failed to encode CA subject: {e}")))?;
         Ok(Self {
             trusted_ca_subject_der,
-            required_san: None,
+            required_sans: None,
             required_ou: None,
         })
     }
@@ -652,7 +660,7 @@ impl TrustedMtlsPeerAuthenticator {
     /// Require the peer certificate to have a SAN matching this value.
     #[must_use]
     pub fn with_required_san(mut self, san: String) -> Self {
-        self.required_san = Some(san);
+        self.required_sans = Some(vec![san]);
         self
     }
 
@@ -697,7 +705,7 @@ impl TrustedMtlsPeerAuthenticator {
     fn check_san_requirement(&self, leaf: &Certificate) -> bool {
         const SAN_OID: der::oid::ObjectIdentifier =
             der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
-        let Some(ref required) = self.required_san else {
+        let Some(ref required) = self.required_sans else {
             return true;
         };
         let Some(extensions) = &leaf.tbs_certificate.extensions else {
@@ -712,10 +720,14 @@ impl TrustedMtlsPeerAuthenticator {
             };
             for name in &san.0 {
                 match name {
-                    GeneralName::UniformResourceIdentifier(uri) if uri.as_str() == required => {
+                    GeneralName::UniformResourceIdentifier(uri)
+                        if required.iter().any(|value| value == uri.as_str()) =>
+                    {
                         return true;
                     }
-                    GeneralName::DnsName(dns) if dns.as_str() == required => {
+                    GeneralName::DnsName(dns)
+                        if required.iter().any(|value| value == dns.as_str()) =>
+                    {
                         return true;
                     }
                     _ => {}
@@ -1443,6 +1455,152 @@ mod tests {
             .headers
             .insert("x-keyrack-project-id".into(), "project-a".into());
         metadata
+    }
+
+    fn delegated_uri_leaf(uri: &str, ca: &TestCaBundle) -> rcgen::Certificate {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri.try_into().unwrap())];
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+        params.signed_by(&key_pair, &issuer).unwrap()
+    }
+
+    fn multi_peer_forwarding_chain(ca: &TestCaBundle) -> AuthenticatorChain {
+        AuthenticatorChain::new(vec![
+            Box::new(build_bound_forwarded_authn(ca).with_required_sans(vec![
+                "spiffe://cluster.local/ns/gateway/sa/kms".into(),
+                "spiffe://cluster.local/ns/adapter/sa/storage".into(),
+            ])),
+            Box::new(BootstrapTokenAuthenticator::new(
+                "fallback-token",
+                std::time::Duration::from_secs(3600),
+            )),
+        ])
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_accepts_each_exact_delegator() {
+        let ca = test_ca();
+        let chain = multi_peer_forwarding_chain(&ca);
+        for uri in [
+            "spiffe://cluster.local/ns/gateway/sa/kms",
+            "spiffe://cluster.local/ns/adapter/sa/storage",
+        ] {
+            let leaf = delegated_uri_leaf(uri, &ca);
+            let result = chain
+                .authenticate(&delegated_metadata(&leaf))
+                .await
+                .unwrap();
+            assert_eq!(result.method, "mtls_bound_forwarded_identity");
+            assert_eq!(result.principal.id, "urn:example:iam:tenant-a:user/user-a");
+            assert_eq!(result.principal.principal_type, "DelegatedIdentity");
+            assert_eq!(
+                result.principal.attributes["delegating_peer_id"],
+                AttributeValue::String(uri.into())
+            );
+            assert_eq!(
+                result.principal.attributes["scope"],
+                AttributeValue::String("tenant:tenant-a".into())
+            );
+            assert_eq!(
+                result.principal.attributes["project_id"],
+                AttributeValue::String("project-a".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_allowlist_refuses_unknown_peers_without_fallback() {
+        let ca = test_ca();
+        let other_ca = test_ca_named("Other CA");
+        let chain = multi_peer_forwarding_chain(&ca);
+        let unknown = delegated_uri_leaf("spiffe://cluster.local/ns/other/sa/other", &ca);
+        let wrong_ca =
+            delegated_uri_leaf("spiffe://cluster.local/ns/adapter/sa/storage", &other_ca);
+        for certificate in [unknown.der().to_vec(), wrong_ca.der().to_vec(), vec![0]] {
+            let mut metadata = delegated_metadata(&unknown);
+            metadata.peer_certificates = vec![certificate];
+            metadata
+                .headers
+                .insert("authorization".into(), "Bearer fallback-token".into());
+            assert!(matches!(
+                chain.authenticate(&metadata).await,
+                Err(AuthnError::InvalidCredential(_))
+            ));
+        }
+        let mut metadata = delegated_metadata(&unknown);
+        metadata.peer_certificates.clear();
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+        assert!(matches!(
+            chain.authenticate(&metadata).await,
+            Err(AuthnError::InvalidCredential(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_allowlist_refuses_malformed_selected_credentials() {
+        let ca = test_ca();
+        let chain = multi_peer_forwarding_chain(&ca);
+        for uri in [
+            "spiffe://cluster.local/ns/gateway/sa/kms",
+            "spiffe://cluster.local/ns/adapter/sa/storage",
+        ] {
+            let leaf = delegated_uri_leaf(uri, &ca);
+            for (header, value) in [
+                ("x-keyrack-principal-id", None),
+                ("x-keyrack-principal-id", Some("")),
+                ("x-keyrack-tenant-id", None),
+                ("x-keyrack-tenant-id", Some("")),
+                ("x-keyrack-tenant-id", Some("tenant:other")),
+                ("x-keyrack-tenant-id", Some("tenant other")),
+            ] {
+                let mut metadata = delegated_metadata(&leaf);
+                metadata.headers.remove(header);
+                if let Some(value) = value {
+                    metadata.headers.insert(header.into(), value.into());
+                }
+                metadata
+                    .headers
+                    .insert("authorization".into(), "Bearer fallback-token".into());
+                assert!(matches!(
+                    chain.authenticate(&metadata).await,
+                    Err(AuthnError::InvalidCredential(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_allowlist_without_headers_allows_independent_credential() {
+        let ca = test_ca();
+        let leaf = delegated_uri_leaf("spiffe://cluster.local/ns/adapter/sa/storage", &ca);
+        let chain = multi_peer_forwarding_chain(&ca);
+        let mut metadata = delegated_metadata(&leaf);
+        metadata.headers.clear();
+        metadata
+            .headers
+            .insert("authorization".into(), "Bearer fallback-token".into());
+        let result = chain.authenticate(&metadata).await.unwrap();
+        assert_eq!(result.method, "bootstrap_token");
+    }
+
+    #[tokio::test]
+    async fn bound_forwarded_identity_allowlist_preserves_ou_and_empty_list_refusal() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_san("gateway", "gateway.internal", &ca);
+        let metadata = delegated_metadata(&leaf);
+        let empty = build_bound_forwarded_authn(&ca).with_required_sans(vec![]);
+        let wrong_ou = build_bound_forwarded_authn(&ca)
+            .with_required_sans(vec!["gateway.internal".into()])
+            .with_required_ou("delegators".into());
+        for authn in [empty, wrong_ou] {
+            assert!(matches!(
+                authn.authenticate(&metadata).await,
+                Err(AuthnError::InvalidCredential(_))
+            ));
+        }
     }
 
     #[tokio::test]

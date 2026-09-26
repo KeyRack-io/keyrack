@@ -89,6 +89,24 @@ authn:
   required_san: spiffe://cluster.local/ns/essentials/sa/essentials
 ```
 
+For multiple delegating workloads under the same CA, replace `required_san`
+with a single exact allowlist on this authenticator:
+
+```yaml
+  required_sans:
+    - spiffe://cluster.local/ns/gateway/sa/kms
+    - spiffe://cluster.local/ns/adapter/sa/storage
+```
+
+`required_sans` accepts 1 to 32 distinct non-empty values without whitespace;
+it cannot be combined with `required_san`. Any configured `required_ou` still
+applies to every listed peer. Do not use separate forwarding authenticators in
+a chain for these alternatives: an attempted delegation from an unlisted peer
+must stop authentication, including JWT/bootstrap fallback. A matching peer with
+missing or malformed principal/tenant headers also refuses. The allowlist changes
+which workloads may forward an identity; it does not grant the forwarded actor
+permission to perform an operation.
+
 The upstream service sets these headers:
 - `x-keyrack-principal-id`
 - `x-keyrack-tenant-id`
@@ -101,8 +119,8 @@ project and domain are optional attributes.
 
 The profile is available on gRPC, where tonic exposes the TLS peer
 certificate. `tls.ca_cert` and `trusted_ca_cert_path` must contain exactly the
-same PEM material, and at least one exact `required_san`/`required_ou` pin is
-mandatory; startup fails otherwise. A REST API request receives
+same PEM material, and an exact `required_san`, `required_sans` or
+`required_ou` pin is mandatory; startup fails otherwise. A REST API request receives
 `501 AuthenticationTransportUnsupported` when every configured authenticator
 requires a peer certificate. Add a JWT/bootstrap authenticator to the chain if
 the REST API must remain usable; health and metrics remain available either

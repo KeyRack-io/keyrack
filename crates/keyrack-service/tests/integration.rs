@@ -43,6 +43,9 @@ use tonic::Request;
 
 use base64::Engine as _;
 
+#[path = "integration/key_version_authorization.rs"]
+mod key_version_authorization;
+
 #[path = "integration/reencrypt_authorization.rs"]
 mod reencrypt_authorization;
 

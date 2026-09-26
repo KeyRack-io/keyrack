@@ -257,6 +257,7 @@ async fn build_authenticators(
         AuthnConfig::MtlsBoundForwardedIdentity {
             trusted_ca_cert_path,
             required_san,
+            required_sans,
             required_ou,
         } => {
             let grpc_client_ca_path =
@@ -286,6 +287,9 @@ async fn build_authenticators(
                 })?;
             if let Some(san) = required_san {
                 authn = authn.with_required_san(san.clone());
+            }
+            if let Some(sans) = required_sans {
+                authn = authn.with_required_sans(sans.clone());
             }
             if let Some(ou) = required_ou {
                 authn = authn.with_required_ou(ou.clone());

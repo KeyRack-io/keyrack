@@ -571,6 +571,10 @@ pub enum AuthnConfig {
         trusted_ca_cert_path: String,
         #[serde(default)]
         required_san: Option<String>,
+        /// Exact SAN alternatives for multiple delegators sharing this CA.
+        /// Mutually exclusive with `required_san`; 1..=32 unique non-empty values.
+        #[serde(default)]
+        required_sans: Option<Vec<String>>,
         #[serde(default)]
         required_ou: Option<String>,
     },
@@ -624,6 +628,7 @@ impl AuthnConfig {
             Self::MtlsBoundForwardedIdentity {
                 trusted_ca_cert_path,
                 required_san,
+                required_sans,
                 required_ou,
             } => {
                 if trusted_ca_cert_path.trim().is_empty() {
@@ -631,11 +636,26 @@ impl AuthnConfig {
                         "mtls_bound_forwarded_identity requires trusted_ca_cert_path".into(),
                     );
                 }
+                if let Some(sans) = required_sans {
+                    if required_san.is_some()
+                        || sans.is_empty()
+                        || sans.len() > 32
+                        || sans.iter().enumerate().any(|(index, value)| {
+                            value.is_empty()
+                                || value.chars().any(char::is_whitespace)
+                                || sans[..index].contains(value)
+                        })
+                    {
+                        return Err(
+                            "mtls_bound_forwarded_identity requires required_san OR 1..=32 unique non-empty required_sans without whitespace".into(),
+                        );
+                    }
+                }
                 let has_san = required_san
                     .as_deref()
                     .is_some_and(|v| !v.trim().is_empty());
                 let has_ou = required_ou.as_deref().is_some_and(|v| !v.trim().is_empty());
-                if !has_san && !has_ou {
+                if !has_san && required_sans.is_none() && !has_ou {
                     return Err(
                         "mtls_bound_forwarded_identity requires a non-empty required_san or required_ou workload pin"
                             .into(),
@@ -943,6 +963,7 @@ authn:
             AuthnConfig::MtlsBoundForwardedIdentity {
                 trusted_ca_cert_path,
                 required_san,
+                required_sans,
                 required_ou,
             } => {
                 assert_eq!(trusted_ca_cert_path, "/etc/keyrack/tls/delegator-ca.pem");
@@ -950,6 +971,7 @@ authn:
                     required_san.as_deref(),
                     Some("spiffe://cluster.local/ns/essentials/sa/essentials")
                 );
+                assert!(required_sans.is_none());
                 assert!(required_ou.is_none());
             }
             other => panic!("unexpected authn config: {other:?}"),
@@ -957,10 +979,54 @@ authn:
     }
 
     #[test]
+    fn delegated_mtls_allowlist_validates_exact_bounded_configuration() {
+        let tls = TlsConfig {
+            server_cert: "/tls/server.crt".into(),
+            server_key: "/tls/server.key".into(),
+            ca_cert: Some("/tls/ca.pem".into()),
+        };
+        let parse = |sans: serde_json::Value, single: serde_json::Value| {
+            serde_json::from_value::<AuthnConfig>(serde_json::json!({
+                "type": "mtls_bound_forwarded_identity",
+                "trusted_ca_cert_path": "/tls/ca.pem",
+                "required_san": single,
+                "required_sans": sans,
+            }))
+            .unwrap()
+        };
+        let valid = parse(
+            serde_json::json!(["gateway.internal", "adapter.internal"]),
+            serde_json::Value::Null,
+        );
+        valid.validate_delegated_mtls_contract(Some(&tls)).unwrap();
+        assert!(valid.validate_delegated_mtls_contract(None).is_err());
+        for sans in [
+            serde_json::json!([]),
+            serde_json::json!([""]),
+            serde_json::json!(["gateway.internal", " "]),
+            serde_json::json!(["gateway.internal", "gateway.internal"]),
+            serde_json::json!((0..33)
+                .map(|i| format!("peer-{i}.internal"))
+                .collect::<Vec<_>>()),
+        ] {
+            assert!(parse(sans, serde_json::Value::Null)
+                .validate_delegated_mtls_contract(Some(&tls))
+                .is_err());
+        }
+        assert!(parse(
+            serde_json::json!(["adapter.internal"]),
+            serde_json::json!("gateway.internal")
+        )
+        .validate_delegated_mtls_contract(Some(&tls))
+        .is_err());
+    }
+
+    #[test]
     fn delegated_mtls_requires_server_client_ca_and_workload_pin() {
         let unpinned = AuthnConfig::MtlsBoundForwardedIdentity {
             trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
             required_san: None,
+            required_sans: None,
             required_ou: None,
         };
         let tls = TlsConfig {
@@ -976,6 +1042,7 @@ authn:
         let pinned = AuthnConfig::MtlsBoundForwardedIdentity {
             trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
             required_san: Some("spiffe://cluster.local/ns/essentials/sa/essentials".into()),
+            required_sans: None,
             required_ou: None,
         };
         assert!(pinned
@@ -998,6 +1065,7 @@ authn:
                 AuthnConfig::MtlsBoundForwardedIdentity {
                     trusted_ca_cert_path: "/etc/keyrack/tls/delegator-ca.pem".into(),
                     required_san: None,
+                    required_sans: None,
                     required_ou: None,
                 },
             ],
