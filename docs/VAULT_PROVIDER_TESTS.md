@@ -37,10 +37,16 @@ Six additional required tests cover authenticated encryption and availability:
 
 The seal test requires `KEYRACK_VAULT_TEST_UNSEAL_KEY`, obtained by the runner from
 its own disposable instance. It refuses to seal without that capability. Do not
-run it concurrently with any Vault tests. It attempts unseal before asserting the
-observations collected while sealed. The runner also checks that Vault is
-unsealed before invoking an additional test runner, and does not pass the unseal
-key to that command. Restarting Vault is not a substitute for unsealing: the
+run it concurrently with any Vault tests. A guard is armed before sealing and
+only disarmed after Vault confirms it is unsealed. On panic, its destructor joins
+a separate cleanup thread/runtime to attempt unseal with bounded HTTP timeouts,
+without depending on the unwinding test runtime. Cleanup errors are reported
+without causing a second panic; the runner still tears down its owned fixture.
+The live test injects a panic after confirming HTTP 503 and verifies that the
+original ciphertext decrypts after the guard runs. Normal execution also unseals
+before asserting the observations collected while sealed. The runner also checks
+that Vault is unsealed before invoking an additional test runner, and does not
+pass the unseal key to that command. Restarting Vault is not a substitute for unsealing: the
 existing ciphertext must remain decryptable.
 
 Ordinary provider unit tests capture encrypt/decrypt HTTP requests to verify

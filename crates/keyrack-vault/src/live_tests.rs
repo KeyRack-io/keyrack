@@ -105,6 +105,73 @@ async fn legacy_ciphertext_without_associated_data_is_authentication_failure() {
     provider.destroy_key(&key).await.unwrap();
 }
 
+// Armed before the seal request; disarmed only after Vault confirms restoration.
+struct UnsealGuard {
+    addr: String,
+    key: Option<zeroize::Zeroizing<String>>,
+}
+
+async fn unseal(addr: &str, key: &str) -> Result<()> {
+    let response = http_client_builder()
+        .build()
+        .map_err(|error| transport_error("unseal client failed", &error))?
+        .put(format!("{addr}/v1/sys/unseal"))
+        .json(&json!({"key": key}))
+        .send()
+        .await
+        .map_err(|error| transport_error("unseal request failed", &error))?
+        .error_for_status()
+        .map_err(|error| transport_error("unseal status failed", &error))?;
+    let status: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| transport_error("unseal response failed", &error))?;
+    if status["sealed"] != false {
+        return Err(KeyRackError::Provider("Vault remains sealed".into()));
+    }
+    Ok(())
+}
+
+impl UnsealGuard {
+    async fn restore(&mut self) -> Result<()> {
+        if let Some(key) = &self.key {
+            unseal(&self.addr, key).await?;
+            self.key = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UnsealGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let addr = self.addr.clone();
+        // Join a separate runtime: spawning on the unwinding test's runtime
+        // could lose cleanup at shutdown, and nested block_on would panic.
+        let cleanup = std::thread::Builder::new().spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    KeyRackError::Provider(format!("unseal runtime failed: {error}"))
+                })?;
+            runtime.block_on(unseal(&addr, &key))
+        });
+        // Never cause a second panic during unwinding. The runner still
+        // tears down its owned fixture if restoration itself fails.
+        match cleanup {
+            Ok(thread) => match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("Vault unseal cleanup failed: {error}"),
+                Err(_) => eprintln!("Vault unseal cleanup panicked"),
+            },
+            Err(error) => eprintln!("Vault unseal cleanup thread failed: {error}"),
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires exclusively owned Vault with KEYRACK_VAULT_TEST_UNSEAL_KEY; run serially"]
 async fn sealed_vault_is_unavailable_and_restores_existing_ciphertext() {
@@ -117,6 +184,10 @@ async fn sealed_vault_is_unavailable_and_restores_existing_ciphertext() {
     let provider = provider().await;
     let key = provider.generate_key(&KeySpec::Aes256).await.unwrap();
     let encrypted = provider.encrypt(&key, PLAINTEXT, AAD).await.unwrap();
+    let mut cleanup = UnsealGuard {
+        addr: provider.vault_addr.clone(),
+        key: Some(unseal_key.clone()),
+    };
     let seal = provider
         .client
         .put(format!("{}/v1/sys/seal", provider.vault_addr))
@@ -131,27 +202,13 @@ async fn sealed_vault_is_unavailable_and_restores_existing_ciphertext() {
         .await;
     let result = provider.decrypt(&key, &encrypted.ciphertext, AAD).await;
     let construction = VaultTransitProvider::new(&provider.vault_addr, &provider.token, None).await;
-    let restored = provider
-        .client
-        .put(format!("{}/v1/sys/unseal", provider.vault_addr))
-        .json(&json!({"key": unseal_key.as_str()}))
-        .send()
-        .await
-        .unwrap();
-    assert!(restored.status().is_success(), "unseal request failed");
-    let status: serde_json::Value = restored.json().await.unwrap();
-    assert_eq!(
-        status["sealed"], false,
-        "Vault must be unsealed before subsequent tests"
-    );
+    cleanup.restore().await.unwrap();
     let plaintext = provider
         .decrypt(&key, &encrypted.ciphertext, AAD)
         .await
         .unwrap();
     // Avoid printing plaintext on assertion failure.
     assert!(plaintext.expose().as_slice().eq(PLAINTEXT));
-    provider.destroy_key(&key).await.unwrap();
-
     assert!(seal.unwrap().status().is_success());
     assert_eq!(
         health.unwrap().status(),
@@ -167,6 +224,46 @@ async fn sealed_vault_is_unavailable_and_restores_existing_ciphertext() {
             "{error}"
         );
     }
+
+    // Exercise Drop during a real panic on the current-thread test runtime.
+    let cleanup = UnsealGuard {
+        addr: provider.vault_addr.clone(),
+        key: Some(unseal_key),
+    };
+    let client = provider.client.clone();
+    let token = provider.token.clone();
+    let panic: std::result::Result<(), _> = tokio::spawn(async move {
+        let guard = cleanup;
+        client
+            .put(format!("{}/v1/sys/seal", guard.addr))
+            .header("X-Vault-Token", token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let health = client
+            .get(format!("{}/v1/sys/health", guard.addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        panic!("injected panic after sealing");
+    })
+    .await;
+    let panic = panic.expect_err("injected panic must reach the join handle");
+    assert!(panic.is_panic());
+    assert_eq!(
+        panic.into_panic().downcast_ref::<&str>(),
+        Some(&"injected panic after sealing")
+    );
+    // No explicit unseal: Drop must finish before the task reports its panic.
+    let plaintext = provider
+        .decrypt(&key, &encrypted.ciphertext, AAD)
+        .await
+        .unwrap();
+    assert!(plaintext.expose().as_slice().eq(PLAINTEXT));
+    provider.destroy_key(&key).await.unwrap();
 }
 
 #[tokio::test]
