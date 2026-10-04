@@ -2,20 +2,37 @@
 
 **Sovereign key management with pluggable HSM backends.**
 
-KeyRack is an open-source key lifecycle coordination layer. It tracks key
-hierarchies, drives rotation, and delegates all cryptographic material to
-HSM backends (PKCS#11, KMIP, Vault Transit). For non-exportable keys in an HSM or
-Vault provider, raw key material remains in the backend. Exportable keys may
-intentionally leave it through authorized export operations. The software
-provider holds key bytes in process memory (dev/test only).
+KeyRack Core is an open-source key lifecycle service with gRPC and REST APIs,
+policy-based authorization, and pluggable software, PKCS#11, KMIP and Vault
+Transit providers. It tracks logical key hierarchies and versions, routes each
+version to its recorded backend, and coordinates rotation and lifecycle changes.
+Non-exportable backend keys remain in their provider; authorized export is a
+separate capability. Software providers hold key bytes in process memory.
 
-- **Sovereign** — you control your keys. No cloud vendor lock-in.
-- **Pluggable HSMs** — PKCS#11 (Thales, Entrust, YubiHSM, CloudHSM), KMIP for tenant-managed HSMs, Vault Transit.
-- **API compatible** — AWS KMS and OpenStack Barbican shims let existing apps work without code changes.
-- **Policy-driven** — external authorization via any PDP (Cedar, OPA). Every operation is authorized and audited.
-- **Hierarchical keys** — KEK-wrapping hierarchy with namespace-scoped rules and cascade disable.
-- **HYOK (Hold Your Own Key)** — tenants plug in their own HSM; disconnect immediately fails crypto operations on that backend. Cross-node cache staleness in the commercial HA tier is bounded by a configurable TTL.
-- **Cryptographic audit** — BLAKE3 hash-chained events delivered over NATS, chained whether or not signing is enabled, so an in-place edit or interior deletion is detectable with no key. Two bounds: an attacker who can rewrite the whole log can recompute every link, which is what opt-in Ed25519 signing closes (it requires a persistent signing key), and tail-truncation needs an external anchor.
+## What 0.5.0 contains
+
+- **Backend integration** — PKCS#11, KMIP and Vault Transit providers, including
+  Vault authenticated encryption context and private-CA trust. Backend and
+  mechanism support must be checked against the selected provider.
+- **Versioned key lifecycle** — namespace-scoped rules, logical parent/child
+  relationships, rotation and cascade operations. Wrapped-child creation is not
+  reachable through the service API in this release; the logical hierarchy is
+  not a claim of KEK-wrapped custody.
+- **Authorization and identity** — external HTTP/gRPC PDP integration, JWT and
+  certificate-bound identity, and an exact-match SAN allowlist for delegated
+  identity. `GetKeyVersion` authorization includes the requested version.
+- **Availability reporting** — optional remote-provider outages are reported
+  separately from instance readiness, with bounded construction retries.
+- **Cryptographic audit** — BLAKE3 hash-chained events and optional Ed25519
+  signatures. Signing requires a persistent key; detecting tail truncation
+  requires an external anchor.
+
+The AWS KMS and OpenStack Barbican compatibility shims are not in this repository.
+The crypto worker is a provisional harness that the service does not use, and
+cross-provider unwrap is not implemented. REST and gRPC coverage differs; see the
+[generated API surface inventory](docs/generated/api-surface-parity.md) for the
+implemented operations, feature gates and gaps. See [CHANGELOG.md](CHANGELOG.md)
+for changes and compatibility notes.
 
 ## Quickstart
 
@@ -82,6 +99,9 @@ rest_addr: "0.0.0.0:8080"
 storage:
   type: sqlite
   path: "/var/lib/keyrack/keyrack.db"
+
+# Development only: software key bytes are lost on restart.
+dev_only_allow_ephemeral_provider_with_persistent_metadata: true
 
 provider:
   type: software        # or: pkcs11, kmip, vault_transit, in_memory
@@ -169,7 +189,8 @@ chain when REST access is required.
 | `GET` | `/readyz` | Readiness probe |
 | `GET` | `/metrics` | Prometheus metrics |
 
-The same operations are available over gRPC on port 50051.
+The gRPC API listens on port 50051. Its operation coverage is listed separately
+in the [API surface inventory](docs/generated/api-surface-parity.md).
 
 ## Documentation
 
@@ -190,7 +211,7 @@ Eight runnable FOSS demos (each a `docker compose up` away):
 | [02-foss-softhsm](demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
 | [04-hyok-full-stack](demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
 | [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across HSM partitions | 2× SoftHSM tokens |
-| [08-cascade-rotation](demos/08-cascade-rotation/) | Hierarchical cascade rotation + cooperative ack/complete | Software |
+| [08-cascade-rotation](demos/08-cascade-rotation/) | Depth-one cascade rotation + cooperative ack/complete | Software |
 | [09-audit-tamper-evidence](demos/09-audit-tamper-evidence/) | Ed25519-signed + BLAKE3 hash-chained audit log verification | Software |
 | [10-mtls-identity](demos/10-mtls-identity/) | mTLS client-certificate identity | Software |
 | [11-multi-tenant-hyok](demos/11-multi-tenant-hyok/) | Multi-tenant HYOK with per-tenant HSMs | 2× SoftHSM tokens |
@@ -202,8 +223,6 @@ Plus a Kubernetes demo (needs `kind` + `kubectl`, not docker compose):
 | Demo | What it shows | Platform |
 |------|--------------|----------|
 | [07-k8s-sidecar](demos/07-k8s-sidecar/) | App + KeyRack sidecar in one pod (localhost), Postgres + Cedar | kind |
-
-AWS KMS-compatible access (including HYOK) is available via the commercial extensions.
 
 ## License
 
