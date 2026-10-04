@@ -349,6 +349,161 @@ async fn a_created_child_encrypts_and_decrypts_through_a_lease() {
     assert_eq!(recovered, b"through grpc");
 }
 
+// These cancellation tests suspend a pending callback after receiving the real
+// opened handles. They check material inoperability, not closure receipts or
+// cancellation during acquisition, close, or a network request.
+#[tokio::test]
+async fn cancelling_single_use_must_settle_its_genuine_lease() {
+    let state = activated();
+    let parent = parent_key(&state).await;
+    let child = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .unwrap();
+    let provider = state
+        .providers
+        .resolve_for_primary(&child)
+        .unwrap()
+        .provider;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let mut use_future = Box::pin(domain::with_usable_handle(
+        &state,
+        &child,
+        child.primary_version().unwrap(),
+        provider.as_ref(),
+        |handle| async move {
+            send.send(handle).unwrap();
+            std::future::pending::<Result<(), DomainError>>().await
+        },
+    ));
+    let genuine = tokio::select! {
+        handle = receive => handle.unwrap(),
+        result = &mut use_future => panic!("operation should be pending: {result:?}"),
+    };
+    provider
+        .encrypt(&genuine, b"before cancellation", b"aad")
+        .await
+        .unwrap();
+    drop(use_future);
+    // Allow scheduled cleanup of this in-process software key, if present.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    let result = provider
+        .encrypt(&genuine, b"after cancellation", b"aad")
+        .await;
+    // Clean up before asserting, including on the failing implementation.
+    provider.destroy_key(&genuine).await.unwrap();
+    assert!(
+        matches!(result, Err(keyrack_core::error::KeyRackError::Provider(ref message))
+        if message == &format!("key not found: {}", genuine.key_id)),
+        "cancelled with_usable_handle must remove its genuine opened child; still operable: {}",
+        result.is_ok()
+    );
+}
+
+#[tokio::test]
+async fn returned_operation_error_still_closes_its_genuine_lease() {
+    let state = activated();
+    let parent = parent_key(&state).await;
+    let child = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .unwrap();
+    let provider = state
+        .providers
+        .resolve_for_primary(&child)
+        .unwrap()
+        .provider;
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let save = captured.clone();
+    let result = domain::with_usable_handle(
+        &state,
+        &child,
+        child.primary_version().unwrap(),
+        provider.as_ref(),
+        |handle| async move {
+            *save.lock().unwrap() = Some(handle);
+            Err::<(), _>(DomainError::Internal("operation failed".into()))
+        },
+    )
+    .await;
+    assert!(
+        matches!(result, Err(DomainError::Internal(ref message)) if message == "operation failed")
+    );
+    let genuine = captured.lock().unwrap().take().unwrap();
+    let result = provider
+        .encrypt(&genuine, b"closed on operation error", b"aad")
+        .await;
+    provider.destroy_key(&genuine).await.unwrap();
+    assert!(
+        matches!(result, Err(keyrack_core::error::KeyRackError::Provider(ref message))
+        if message == &format!("key not found: {}", genuine.key_id))
+    );
+}
+
+#[tokio::test]
+async fn cancelling_two_key_use_must_settle_both_genuine_leases() {
+    let state = activated();
+    let parent = parent_key(&state).await;
+    let source = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .unwrap();
+    let destination = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
+        .await
+        .unwrap();
+    let provider = state
+        .providers
+        .resolve_for_primary(&source)
+        .unwrap()
+        .provider;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let mut use_future = Box::pin(domain::with_usable_handles(
+        &state,
+        domain::VersionUse {
+            record: &source,
+            version: source.primary_version().unwrap(),
+            provider: provider.as_ref(),
+        },
+        domain::VersionUse {
+            record: &destination,
+            version: destination.primary_version().unwrap(),
+            provider: provider.as_ref(),
+        },
+        |a, b| async move {
+            send.send((a, b)).unwrap();
+            std::future::pending::<Result<(), DomainError>>().await
+        },
+    ));
+    let handles = tokio::select! {
+        handles = receive => handles.unwrap(),
+        result = &mut use_future => panic!("operation should be pending: {result:?}"),
+    };
+    assert_ne!(handles.0.key_id, handles.1.key_id);
+    for handle in [&handles.0, &handles.1] {
+        provider
+            .encrypt(handle, b"before cancellation", b"aad")
+            .await
+            .unwrap();
+    }
+    drop(use_future);
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    let mut usable = 0;
+    let mut removed = 0;
+    for handle in [handles.0, handles.1] {
+        let result = provider
+            .encrypt(&handle, b"after cancellation", b"aad")
+            .await;
+        usable += usize::from(result.is_ok());
+        removed += usize::from(matches!(result,
+            Err(keyrack_core::error::KeyRackError::Provider(ref message))
+            if message == &format!("key not found: {}", handle.key_id)));
+        provider.destroy_key(&handle).await.unwrap();
+    }
+    assert_eq!(removed, 2,
+        "cancelled with_usable_handles must remove both genuine opened children; still operable: {usable}");
+}
+
 /// The key cache is a `StorageBackend` wrapper, and a wrapper that does not
 /// forward the creation journal answers "this backend cannot journal a
 /// creation" for a backend that can. Every demo and most deployments enable
