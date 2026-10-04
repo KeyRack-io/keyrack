@@ -316,8 +316,8 @@ impl ServiceConfig {
     /// startup against the live provider, not here: only the provider knows.
     ///
     /// # Errors
-    /// Returns a configuration error for an unknown, customer-custody or repeated provider, or
-    /// for a mechanism or security domain that is not a valid identifier.
+    /// Returns a configuration error for an unknown, customer-custody or repeated
+    /// provider, or for a mechanism or security domain that is not a valid identifier.
     pub fn validate_wrapping(&self) -> Result<(), String> {
         if self.wrapping.is_empty() {
             return Ok(());
@@ -1058,6 +1058,86 @@ wrapping:
         assert_eq!(config.wrapping[0].provider, "default");
         assert_eq!(config.wrapping[0].mechanism, "software:aes-256-gcm:v1");
         assert_eq!(config.wrapping[0].security_domain, "dev-single-process");
+    }
+
+    #[test]
+    fn wrapping_rejects_customer_custody_during_config_validation() {
+        for provider in [
+            serde_json::json!({"name": "external", "custody": "customer", "type": "software"}),
+            serde_json::json!({"name": "external", "custody": "customer", "type": "vault_transit",
+                "vault_addr": "https://127.0.0.1:1", "vault_token": "test-token",
+                "ca_cert": "/missing/customer-ca.pem"}),
+        ] {
+            let config: ServiceConfig = serde_json::from_value(serde_json::json!({
+                "pdp": {"type": "always_allow"},
+                "storage": {"type": "memory"},
+                "providers": [provider],
+                "wrapping": [{"provider": "external", "mechanism": "test:wrap:v1",
+                    "security_domain": "test-domain"}]
+            }))
+            .unwrap();
+            // Exercise the top-level startup gate, not only its helper. The
+            // Vault case must refuse custody before reading CA files or dialing.
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains("'external' must have platform custody"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_wrapping_allows_an_unrelated_customer_provider() {
+        for explicit_custody in [false, true] {
+            let mut platform = serde_json::json!({"name": "local", "type": "software"});
+            if explicit_custody {
+                platform["custody"] = serde_json::json!("platform");
+            }
+            let config: ServiceConfig = serde_json::from_value(serde_json::json!({
+                "pdp": {"type": "always_allow"},
+                "storage": {"type": "memory"},
+                "default_provider": "local",
+                "providers": [platform, {"name": "external", "custody": "customer",
+                    "type": "vault_transit", "vault_addr": "http://127.0.0.1:1",
+                    "vault_token": "test-token"}],
+                "wrapping": [{"provider": "local", "mechanism": "software:aes-256-gcm:v1",
+                    "security_domain": "test-domain"}]
+            }))
+            .unwrap();
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn wrapping_config_preserves_vault_ca_and_custody_settings() {
+        let config = ServiceConfig::from_yaml(
+            r"
+providers:
+  - name: vault
+    custody: platform
+    type: vault_transit
+    vault_addr: https://vault.example.test:8200
+    vault_token: test-token
+    ca_cert: /etc/keyrack/vault-ca.pem
+wrapping:
+  - provider: vault
+    mechanism: test:wrap:v1
+    security_domain: test-domain
+",
+        )
+        .unwrap();
+        // Parsing/config validation does not qualify a wrapping mechanism.
+        config.validate_wrapping().unwrap();
+        let (providers, _) = config.resolved_providers().unwrap();
+        assert_eq!(
+            providers[0].custody,
+            crate::readiness::ProviderCustody::Platform
+        );
+        let ProviderConfig::VaultTransit { ca_cert, .. } = &providers[0].provider else {
+            panic!("expected Vault provider");
+        };
+        assert_eq!(ca_cert.as_deref(), Some("/etc/keyrack/vault-ca.pem"));
+        assert_eq!(config.wrapping[0].provider, "vault");
     }
 
     #[test]

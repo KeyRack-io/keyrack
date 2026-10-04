@@ -658,7 +658,8 @@ async fn build_state(
                 {
                     deferred
                 } else {
-                    let (provider, class) = build_provider(&np.name, &np.provider, &audit, None).await?;
+                    let (provider, class) =
+                        build_provider(&np.name, &np.provider, &audit, None).await?;
                     (
                         keyrack_service::provider_startup::defer_ready_provider(&np.name, provider),
                         class,

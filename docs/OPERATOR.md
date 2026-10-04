@@ -65,7 +65,13 @@ not retained in memory.
 
 Creating a key with a `parent_key_id` means its material is wrapped under that
 parent. It is refused unless the provider that will hold it has been activated
-for wrapping:
+for wrapping. A wrapping profile may name only a platform-custody provider
+(`custody: platform`, the default). Customer-custody providers are constructed
+lazily, so configuration validation refuses a wrapping profile naming one.
+Unrelated customer-custody providers may still be configured alongside it.
+This startup classification does not establish hardware custody.
+
+For example:
 
 ```yaml
 wrapping:
