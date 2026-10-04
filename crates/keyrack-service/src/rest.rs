@@ -377,8 +377,6 @@ async fn create_key(
 
             let entry = state.providers.resolve(&provider_name).map_err(map_core_err)?;
 
-            let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
-
             let parent_lid = body.get("parent_key_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
@@ -405,7 +403,7 @@ async fn create_key(
                     .map_err(|e| e.to_rest_error())?;
             }
 
-            let record = keyrack_core::key::KeyRecord {
+            let mut record = keyrack_core::key::KeyRecord {
                 lid,
                 canonicalization_version: keyrack_core::canon::CanonicalizationVersion::V2,
                 parent_lid,
@@ -413,7 +411,7 @@ async fn create_key(
                 current_key_version: 1,
                 state: keyrack_core::key::KeyState::Enabled,
                 key_usage,
-                key_spec: spec,
+                key_spec: spec.clone(),
                 origin: keyrack_core::key::KeyOrigin::KeyRack,
                 provider_class: entry.class,
                 provider_ref: Some(provider_name.clone()),
@@ -431,22 +429,37 @@ async fn create_key(
                 updated_at: now,
                 scheduled_deletion_at: None,
                 description: desc,
-                key_versions: vec![keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true)],
+                key_versions: Vec::new(),
             };
 
-            // Born-exportable double-gate + leaf-only + provider wiring.
-            if exportable {
-                crate::domain::enforce_born_exportable(
-                    &state,
-                    &record,
-                    &principal_for_export_gate,
-                    &entry.provider,
-                )
-                .await
-                .map_err(|e| e.to_rest_error())?;
-            }
+            // A parent means this key's material is wrapped under it: there is
+            // no independent key to generate, and the provider must implement
+            // the configured wrapping profile or be refused.
+            let record = if parent_lid.is_some() {
+                let proposal = crate::hierarchy::ChildProposal::new(record)
+                    .map_err(|e| e.to_rest_error())?;
+                crate::hierarchy::create_wrapped_child(&state, &provider_name, &entry, proposal)
+                    .await
+                    .map_err(|e| e.to_rest_error())?
+            } else {
+                let handle = entry.provider.generate_key(&spec).await.map_err(map_core_err)?;
+                record.key_versions.push(keyrack_core::key::KeyVersionRecord::provider_resident(1, handle, Some(provider_name.clone()), now, true));
 
-            state.storage.create_key(&record).await.map_err(map_core_err)?;
+                // Born-exportable double-gate + leaf-only + provider wiring.
+                if exportable {
+                    crate::domain::enforce_born_exportable(
+                        &state,
+                        &record,
+                        &principal_for_export_gate,
+                        &entry.provider,
+                    )
+                    .await
+                    .map_err(|e| e.to_rest_error())?;
+                }
+
+                state.storage.create_key(&record).await.map_err(map_core_err)?;
+                record
+            };
             Ok((StatusCode::CREATED, key_json(&record)))
         },
     ).await
@@ -1034,15 +1047,25 @@ async fn encrypt(
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
-        let output = enc_entry
-            .provider
-            .encrypt(
-                primary.resident_handle().map_err(map_core_err)?,
-                &plaintext,
-                &aad,
-            )
-            .await
-            .map_err(map_core_err)?;
+        let output = crate::domain::with_usable_handle(
+            &state,
+            &record,
+            primary,
+            enc_entry.provider.as_ref(),
+            |handle| {
+                let provider = Arc::clone(&enc_entry.provider);
+                let plaintext = plaintext.clone();
+                let aad = aad.clone();
+                async move {
+                    provider
+                        .encrypt(&handle, &plaintext, &aad)
+                        .await
+                        .map_err(crate::domain::DomainError::from)
+                }
+            },
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         let blob = header.wrap_payload(&output.ciphertext);
         Ok(Json(serde_json::json!({
             "ciphertext_blob": base64_encode(&blob),
@@ -1145,15 +1168,25 @@ async fn decrypt(
         decrypt_permission
             .record_use(&state, &record, &legacy_audit_context)
             .await;
-        let plaintext = dec_entry
-            .provider
-            .decrypt(
-                version_record.resident_handle().map_err(map_core_err)?,
-                ciphertext,
-                &aad,
-            )
-            .await
-            .map_err(map_core_err)?;
+        let plaintext = crate::domain::with_usable_handle(
+            &state,
+            &record,
+            version_record,
+            dec_entry.provider.as_ref(),
+            |handle| {
+                let provider = Arc::clone(&dec_entry.provider);
+                let ciphertext = ciphertext.to_vec();
+                let aad = aad.clone();
+                async move {
+                    provider
+                        .decrypt(&handle, &ciphertext, &aad)
+                        .await
+                        .map_err(crate::domain::DomainError::from)
+                }
+            },
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         Ok(Json(serde_json::json!({
             "plaintext": base64_encode(plaintext.expose()),
             "key_id": record.lid.to_string(),
@@ -1639,15 +1672,24 @@ async fn generate_data_key(
             .providers
             .resolve_for_primary(&record)
             .map_err(map_core_err)?;
-        let output = gdek_entry
-            .provider
-            .generate_data_key(
-                primary.resident_handle().map_err(map_core_err)?,
-                dek_len,
-                &aad,
-            )
-            .await
-            .map_err(map_core_err)?;
+        let output = crate::domain::with_usable_handle(
+            &state,
+            &record,
+            primary,
+            gdek_entry.provider.as_ref(),
+            |handle| {
+                let provider = Arc::clone(&gdek_entry.provider);
+                let aad = aad.clone();
+                async move {
+                    provider
+                        .generate_data_key(&handle, dek_len, &aad)
+                        .await
+                        .map_err(crate::domain::DomainError::from)
+                }
+            },
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         Ok(Json(serde_json::json!({
             "plaintext_data_key": base64_encode(&output.plaintext_key.into_inner()),
             "encrypted_data_key": base64_encode(&header.wrap_payload(&output.encrypted_key)),
@@ -1797,30 +1839,49 @@ async fn re_encrypt(
             .map(keyrack_core::encryption_context::EncryptionContext::to_aad_bytes)
             .unwrap_or_default();
         let dst_aad = new_header.build_aad(&dst_ec_aad);
-        // Validate both representations before invoking either provider.
-        let src_handle = src_version.resident_handle().map_err(map_core_err)?;
-        let dst_handle = dst_primary.resident_handle().map_err(map_core_err)?;
         decrypt_permission
             .record_use(&state, &src_record, &legacy_audit_context)
             .await;
-        let output = if std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider) {
-            src_re_entry
-                .provider
-                .re_encrypt(src_handle, ciphertext, &src_aad, dst_handle, &dst_aad)
-                .await
-                .map_err(map_core_err)?
-        } else {
-            let plaintext = src_re_entry
-                .provider
-                .decrypt(src_handle, ciphertext, &src_aad)
-                .await
-                .map_err(map_core_err)?;
-            dst_re_entry
-                .provider
-                .encrypt(dst_handle, plaintext.expose(), &dst_aad)
-                .await
-                .map_err(map_core_err)?
-        };
+        let same_provider = std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider);
+        let output = crate::domain::with_usable_handles(
+            &state,
+            crate::domain::VersionUse {
+                record: &src_record,
+                version: src_version,
+                provider: src_re_entry.provider.as_ref(),
+            },
+            crate::domain::VersionUse {
+                record: &dst_record,
+                version: dst_primary,
+                provider: dst_re_entry.provider.as_ref(),
+            },
+            |src_handle, dst_handle| {
+                let src_provider = Arc::clone(&src_re_entry.provider);
+                let dst_provider = Arc::clone(&dst_re_entry.provider);
+                let ciphertext = ciphertext.to_vec();
+                let src_aad = src_aad.clone();
+                let dst_aad = dst_aad.clone();
+                async move {
+                    if same_provider {
+                        src_provider
+                            .re_encrypt(&src_handle, &ciphertext, &src_aad, &dst_handle, &dst_aad)
+                            .await
+                            .map_err(crate::domain::DomainError::from)
+                    } else {
+                        let plaintext = src_provider
+                            .decrypt(&src_handle, &ciphertext, &src_aad)
+                            .await
+                            .map_err(crate::domain::DomainError::from)?;
+                        dst_provider
+                            .encrypt(&dst_handle, plaintext.expose(), &dst_aad)
+                            .await
+                            .map_err(crate::domain::DomainError::from)
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|e| e.to_rest_error())?;
         Ok(Json(serde_json::json!({
             "ciphertext_blob": base64_encode(&new_header.wrap_payload(&output.ciphertext)),
             "source_key_id": src_record.lid.to_string(),
