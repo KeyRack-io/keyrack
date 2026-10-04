@@ -114,18 +114,18 @@ struct UnsealGuard {
 async fn unseal(addr: &str, key: &str) -> Result<()> {
     let response = http_client_builder()
         .build()
-        .map_err(|error| transport_error("unseal client failed", &error))?
+        .map_err(|error| transport_error("unseal client failed", error))?
         .put(format!("{addr}/v1/sys/unseal"))
         .json(&json!({"key": key}))
         .send()
         .await
-        .map_err(|error| transport_error("unseal request failed", &error))?
+        .map_err(|error| transport_error("unseal request failed", error))?
         .error_for_status()
-        .map_err(|error| transport_error("unseal status failed", &error))?;
+        .map_err(|error| transport_error("unseal status failed", error))?;
     let status: serde_json::Value = response
         .json()
         .await
-        .map_err(|error| transport_error("unseal response failed", &error))?;
+        .map_err(|error| transport_error("unseal response failed", error))?;
     if status["sealed"] != false {
         return Err(KeyRackError::Provider("Vault remains sealed".into()));
     }

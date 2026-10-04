@@ -138,6 +138,7 @@ async fn only_http_503_changes_the_existing_status_error_class() {
             let (addr, task) =
                 server(status, r#"{"errors":["specific failure"]}"#, false, false).await;
             let error = operation(&provider(addr), kind).await.unwrap_err();
+            assert_no_url(&error.to_string());
             match (status, error) {
                 (503, KeyRackError::ProviderUnavailable(message))
                 | (400 | 403 | 404 | 500, KeyRackError::Provider(message)) => {
@@ -171,6 +172,7 @@ async fn stalled_headers_and_response_bodies_are_unavailable() {
             let KeyRackError::ProviderUnavailable(message) = result.unwrap_err() else {
                 panic!("timeout must be unavailable");
             };
+            assert_no_url(&message);
             assert!(
                 message.contains("timed out") || message.contains("deadline has elapsed"),
                 "{message}"
@@ -189,4 +191,44 @@ async fn malformed_success_json_keeps_provider_error() {
         );
         task.await.unwrap();
     }
+}
+
+fn assert_no_url(message: &str) {
+    assert!(
+        !message.contains("http://") && !message.contains("https://"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn connection_and_request_errors_omit_backend_urls() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    for scheme in ["http", "https"] {
+        for kind in 0..5 {
+            let error = operation(
+                &provider(format!("{scheme}://{addr}/private-backend")),
+                kind,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, KeyRackError::ProviderUnavailable(_)));
+            let message = error.to_string();
+            assert!(message.contains("connection failed"));
+            assert_no_url(&message);
+            assert!(!message.contains("private-backend"));
+        }
+    }
+    // Builder/request failures retain Provider, and discard their attached URL too.
+    let error = provider("http://127.0.0.1:1/private-backend".into())
+        .client
+        .get("http://127.0.0.1:1/private-backend")
+        .header("invalid\nname", "value")
+        .send()
+        .await
+        .unwrap_err();
+    let error = transport_error("vault request failed", error);
+    assert!(matches!(error, KeyRackError::Provider(_)));
+    assert_no_url(&error.to_string());
 }
