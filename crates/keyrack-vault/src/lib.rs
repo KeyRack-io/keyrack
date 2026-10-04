@@ -56,7 +56,7 @@ fn configured_client(
             |reason| KeyRackError::Provider(format!("Vault Transit CA file {path}: {reason}"));
         let pem = std::fs::read(path).map_err(|error| invalid(format!("cannot read: {error}")))?;
         let certificates = reqwest::Certificate::from_pem_bundle(&pem)
-            .map_err(|error| invalid(format!("invalid PEM: {error}")))?;
+            .map_err(|error| invalid(format!("invalid PEM: {}", error.without_url())))?;
         if certificates.is_empty() {
             return Err(invalid("no certificates in PEM file".into()));
         }
@@ -66,6 +66,7 @@ fn configured_client(
         }
     }
     customize(builder).build().map_err(|error| {
+        let error = error.without_url();
         KeyRackError::Provider(match ca_cert {
             Some(path) => format!("Vault Transit CA file {path}: cannot build TLS client: {error}"),
             None => format!("failed to build HTTP client: {error}"),
@@ -94,8 +95,9 @@ fn tls_verification_failure(error: &(dyn std::error::Error + 'static)) -> Option
     None
 }
 
-fn transport_error(context: &str, error: &reqwest::Error) -> KeyRackError {
-    if let Some(reason) = tls_verification_failure(error) {
+fn transport_error(context: &str, error: reqwest::Error) -> KeyRackError {
+    let error = error.without_url();
+    if let Some(reason) = tls_verification_failure(&error) {
         return KeyRackError::Provider(format!("{context}: TLS verification failed: {reason}"));
     }
     let message = format!("{context}: {error}");
@@ -124,11 +126,11 @@ async fn response_text(response: reqwest::Response, allow_empty_on_error: bool) 
             status,
             format!(
                 "vault returned {status}: {}",
-                transport_error("failed to read vault response", &error)
+                transport_error("failed to read vault response", error)
             ),
         )),
         Err(error) if error.is_connect() || error.is_timeout() || !allow_empty_on_error => {
-            Err(transport_error("failed to read vault response", &error))
+            Err(transport_error("failed to read vault response", error))
         }
         Err(_) => Ok(String::new()),
     }
@@ -196,7 +198,7 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| transport_error("vault health check failed", &e))?;
+            .map_err(|e| transport_error("vault health check failed", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -226,7 +228,7 @@ impl VaultTransitProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| transport_error("vault request failed", &e))?;
+            .map_err(|e| transport_error("vault request failed", e))?;
 
         let status = resp.status();
         let text = response_text(resp, false).await?;
@@ -252,7 +254,7 @@ impl VaultTransitProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| transport_error("vault request failed", &e))?;
+            .map_err(|e| transport_error("vault request failed", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -274,7 +276,7 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| transport_error("vault delete failed", &e))?;
+            .map_err(|e| transport_error("vault delete failed", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -296,7 +298,7 @@ impl VaultTransitProvider {
             .header("X-Vault-Token", &self.token)
             .send()
             .await
-            .map_err(|e| transport_error("vault GET failed", &e))?;
+            .map_err(|e| transport_error("vault GET failed", e))?;
 
         let status = resp.status();
         let text = response_text(resp, false).await?;
