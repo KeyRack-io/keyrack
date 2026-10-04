@@ -642,6 +642,51 @@ audit:
 
 ---
 
+## Secrets on Kubernetes
+
+Two file-provisioning modes are supported, depending on the component consuming
+the secret. Restart the consuming application after rotating credentials; a
+projected-volume update alone is not the rotation contract. The gRPC certificate
+watcher detects a newer certificate-file modification time and logs it, but the
+listener still needs a restart to use new TLS material.
+Key-only changes or replacements retaining the same modification time are not
+guaranteed to be detected. Use a rolling restart where the deployment supports it.
+
+### Projected Secret for service references
+
+Mount a Kubernetes Secret read-only under `KEYRACK_SECRET_ROOT` and reference
+its files with `file:` references, such as `pin_ref: "file:user-pin"`. The service
+resolves references within that root; projected-volume symlinks are acceptable
+when their canonical targets stay inside it.
+
+The supplied [SoftHSM deployment](../deploy/softhsm/deployment.yaml) mounts
+`/run/secrets/keyrack` read-only with `defaultMode: 0440` (written as decimal
+`288` in the manifest) and `fsGroup: 10001`. Its app user/group is `10001`, and the
+[SoftHSM image](../docker/Dockerfile.softhsm) sets
+`KEYRACK_SECRET_ROOT=/run/secrets/keyrack`. Set that environment variable explicitly
+when using an image that does not supply it. Only mount the secret keys that the
+consuming container needs; the supplied service container does not receive the
+security-officer PIN used by initialization.
+
+### Strict regular files for components that require them
+
+The provisional crypto worker requires a credential file owned by its effective
+UID with no group or world permissions, and rejects symlinks and non-regular
+files. A normal projected Secret is therefore not suitable for that loader.
+Use an init step to copy the projected secret into a private shared volume as a
+regular file, set ownership to the app user, and set mode `0400`. Mount the
+materialized directory read-only in the app container. The init step must have
+only the privileges needed to establish that ownership; verify the resulting
+owner and mode after any volume ownership handling. Do not mount that volume in
+the coordinator container. This mode describes credential provisioning for the
+worker harness; it does not connect the worker to the service.
+
+On rotation, replace the source Secret and recreate the pod so the init step
+materializes fresh files and the app starts with them. The service's Vault token
+is still inline `vault_token` configuration today; `pin_ref`-style file references
+are not supported for that token. Supply that configuration securely and restart
+the service to adopt a rotated token.
+
 ## TLS configuration
 
 ### gRPC server TLS
@@ -675,12 +720,12 @@ faster.
 
 ### Certificate hot-reload
 
-When TLS is enabled, KeyRack polls the cert/key files every 30 seconds.
-If the files change on disk (e.g. after cert-manager renewal), the
-service logs a notice. **V1 limitation:** tonic does not support live TLS
-credential swapping on a running listener; perform a rolling restart
-after certificate renewal. The infrastructure is in place for seamless
-reload in a future version.
+When TLS is enabled, KeyRack polls the server certificate's modification time
+every 30 seconds. A newer timestamp triggers a read of the certificate and key
+and a log notice. Key-only changes and replacements preserving the timestamp
+are not guaranteed to trigger detection. The running listener does not swap TLS
+credentials: restart after rotating the certificate, private key or client CA.
+Use a rolling restart where the deployment supports it.
 
 ### Audit tamper evidence and authenticity
 
