@@ -13,7 +13,10 @@ separate capability. Software providers hold key bytes in process memory.
 
 - **Backend integration** — PKCS#11, KMIP and Vault Transit providers, including
   Vault authenticated encryption context and private-CA trust. Backend and
-  mechanism support must be checked against the selected provider.
+  mechanism support must be checked against the selected provider. SoftHSM is a
+  supported production software token: its storage permissions and PIN protect
+  keys, with no hardware boundary. Hardware HSMs over PKCS#11 are not yet
+  qualified.
 - **Versioned key lifecycle** — namespace-scoped rules, logical parent/child
   relationships, rotation and cascade operations. Wrapped-child creation is not
   reachable through the service API in this release; the logical hierarchy is
@@ -208,13 +211,13 @@ Eight runnable FOSS demos (each a `docker compose up` away):
 | Demo | What it shows | Provider |
 |------|--------------|----------|
 | [01-foss-vault](demos/01-foss-vault/) | Key lifecycle with Vault Transit | Vault |
-| [02-foss-softhsm](demos/02-foss-softhsm/) | HSM-backed crypto via PKCS#11 | SoftHSM |
+| [02-foss-softhsm](demos/02-foss-softhsm/) | Software-token crypto via PKCS#11 | SoftHSM |
 | [04-hyok-full-stack](demos/04-hyok-full-stack/) | AuthN + AuthZ + Audit + HYOK disconnect | SoftHSM + NATS + Cedar |
-| [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across HSM partitions | 2× SoftHSM tokens |
+| [06-provider-routing](demos/06-provider-routing/) | Tag-driven routing across software tokens | 2× SoftHSM tokens |
 | [08-cascade-rotation](demos/08-cascade-rotation/) | Depth-one cascade rotation + cooperative ack/complete | Software |
 | [09-audit-tamper-evidence](demos/09-audit-tamper-evidence/) | Ed25519-signed + BLAKE3 hash-chained audit log verification | Software |
 | [10-mtls-identity](demos/10-mtls-identity/) | mTLS client-certificate identity | Software |
-| [11-multi-tenant-hyok](demos/11-multi-tenant-hyok/) | Multi-tenant HYOK with per-tenant HSMs | 2× SoftHSM tokens |
+| [11-multi-tenant-hyok](demos/11-multi-tenant-hyok/) | Multi-tenant HYOK with per-tenant software tokens | 2× SoftHSM tokens |
 
 Run them all with a pass/fail summary via [`scripts/run-demos-ci.sh`](scripts/run-demos-ci.sh).
 

@@ -3,9 +3,9 @@
 ## What is KeyRack?
 
 KeyRack is the coordination layer for cryptographic key lifecycle
-management. It tracks which key wraps which, what data depends on
-which key, and orchestrates safe, zero-downtime key rotation — a
-capability that no existing tool provides, at any price point.
+management. It tracks logical key relationships and coordinates
+rotation jobs while applications migrate their data. Logical ancestry
+does not imply cryptographic wrapping.
 
 KeyRack does not replace your HSM, Vault, or cloud KMS. It sits above
 them. It answers "what depends on this key?" and handles the
@@ -46,7 +46,9 @@ rotation tooling. The capability gap is universal.
 ### FOSS Core
 
 **Key Lifecycle Coordination**
-- Hierarchical key management (KEK-wrapping hierarchy) with parent-child dependency tracking
+- Logical key hierarchies with parent-child dependency tracking. Wrapped-child
+  creation is not reachable through the service API in 0.5.0; these relationships
+  do not establish KEK-wrapped custody.
 - Content-addressed key identity via Logical IDs (LIDs)
 - Full key state machine: Creating → Enabled ⇄ Disabled →
   PendingDeletion → Destroyed
@@ -54,18 +56,22 @@ rotation tooling. The capability gap is universal.
   become inoperable
 - LID aliasing for routing evolution stability
 
-**Zero-Downtime Key Rotation**
+**Cooperative Key Rotation**
 - Cooperative rotation protocol: KeyRack orchestrates, applications
   execute
-- Rotation jobs with scheduling, retry, progress tracking
+- Rotation jobs with acknowledgement, completion, failure and expiry tracking
 - Recursive dependency discovery: "what needs rotating?"
-- Version coexistence: old key versions remain valid until all
-  dependents are re-wrapped
-- Policy-driven scheduling (30d, 90d, 365d per key pattern)
+- Version coexistence: old versions remain available for decryption subject to
+  key state and authorization. Applications migrate their data; job completion
+  does not prove that all ciphertext has migrated or retire old versions.
+- Rotation policy settings can be stored; automatic policy scheduling and
+  cryptographic child rewrapping are not implemented.
 
 **Pluggable Crypto Providers**
 - Software (RustCrypto): development, non-regulated workloads
-- PKCS#11: production HSMs (SoftHSM, Thales, Entrust, Utimaco)
+- PKCS#11: SoftHSM is a supported production software token. Its storage
+  permissions and PIN protect keys; it provides no hardware boundary. Hardware
+  HSMs over PKCS#11, including Thales, Entrust and Utimaco, are not yet qualified.
 - KMIP: remote HSM via standardized network protocol
 - Vault Transit: HashiCorp Vault-backed crypto operations
 - Parsec: IoT/embedded via PSA Crypto API (stub — integration pending)
@@ -99,11 +105,17 @@ rotation tooling. The capability gap is universal.
 
 **AWS KMS Pass-Through Proxy (FOSS)**
 - Proxy that forwards AWS SDK calls to real AWS KMS
-- Adds KeyRack metadata tracking (LIDs, dependency graph)
-- Zero-risk adoption: no crypto behavior changes
+- Records selected key metadata and forwards calls using the proxy's configured
+  AWS credentials
+- Cryptography remains in AWS KMS; this is not a Core-backed AWS API shim
 - Migration path to full KeyRack when ready
 
-### Commercial Extensions
+### Commercial Extensions (outside this repository)
+
+The following describes separate extension scope, not features shipped in
+KeyRack Core 0.5.0. This repository ships neither an AWS KMS compatibility shim
+nor an OpenStack Barbican REST API. The AWS pass-through proxy above continues
+to use AWS KMS for cryptography.
 
 **Protocol Compatibility Shims**
 - AWS KMS JSON-RPC + SigV4 authentication: use existing AWS SDK code
@@ -140,9 +152,9 @@ on localhost. The host communicates via gRPC or REST. Suitable for:
 - Multi-service platforms needing unified key management
 - Applications requiring embedded KMS coordination
 
-### Cloud Provider (Commercial)
+### Cloud Provider (Commercial, outside this repository)
 
-Full deployment with protocol shims, HA clustering, and HSM pool.
+A separate deployment with protocol shims, HA clustering, and HSM pool.
 Suitable for:
 - Sovereign cloud providers
 - Enterprises offering KMS-as-a-service to internal tenants
@@ -153,7 +165,9 @@ Suitable for:
 
 The boundary rule: if a capability is needed for key lifecycle
 coordination, it lives in the FOSS core. Commercial extensions add
-protocol compatibility, operational tooling, and compliance reporting.
+protocol compatibility, operational tooling, and compliance reporting. The
+commercial column below describes extension scope outside this repository,
+not a Core 0.5.0 delivery or availability claim.
 
 | Capability | FOSS | Commercial |
 |------------|:----:|:----------:|
@@ -206,20 +220,21 @@ protocol compatibility, operational tooling, and compliance reporting.
    from day one.
 
 2. **Brownfield AWS KMS migration** — deploy `keyrack-aws-proxy`,
-   point AWS SDK at it. Gain dependency tracking without changing
-   crypto behavior.
+   configure AWS SDK callers to use it. Record selected key metadata while
+   cryptography remains in AWS KMS.
 
-3. **Sovereign cloud provider** — deploy FOSS core + commercial
-   shims. Offer AWS KMS-compatible API to tenants. Enable BYOK/HYOK
-   with customer-connected HSMs.
+3. **Cloud provider** — expose the native gRPC or REST API. AWS KMS API
+   compatibility requires a separate shim not shipped here; hardware HSM
+   qualification remains provider-specific work.
 
-4. **OpenStack integration** — Barbican shim lets unmodified
-   Cinder/Nova talk to KeyRack.
+4. **OpenStack integration** — requires a separate Barbican compatibility shim,
+   which is not shipped in this repository. Core does not expose the Barbican
+   REST API to Cinder/Nova.
 
 5. **IoT gateway KMS** — run KeyRack on Raspberry Pi (ARM64). Manage
-   sensor encryption keys with automatic rotation.
+   sensor encryption keys and coordinate application-driven rotation.
 
-6. **Compliance-driven enterprise** — scheduled rotation policies,
+6. **Compliance-driven enterprise** — rotation policy settings,
    audit trail, dependency queries for auditors.
 
 7. **E2E encrypted applications** — WASM library in browser for
