@@ -970,12 +970,12 @@ mod tests {
     fn scanner_excludes_test_modules_but_rejects_production_helper_routes() {
         let mut scanner = SurfaceScan::default();
         scanner.visit_file(&syn::parse_file(r#"#[cfg(test)] mod tests { fn helper() { Router::new().route("/test", get(test)); } }"#).unwrap());
-        assert!(scanner.errors.is_empty());
+        assert_eq!(scanner.errors, [] as [std::string::String; 0]);
         scanner.visit_file(
             &syn::parse_file(r#"fn helper() { Router::new().route("/hidden", get(handler)); }"#)
                 .unwrap(),
         );
-        assert!(!scanner.errors.is_empty());
+        assert_ne!(scanner.errors, [] as [std::string::String; 0]);
     }
 
     #[test]
