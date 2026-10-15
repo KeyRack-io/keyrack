@@ -119,7 +119,8 @@ impl DocumentStore {
 
 // Swap provider without changing application code:
 //   SoftwareProvider::new()        → dev/test
-//   Pkcs11Provider::new(&config)   → production HSM
+//   Pkcs11Provider::new(&config)   → PKCS#11 tokens
+//     SoftHSM is supported as a software token; hardware HSMs are not yet qualified.
 //   KmipProvider::new(&config)     → tenant-managed HYOK HSM
 //   VaultTransitProvider::new(url) → existing Vault infrastructure
 ```
