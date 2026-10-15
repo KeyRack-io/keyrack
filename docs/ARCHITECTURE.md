@@ -9,7 +9,10 @@ concerns that existing tools conflate:
    key, what needs rotating) — no existing solution provides this
 
 KeyRack sits above cryptographic providers, coordinating lifecycle
-while delegating actual cryptography to pluggable backends.
+while delegating actual cryptography to pluggable backends. AWS KMS and
+Barbican compatibility shims shown below are separate extensions, not shipped
+in this repository. Core exposes the native gRPC and REST APIs; their coverage
+is recorded in [the API surface inventory](generated/api-surface-parity.md).
 
 ---
 
@@ -115,7 +118,11 @@ uniqueness even without caller-supplied identity attributes.
 
 ### Key Hierarchy
 
-Keys form a parent-child hierarchy:
+Keys form a logical parent-child hierarchy. The KEK/DEK labels below describe
+intended roles, not cryptographic wrapping relationships: wrapped-child creation
+is not reachable through the service API in 0.5.0. API-created keys are
+provider-resident. `CreateKey.parent_key_id` can record logical ancestry;
+namespace rules also describe parent relationships. Neither establishes wrapping.
 
 ```
 Root KEK (operator-managed)
@@ -126,7 +133,7 @@ Root KEK (operator-managed)
     └── Service DEK
 ```
 
-The hierarchy is defined by **namespace routing rules** — YAML
+Namespace hierarchies can be described by **namespace routing rules** — YAML
 configuration that maps attribute patterns to parent relationships:
 
 ```yaml
@@ -163,8 +170,9 @@ configured.
 - LID is stable (derived from attributes)
 - Version is metadata tracked separately
 - Rotation creates a new version with fresh material; same LID
-- Old versions are retained for decryption until all dependents are
-  re-wrapped
+- Old versions remain available for decryption subject to key state and
+  authorization; rotation-job completion does not retire them or prove data
+  migration
 - Self-describing ciphertext header embeds key ID and version, so
   decrypt knows which version to use
 
@@ -224,24 +232,25 @@ pub trait CryptoProvider: Send + Sync {
 | Provider | Key Material | Production Use | FIPS Path |
 |----------|-------------|----------------|-----------|
 | **Software** (RustCrypto) | In-process memory | Dev/test, non-regulated | No (not validated) |
-| **PKCS#11** | HSM hardware | Production, regulated | Yes (if HSM is FIPS-validated) |
+| **PKCS#11** | Token storage | SoftHSM supported for production; hardware HSMs not yet qualified | No qualified hardware path yet |
 | **KMIP** | Remote HSM via TTLV/TLS | Production, HYOK | Yes (if HSM is FIPS-validated) |
 | **Parsec** (stub) | PSA Crypto / TPM | IoT/embedded (future) | Depends on backend |
 | **Vault Transit** | Vault server | Brownfield adoption | No (Vault is not FIPS module) |
 
 The provider choice is a deployment-time configuration decision. Same
 KeyRack API, same key hierarchy, different security properties based
-on provider. Organizations can start with Software and graduate to
-PKCS#11 when requirements demand it.
+on provider. SoftHSM is a supported production software token: its storage
+permissions and PIN protect keys, with no hardware boundary. Hardware HSMs
+over PKCS#11 need separate qualification before making hardware custody claims.
 
 ### Security Boundary by Provider
 
 | Component | Software | PKCS#11 | KMIP |
 |-----------|----------|---------|------|
-| Key material location | Process memory | HSM hardware | Remote HSM |
+| Key material location | Process memory | Token storage (software for SoftHSM) | Remote backend |
 | KeyRack sees material? | Yes | Opaque handles for non-exportable keys | Opaque UIDs for non-exportable keys |
-| Zeroization | Partial (AES, Ed25519) | HSM-managed | HSM-managed |
-| FIPS-compliant path? | No | Yes | Yes |
+| Zeroization | Partial (AES, Ed25519) | Token-managed | Backend-managed |
+| FIPS qualification | No | Hardware HSMs not yet qualified | Depends on backend and deployment |
 
 ---
 
@@ -281,12 +290,15 @@ documentation that operators copy into their PDP deployment.
 When a key rotates:
 
 1. KeyRack creates a new key version (fresh material, same LID)
-2. Old versions remain valid for decryption
-3. Rotation jobs are created for all dependent keys (recursive)
+2. Old versions remain available for decryption subject to key state and authorization
+3. KeyRack attempts to persist rotation jobs for logical descendants (recursive);
+   the result reports successful and failed enqueue counts
 4. Applications poll for pending jobs via the rotation job API
 5. Applications re-encrypt affected data with the new key version
 6. Applications report completion via the job API
-7. When all dependents are re-wrapped, old versions can be destroyed
+7. Operators must verify data migration before scheduling key deletion. Job
+   completion does not prove cryptographic child rewrapping, retire old
+   versions, or provide a version-deletion API.
 
 KeyRack orchestrates but does not execute data re-encryption. Only
 applications understand their data model — transaction boundaries,

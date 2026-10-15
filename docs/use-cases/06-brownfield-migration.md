@@ -22,77 +22,39 @@ Migrating away from a cloud KMS is painful:
 
 ## How KeyRack enables brownfield migration
 
-### Phase 1: Drop-in shim (zero code changes)
+### AWS KMS pass-through versus migration
 
-The AWS KMS compatibility shim accepts standard AWS SDK requests and
-forwards them to KeyRack:
+This repository ships `keyrack-aws-proxy`, which forwards requests to real
+AWS KMS using the proxy's configured credentials and records selected key
+metadata. It does not translate AWS SDK operations onto Core providers, add
+Core PDP enforcement, or remove the AWS dependency.
 
-```yaml
-# Before: point at AWS
-AWS_ENDPOINT_URL: https://kms.us-east-1.amazonaws.com
+The AWS KMS compatibility shim and OpenStack Barbican shim are not shipped
+in this repository. Core 0.5.0 does not provide their APIs, so changing an
+AWS SDK or Cinder endpoint to the Core service is not a migration procedure.
 
-# After: point at KeyRack's AWS KMS shim
-AWS_ENDPOINT_URL: http://keyrack-aws-shim:8080
-```
+### Moving applications to the native API
 
-That's it. No code changes. The application still uses `aws-sdk`,
-`boto3`, `aws-sdk-go-v2`, or any other AWS SDK. It now talks to
-KeyRack.
+Use Core's gRPC or REST API for new keys and cryptographic operations.
+Applications can keep reading existing ciphertext through their original
+provider while writing new data through Core. Migrating old data requires
+an application-managed decrypt-and-encrypt process with access to both keys;
+Core cannot decrypt arbitrary AWS KMS ciphertext through its native providers.
+Verify data migration before removing the old provider dependency.
 
-**What you get immediately:**
-
-- Centralized audit log of all KMS operations
-- Key rotation tracking (which keys were rotated, when, by whom)
-- Dependency graph (which service uses which key)
-- PDP authorization (who can use which key)
-- The ability to run fully on-prem
-
-**What you don't lose:**
-
-- Application code remains unchanged
-- Existing AWS SDK patterns (aliases, encryption context, tags) work
-- SigV4 authentication is handled by the shim
-
-### Phase 2: Hybrid mode
-
-Run KeyRack alongside the cloud KMS during migration:
-
-```
-App → AWS KMS shim → KeyRack (new keys)
-App → AWS KMS (existing keys, read-only)
-```
-
-New keys are created in KeyRack. Existing keys are gradually migrated
-using `ReEncrypt` as data is naturally accessed or during maintenance
-windows.
-
-### Phase 3: Full migration
-
-Once all active data is re-encrypted under KeyRack-managed keys, remove
-the cloud KMS dependency entirely.
-
-### For OpenStack / Barbican users
-
-Same pattern via the Barbican shim:
-
-```ini
-# cinder.conf
-[key_manager]
-backend = barbican
-barbican_endpoint = http://keyrack-barbican-shim:9311
-```
-
-Cinder, Nova, and Manila talk to what they think is Barbican. No
-OpenStack code is modified.
+Native REST and gRPC coverage differs; consult the
+[API surface inventory](../generated/api-surface-parity.md) when selecting
+operations. OpenStack integration requires a separate Barbican compatibility
+implementation and is not included in this release.
 
 ## Backend / provider migration (BYOK ↔ HYOK)
 
-The shim phases above move your *callers*. A separate axis moves where a key's
+Moving callers to the native API is separate from changing where a key's
 *material* lives — e.g. from a KeyRack-managed software/Vault backend (BYOK) to
 a customer-owned HSM (HYOK), or between HSM partitions. KeyRack treats logical
-key identity (LID) as independent of the physical backend, so a key can change
-providers without its `key_id` — or the header-pinned references in existing
-ciphertext — changing.
+key identity (LID) as independent of the physical backend. Per-version
+bindings provide a foundation for changing providers while retaining identity;
+`RotateKey` does not yet accept a target provider.
 
 What ships today (see [OPERATOR.md → Multiple providers and routing](../OPERATOR.md)):
 
@@ -107,75 +69,38 @@ What ships today (see [OPERATOR.md → Multiple providers and routing](../OPERAT
   the foundation for re-key-style migration.
 - **Cross-provider `ReEncrypt`.** When source and destination keys live on
   different providers, KeyRack decrypts on the source and re-encrypts on the
-  destination (same-provider stays a single in-provider op).
+  destination. Both same-provider and cross-provider paths currently expose
+  plaintext in service memory during decrypt-and-encrypt processing. This
+  migrates data ciphertext, not wrapped keys, and is not custody-preserving
+  wrapped-key transport.
 
-Because HSM key material is non-extractable, "move key A → HSM B" is a **re-key**,
-not a byte-copy: a new version is generated on B and becomes primary; old
-ciphertext keeps decrypting on A (its header pins the version); data is
-re-wrapped/re-encrypted over time, then A is retired — no big-bang re-encryption.
-Literal byte-movement is only possible for explicitly wrapped/extractable
-material via the BYOK import path.
+For non-extractable keys, migration requires generating new material at the
+destination and re-encrypting data, rather than copying the original key.
+Today applications can create a separate destination key and use data
+`ReEncrypt`; old ciphertext still needs the original key and backend until
+migration is complete.
 
 Next step (not yet shipped): `rotate_key` with an optional target provider so an
 in-place re-key onto a different backend is a single primitive; today the new
 version inherits the key's current provider. A bulk re-wrap/re-encrypt sweep
 builds on that.
 
-## Fit rating
+## What is ready and what remains
 
-**Excellent for AWS KMS users. Good for OpenStack/Barbican users.
-Not yet available for GCP/Azure.**
+Core 0.5.0 includes multiple named providers, routing, per-version provider
+bindings and data `ReEncrypt` between existing Core-managed keys. SoftHSM is
+a supported production software token, protected by storage permissions and
+its PIN, with no hardware boundary. Hardware HSMs over PKCS#11 are not yet
+qualified.
 
-The AWS KMS shim is the strongest brownfield wedge. It's already
-implemented and covers the most common operations. The Barbican shim
-covers the OpenStack ecosystem.
+Remaining migration work includes:
 
-GCP KMS and Azure Key Vault shims do not exist today but could follow
-the same pattern.
+- Adapting applications to Core's native API, or obtaining a separate protocol
+  compatibility implementation. AWS KMS and Barbican shims are not in this repo.
+- Selecting a different provider during `RotateKey`; the operation currently
+  uses the existing primary version's provider.
+- Orchestrating and verifying bulk data re-encryption before retiring old keys.
+- Cross-provider wrapped-key transport; data `ReEncrypt` does not provide it.
 
-## What's ready today
-
-- AWS KMS shim with SigV4 authentication
-- Supported operations: CreateKey, DescribeKey, ListKeys, Encrypt,
-  Decrypt, GenerateDataKey, GenerateDataKeyWithoutPlaintext,
-  GenerateRandom, ReEncrypt, Sign, Verify, Enable/DisableKey,
-  Enable/DisableKeyRotation, GetKeyRotationStatus,
-  ScheduleKeyDeletion, CancelKeyDeletion, CreateAlias, DeleteAlias,
-  ListAliases, TagResource, UntagResource, ListResourceTags
-- Barbican shim with Keystone authentication
-- Supported: POST/GET/DELETE /v1/secrets, GET /v1/secrets/{id}/payload
-
-## What's missing
-
-| Item | Effort | Impact |
-|---|---|---|
-| AWS shim: NATS cache invalidation | 2-3 days | Medium — performance for high-throughput |
-| AWS shim: published container image | 0.5 days | High — deployment ease |
-| GCP KMS shim | 2-3 weeks | Medium — smaller target audience |
-| Azure Key Vault shim | 2-3 weeks | Medium — smaller target audience |
-| Vault Transit shim | 1-2 weeks | Medium — HashiCorp users |
-| `rotate_key` with target provider (in-place re-key onto a different backend) | days | High — completes the BYOK↔HYOK primitive |
-| Bulk re-wrap / re-encrypt sweep (orchestrate phase 2→3) | 1-2 weeks | High — needed at scale |
-
-Already shipped (previously listed as missing): multiple named providers +
-routing, per-version provider binding, and cross-provider `ReEncrypt` — the
-foundations for backend/provider migration. See the section above.
-
-## Strategic note
-
-**The AWS KMS shim is KeyRack's most powerful adoption wedge.**
-
-Consider this positioning:
-
-> "Switch from AWS KMS to KeyRack in 5 minutes. Change one environment
-> variable. Keep all your existing code. Get on-prem capability, crypto
-> agility, and centralized key management."
-
-This is a real, demonstrable value proposition with near-zero adoption
-friction. It should be prominently featured on the website and be the
-primary call-to-action for brownfield users.
-
-The commercial angle: the shim itself could be OSS (encouraging
-adoption), while HA clustering, vendor HSM adapters, and the management
-UI remain commercial. Users who migrate via the shim and scale up
-become natural commercial customers.
+Core's logical parent-child relationships do not establish a wrapping chain.
+Wrapped-child creation is not reachable through the service API in this release.
