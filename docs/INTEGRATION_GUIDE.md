@@ -107,6 +107,12 @@ missing or malformed principal/tenant headers also refuses. The allowlist change
 which workloads may forward an identity; it does not grant the forwarded actor
 permission to perform an operation.
 
+The order of `required_sans` determines the `delegating_peer_id` presented to
+the PDP. When a certificate matches several entries, the earliest listed entry
+is recorded, regardless of certificate SAN order. Listing a higher-privilege
+identity first therefore attributes every certificate containing both matching
+SANs to that identity. Order the list according to the intended policy identity.
+
 The upstream service sets these headers:
 - `x-keyrack-principal-id`
 - `x-keyrack-tenant-id`

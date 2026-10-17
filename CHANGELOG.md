@@ -486,7 +486,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   configured values match, allowlist order selects the peer; certificate SAN
   order and extra unlisted SANs do not select another identity. Matching remains
   exact and case-sensitive; email and IP SANs are ineligible. Standalone trusted
-  mTLS principal selection and delegation without a SAN pin are unchanged.
+  mTLS principal selection and delegation without a SAN pin are unchanged. SAN-pinned
+  policies must stop relying on the former peer identity: the certificate's first
+  SPIFFE URI, or its CN when no SPIFFE URI was present.
 
 ## [0.4.0] — 2026-08-30
 
