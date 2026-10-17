@@ -25,7 +25,9 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "Existing locked instant@0.1.13: `instant` is unmaintained. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
     # rsa@0.9.10: Marvin Attack: potential key recovery through timing sidechannels
     # No safe upgrade is available!
-    { id = "RUSTSEC-2023-0071", reason = "Existing locked rsa@0.9.10: Marvin Attack: potential key recovery through timing sidechannels. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # No fixed release is available. Software-backend RSA private-key operations are not
+    # constant-time; production RSA keys belong on PKCS#11.
+    { id = "RUSTSEC-2023-0071", reason = "No fixed release is available. Software-backend RSA private-key operations are not constant-time; production RSA keys belong on PKCS#11." },
     # rustls@0.23.40: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries
     # Upgrade to >=0.23.45 (try `cargo update -p rustls`)
     { id = "RUSTSEC-2026-0285", reason = "Existing locked rustls@0.23.40: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
@@ -40,22 +42,32 @@ ignore = [
     { id = "RUSTSEC-2026-0349", reason = "Existing locked rustls@0.23.40: Unauthenticated ServerHello can downgrade later connections to classical key exchange. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
     # rustls-pemfile@2.2.0: rustls-pemfile is unmaintained
     # No safe upgrade is available!
-    { id = "RUSTSEC-2025-0134", reason = "Existing locked rustls-pemfile@2.2.0: rustls-pemfile is unmaintained. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Unmaintained, with no open vulnerability. Replace rustls-pemfile after 0.5.0.
+    { id = "RUSTSEC-2025-0134", reason = "Unmaintained, with no open vulnerability. Replace rustls-pemfile after 0.5.0." },
     # rustls-webpki@0.102.8: CRLs not considered authoritative by Distribution Point due to faulty matching logic
     # Upgrade to >=0.103.10 (try `cargo update -p rustls-webpki`)
-    { id = "RUSTSEC-2026-0049", reason = "Existing locked rustls-webpki@0.102.8: CRLs not considered authoritative by Distribution Point due to faulty matching logic. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
+    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
+    { id = "RUSTSEC-2026-0049", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
     # rustls-webpki@0.102.8: Name constraints for URI names were incorrectly accepted
     # Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (try `cargo update -p rustls-webpki`)
-    { id = "RUSTSEC-2026-0098", reason = "Existing locked rustls-webpki@0.102.8: Name constraints for URI names were incorrectly accepted. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
+    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
+    { id = "RUSTSEC-2026-0098", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
     # rustls-webpki@0.102.8: Name constraints were accepted for certificates asserting a wildcard name
     # Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (try `cargo update -p rustls-webpki`)
-    { id = "RUSTSEC-2026-0099", reason = "Existing locked rustls-webpki@0.102.8: Name constraints were accepted for certificates asserting a wildcard name. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
+    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
+    { id = "RUSTSEC-2026-0099", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
     # rustls-webpki@0.102.8: Reachable panic in certificate revocation list parsing
     # Upgrade to >=0.103.13, <0.104.0-alpha.1 OR >=0.104.0-alpha.7 (try `cargo update -p rustls-webpki`)
-    { id = "RUSTSEC-2026-0104", reason = "Existing locked rustls-webpki@0.102.8: Reachable panic in certificate revocation list parsing. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
+    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
+    { id = "RUSTSEC-2026-0104", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
     # unsafe-libyaml@0.2.11: unsafe-libyaml is unmaintained
     # No safe upgrade is available!
-    { id = "RUSTSEC-2024-0449", reason = "Existing locked unsafe-libyaml@0.2.11: unsafe-libyaml is unmaintained. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Unmaintained, with no open vulnerability. Replace unsafe-libyaml after 0.5.0.
+    { id = "RUSTSEC-2024-0449", reason = "Unmaintained, with no open vulnerability. Replace unsafe-libyaml after 0.5.0." },
     # metrics@0.24.5: Yanked release
     # Replace the yanked version in a dependency-update change.
     { crate = "metrics@0.24.5", reason = "Existing locked metrics@0.24.5: Yanked release. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },

@@ -3,6 +3,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Weekly on Monday at 03:17 UTC, including when main has no new commits.
+    - cron: "17 3 * * 1"
 permissions:
   contents: read
 jobs:
