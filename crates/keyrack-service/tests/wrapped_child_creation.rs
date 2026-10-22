@@ -203,6 +203,7 @@ fn state_over(
         max_plaintext_bytes: 4096,
         legacy_compromised_key_decrypt: false,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         wrapping: WrappingProfiles::new(
             wrapping
                 .into_iter()
@@ -292,7 +293,7 @@ async fn a_created_child_encrypts_and_decrypts_through_a_lease() {
         .expect("child provider");
 
     let ciphertext =
-        domain::with_usable_handle(&state, &child, version, entry.provider.as_ref(), |handle| {
+        domain::with_usable_handle(&state, &child, version, &entry.provider, |handle| {
             let provider = Arc::clone(&entry.provider);
             async move {
                 provider
@@ -306,7 +307,7 @@ async fn a_created_child_encrypts_and_decrypts_through_a_lease() {
         .expect("a created child must encrypt");
 
     let plaintext =
-        domain::with_usable_handle(&state, &child, version, entry.provider.as_ref(), |handle| {
+        domain::with_usable_handle(&state, &child, version, &entry.provider, |handle| {
             let provider = Arc::clone(&entry.provider);
             let ciphertext = ciphertext.clone();
             async move {
@@ -369,7 +370,7 @@ async fn cancelling_single_use_must_settle_its_genuine_lease() {
         &state,
         &child,
         child.primary_version().unwrap(),
-        provider.as_ref(),
+        &provider,
         |handle| async move {
             send.send(handle).unwrap();
             std::future::pending::<Result<(), DomainError>>().await
@@ -419,7 +420,7 @@ async fn returned_operation_error_still_closes_its_genuine_lease() {
         &state,
         &child,
         child.primary_version().unwrap(),
-        provider.as_ref(),
+        &provider,
         |handle| async move {
             *save.lock().unwrap() = Some(handle);
             Err::<(), _>(DomainError::Internal("operation failed".into()))
@@ -440,8 +441,16 @@ async fn returned_operation_error_still_closes_its_genuine_lease() {
     );
 }
 
-#[tokio::test]
-async fn cancelling_two_key_use_must_settle_both_genuine_leases() {
+/// Which half of a two-key use is pending when it is cancelled.
+#[derive(Clone, Copy)]
+enum TwoKeyPhase {
+    Source,
+    Destination,
+}
+
+/// Cancel a two-key use while `phase` is pending and return every handle it
+/// had opened by then.
+async fn cancel_two_key_use(phase: TwoKeyPhase) -> Vec<KeyHandle> {
     let state = activated();
     let parent = parent_key(&state).await;
     let source = domain::create_key(&state, input(KeySpec::Aes256, Some(&parent)))
@@ -456,20 +465,32 @@ async fn cancelling_two_key_use_must_settle_both_genuine_leases() {
         .unwrap()
         .provider;
     let (send, receive) = tokio::sync::oneshot::channel();
+    let send = Arc::new(std::sync::Mutex::new(Some(send)));
+    let (first_send, then_send) = (send.clone(), send);
     let mut use_future = Box::pin(domain::with_usable_handles(
         &state,
         domain::VersionUse {
             record: &source,
             version: source.primary_version().unwrap(),
-            provider: provider.as_ref(),
+            provider: &provider,
         },
         domain::VersionUse {
             record: &destination,
             version: destination.primary_version().unwrap(),
-            provider: provider.as_ref(),
+            provider: &provider,
         },
-        |a, b| async move {
-            send.send((a, b)).unwrap();
+        move |a| async move {
+            if matches!(phase, TwoKeyPhase::Source) {
+                let send = first_send.lock().unwrap().take().unwrap();
+                send.send(vec![a]).unwrap();
+                std::future::pending::<Result<KeyHandle, DomainError>>().await
+            } else {
+                Ok(a)
+            }
+        },
+        move |b, a| async move {
+            let send = then_send.lock().unwrap().take().unwrap();
+            send.send(vec![a, b]).unwrap();
             std::future::pending::<Result<(), DomainError>>().await
         },
     ));
@@ -477,31 +498,41 @@ async fn cancelling_two_key_use_must_settle_both_genuine_leases() {
         handles = receive => handles.unwrap(),
         result = &mut use_future => panic!("operation should be pending: {result:?}"),
     };
-    assert_ne!(handles.0.key_id, handles.1.key_id);
-    for handle in [&handles.0, &handles.1] {
-        provider
-            .encrypt(handle, b"before cancellation", b"aad")
-            .await
-            .unwrap();
-    }
+    let pending = handles.last().unwrap();
+    provider
+        .encrypt(pending, b"before cancellation", b"aad")
+        .await
+        .unwrap();
     drop(use_future);
     for _ in 0..32 {
         tokio::task::yield_now().await;
     }
     let mut usable = 0;
-    let mut removed = 0;
-    for handle in [handles.0, handles.1] {
+    for handle in &handles {
         let result = provider
-            .encrypt(&handle, b"after cancellation", b"aad")
+            .encrypt(handle, b"after cancellation", b"aad")
             .await;
-        usable += usize::from(result.is_ok());
-        removed += usize::from(matches!(result,
+        usable += usize::from(!matches!(result,
             Err(keyrack_core::error::KeyRackError::Provider(ref message))
             if message == &format!("key not found: {}", handle.key_id)));
-        provider.destroy_key(&handle).await.unwrap();
+        provider.destroy_key(handle).await.unwrap();
     }
-    assert_eq!(removed, 2,
-        "cancelled with_usable_handles must remove both genuine opened children; still operable: {usable}");
+    assert_eq!(
+        usable, 0,
+        "a cancelled with_usable_handles must remove every genuine opened child"
+    );
+    handles
+}
+
+#[tokio::test]
+async fn cancelling_two_key_use_in_the_source_phase_settles_its_lease() {
+    assert_eq!(cancel_two_key_use(TwoKeyPhase::Source).await.len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_two_key_use_must_settle_both_genuine_leases() {
+    let handles = cancel_two_key_use(TwoKeyPhase::Destination).await;
+    assert_ne!(handles[0].key_id, handles[1].key_id);
 }
 
 /// The key cache is a `StorageBackend` wrapper, and a wrapper that does not

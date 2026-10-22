@@ -1130,7 +1130,7 @@ async fn open_usable(
     state: &ServiceState,
     record: &KeyRecord,
     version: &KeyVersionRecord,
-    provider: &dyn CryptoProvider,
+    provider: &Arc<dyn CryptoProvider>,
 ) -> Result<OpenedUse, DomainError> {
     match &version.material {
         KeyMaterial::ProviderResident { .. } => Ok(OpenedUse {
@@ -1196,7 +1196,10 @@ async fn open_usable(
     }
 }
 
-async fn close_usable(provider: &dyn CryptoProvider, opened: OpenedUse) -> Result<(), DomainError> {
+async fn close_usable(
+    provider: &Arc<dyn CryptoProvider>,
+    opened: OpenedUse,
+) -> Result<(), DomainError> {
     if let Some(lease) = opened.lease {
         provider
             .close_wrapped_key(&lease)
@@ -1217,7 +1220,7 @@ fn finish_use<T>(
 pub struct VersionUse<'a> {
     pub record: &'a KeyRecord,
     pub version: &'a KeyVersionRecord,
-    pub provider: &'a dyn CryptoProvider,
+    pub provider: &'a Arc<dyn CryptoProvider>,
 }
 
 /// Run one provider operation against a version's usable handle.
@@ -1231,7 +1234,7 @@ pub async fn with_usable_handle<F, Fut, T>(
     state: &ServiceState,
     record: &KeyRecord,
     version: &KeyVersionRecord,
-    provider: &dyn CryptoProvider,
+    provider: &Arc<dyn CryptoProvider>,
     op: F,
 ) -> Result<T, DomainError>
 where
@@ -1244,16 +1247,20 @@ where
     finish_use(result, close_usable(provider, opened).await)
 }
 
-/// Open two versions for one operation (re-encrypt), then close both.
-pub async fn with_usable_handles<F, Fut, T>(
+/// Run `first` against the source version, then `then` against the
+/// destination with `first`'s result.
+pub async fn with_usable_handles<A, AFut, M, B, BFut, T>(
     state: &ServiceState,
     source: VersionUse<'_>,
     destination: VersionUse<'_>,
-    op: F,
+    first: A,
+    then: B,
 ) -> Result<T, DomainError>
 where
-    F: FnOnce(KeyHandle, KeyHandle) -> Fut,
-    Fut: std::future::Future<Output = Result<T, DomainError>>,
+    A: FnOnce(KeyHandle) -> AFut,
+    AFut: std::future::Future<Output = Result<M, DomainError>>,
+    B: FnOnce(KeyHandle, M) -> BFut,
+    BFut: std::future::Future<Output = Result<T, DomainError>>,
 {
     let opened_source = open_usable(state, source.record, source.version, source.provider).await?;
     let opened_destination = match open_usable(
@@ -1270,14 +1277,60 @@ where
             return Err(error);
         }
     };
-    let result = op(
-        opened_source.handle.clone(),
-        opened_destination.handle.clone(),
-    )
-    .await;
+    let result = match first(opened_source.handle.clone()).await {
+        Ok(intermediate) => then(opened_destination.handle.clone(), intermediate).await,
+        Err(error) => Err(error),
+    };
     let destination_closed = close_usable(destination.provider, opened_destination).await;
     let source_closed = close_usable(source.provider, opened_source).await;
     finish_use(finish_use(result, destination_closed), source_closed)
+}
+
+/// Re-encrypt `ciphertext` from the source version to the destination.
+///
+/// Two resident versions on one provider use the provider's own
+/// `re_encrypt`. Otherwise the source decrypts and the destination encrypts,
+/// and the plaintext transits service memory.
+pub async fn re_encrypt_with_usable_handles(
+    state: &ServiceState,
+    source: VersionUse<'_>,
+    destination: VersionUse<'_>,
+    ciphertext: &[u8],
+    source_aad: &[u8],
+    destination_aad: &[u8],
+) -> Result<keyrack_core::provider::EncryptOutput, DomainError> {
+    if Arc::ptr_eq(source.provider, destination.provider) {
+        if let (Ok(src), Ok(dst)) = (
+            source.version.resident_handle(),
+            destination.version.resident_handle(),
+        ) {
+            return source
+                .provider
+                .re_encrypt(src, ciphertext, source_aad, dst, destination_aad)
+                .await
+                .map_err(DomainError::from);
+        }
+    }
+    let src_provider = Arc::clone(source.provider);
+    let dst_provider = Arc::clone(destination.provider);
+    with_usable_handles(
+        state,
+        source,
+        destination,
+        |src| async move {
+            src_provider
+                .decrypt(&src, ciphertext, source_aad)
+                .await
+                .map_err(DomainError::from)
+        },
+        |dst, plaintext| async move {
+            dst_provider
+                .encrypt(&dst, plaintext.expose(), destination_aad)
+                .await
+                .map_err(DomainError::from)
+        },
+    )
+    .await
 }
 
 /// Rotate `lid` to a new primary version and queue rotation jobs for its
@@ -1550,7 +1603,7 @@ pub mod crypto {
         let aad = header.build_aad(&ec_aad);
 
         let output =
-            super::with_usable_handle(state, &record, primary, entry.provider.as_ref(), |handle| {
+            super::with_usable_handle(state, &record, primary, &entry.provider, |handle| {
                 let provider = Arc::clone(&entry.provider);
                 let plaintext = input.plaintext.clone();
                 let aad = aad.clone();
@@ -1635,12 +1688,8 @@ pub mod crypto {
         decrypt_permission
             .record_use(state, &record, &input.audit_context)
             .await;
-        let plaintext = super::with_usable_handle(
-            state,
-            &record,
-            version_record,
-            entry.provider.as_ref(),
-            |handle| {
+        let plaintext =
+            super::with_usable_handle(state, &record, version_record, &entry.provider, |handle| {
                 let provider = Arc::clone(&entry.provider);
                 let ciphertext = ciphertext.to_vec();
                 let aad = aad.clone();
@@ -1650,9 +1699,8 @@ pub mod crypto {
                         .await
                         .map_err(DomainError::from)
                 }
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         Ok(DecryptOutput {
             plaintext: plaintext.expose().clone(),
@@ -1774,49 +1822,23 @@ pub mod crypto {
         decrypt_permission
             .record_use(state, &src_record, &input.audit_context)
             .await;
-        // Same-provider path: calls `re_encrypt` on the shared provider.
-        // NOTE: no in-tree provider currently overrides `re_encrypt`, so the
-        // trait default fires and plaintext surfaces in coordinator memory
-        // regardless of the Arc::ptr_eq check.
-        // Cross-provider path: decrypt on source, re-encrypt on destination
-        // (plaintext transits service memory).
-        let same_provider = Arc::ptr_eq(&src_entry.provider, &dst_entry.provider);
-        let output = super::with_usable_handles(
+        // NOTE: no in-tree provider overrides `re_encrypt`, so even the
+        // same-provider path decrypts into coordinator memory.
+        let output = super::re_encrypt_with_usable_handles(
             state,
             super::VersionUse {
                 record: &src_record,
                 version: src_version,
-                provider: src_entry.provider.as_ref(),
+                provider: &src_entry.provider,
             },
             super::VersionUse {
                 record: &dst_record,
                 version: dst_primary,
-                provider: dst_entry.provider.as_ref(),
+                provider: &dst_entry.provider,
             },
-            |src_handle, dst_handle| {
-                let src_provider = Arc::clone(&src_entry.provider);
-                let dst_provider = Arc::clone(&dst_entry.provider);
-                let ciphertext = ciphertext.to_vec();
-                let src_aad = src_aad.clone();
-                let dst_aad = dst_aad.clone();
-                async move {
-                    if same_provider {
-                        src_provider
-                            .re_encrypt(&src_handle, &ciphertext, &src_aad, &dst_handle, &dst_aad)
-                            .await
-                            .map_err(DomainError::from)
-                    } else {
-                        let plaintext = src_provider
-                            .decrypt(&src_handle, &ciphertext, &src_aad)
-                            .await
-                            .map_err(DomainError::from)?;
-                        dst_provider
-                            .encrypt(&dst_handle, plaintext.expose(), &dst_aad)
-                            .await
-                            .map_err(DomainError::from)
-                    }
-                }
-            },
+            ciphertext,
+            &src_aad,
+            &dst_aad,
         )
         .await?;
 
@@ -1867,7 +1889,7 @@ pub mod crypto {
             .map_err(DomainError::from)?;
 
         let signature =
-            super::with_usable_handle(state, &record, primary, entry.provider.as_ref(), |handle| {
+            super::with_usable_handle(state, &record, primary, &entry.provider, |handle| {
                 let provider = Arc::clone(&entry.provider);
                 let algorithm = input.signing_algorithm;
                 let message = input.message.clone();
@@ -1927,20 +1949,19 @@ pub mod crypto {
             .resolve_for_primary(&record)
             .map_err(DomainError::from)?;
 
-        let valid =
-            super::with_usable_handle(state, &record, primary, entry.provider.as_ref(), |handle| {
-                let provider = Arc::clone(&entry.provider);
-                let algorithm = input.signing_algorithm;
-                let message = input.message.clone();
-                let signature = input.signature.clone();
-                async move {
-                    provider
-                        .verify(&handle, algorithm, &message, &signature)
-                        .await
-                        .map_err(DomainError::from)
-                }
-            })
-            .await?;
+        let valid = super::with_usable_handle(state, &record, primary, &entry.provider, |handle| {
+            let provider = Arc::clone(&entry.provider);
+            let algorithm = input.signing_algorithm;
+            let message = input.message.clone();
+            let signature = input.signature.clone();
+            async move {
+                provider
+                    .verify(&handle, algorithm, &message, &signature)
+                    .await
+                    .map_err(DomainError::from)
+            }
+        })
+        .await?;
 
         Ok(VerifyOutput {
             signature_valid: valid,
@@ -2018,7 +2039,7 @@ pub mod crypto {
         let dek_len = dek_length(input.key_spec.as_ref(), input.number_of_bytes);
 
         let output =
-            super::with_usable_handle(state, &record, primary, entry.provider.as_ref(), |handle| {
+            super::with_usable_handle(state, &record, primary, &entry.provider, |handle| {
                 let provider = Arc::clone(&entry.provider);
                 let aad = aad.clone();
                 async move {

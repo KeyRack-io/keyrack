@@ -101,6 +101,7 @@ fn state(providers: Arc<dyn ProviderRegistry>) -> Arc<ServiceState> {
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
     })
 }
 

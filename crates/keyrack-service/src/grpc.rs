@@ -177,7 +177,7 @@ impl KeyService for KeyServiceImpl {
                     &state,
                     &record,
                     primary_version,
-                    enc_entry.provider.as_ref(),
+                    &enc_entry.provider,
                     |handle| {
                         let provider = Arc::clone(&enc_entry.provider);
                         let plaintext = req.plaintext.clone();
@@ -303,7 +303,7 @@ impl KeyService for KeyServiceImpl {
                     &state,
                     &record,
                     version_record,
-                    dec_entry.provider.as_ref(),
+                    &dec_entry.provider,
                     |handle| {
                         let provider = Arc::clone(&dec_entry.provider);
                         let ciphertext = ciphertext.to_vec();
@@ -465,50 +465,21 @@ impl KeyService for KeyServiceImpl {
                 decrypt_permission
                     .record_use(&state, &src_record, &legacy_audit_context)
                     .await;
-                let same_provider =
-                    std::sync::Arc::ptr_eq(&src_re_entry.provider, &dst_re_entry.provider);
-                let output = crate::domain::with_usable_handles(
+                let output = crate::domain::re_encrypt_with_usable_handles(
                     &state,
                     crate::domain::VersionUse {
                         record: &src_record,
                         version: src_version,
-                        provider: src_re_entry.provider.as_ref(),
+                        provider: &src_re_entry.provider,
                     },
                     crate::domain::VersionUse {
                         record: &dst_record,
                         version: dst_primary,
-                        provider: dst_re_entry.provider.as_ref(),
+                        provider: &dst_re_entry.provider,
                     },
-                    |src_handle, dst_handle| {
-                        let src_provider = Arc::clone(&src_re_entry.provider);
-                        let dst_provider = Arc::clone(&dst_re_entry.provider);
-                        let ciphertext = ciphertext.to_vec();
-                        let src_aad = src_aad.clone();
-                        let dst_aad = dst_aad.clone();
-                        async move {
-                            if same_provider {
-                                src_provider
-                                    .re_encrypt(
-                                        &src_handle,
-                                        &ciphertext,
-                                        &src_aad,
-                                        &dst_handle,
-                                        &dst_aad,
-                                    )
-                                    .await
-                                    .map_err(crate::domain::DomainError::from)
-                            } else {
-                                let plaintext = src_provider
-                                    .decrypt(&src_handle, &ciphertext, &src_aad)
-                                    .await
-                                    .map_err(crate::domain::DomainError::from)?;
-                                dst_provider
-                                    .encrypt(&dst_handle, plaintext.expose(), &dst_aad)
-                                    .await
-                                    .map_err(crate::domain::DomainError::from)
-                            }
-                        }
-                    },
+                    ciphertext,
+                    &src_aad,
+                    &dst_aad,
                 )
                 .await
                 .map_err(|e| e.to_grpc_status())?;
@@ -613,7 +584,7 @@ impl KeyService for KeyServiceImpl {
                     &state,
                     &record,
                     primary,
-                    gdek_entry.provider.as_ref(),
+                    &gdek_entry.provider,
                     |handle| {
                         let provider = Arc::clone(&gdek_entry.provider);
                         let aad = aad.clone();
@@ -708,7 +679,7 @@ impl KeyService for KeyServiceImpl {
                     &state,
                     &record,
                     primary,
-                    gdkwp_entry.provider.as_ref(),
+                    &gdkwp_entry.provider,
                     |handle| {
                         let provider = Arc::clone(&gdkwp_entry.provider);
                         let aad = aad.clone();

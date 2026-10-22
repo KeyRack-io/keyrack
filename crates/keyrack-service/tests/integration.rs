@@ -295,6 +295,7 @@ fn build_test_state_with_provider(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
@@ -947,6 +948,7 @@ fn build_two_provider_state(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
@@ -1783,6 +1785,7 @@ fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -1857,6 +1860,7 @@ fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -3029,6 +3033,7 @@ fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -3223,6 +3228,7 @@ fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -3269,6 +3275,7 @@ fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<Capturing
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -3799,6 +3806,7 @@ fn build_rejecting_authn_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -3836,6 +3844,7 @@ fn build_invalid_cred_authn_state() -> Arc<ServiceState> {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
@@ -4108,6 +4117,7 @@ async fn grpc_authn_reject_no_credential() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4217,6 +4227,7 @@ async fn mtls_valid_cert_principal_reaches_pdp_audit() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4276,6 +4287,7 @@ async fn mtls_no_cert_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4354,6 +4366,7 @@ async fn mtls_untrusted_ca_tls_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4475,6 +4488,7 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4557,6 +4571,7 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -4782,6 +4797,7 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -5015,6 +5031,7 @@ async fn trusted_mtls_peer_denied_on_tenant_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -5107,6 +5124,7 @@ async fn trusted_mtls_peer_passes_platform_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -6317,6 +6335,7 @@ async fn grpc_list_keys_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -6355,6 +6374,7 @@ async fn grpc_list_aliases_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -6393,6 +6413,7 @@ async fn grpc_generate_random_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
@@ -6501,6 +6522,7 @@ fn build_state_for_principal(
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
         wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })

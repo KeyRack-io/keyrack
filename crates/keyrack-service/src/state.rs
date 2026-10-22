@@ -53,6 +53,9 @@ pub struct ServiceState {
     /// refused: a hierarchy is configured, never inferred from a request.
     pub wrapping: crate::hierarchy::WrappingProfiles,
     pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
+    /// Owner of wrapped-lease opens and closes that must outlive a cancelled
+    /// request. Drained by [`crate::shutdown::drain`].
+    pub lease_cleanup: crate::lease::LeaseCleanup,
 }
 
 impl ServiceState {

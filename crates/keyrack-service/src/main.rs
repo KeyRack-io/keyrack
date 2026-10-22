@@ -161,17 +161,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("initiating graceful shutdown (drain timeout: {DRAIN_TIMEOUT:?})");
     cancel.cancel();
 
-    if let Ok(()) = tokio::time::timeout(DRAIN_TIMEOUT, async {
-        let _ = grpc_handle.await;
-        let _ = rest_handle.await;
-        let _ = deletion_handle.await;
-        let _ = rotation_expiry_handle.await;
-    })
-    .await
-    {
+    let report = keyrack_service::shutdown::drain(
+        &state,
+        async {
+            let _ = grpc_handle.await;
+            let _ = rest_handle.await;
+            let _ = deletion_handle.await;
+            let _ = rotation_expiry_handle.await;
+        },
+        DRAIN_TIMEOUT,
+    )
+    .await;
+    if report.tasks_drained {
         tracing::info!("all servers and workers drained");
     } else {
         tracing::warn!("drain timeout reached, forcing shutdown");
+    }
+    if report.cleanups_abandoned > 0 {
+        tracing::error!(
+            abandoned = report.cleanups_abandoned,
+            "wrapped lease closes still pending at the drain deadline were abandoned"
+        );
     }
 
     tracing::info!("flushing audit sink");
@@ -852,6 +862,7 @@ async fn build_state(
             legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
             nats_publisher,
             wrapping,
+            lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         },
         custody_readiness,
     ))
