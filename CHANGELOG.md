@@ -490,6 +490,14 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   policies must stop relying on the former peer identity: the certificate's first
   SPIFFE URI, or its CN when no SPIFFE URI was present.
 
+### Security reporting and dependency checks
+
+- Add a root security policy using GitHub private vulnerability reporting, with
+  support for the latest 0.5.x patch and explicit response targets.
+- Check dependency advisories, licenses, bans, and sources with cargo-deny on
+  every pull request and push to main. Dependency exceptions are recorded in
+  `deny.toml`; external sources are restricted to crates.io.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave
