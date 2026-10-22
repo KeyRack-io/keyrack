@@ -173,3 +173,32 @@ them: they are refused as wrapping parents with a message naming the change, and
 listed at startup so an operator learns that migration is needed before traffic
 arrives rather than from a first failed use.
 There is no migration script until someone needs one.
+
+## Using a child
+
+Encrypt, decrypt, re-encrypt and generate-data-key open a wrapped child for
+the call and close it before a normal return, on success and on the
+operation's error: the call returns only after the provider has answered the
+close, and a failed close fails the call. If the request is cancelled first —
+client disconnect, client deadline, shutdown — closing passes to a cleanup
+owner independent of the request: it is scheduled, not verified, before the
+request ends, and its outcome is recorded in the service log and metrics only
+as an unverified cleanup outcome, never as verified closure. A close still
+pending when the shutdown drain ends is recorded as abandoned. A cancelled
+request records no audit outcome for its operation.
+
+The owner also runs the open, because a provider open may block and cannot be
+cancelled: a lease produced after its request has gone is owned and closed
+like any other. Shutdown keeps its single deadline; the owner gets whatever the
+server drain leaves of it. Outcomes are counted in
+`keyrack_wrapped_lease_cleanup_total` by `outcome` — `scheduled`,
+`closed_after_return`, `close_failed`, `abandoned` — and each log record names
+the key, version, provider, object and context digest, never material. A close
+that fails within the request is retried once by the owner.
+
+Re-encrypt that involves a wrapped version holds at most one lease: the source
+is opened, decrypts and is closed before the destination opens, and a failed
+source close fails the call without opening the destination.
+
+Native PKCS#11 wrapping is not reachable through the service in 0.5.0, for any
+token, SoftHSM included.

@@ -1123,23 +1123,62 @@ const WRAPPED_UNSUPPORTED: &str = "parent-wrapped material is not supported by t
 
 struct OpenedUse {
     handle: KeyHandle,
-    lease: Option<keyrack_core::provider::WrappedKeyLease>,
+    lease: Option<crate::lease::LeaseGuard>,
+}
+
+/// A version checked against storage and ready to open, before any provider
+/// call.
+enum PreparedUse {
+    Resident(KeyHandle),
+    Wrapped {
+        context: Box<WrappingContext>,
+        parent: KeyHandle,
+        envelope: Vec<u8>,
+        used: crate::lease::LeaseUse,
+    },
 }
 
 async fn open_usable(
     state: &ServiceState,
-    record: &KeyRecord,
-    version: &KeyVersionRecord,
+    prepared: PreparedUse,
     provider: &Arc<dyn CryptoProvider>,
 ) -> Result<OpenedUse, DomainError> {
+    match prepared {
+        PreparedUse::Resident(handle) => Ok(OpenedUse {
+            handle,
+            lease: None,
+        }),
+        PreparedUse::Wrapped {
+            context,
+            parent,
+            envelope,
+            used,
+        } => {
+            let lease = state
+                .lease_cleanup
+                .open(Arc::clone(provider), *context, parent, envelope, used)
+                .await
+                .map_err(DomainError::from)?;
+            Ok(OpenedUse {
+                handle: lease.handle().clone(),
+                lease: Some(lease),
+            })
+        }
+    }
+}
+
+async fn prepare_usable(
+    state: &ServiceState,
+    record: &KeyRecord,
+    version: &KeyVersionRecord,
+) -> Result<PreparedUse, DomainError> {
     match &version.material {
-        KeyMaterial::ProviderResident { .. } => Ok(OpenedUse {
-            handle: version
+        KeyMaterial::ProviderResident { .. } => Ok(PreparedUse::Resident(
+            version
                 .resident_handle()
                 .map_err(DomainError::from)?
                 .clone(),
-            lease: None,
-        }),
+        )),
         KeyMaterial::ParentWrapped(material) => {
             let operation = material
                 .wrapped_material_ref()
@@ -1184,27 +1223,23 @@ async fn open_usable(
                 mechanism: material.mechanism().clone(),
                 public_material_sha256: None,
             };
-            let lease = provider
-                .open_wrapped_key(&context, &parent_handle, &envelope)
-                .await
-                .map_err(DomainError::from)?;
-            Ok(OpenedUse {
-                handle: lease.handle().clone(),
-                lease: Some(lease),
+            Ok(PreparedUse::Wrapped {
+                context: Box::new(context),
+                parent: parent_handle,
+                envelope,
+                used: crate::lease::LeaseUse {
+                    key_id: record.lid.to_string(),
+                    version: version.version_number,
+                    provider: material.provider_ref().as_str().to_owned(),
+                },
             })
         }
     }
 }
 
-async fn close_usable(
-    provider: &Arc<dyn CryptoProvider>,
-    opened: OpenedUse,
-) -> Result<(), DomainError> {
+async fn close_usable(opened: OpenedUse) -> Result<(), DomainError> {
     if let Some(lease) = opened.lease {
-        provider
-            .close_wrapped_key(&lease)
-            .await
-            .map_err(DomainError::from)?;
+        lease.close().await.map_err(DomainError::from)?;
     }
     Ok(())
 }
@@ -1226,10 +1261,19 @@ pub struct VersionUse<'a> {
 /// Run one provider operation against a version's usable handle.
 ///
 /// Resident material uses its durable handle. Wrapped material is opened for
-/// this call from the journaled envelope and closed before return, including
-/// when the operation fails. The handle is whatever the issuing provider
-/// returned for this open: possessing it is not a grant, and the caller must
-/// already have authorized the operation.
+/// this call from the journaled envelope and closed before a normal return,
+/// on success and on the operation's error: this returns only after the
+/// provider has answered the close, and a failed close fails the call.
+///
+/// If this future is dropped first, closing passes to
+/// [`ServiceState::lease_cleanup`], which does not depend on it: the close is
+/// scheduled, not verified, and its outcome is recorded only as an
+/// unverified cleanup outcome. The same holds for a lease whose open was
+/// still running when the future was dropped.
+///
+/// The handle is whatever the issuing provider returned for this open:
+/// possessing it is not a grant, and the caller must already have authorized
+/// the operation.
 pub async fn with_usable_handle<F, Fut, T>(
     state: &ServiceState,
     record: &KeyRecord,
@@ -1241,14 +1285,34 @@ where
     F: FnOnce(KeyHandle) -> Fut,
     Fut: std::future::Future<Output = Result<T, DomainError>>,
 {
-    let opened = open_usable(state, record, version, provider).await?;
+    let prepared = prepare_usable(state, record, version).await?;
+    use_prepared(state, prepared, provider, op).await
+}
+
+async fn use_prepared<F, Fut, T>(
+    state: &ServiceState,
+    prepared: PreparedUse,
+    provider: &Arc<dyn CryptoProvider>,
+    op: F,
+) -> Result<T, DomainError>
+where
+    F: FnOnce(KeyHandle) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DomainError>>,
+{
+    let opened = open_usable(state, prepared, provider).await?;
     let handle = opened.handle.clone();
     let result = op(handle).await;
-    finish_use(result, close_usable(provider, opened).await)
+    finish_use(result, close_usable(opened).await)
 }
 
 /// Run `first` against the source version, then `then` against the
 /// destination with `first`'s result.
+///
+/// Both versions are checked against storage before any provider call. At
+/// most one lease is open at a time: the source is closed, and its close
+/// answered, before the destination opens. A failed source close fails the
+/// call without opening the destination. Each phase is closed as
+/// [`with_usable_handle`] describes.
 pub async fn with_usable_handles<A, AFut, M, B, BFut, T>(
     state: &ServiceState,
     source: VersionUse<'_>,
@@ -1262,28 +1326,17 @@ where
     B: FnOnce(KeyHandle, M) -> BFut,
     BFut: std::future::Future<Output = Result<T, DomainError>>,
 {
-    let opened_source = open_usable(state, source.record, source.version, source.provider).await?;
-    let opened_destination = match open_usable(
+    let prepared_source = prepare_usable(state, source.record, source.version).await?;
+    let prepared_destination =
+        prepare_usable(state, destination.record, destination.version).await?;
+    let intermediate = use_prepared(state, prepared_source, source.provider, first).await?;
+    use_prepared(
         state,
-        destination.record,
-        destination.version,
+        prepared_destination,
         destination.provider,
+        |handle| then(handle, intermediate),
     )
     .await
-    {
-        Ok(opened) => opened,
-        Err(error) => {
-            let _ = close_usable(source.provider, opened_source).await;
-            return Err(error);
-        }
-    };
-    let result = match first(opened_source.handle.clone()).await {
-        Ok(intermediate) => then(opened_destination.handle.clone(), intermediate).await,
-        Err(error) => Err(error),
-    };
-    let destination_closed = close_usable(destination.provider, opened_destination).await;
-    let source_closed = close_usable(source.provider, opened_source).await;
-    finish_use(finish_use(result, destination_closed), source_closed)
 }
 
 /// Re-encrypt `ciphertext` from the source version to the destination.

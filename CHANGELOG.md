@@ -10,7 +10,10 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Not in this release
 
-- Wrapped-child creation is not reachable through the service API.
+- Wrapped-child custody. Wrapped-child creation needs a `wrapping:` profile, and
+  the only mechanism a profile can name is the software one, which is shape, not
+  custody. Native PKCS#11 wrapping is not reachable through the service, for any
+  token, SoftHSM included.
 - The crypto worker remains a provisional harness that the service does not use.
 - Cross-provider unwrap is not implemented.
 - REST/gRPC gaps and feature gates remain as listed in
@@ -90,8 +93,20 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   that parent, created through the crash-safe creation journal, with the exact
   parent version, mechanism and security domain written into the descriptor.
   All three surfaces take the same branch. Encrypt, decrypt, re-encrypt and
-  generate-data-key open a lease for the call and close it before return,
-  including on the operation's error. The handle is whatever the issuing
+  generate-data-key open wrapped material for the call and close it before a
+  normal return, on success and on the operation's error: the call returns only
+  after the provider has answered the close, and a failed close fails the call.
+  If the request is cancelled first (client disconnect, client deadline,
+  shutdown), closing passes to a cleanup owner independent of the request: it
+  is scheduled, not verified, before the request ends, and its outcome is
+  recorded in the service log and metrics only as an unverified cleanup
+  outcome, never as verified closure. A close still pending when the shutdown
+  drain ends is recorded as abandoned. A cancelled request records no audit
+  outcome for its operation. Native PKCS#11 wrapping is not reachable through
+  the service in 0.5.0, for any token, SoftHSM included. Re-encrypt involving a
+  wrapped version closes the source lease before opening the destination. Cleanup
+  outcomes are counted in `keyrack_wrapped_lease_cleanup_total{outcome}`, and
+  shutdown keeps its single 30-second deadline. The handle is whatever the issuing
   provider returned for that open: possessing it is not a grant. A planted
   wrapped descriptor that does not name a journaled envelope is still refused
   without talking to the provider. Export, rotation and destroy of wrapped
