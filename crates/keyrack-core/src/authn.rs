@@ -534,7 +534,7 @@ impl Authenticator for MtlsBoundForwardedIdentityAuthenticator {
         &self,
         metadata: &RequestMetadata,
     ) -> Result<Option<AuthnResult>, AuthnError> {
-        let trusted_peer = self.trusted_peer.authenticate(metadata).await?;
+        let trusted_peer = self.trusted_peer.authenticate_peer(metadata)?;
         let Some(trusted_peer) = trusted_peer else {
             if has_forwarded_identity_headers(metadata) {
                 return Err(AuthnError::InvalidCredential(
@@ -575,7 +575,11 @@ impl Authenticator for MtlsBoundForwardedIdentityAuthenticator {
         );
         attributes.insert(
             "delegating_peer_id".into(),
-            AttributeValue::String(trusted_peer.principal.id),
+            AttributeValue::String(
+                trusted_peer
+                    .matched_san
+                    .unwrap_or(trusted_peer.authentication.principal.id),
+            ),
         );
         if let Some(project_id) = forwarded_header(metadata, "x-keyrack-project-id") {
             attributes.insert(
@@ -637,6 +641,17 @@ pub struct TrustedMtlsPeerAuthenticator {
     required_sans: Option<Vec<String>>,
     /// Optional: require the leaf cert's Subject to contain this OU.
     required_ou: Option<String>,
+}
+
+enum SanRequirement {
+    Unrestricted,
+    Matched(String),
+    Unmatched,
+}
+
+struct TrustedPeer {
+    authentication: AuthnResult,
+    matched_san: Option<String>,
 }
 
 impl TrustedMtlsPeerAuthenticator {
@@ -702,39 +717,37 @@ impl TrustedMtlsPeerAuthenticator {
         }
     }
 
-    fn check_san_requirement(&self, leaf: &Certificate) -> bool {
+    fn match_san_requirement(&self, leaf: &Certificate) -> SanRequirement {
         const SAN_OID: der::oid::ObjectIdentifier =
             der::oid::ObjectIdentifier::new_unwrap("2.5.29.17");
         let Some(ref required) = self.required_sans else {
-            return true;
+            return SanRequirement::Unrestricted;
         };
         let Some(extensions) = &leaf.tbs_certificate.extensions else {
-            return false;
+            return SanRequirement::Unmatched;
         };
-        for ext in extensions {
-            if ext.extn_id != SAN_OID {
-                continue;
-            }
-            let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) else {
-                continue;
-            };
-            for name in &san.0 {
-                match name {
-                    GeneralName::UniformResourceIdentifier(uri)
-                        if required.iter().any(|value| value == uri.as_str()) =>
-                    {
-                        return true;
+        // Configuration order, not certificate order, selects among allowed peers.
+        for value in required {
+            for ext in extensions {
+                if ext.extn_id != SAN_OID {
+                    continue;
+                }
+                let Ok(san) = SubjectAltName::from_der(ext.extn_value.as_bytes()) else {
+                    continue;
+                };
+                for name in &san.0 {
+                    let candidate = match name {
+                        GeneralName::UniformResourceIdentifier(uri) => uri.as_str(),
+                        GeneralName::DnsName(dns) => dns.as_str(),
+                        _ => continue,
+                    };
+                    if candidate == value {
+                        return SanRequirement::Matched(value.clone());
                     }
-                    GeneralName::DnsName(dns)
-                        if required.iter().any(|value| value == dns.as_str()) =>
-                    {
-                        return true;
-                    }
-                    _ => {}
                 }
             }
         }
-        false
+        SanRequirement::Unmatched
     }
 
     fn check_ou_requirement(&self, leaf: &Certificate) -> bool {
@@ -763,16 +776,11 @@ impl TrustedMtlsPeerAuthenticator {
     }
 }
 
-#[async_trait]
-impl Authenticator for TrustedMtlsPeerAuthenticator {
-    fn supports_requests_without_peer_certificate(&self) -> bool {
-        false
-    }
-
-    async fn authenticate(
+impl TrustedMtlsPeerAuthenticator {
+    fn authenticate_peer(
         &self,
         metadata: &RequestMetadata,
-    ) -> Result<Option<AuthnResult>, AuthnError> {
+    ) -> Result<Option<TrustedPeer>, AuthnError> {
         if metadata.peer_certificates.is_empty() {
             return Ok(None);
         }
@@ -786,9 +794,11 @@ impl Authenticator for TrustedMtlsPeerAuthenticator {
             return Ok(None);
         }
 
-        if !self.check_san_requirement(&leaf) {
-            return Ok(None);
-        }
+        let matched_san = match self.match_san_requirement(&leaf) {
+            SanRequirement::Unrestricted => None,
+            SanRequirement::Matched(san) => Some(san),
+            SanRequirement::Unmatched => return Ok(None),
+        };
 
         if !self.check_ou_requirement(&leaf) {
             return Ok(None);
@@ -857,14 +867,33 @@ impl Authenticator for TrustedMtlsPeerAuthenticator {
             "platform peer authenticated via trusted mTLS fast-path"
         );
 
-        Ok(Some(AuthnResult {
-            principal: Principal {
-                id: principal_id,
-                principal_type: "TrustedPlatformPeer".into(),
-                attributes,
+        Ok(Some(TrustedPeer {
+            matched_san,
+            authentication: AuthnResult {
+                principal: Principal {
+                    id: principal_id,
+                    principal_type: "TrustedPlatformPeer".into(),
+                    attributes,
+                },
+                method: "trusted_mtls_peer".into(),
             },
-            method: "trusted_mtls_peer".into(),
         }))
+    }
+}
+
+#[async_trait]
+impl Authenticator for TrustedMtlsPeerAuthenticator {
+    fn supports_requests_without_peer_certificate(&self) -> bool {
+        false
+    }
+
+    async fn authenticate(
+        &self,
+        metadata: &RequestMetadata,
+    ) -> Result<Option<AuthnResult>, AuthnError> {
+        Ok(self
+            .authenticate_peer(metadata)?
+            .map(|peer| peer.authentication))
     }
 }
 
@@ -1465,6 +1494,186 @@ mod tests {
         params.signed_by(&key_pair, &issuer).unwrap()
     }
 
+    fn delegated_sans_leaf(sans: Vec<rcgen::SanType>, ca: &TestCaBundle) -> rcgen::Certificate {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = sans;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key_pair);
+        params.signed_by(&key_pair, &issuer).unwrap()
+    }
+
+    async fn assert_delegator_san(sans: Vec<rcgen::SanType>, allowed: &[&str], expected: &str) {
+        let ca = test_ca();
+        let leaf = delegated_sans_leaf(sans, &ca);
+        for authn in [
+            build_bound_forwarded_authn(&ca)
+                .with_required_sans(allowed.iter().map(|s| (*s).into()).collect()),
+            build_bound_forwarded_authn(&ca).with_required_san(expected.into()),
+        ] {
+            let result = authn
+                .authenticate(&delegated_metadata(&leaf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.principal.attributes["delegating_peer_id"],
+                AttributeValue::String(expected.into()),
+                "delegating peer must be the matched SAN"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_ignores_unlisted_sans_and_certificate_order() {
+        let allowed = "spiffe://cluster.local/allowed";
+        let other = "spiffe://cluster.local/unlisted";
+        for values in [[other, allowed], [allowed, other]] {
+            assert_delegator_san(
+                values
+                    .into_iter()
+                    .map(|v| rcgen::SanType::URI(v.try_into().unwrap()))
+                    .collect(),
+                &[allowed],
+                allowed,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_uses_allowlist_order_for_multiple_matches() {
+        let first = "spiffe://cluster.local/first";
+        let second = "spiffe://cluster.local/second";
+        for values in [[second, first], [first, second]] {
+            for allowed in [[first, second], [second, first]] {
+                assert_delegator_san(
+                    values
+                        .into_iter()
+                        .map(|v| rcgen::SanType::URI(v.try_into().unwrap()))
+                        .collect(),
+                    &allowed,
+                    allowed[0],
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_records_dns_match_instead_of_unlisted_spiffe() {
+        assert_delegator_san(
+            vec![
+                rcgen::SanType::URI("spiffe://cluster.local/unlisted".try_into().unwrap()),
+                rcgen::SanType::DnsName("gateway.internal".try_into().unwrap()),
+            ],
+            &["gateway.internal"],
+            "gateway.internal",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_same_string_dns_and_uri_are_equivalent() {
+        let value = "gateway.internal";
+        let dns = rcgen::SanType::DnsName(value.try_into().unwrap());
+        let uri = rcgen::SanType::URI(value.try_into().unwrap());
+        for sans in [
+            vec![dns.clone()],
+            vec![uri.clone()],
+            vec![dns.clone(), uri.clone()],
+            vec![uri, dns],
+        ] {
+            assert_delegator_san(sans, &[value], value).await;
+        }
+    }
+
+    async fn assert_delegator_refused(san: rcgen::SanType, allowed: &str) {
+        let ca = test_ca();
+        let leaf = delegated_sans_leaf(vec![san], &ca);
+        for authn in [
+            build_bound_forwarded_authn(&ca).with_required_sans(vec![allowed.into()]),
+            build_bound_forwarded_authn(&ca).with_required_san(allowed.into()),
+        ] {
+            let chain = AuthenticatorChain::new(vec![
+                Box::new(authn),
+                Box::new(BootstrapTokenAuthenticator::new(
+                    "fallback-token",
+                    std::time::Duration::from_secs(3600),
+                )),
+            ]);
+            let mut metadata = delegated_metadata(&leaf);
+            metadata
+                .headers
+                .insert("authorization".into(), "Bearer fallback-token".into());
+            assert!(
+                matches!(
+                    chain.authenticate(&metadata).await,
+                    Err(AuthnError::InvalidCredential(_))
+                ),
+                "ineligible SAN must refuse delegation without fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_email_and_ip_sans_are_ineligible() {
+        assert_delegator_refused(
+            rcgen::SanType::Rfc822Name("gateway@example.test".try_into().unwrap()),
+            "gateway@example.test",
+        )
+        .await;
+        assert_delegator_refused(
+            rcgen::SanType::IpAddress("192.0.2.1".parse().unwrap()),
+            "192.0.2.1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_san_matching_is_case_sensitive() {
+        assert_delegator_refused(
+            rcgen::SanType::DnsName("Gateway.internal".try_into().unwrap()),
+            "gateway.internal",
+        )
+        .await;
+        assert_delegator_refused(
+            rcgen::SanType::URI("spiffe://cluster.local/Gateway".try_into().unwrap()),
+            "spiffe://cluster.local/gateway",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delegated_peer_unrestricted_san_keeps_existing_identity() {
+        let ca = test_ca();
+        let leaf = delegated_uri_leaf("spiffe://cluster.local/unrestricted", &ca);
+        let result = build_bound_forwarded_authn(&ca)
+            .authenticate(&delegated_metadata(&leaf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.principal.attributes["delegating_peer_id"],
+            AttributeValue::String("spiffe://cluster.local/unrestricted".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_san_pin_preserves_standalone_principal() {
+        let ca = test_ca();
+        let leaf = test_leaf_with_san("gateway-cn", "gateway.internal", &ca);
+        let result = build_trusted_authn(&ca)
+            .with_required_san("gateway.internal".into())
+            .authenticate(&delegated_metadata(&leaf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.principal.id, "gateway-cn",
+            "standalone principal must remain unchanged"
+        );
+    }
+
     fn multi_peer_forwarding_chain(ca: &TestCaBundle) -> AuthenticatorChain {
         AuthenticatorChain::new(vec![
             Box::new(build_bound_forwarded_authn(ca).with_required_sans(vec![
@@ -1606,9 +1815,8 @@ mod tests {
     #[tokio::test]
     async fn bound_forwarded_identity_derives_tenant_scope() {
         let ca = test_ca();
-        let leaf = test_leaf_with_san("essentials", "essentials.internal", &ca);
-        let authn =
-            build_bound_forwarded_authn(&ca).with_required_san("essentials.internal".into());
+        let leaf = test_leaf_with_san("gateway", "gateway.internal", &ca);
+        let authn = build_bound_forwarded_authn(&ca).with_required_san("gateway.internal".into());
 
         let result = authn
             .authenticate(&delegated_metadata(&leaf))
@@ -1633,7 +1841,7 @@ mod tests {
         );
         assert_eq!(
             result.principal.attributes.get("delegating_peer_id"),
-            Some(&AttributeValue::String("essentials".into()))
+            Some(&AttributeValue::String("gateway.internal".into()))
         );
     }
 

@@ -479,6 +479,17 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   entirely. Callers that were formatting the config with `{:?}` will no longer
   compile.
 
+### Delegated peer identity
+
+- SAN-pinned delegated authentication records the matched DNS or URI SAN as
+  `delegating_peer_id`, including the singular `required_san` setting. If several
+  configured values match, allowlist order selects the peer; certificate SAN
+  order and extra unlisted SANs do not select another identity. Matching remains
+  exact and case-sensitive; email and IP SANs are ineligible. Standalone trusted
+  mTLS principal selection and delegation without a SAN pin are unchanged. SAN-pinned
+  policies must stop relying on the former peer identity: the certificate's first
+  SPIFFE URI, or its CN when no SPIFFE URI was present.
+
 ### Security reporting and dependency checks
 
 - Add a root security policy using GitHub private vulnerability reporting, with
