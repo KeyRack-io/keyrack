@@ -18,9 +18,11 @@ separate capability. Software providers hold key bytes in process memory.
   keys, with no hardware boundary. Hardware HSMs over PKCS#11 are not yet
   qualified.
 - **Versioned key lifecycle** — namespace-scoped rules, logical parent/child
-  relationships, rotation and cascade operations. Wrapped-child creation is not
-  reachable through the service API in this release; the logical hierarchy is
-  not a claim of KEK-wrapped custody.
+  relationships, rotation and cascade operations. Wrapped-child creation needs a
+  `wrapping:` profile, and in this release only the software mechanism serves
+  one: the hierarchy is shape, not a claim of KEK-wrapped custody. Native
+  PKCS#11 wrapping is not reachable through the service, for any token, SoftHSM
+  included.
 - **Authorization and identity** — external HTTP/gRPC PDP integration, JWT and
   certificate-bound identity, and an exact-match SAN allowlist for delegated
   identity. `GetKeyVersion` authorization includes the requested version.
