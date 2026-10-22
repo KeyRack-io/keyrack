@@ -3,6 +3,7 @@ name = "keyrack-examples"
 version = "0.0.0"
 edition = "2021"
 publish = false
+license.workspace = true
 
 autolib = false
 autobins = false

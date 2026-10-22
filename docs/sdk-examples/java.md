@@ -55,107 +55,52 @@ public class TransactionEncryptionService {
 
 ---
 
-## After (zero code changes): AWS KMS shim
+## After: use the native gRPC or REST API
 
-The fastest path for Java teams. No new SDK, no code changes. Just
-change the endpoint:
+Core 0.5.0 does not ship an AWS KMS compatibility shim. Changing an AWS SDK
+endpoint to `keyrack-service` will not translate AWS operations into Core
+operations. The in-tree `keyrack-aws-proxy` forwards requests to real AWS KMS;
+it does not replace that backend with KeyRack providers.
 
-```java
-@Service
-public class TransactionEncryptionService {
+There is also no packaged native Java SDK in this repository. Generate Java
+gRPC bindings from [`key_service.proto`](../../proto/keyrack/v1/key_service.proto)
+and its imports, or use an HTTP client against the REST API. The
+[API surface inventory](../generated/api-surface-parity.md) lists available
+operations and differences between the two transports.
 
-    private final KmsClient kms;
-    private static final String KEY_ARN =
-        "arn:aws:kms:us-east-1:123456789:key/abc-def-123";
+For the transaction service above, a native integration needs to:
 
-    public TransactionEncryptionService() {
-        this.kms = KmsClient.builder()
-            .endpointOverride(URI.create("http://keyrack-aws-shim:8080"))
-            .region(Region.US_EAST_1)
-            .build();
-        // That's it. Every existing encrypt/decrypt/sign/verify call
-        // now goes through KeyRack. You get:
-        // - On-prem or multi-cloud deployment
-        // - KeyRack's audit trail (structured, queryable)
-        // - Key hierarchy and rotation tracking
-        // - PDP authorization on every operation
-        // - Crypto agility (swap provider without changing app code)
-    }
+1. Configure a client connection and authentication for the deployed service.
+2. Create a key through `CreateKey`, supplying attributes for namespace routing
+   and optionally `parent_key_id` for logical ancestry. Store the returned key ID
+   for subsequent use.
+3. Call `Encrypt` with that key ID, the record bytes and encryption context.
+4. Store the returned ciphertext blob intact, including its versioned header.
+5. Supply the same encryption context to `Decrypt`.
 
-    // encrypt() and decrypt() methods are UNCHANGED.
-}
-```
+These are integration steps, not calls to a supplied `KeyRackClient` Java
+builder. Generated bindings expose `CreateKey.parent_key_id` for logical
+ancestry; the illustrative `.parent(...)` builder is not a supplied Java API.
+Creating cryptographically parent-wrapped children is not exposed through
+the service API in 0.5.0.
 
----
+### Rotation
 
-## After (native SDK): idiomatic Java client
+`RotateKey` creates a new primary version and attempts to enqueue rotation jobs
+for logical descendants. Existing versions remain available for decryption
+subject to authorization, key state and backend availability. Applications
+perform and verify data migration; completing a rotation job does not prove
+all data has migrated or retire an old version. This is not automatic child-key
+rewrapping.
 
-For greenfield Java projects or teams that want the full lifecycle API:
+### Migration choice
 
-```java
-@Service
-public class TransactionEncryptionService {
+| Approach | What changes | Where cryptography runs |
+|----------|--------------|-------------------------|
+| Existing AWS SDK | Keep the AWS integration | AWS KMS |
+| In-tree AWS pass-through proxy | Configure the proxy endpoint and credentials; validate supported calls | AWS KMS |
+| Native Core API | Generate gRPC bindings or implement REST calls; adapt lifecycle and migration logic | The selected Core provider |
 
-    private final KeyRackClient kr;
-
-    public TransactionEncryptionService(
-            @Value("${keyrack.service-url}") String serviceUrl) {
-        this.kr = KeyRackClient.builder()
-            .serviceUrl(serviceUrl)
-            .mtls("certs/client.pem", "certs/client-key.pem", "certs/ca.pem")
-            .build();
-    }
-
-    public byte[] encryptTransaction(String tenantId, byte[] record) {
-        // Per-tenant DEK, child of tenant KEK, child of root KEK
-        Key key = kr.createKey(KeySpec.AES_256)
-            .parent("tenant-kek-" + tenantId)
-            .description("transaction-dek")
-            .tags(Map.of("tenant", tenantId))
-            .send();
-
-        return kr.encrypt(key.getId(), record)
-            .encryptionContext(Map.of(
-                "tenant", tenantId,
-                "purpose", "transaction_record"
-            ))
-            .send();
-    }
-
-    public byte[] decryptTransaction(String tenantId, byte[] ciphertext) {
-        return kr.decrypt(ciphertext)
-            .encryptionContext(Map.of(
-                "tenant", tenantId,
-                "purpose", "transaction_record"
-            ))
-            .send();
-    }
-
-    // Rotation with dependency tracking:
-    //
-    // @Scheduled(cron = "0 0 2 1 * *")  // monthly
-    // public void rotateKeys() {
-    //     kr.rotateKey("root-kek").send();
-    //     // Cascade creates jobs for all tenant KEKs → all DEKs.
-    //     // Each service polls its jobs and re-encrypts.
-    // }
-}
-```
-
-### What changed
-
-| Concern | AWS KMS | KeyRack (shim) | KeyRack (native) |
-|---------|---------|----------------|------------------|
-| Code changes | — | 1 line (endpoint) | Full rewrite |
-| Vendor lock-in | AWS only | Portable | Portable |
-| Key hierarchy | Flat | Tracked (via metadata) | Native hierarchy |
-| Cascade rotation | Manual | Tracked | Automated jobs |
-| Audit | CloudTrail | KeyRack audit log | KeyRack audit log |
-| On-prem | No | Yes | Yes |
-| Effort | — | 5 minutes | 1-2 days |
-
-### Recommendation for Java teams
-
-Start with the AWS KMS shim (zero effort, immediate value). Evaluate
-the native SDK path when you need key hierarchy, cascade rotation, or
-are building greenfield.
+Use the native API when moving cryptographic operations to Core. Plan data
+migration explicitly; an endpoint-only switch to Core is not supported by
+this release.

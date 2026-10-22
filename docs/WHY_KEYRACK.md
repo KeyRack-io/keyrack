@@ -42,7 +42,10 @@ KeyRack is not a hosted service — it is software you operate. The security bou
 
 KeyRack separates key management logic from cryptographic operations through a provider abstraction. Supported backends:
 
-- **PKCS#11** — any FIPS 140-3 certified HSM (Thales Luna, Entrust nShield, YubiHSM, AWS CloudHSM, SoftHSM for development)
+- **PKCS#11** — SoftHSM is a supported production software token. Storage
+  permissions and its PIN protect keys; there is no hardware boundary. Hardware
+  HSMs over PKCS#11 are not yet qualified; the interface is not a vendor-support
+  or FIPS certification claim.
 - **KMIP** — remote key servers and HSMs speaking the OASIS standard
 - **Software** — in-process RustCrypto implementation for development and testing
 
@@ -50,7 +53,10 @@ Switch providers without changing application code. Your key hierarchy, policies
 
 ### Hold Your Own Key (HYOK)
 
-Tenants provision their own HSM or KMIP-compatible crypto backend. KeyRack manages the key hierarchy on top — tenant root key, KEKs, DEKs. The backend relationship operates in one of two modes:
+Tenants provision their own supported crypto backend. KeyRack tracks logical
+parent-child relationships on top. Wrapped-child creation is not reachable
+through the service API in 0.5.0, so these relationships do not establish a
+root → KEK → DEK wrapping chain. The backend relationship operates in one of two modes:
 
 - **Custody / managed mode** — the database or application uses server-side Encrypt/Decrypt via KMIP; key material never leaves the HSM or Vault (e.g. MongoDB KMIP default). KeyRack holds only opaque handles.
 - **Sovereign / keystore mode** — for appliances that pull raw keys (MySQL/Percona, vSphere), KeyRack serves an exportable key. Material intentionally leaves the backend, so the value proposition is governance (hierarchy, policy, audit, per-key exportability), not "keys never leave."
@@ -81,24 +87,18 @@ When a tenant disconnects their HSM or an operator disables a root key:
 2. HSM disconnect is immediately fatal: every crypto operation calls the provider unconditionally; a disconnected KMIP/PKCS#11 backend fails at the transport layer.
 3. In the commercial HA tier, cross-node cache-invalidation staleness is bounded by a configurable TTL — this is the upper bound on "time until lockout" across replicas.
 
-### AWS KMS API compatibility (commercial)
+### AWS KMS API compatibility (outside this repository)
 
-Existing applications using the AWS SDK (`aws-sdk`, `boto3`, `aws-sdk-go`) can point to KeyRack by changing a single endpoint URL. The AWS KMS compatibility shim translates JSON-RPC requests to native KeyRack gRPC calls. SigV4 authentication is handled transparently.
+Core 0.5.0 does not ship an AWS KMS compatibility shim. Its in-tree
+`keyrack-aws-proxy` forwards requests to real AWS KMS and tracks metadata;
+it does not translate them to native KeyRack operations or remove the AWS
+dependency. Applications using Core directly use its gRPC or REST API.
 
-No SDK modifications. No code changes. Supported V1 operations include `CreateKey`, `Encrypt`, `Decrypt`, `GenerateDataKey`, `Sign`, `Verify`, `RotateKey`, and the full key lifecycle surface.
+### OpenStack Barbican compatibility (outside this repository)
 
-### OpenStack Barbican compatibility (commercial)
-
-KeyRack's Barbican shim is a drop-in replacement for OpenStack Barbican's key management API. Unmodified Cinder and Nova talk to KeyRack as if it were Barbican:
-
-```ini
-# cinder.conf
-[key_manager]
-backend = barbican
-barbican_endpoint = http://keyrack:9311
-```
-
-Unlike Barbican, KeyRack provides actual HYOK semantics, a proper key hierarchy, and PDP-based authorization on every operation — including the Barbican path. No OpenStack code is modified.
+Core 0.5.0 does not expose the Barbican REST API or ship a Barbican shim.
+Connecting unmodified Cinder or Nova requires a separate compatibility
+implementation; pointing them at the Core service is not sufficient.
 
 ---
 
@@ -107,7 +107,7 @@ Unlike Barbican, KeyRack provides actual HYOK semantics, a proper key hierarchy,
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                        Clients                               │
-│   (gRPC / REST / AWS SDK / OpenStack Barbican)               │
+│   (native gRPC / REST clients)                                │
 └──────────────┬───────────────────────────────────────────────┘
                │
 ┌──────────────▼───────────────────────────────────────────────┐
@@ -126,22 +126,29 @@ Unlike Barbican, KeyRack provides actual HYOK semantics, a proper key hierarchy,
 | Component | Role | License |
 |-----------|------|---------|
 | **keyrack-oss** | Core KMS: key lifecycle, crypto operations, gRPC + REST APIs, pluggable providers, Cedar authorization, NATS eventing | AGPL-3.0-or-later (proto + client SDK: Apache-2.0) |
-| **keyrack-commercial** | AWS KMS shim, Barbican shim, HA clustering, key pooling, vendor HSM adapters, management UI | Proprietary |
+| Separate extensions (not shipped here) | AWS KMS and Barbican compatibility, HA clustering and operational tooling are outside the Core 0.5.0 release | Separate licensing |
 
-### Key hierarchy
+### Logical key hierarchy
+
+The service records ancestry and enforces lifecycle checks along it. The
+following is a logical layout, not a shipped wrapping chain; wrapped children
+are not reachable through the API.
 
 ```
-Tenant HSM (HYOK) or Operator HSM
-  └── Tenant Root Key (never leaves HSM)
-        └── Tenant KEK (wrapped by root)
-              └── Application KEK (wrapped by tenant KEK)
+Selected provider
+  └── Tenant Root Key
+        └── Tenant KEK (logical parent: root)
+              └── Application KEK (logical parent: tenant KEK)
                     ├── DEK (volume encryption)
                     ├── DEK (object encryption)
                     ├── DEK (backup encryption)
                     └── Signing Key (image manifests)
 ```
 
-Disabling any key in the chain cascades downward. Destroying a key permanently renders all descendants inoperable — this is the mechanism behind crypto-shredding for GDPR Article 17 compliance.
+Disabling an ancestor makes descendants unusable through service lifecycle
+checks. Logical ancestry alone does not cryptographically destroy independently
+stored descendant material, and is not evidence of crypto-shredding or
+regulatory compliance.
 
 ### Authentication
 
@@ -170,7 +177,9 @@ External Cedar Policy Decision Point (PDP) for fine-grained, policy-as-code acce
 
 **SaaS providers** — Platforms offering enterprise customers the ability to hold their own encryption keys. KeyRack's HYOK model lets each tenant bring their own HSM while the platform manages the key hierarchy on top.
 
-**OpenStack operators** — Deployments that need real tenant key isolation, not Barbican's flat key-per-volume model. KeyRack provides a proper key hierarchy with cascade-disable, HYOK support, and PDP-based authorization — while remaining a transparent Barbican replacement for existing OpenStack services.
+**OpenStack operators** — Core supplies lifecycle and authorization primitives,
+but integration with existing OpenStack services requires a separate Barbican
+compatibility shim, not included in this release.
 
 ---
 
@@ -178,14 +187,14 @@ External Cedar Policy Decision Point (PDP) for fine-grained, policy-as-code acce
 
 | Feature | Cloud KMS | KeyRack |
 |---------|-----------|---------|
-| Key sovereignty | Provider-controlled HSM | Customer-controlled (any PKCS#11/KMIP device) |
-| HSM choice | Provider's hardware only | Bring any certified HSM |
+| Key sovereignty | Provider-controlled HSM | Customer-controlled supported backend |
+| HSM choice | Provider's hardware only | SoftHSM supported; hardware PKCS#11 HSMs not yet qualified |
 | Instant revocation | No guarantee; provider-dependent | Immediate on the local node; cross-node staleness bounded by configurable TTL (commercial HA) |
 | Multi-cloud portable | No (proprietary APIs) | Yes (single KMS across all environments) |
 | HYOK | Limited (CloudHSM-only in AWS) | Full: tenant-managed HSM with unilateral revocation |
-| API compatibility | Proprietary per provider | Native gRPC/REST + AWS KMS shim + Barbican shim |
+| API compatibility | Proprietary per provider | Native gRPC/REST; AWS KMS and Barbican shims not shipped here |
 | Authorization model | IAM policies (provider-specific) | Cedar policy-as-code (portable, auditable) |
-| Crypto-shredding | Manual, no cascade guarantee | Key hierarchy with cascade-disable and cascade-destroy |
+| Lifecycle enforcement | Provider-specific | Logical hierarchy with cascade-disable; not proof of cryptographic child destruction |
 | Open source | No | Core is AGPL-3.0-or-later (OSI/FSF-approved) |
 
 ---

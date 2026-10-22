@@ -213,17 +213,10 @@ Current coverage:
 
 ## Vulnerability disclosure
 
-If you discover a security vulnerability in KeyRack:
-
-1. **Do not open a public issue.**
-2. Email `security@keyrack.dev` with:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Impact assessment
-   - Your contact information
-3. We will acknowledge receipt within 48 hours.
-4. We aim to provide a fix within 14 days for critical issues.
-5. We will credit reporters in the advisory (unless they prefer anonymity).
+Use GitHub private vulnerability reporting as described in the
+[root security policy](../SECURITY.md). That policy defines supported versions,
+response expectations, and coordinated disclosure. Do not open public issues
+containing vulnerability details.
 
 ### Scope
 

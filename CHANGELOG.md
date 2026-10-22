@@ -4,6 +4,18 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
+Release preparation sets the eighteen workspace crates previously at 0.4.0 to
+0.5.0. The unpublished `keyrack-crypto-worker` and `keyrack-surface-contract`
+remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
+
+### Not in this release
+
+- Wrapped-child creation is not reachable through the service API.
+- The crypto worker remains a provisional harness that the service does not use.
+- Cross-provider unwrap is not implemented.
+- REST/gRPC gaps and feature gates remain as listed in
+  [the generated API surface inventory](docs/generated/api-surface-parity.md).
+
 ### Breaking changes
 
 - Vault Transit now authenticates encryption AAD using `associated_data` instead
@@ -15,6 +27,11 @@ All notable changes to KeyRack will be documented in this file.
   `ProviderUnavailable`; other error classes are unchanged.
 
 ### Added
+
+- Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
+  URI SANs on the delegating client certificate. Any listed SAN may match;
+  `required_sans` and the existing singular `required_san` are mutually exclusive.
+  The optional OU restriction still applies in addition to the SAN check. (#50)
 
 - Vault Transit accepts an optional `ca_cert` PEM bundle. Configuring it replaces
   built-in trust roots for that client while retaining chain and hostname
@@ -149,6 +166,11 @@ All notable changes to KeyRack will be documented in this file.
   legacy tolerance left anywhere.
 
 ### Fixed
+
+- `GetKeyVersion` authorization is bound to the requested version through the
+  integer `key_version` attribute from the decoded request. Version 0 returns
+  `InvalidArgument`. Authorization precedes key-ID parsing, so a denied version
+  can return `PermissionDenied` even when the key ID is invalid. (#50)
 
 - **A failed PKCS#11 reinitialization left the library unusable and then
   rationed the repair.** When custody of a token is lost by its storage
@@ -511,6 +533,14 @@ All notable changes to KeyRack will be documented in this file.
   KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`
   entirely. Callers that were formatting the config with `{:?}` will no longer
   compile.
+
+### Security reporting and dependency checks
+
+- Add a root security policy using GitHub private vulnerability reporting, with
+  support for the latest 0.5.x patch and explicit response targets.
+- Check dependency advisories, licenses, bans, and sources with cargo-deny on
+  every pull request and push to main. Dependency exceptions are recorded in
+  `deny.toml`; external sources are restricted to crates.io.
 
 ## [0.4.0] — 2026-08-30
 
