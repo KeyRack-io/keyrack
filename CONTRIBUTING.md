@@ -13,7 +13,7 @@ Open an issue with:
 
 ### Security vulnerabilities
 
-**Do not open a public issue.** See [SECURITY.md](docs/SECURITY.md) for
+**Do not open a public issue.** See [SECURITY.md](SECURITY.md) for
 the disclosure process.
 
 ### Feature requests
