@@ -61,6 +61,64 @@ With `bootstrap_token` auth, set the token via the `KMS_BOOTSTRAP_TOKEN`
 environment variable. The token is hashed at startup — the plaintext is
 not retained in memory.
 
+### Child keys wrapped under a parent
+
+Creating a key with a `parent_key_id` means its material is wrapped under that
+parent. It is refused unless the provider that will hold it has been activated
+for wrapping. A wrapping profile may name only a platform-custody provider
+(`custody: platform`, the default). Customer-custody providers are constructed
+lazily, so configuration validation refuses a wrapping profile naming one.
+Unrelated customer-custody providers may still be configured alongside it.
+This startup classification does not establish hardware custody.
+
+For example:
+
+```yaml
+wrapping:
+  - provider: default
+    mechanism: software:aes-256-gcm:v1
+    security_domain: dev-single-process
+```
+
+Both values are recorded in every child's durable descriptor, which is why they
+are stated here rather than derived from the provider name. Startup refuses to
+run if that provider does not declare the mechanism for generate, open and
+close, or cannot evidence its own closures. Omit the block — the default — and
+child creation is refused everywhere.
+
+`software:aes-256-gcm:v1` is a development and conformance mechanism, and
+startup says so: the child is unwrapped into the service process's memory for
+the length of a lease, which is exactly as contained as the parent wrapping it.
+It gives you the hierarchy's shape, not its custody. No provider with a custody
+boundary implements the operations yet.
+
+Parent and child must be on the same provider: a wrapped child in another
+security domain is refused, not deferred. A parent must be enabled,
+non-exportable and independently resident, so a wrapped key cannot itself wrap
+children yet.
+
+**Keys created before 0.5.0 that name a parent are refused.** In earlier
+versions a parent binding recorded lineage only, and the child had its own
+independent material; 0.5 cannot distinguish that from a wrapped child except
+by what the material is. Such keys are refused as wrapping parents with a
+message naming the change, and startup warns when any are present. Migration is
+required before using them under 0.5 semantics; there is no migration script
+yet.
+
+A request that is cancelled while it holds a child's use lease (client
+disconnect, client deadline, shutdown) leaves the close to the service, which
+closes it after the request has ended and records that only as an unverified
+cleanup outcome. Those closes are bounded:
+
+```yaml
+wrapped_lease_cleanup_limit: 1024   # default; must be at least 1
+```
+
+While that many closes are outstanding, new uses of wrapped keys are refused
+with gRPC `UNAVAILABLE` / HTTP 503 (retryable) instead of queuing more. Watch
+`keyrack_wrapped_lease_cleanup_pending` and
+`keyrack_wrapped_lease_cleanup_total{outcome}`.
+
 ### Compromised-key default denial and dangerous legacy opt-in
 
 Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.
@@ -845,6 +903,8 @@ metadata likewise does not establish live availability.
 | `keyrack_pdp_request_duration_seconds` | PDP evaluation latency |
 | `keyrack_pdp_errors_total` | PDP transport/evaluation failures |
 | `keyrack_audit_emit_errors_total` | Audit sink write failures |
+| `keyrack_wrapped_lease_cleanup_total{outcome}` | Wrapped-child lease closes after a cancelled request: `scheduled`, then `closed_after_return`, `close_failed` or `abandoned`. Unverified; never closure evidence |
+| `keyrack_wrapped_lease_cleanup_pending` | Those closes still outstanding; at `wrapped_lease_cleanup_limit`, wrapped-key uses are refused as unavailable |
 
 ### Request correlation (`x-request-id`)
 

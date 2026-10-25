@@ -72,6 +72,14 @@ with `parent_lid = None` is a root key. A key with
 The hierarchy is set at creation time via `CreateKey(parent_key_id: ...)`.
 Once set, `parent_lid` is immutable — it is stored, not recomputed.
 
+> **From 0.5.0 a parent means wrapping.** The diagrams and scenarios below show
+> each key with its own independent provider material, which is what a parent
+> meant before 0.5.0. Now `CreateKey` with a parent creates a child wrapped
+> under it, one level deep, only under a `wrapping:` profile on a
+> platform-custody provider, and is refused without one; a multi-level chain
+> like Scenario 3 cannot be created. See
+> [Key-version material representation](KEY_MATERIAL_REPRESENTATION.md#creating-a-child).
+
 ```
                ┌──────────────┐
                │  Root CMK     │  parent_lid: None

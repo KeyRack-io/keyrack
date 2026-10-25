@@ -5,8 +5,9 @@ engine as the crypto provider. Everything runs locally via Docker Compose.
 
 ## What this demo shows
 
-1. **Key hierarchy** — creates a tenant root key (AES-256) and a child
-   data-encryption key underneath it.
+1. **Key creation** — creates a tenant key (AES-256) and an independent
+   data-encryption key. Vault Transit does not wrap child material, so
+   this demo does not send `parent_key_id`.
 2. **Encrypt / Decrypt** — encrypts plaintext through the REST API and
    decrypts it back, verifying round-trip integrity.
 3. **Zero-downtime key rotation** — rotates the key while a background loop

@@ -34,8 +34,10 @@ pub mod convert;
 pub mod deferred_provider;
 pub mod domain;
 pub mod grpc;
+pub mod hierarchy;
 pub mod hsm_registration;
 pub mod identity_input;
+pub mod lease;
 pub mod metrics;
 pub mod ops;
 pub mod pdp_grpc;
@@ -45,6 +47,7 @@ pub mod readiness;
 pub mod rest;
 pub mod routing;
 pub mod secret_ref;
+pub mod shutdown;
 pub mod state;
 pub mod workers;
 
