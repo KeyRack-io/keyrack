@@ -439,3 +439,31 @@ fn hex(bytes: &[u8]) -> String {
             s
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A close whose task ended without settling (it cannot be retried any
+    /// more) must not let a finished drain report a clean shutdown.
+    #[tokio::test]
+    async fn drain_abandons_what_is_still_pending_after_its_tasks_finish() {
+        let owner = LeaseCleanup::default();
+        owner.pending_map().insert(
+            0,
+            LeaseSubject {
+                key_id: "lid_test".into(),
+                version: 1,
+                provider: "default".into(),
+                object: "object".into(),
+                context_sha256: [0; 32],
+            },
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let abandoned = owner.drain(deadline).await;
+        assert_eq!(
+            (abandoned, owner.counts().abandoned, owner.pending()),
+            (1, 1, 0)
+        );
+    }
+}

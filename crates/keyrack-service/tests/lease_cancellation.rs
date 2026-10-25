@@ -110,6 +110,8 @@ struct Controls {
     fail_open: AtomicUsize,
     /// Fail the next use close once, leaving the object open.
     fail_next_close: AtomicBool,
+    /// Panic in every use close, leaving the object open.
+    panic_close: AtomicBool,
 }
 
 impl Controls {
@@ -272,6 +274,10 @@ impl CryptoProvider for Pausable {
             return self.inner.close_wrapped_key(lease).await;
         }
         self.controls.closes_started.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.controls.panic_close.load(Ordering::SeqCst),
+            "injected close panic"
+        );
         let (inner, controls, lease) = (
             Arc::clone(&self.inner),
             Arc::clone(&self.controls),
@@ -319,8 +325,26 @@ impl keyrack_core::audit::AuditSink for SilentAudit {
     }
 }
 
+/// One recorder for the whole test binary, so service metrics can be read.
+/// Tests run concurrently, so values are shared: check presence, not counts.
+fn metrics() -> metrics_exporter_prometheus::PrometheusHandle {
+    static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .install_recorder()
+                .expect("the only recorder in this test binary")
+        })
+        .clone()
+}
+
 impl Service {
     async fn start() -> Self {
+        Self::start_with_limit(keyrack_service::lease::DEFAULT_CLEANUP_LIMIT).await
+    }
+
+    async fn start_with_limit(limit: usize) -> Self {
         let inner = Arc::new(SoftwareProvider::scoped(
             ProviderRef::new(PROVIDER),
             identifier(DOMAIN),
@@ -352,13 +376,11 @@ impl Service {
             authn: Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
                 Box::new(keyrack_core::authn::InsecureAuthenticator),
             ])),
-            metrics_handle: metrics_exporter_prometheus::PrometheusBuilder::new()
-                .build_recorder()
-                .handle(),
+            metrics_handle: metrics(),
             max_plaintext_bytes: 4096,
             legacy_compromised_key_decrypt: false,
             nats_publisher: None,
-            lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
+            lease_cleanup: keyrack_service::lease::LeaseCleanup::new(limit),
             wrapping: WrappingProfiles::new([(
                 ProviderRef::new(PROVIDER),
                 WrappingProfile {
@@ -712,9 +734,11 @@ async fn re_encrypt_closes_the_source_lease_before_opening_the_destination() {
     );
 }
 
-/// The source close fails and the destination cannot be opened. The failure
-/// must reach the caller, not be discarded, and the lease is still owed a
-/// close, which the cleanup owner retries.
+/// The source close fails. The failure must reach the caller, not be
+/// discarded or replaced by a later error, the destination must never be
+/// opened, and the source lease is still owed a close, which the cleanup owner
+/// retries. The destination's open is set to fail so that an implementation
+/// that opens it anyway shows that error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_source_close_is_reported_and_retried() {
     let service = Service::start().await;
@@ -748,9 +772,145 @@ async fn a_failed_source_close_is_reported_and_retried() {
         status.message().contains("injected close failure"),
         "the failed source close must be returned, not discarded: {status:?}"
     );
+    let destination_opens = service.controls.opened()[from..]
+        .iter()
+        .filter(|(key_id, ..)| *key_id == destination.lid.to_string())
+        .count();
+    assert_eq!(
+        (
+            service.controls.opens_started.load(Ordering::SeqCst) - opens,
+            destination_opens
+        ),
+        (1, 0),
+        "after a failed source close the destination lease is never opened"
+    );
     service
         .assert_settled(&handle, &object, "failed source close")
         .await;
+}
+
+/// Cancellations are cheap for a client (a short `grpc-timeout`), so the
+/// closes they leave behind are bounded: at the limit, new uses of wrapped
+/// keys are refused as unavailable, without opening anything, until the
+/// backlog drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrapped_use_is_refused_while_the_cleanup_backlog_is_full() {
+    let service = Service::start_with_limit(1).await;
+    let key = service.child().await;
+    let blob = service.encrypt(&key).await;
+    cancel_with_close_pending(&service).await;
+    assert_eq!(
+        service.state.lease_cleanup.pending(),
+        1,
+        "the backlog is full"
+    );
+    let opens = service.controls.opens_started.load(Ordering::SeqCst);
+
+    let mut request = tonic::Request::new(proto::DecryptRequest {
+        key_id: key.lid.to_string(),
+        ciphertext_blob: blob.clone(),
+        ..Default::default()
+    });
+    request.set_timeout(Duration::from_secs(2));
+    let status = service
+        .client()
+        .await
+        .decrypt(request)
+        .await
+        .expect_err("refused at the limit");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+        .post(format!(
+            "{}/v1/keys/{}/actions-decrypt",
+            service.rest, key.lid
+        ))
+        .json(&rest_decrypt_body(&blob))
+        .send()
+        .await
+        .expect("REST answers at the limit");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        service.controls.opens_started.load(Ordering::SeqCst),
+        opens,
+        "nothing is opened at the limit"
+    );
+    assert!(
+        metrics()
+            .render()
+            .contains("keyrack_wrapped_lease_cleanup_pending"),
+        "the backlog is exposed as a metric"
+    );
+
+    service.controls.close_gate.release();
+    let drained = tokio::time::timeout(PATIENCE, async {
+        while service.state.lease_cleanup.pending() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the backlog drains once the close finishes"
+    );
+    service
+        .client()
+        .await
+        .decrypt(proto::DecryptRequest {
+            key_id: key.lid.to_string(),
+            ciphertext_blob: blob,
+            ..Default::default()
+        })
+        .await
+        .expect("uses resume once the backlog is below the limit");
+}
+
+/// A close that panics in the provider still settles: it is recorded as a
+/// failed cleanup, and nothing is left pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_detached_close_is_recorded_as_failed() {
+    let service = Service::start().await;
+    let key = service.child().await;
+    let blob = service.encrypt(&key).await;
+    let from = service.controls.opened().len();
+    service.controls.decrypt_held.store(true, Ordering::SeqCst);
+    service.controls.panic_close.store(true, Ordering::SeqCst);
+
+    let mut client = service.client().await;
+    let lid = key.lid.to_string();
+    let request = tokio::spawn(async move {
+        let mut request = tonic::Request::new(proto::DecryptRequest {
+            key_id: lid,
+            ciphertext_blob: blob,
+            ..Default::default()
+        });
+        request.set_timeout(Duration::from_millis(300));
+        let _ = client.decrypt(request).await;
+    });
+    let (request, ..) = service
+        .hold_decrypt_until_entered(&key, from, request)
+        .await;
+    request.await.expect("the client saw its deadline");
+
+    let owner = &service.state.lease_cleanup;
+    let _ = tokio::time::timeout(PATIENCE, async {
+        while owner.counts().close_failed == 0 || owner.pending() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let counts = owner.counts();
+    assert_eq!(
+        (
+            counts.close_failed,
+            counts.closed_after_return,
+            owner.pending()
+        ),
+        (1, 0, 0),
+        "a panicked close is recorded as failed, not left pending: {counts:?}"
+    );
 }
 
 /// Cancel a decrypt while its close is blocked in the provider, so the close
@@ -775,6 +935,15 @@ async fn cancel_with_close_pending(service: &Service) -> String {
         closes + 1,
         "the deadline expired during the close: {status:?}"
     );
+    // The client gives up on its own deadline, a moment before the server
+    // drops the request and hands its close to the owner.
+    let handed_over = tokio::time::timeout(PATIENCE, async {
+        while service.state.lease_cleanup.pending() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(handed_over.is_ok(), "the cancelled close reached the owner");
     service.lease_for(&key, from).1
 }
 

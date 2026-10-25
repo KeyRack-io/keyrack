@@ -385,10 +385,7 @@ async fn cancelling_single_use_must_settle_its_genuine_lease() {
         .await
         .unwrap();
     drop(use_future);
-    // Allow scheduled cleanup of this in-process software key, if present.
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
+    let counts = cleanup_settled(&state).await;
     let result = provider
         .encrypt(&genuine, b"after cancellation", b"aad")
         .await;
@@ -397,9 +394,26 @@ async fn cancelling_single_use_must_settle_its_genuine_lease() {
     assert!(
         matches!(result, Err(keyrack_core::error::KeyRackError::Provider(ref message))
         if message == &format!("key not found: {}", genuine.key_id)),
-        "cancelled with_usable_handle must remove its genuine opened child; still operable: {}",
+        "cancelled with_usable_handle must remove its genuine opened child; still operable: {}, \
+         cleanup records: {counts:?}",
         result.is_ok()
     );
+}
+
+/// Wait, bounded, until every close handed to the cleanup owner has an
+/// outcome, and return the counts either way.
+async fn cleanup_settled(state: &ServiceState) -> keyrack_service::lease::CleanupCounts {
+    let owner = &state.lease_cleanup;
+    let settled = |c: keyrack_service::lease::CleanupCounts| {
+        c.scheduled >= 1 && c.closed_after_return + c.close_failed + c.abandoned >= c.scheduled
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !settled(owner.counts()) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    owner.counts()
 }
 
 #[tokio::test]
@@ -504,9 +518,7 @@ async fn cancel_two_key_use(phase: TwoKeyPhase) -> Vec<KeyHandle> {
         .await
         .unwrap();
     drop(use_future);
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
+    let counts = cleanup_settled(&state).await;
     let mut usable = 0;
     for handle in &handles {
         let result = provider
@@ -519,7 +531,8 @@ async fn cancel_two_key_use(phase: TwoKeyPhase) -> Vec<KeyHandle> {
     }
     assert_eq!(
         usable, 0,
-        "a cancelled with_usable_handles must remove every genuine opened child"
+        "a cancelled with_usable_handles must remove every genuine opened child; \
+         cleanup records: {counts:?}"
     );
     handles
 }
