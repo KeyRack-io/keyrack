@@ -192,23 +192,54 @@ struct Counters {
     abandoned: AtomicU64,
 }
 
-#[derive(Default)]
 struct Inner {
     stopped: AtomicBool,
     next: AtomicU64,
+    limit: usize,
     pending: Mutex<BTreeMap<u64, LeaseSubject>>,
     counters: Counters,
 }
 
+/// Default for [`LeaseCleanup::new`]'s `limit`.
+pub const DEFAULT_CLEANUP_LIMIT: usize = 1024;
+
 /// Owner of every wrapped-lease open and close that must not depend on the
 /// request future that started it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LeaseCleanup {
     tracker: TaskTracker,
     inner: Arc<Inner>,
 }
 
+impl Default for LeaseCleanup {
+    fn default() -> Self {
+        Self::new(DEFAULT_CLEANUP_LIMIT)
+    }
+}
+
 impl LeaseCleanup {
+    /// An owner that refuses new wrapped-key uses while `limit` closes are
+    /// outstanding.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            tracker: TaskTracker::new(),
+            inner: Arc::new(Inner {
+                stopped: AtomicBool::new(false),
+                next: AtomicU64::new(0),
+                limit,
+                pending: Mutex::new(BTreeMap::new()),
+                counters: Counters::default(),
+            }),
+        }
+    }
+
+    /// The outstanding-close limit this owner was created with.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.inner.limit
+    }
+
     /// Open a wrapped child for one use.
     ///
     /// The open runs on the owner: a provider open may block and cannot be

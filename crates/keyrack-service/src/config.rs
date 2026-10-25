@@ -137,6 +137,17 @@ pub struct ServiceConfig {
     /// here rather than implied by whatever a provider happens to support.
     #[serde(default)]
     pub wrapping: Vec<WrappingProfileConfig>,
+
+    /// Most wrapped-child lease closes that may be outstanding after the
+    /// requests that opened them were cancelled. At the limit, new uses of
+    /// wrapped keys are refused as unavailable, and retryable, until the
+    /// backlog drains. Must be at least 1.
+    #[serde(default = "default_wrapped_lease_cleanup_limit")]
+    pub wrapped_lease_cleanup_limit: usize,
+}
+
+fn default_wrapped_lease_cleanup_limit() -> usize {
+    crate::lease::DEFAULT_CLEANUP_LIMIT
 }
 
 /// Activation of parent-wrapped child keys on one named provider.
@@ -268,6 +279,7 @@ impl Default for ServiceConfig {
             dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
             wrapping: Vec::new(),
+            wrapped_lease_cleanup_limit: default_wrapped_lease_cleanup_limit(),
         }
     }
 }
@@ -301,6 +313,13 @@ impl ServiceConfig {
         self.validate_audit_signing()?;
         self.validate_provider_durability()?;
         self.validate_wrapping()?;
+        if self.wrapped_lease_cleanup_limit == 0 {
+            return Err(
+                "config error: `wrapped_lease_cleanup_limit` must be at least 1; \
+                 0 would refuse every use of a wrapped key"
+                    .into(),
+            );
+        }
         for entry in self.resolved_providers()?.0 {
             if entry.custody == crate::readiness::ProviderCustody::Customer {
                 crate::provider_startup::validate_remote_config(&entry.provider)?;
@@ -913,6 +932,7 @@ mod tests {
             dev_only_allow_ephemeral_provider_with_persistent_metadata: false,
             legacy_compromised_key_decrypt: false,
             wrapping: Vec::new(),
+            wrapped_lease_cleanup_limit: default_wrapped_lease_cleanup_limit(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed = ServiceConfig::from_yaml(&yaml).unwrap();

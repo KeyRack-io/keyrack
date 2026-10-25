@@ -862,7 +862,9 @@ async fn build_state(
             legacy_compromised_key_decrypt: config.legacy_compromised_key_decrypt,
             nats_publisher,
             wrapping,
-            lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
+            lease_cleanup: keyrack_service::lease::LeaseCleanup::new(
+                config.wrapped_lease_cleanup_limit,
+            ),
         },
         custody_readiness,
     ))
