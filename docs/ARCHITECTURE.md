@@ -118,11 +118,32 @@ uniqueness even without caller-supplied identity attributes.
 
 ### Key Hierarchy
 
-Keys form a logical parent-child hierarchy. The KEK/DEK labels below describe
-intended roles, not cryptographic wrapping relationships: wrapped-child creation
-is not reachable through the service API in 0.5.0. API-created keys are
-provider-resident. `CreateKey.parent_key_id` can record logical ancestry;
-namespace rules also describe parent relationships. Neither establishes wrapping.
+Keys form a parent-child hierarchy. The KEK/DEK labels below describe intended
+roles; namespace rules describe logical parent relationships and do not
+establish wrapping.
+
+From 0.5.0, `CreateKey.parent_key_id` creates a wrapped child: one level of
+wrapping, under an independently resident parent (a wrapped key cannot itself
+wrap children). It is opt-in per provider through a `wrapping:` profile, and a
+profile may only name a platform-custody provider. The only mechanism in this
+release is the software one, `software:aes-256-gcm:v1`, which unwraps the child
+into service memory for each use: the hierarchy has the shape of key wrapping,
+not custody. Two consequences are breaking: `CreateKey` with a parent is refused
+on any provider without a profile, and keys created before 0.5.0 that name a
+parent are refused as wrapping parents (and listed at startup). Native PKCS#11
+wrapping is not reachable through the service in 0.5.0, for any token, SoftHSM
+included. See [Key-version material
+representation](KEY_MATERIAL_REPRESENTATION.md#creating-a-child).
+
+Wrapped material is opened for the call and closed before a normal return, on
+success and on the operation's error: the call returns only after the provider
+has answered the close, and a failed close fails the call. If the request is
+cancelled first (client disconnect, client deadline, shutdown), closing passes
+to a cleanup owner independent of the request: it is scheduled, not verified,
+before the request ends, and its outcome is recorded in the service log and
+metrics only as an unverified cleanup outcome, never as verified closure. A
+close still pending when the shutdown drain ends is recorded as abandoned. A
+cancelled request records no audit outcome for its operation.
 
 ```
 Root KEK (operator-managed)

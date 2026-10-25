@@ -72,17 +72,21 @@ For the transaction service above, a native integration needs to:
 
 1. Configure a client connection and authentication for the deployed service.
 2. Create a key through `CreateKey`, supplying attributes for namespace routing
-   and optionally `parent_key_id` for logical ancestry. Store the returned key ID
-   for subsequent use.
+   and, where the deployment has a `wrapping:` profile, optionally
+   `parent_key_id` to wrap the key under a parent. Store the returned key ID for
+   subsequent use.
 3. Call `Encrypt` with that key ID, the record bytes and encryption context.
 4. Store the returned ciphertext blob intact, including its versioned header.
 5. Supply the same encryption context to `Decrypt`.
 
 These are integration steps, not calls to a supplied `KeyRackClient` Java
-builder. Generated bindings expose `CreateKey.parent_key_id` for logical
-ancestry; the illustrative `.parent(...)` builder is not a supplied Java API.
-Creating cryptographically parent-wrapped children is not exposed through
-the service API in 0.5.0.
+builder; the illustrative `.parent(...)` builder is not a supplied Java API.
+Generated bindings expose `CreateKey.parent_key_id`. From 0.5.0 it creates a
+child wrapped under that parent — one level, only under a `wrapping:` profile on
+a platform-custody provider — and is refused without one. The only mechanism in
+0.5.0 is software, which unwraps the child into service memory, so it is not
+custody; native PKCS#11 wrapping is not reachable through the service, for any
+token, SoftHSM included.
 
 ### Rotation
 

@@ -52,7 +52,9 @@ constructor or material enum. This is unreleased feature-branch work.
 
 ## Current fail-closed behavior
 
-All ordinary handle access and provider resolution refuse wrapped versions.
+Outside the per-call lease that encrypt, decrypt, re-encrypt and
+generate-data-key open (see [Using a child](#using-a-child)), handle access and
+provider resolution refuse wrapped versions.
 Rotation and exportability mutations preflight the complete history. The deletion
 worker rejects a mixed history before deleting any resident sibling, leaving it
 pending rather than claiming completion. CLI identity/reparent migrations and
@@ -65,8 +67,7 @@ stale `is_primary` flag. Both REST and gRPC rotation use the shared domain path
 and persist the binding actually used for generation. Logical descendant traversal
 is preflighted before rotation; logical rotation jobs are not cryptographic rewrap.
 
-Still required before activation: a service path that creates wrapped children,
-authoritative per-version lifecycle, dependency indexing, rewrap/retirement
+Still required before a custody claim: authoritative per-version lifecycle, dependency indexing, rewrap/retirement
 semantics, metadata API exposure, and real-provider restart/crash/erasure
 acceptance. The primitive SoftHSM experiment is described separately in
 [PKCS11_WRAPPING_PROBE.md](PKCS11_WRAPPING_PROBE.md).
