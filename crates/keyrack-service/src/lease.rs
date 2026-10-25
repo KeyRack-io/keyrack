@@ -164,11 +164,34 @@ impl LeaseGuard {
                 );
                 Err(error)
             }
-            Err(error) => Err(KeyRackError::Provider(format!(
-                "wrapped lease close did not finish: {error}"
-            ))),
+            Err(error) => Err(close_did_not_finish(&error)),
         }
     }
+}
+
+/// One close attempt, run as its own task so that a panic in the provider is
+/// a failed attempt rather than the end of the cleanup task that must record
+/// an outcome.
+async fn attempt_close(
+    provider: Arc<dyn CryptoProvider>,
+    lease: WrappedKeyLease,
+) -> Result<WrappedKeyClosure> {
+    tokio::spawn(async move { provider.close_wrapped_key(&lease).await })
+        .await
+        .unwrap_or_else(|error| Err(close_did_not_finish(&error)))
+}
+
+fn close_did_not_finish(error: &tokio::task::JoinError) -> KeyRackError {
+    if error.is_panic() {
+        KeyRackError::Provider("wrapped lease close panicked in the provider".into())
+    } else {
+        KeyRackError::Provider(format!("wrapped lease close did not finish: {error}"))
+    }
+}
+
+fn publish_pending(len: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!("keyrack_wrapped_lease_cleanup_pending").set(len as f64);
 }
 
 impl Drop for LeaseGuard {
@@ -245,6 +268,10 @@ impl LeaseCleanup {
     /// The open runs on the owner: a provider open may block and cannot be
     /// cancelled, so a lease it produces after the request has gone is still
     /// owned, and closed.
+    ///
+    /// Refused as unavailable while [`limit`](Self::limit) closes are pending:
+    /// a client can cancel requests at will, and every cancelled use leaves a
+    /// close behind, so new uses wait for the backlog instead of growing it.
     pub(crate) async fn open(
         &self,
         provider: Arc<dyn CryptoProvider>,
@@ -253,6 +280,12 @@ impl LeaseCleanup {
         envelope: Vec<u8>,
         used: LeaseUse,
     ) -> Result<LeaseGuard> {
+        if self.pending() >= self.inner.limit {
+            return Err(KeyRackError::ProviderUnavailable(format!(
+                "wrapped lease cleanup backlog is at its limit of {}; retry later",
+                self.inner.limit
+            )));
+        }
         let (answer, answered) = tokio::sync::oneshot::channel();
         let owner = self.clone();
         let opening = self.spawn(async move {
@@ -302,17 +335,18 @@ impl LeaseCleanup {
     /// Work already handed over, and work handed over while waiting, gets
     /// until `deadline`. Every close still pending then is recorded as
     /// [`CleanupOutcome::Abandoned`], as is anything handed over afterwards.
-    /// Returns how many were abandoned here.
+    /// That includes a close whose task finished without an outcome: the
+    /// tracker finishing is not closure. Returns how many were abandoned here.
     pub async fn drain(&self, deadline: tokio::time::Instant) -> usize {
         self.tracker.close();
-        let drained = tokio::time::timeout_at(deadline, self.tracker.wait())
-            .await
-            .is_ok();
+        let _ = tokio::time::timeout_at(deadline, self.tracker.wait()).await;
         self.inner.stopped.store(true, Ordering::SeqCst);
-        if drained {
-            return 0;
-        }
-        let abandoned = std::mem::take(&mut *self.pending_map());
+        let abandoned = {
+            let mut pending = self.pending_map();
+            let taken = std::mem::take(&mut *pending);
+            publish_pending(0);
+            taken
+        };
         for subject in abandoned.values() {
             self.record(CleanupOutcome::Abandoned, subject, None);
         }
@@ -344,33 +378,42 @@ impl LeaseCleanup {
         in_flight: Option<CloseTask>,
     ) {
         let id = self.inner.next.fetch_add(1, Ordering::SeqCst);
-        self.pending_map().insert(id, subject.clone());
+        {
+            let mut pending = self.pending_map();
+            pending.insert(id, subject.clone());
+            publish_pending(pending.len());
+        }
         let owner = self.clone();
         let spawned = self.spawn(async move {
             let first = match in_flight {
-                Some(task) => task.await.unwrap_or_else(|error| {
-                    Err(KeyRackError::Provider(format!(
-                        "wrapped lease close did not finish: {error}"
-                    )))
-                }),
-                None => provider.close_wrapped_key(&lease).await,
+                Some(task) => task
+                    .await
+                    .unwrap_or_else(|error| Err(close_did_not_finish(&error))),
+                None => attempt_close(Arc::clone(&provider), lease.clone()).await,
             };
             let result = match first {
                 Ok(closure) => Ok(closure),
-                Err(_) => provider.close_wrapped_key(&lease).await,
+                Err(_) => attempt_close(provider, lease).await,
             };
             owner.settle(id, result);
         });
         if spawned.is_some() {
             self.record(CleanupOutcome::Scheduled, subject, None);
-        } else if self.pending_map().remove(&id).is_some() {
+        } else if self.take_pending(id).is_some() {
             self.record(CleanupOutcome::Abandoned, subject, None);
         }
     }
 
+    fn take_pending(&self, id: u64) -> Option<LeaseSubject> {
+        let mut pending = self.pending_map();
+        let subject = pending.remove(&id);
+        publish_pending(pending.len());
+        subject
+    }
+
     fn settle(&self, id: u64, result: Result<WrappedKeyClosure>) {
         // Absent once abandoned at the drain deadline: that record stands.
-        let Some(subject) = self.pending_map().remove(&id) else {
+        let Some(subject) = self.take_pending(id) else {
             return;
         };
         match result {

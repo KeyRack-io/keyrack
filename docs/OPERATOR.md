@@ -105,6 +105,20 @@ message naming the change, and startup warns when any are present. Migration is
 required before using them under 0.5 semantics; there is no migration script
 yet.
 
+A request that is cancelled while it holds a child's use lease (client
+disconnect, client deadline, shutdown) leaves the close to the service, which
+closes it after the request has ended and records that only as an unverified
+cleanup outcome. Those closes are bounded:
+
+```yaml
+wrapped_lease_cleanup_limit: 1024   # default; must be at least 1
+```
+
+While that many closes are outstanding, new uses of wrapped keys are refused
+with gRPC `UNAVAILABLE` / HTTP 503 (retryable) instead of queuing more. Watch
+`keyrack_wrapped_lease_cleanup_pending` and
+`keyrack_wrapped_lease_cleanup_total{outcome}`.
+
 ### Compromised-key default denial and dangerous legacy opt-in
 
 Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.
@@ -889,6 +903,8 @@ metadata likewise does not establish live availability.
 | `keyrack_pdp_request_duration_seconds` | PDP evaluation latency |
 | `keyrack_pdp_errors_total` | PDP transport/evaluation failures |
 | `keyrack_audit_emit_errors_total` | Audit sink write failures |
+| `keyrack_wrapped_lease_cleanup_total{outcome}` | Wrapped-child lease closes after a cancelled request: `scheduled`, then `closed_after_return`, `close_failed` or `abandoned`. Unverified; never closure evidence |
+| `keyrack_wrapped_lease_cleanup_pending` | Those closes still outstanding; at `wrapped_lease_cleanup_limit`, wrapped-key uses are refused as unavailable |
 
 ### Request correlation (`x-request-id`)
 

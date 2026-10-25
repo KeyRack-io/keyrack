@@ -106,7 +106,10 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   the service in 0.5.0, for any token, SoftHSM included. Re-encrypt involving a
   wrapped version closes the source lease before opening the destination. Cleanup
   outcomes are counted in `keyrack_wrapped_lease_cleanup_total{outcome}`, and
-  shutdown keeps its single 30-second deadline. The handle is whatever the issuing
+  shutdown keeps its single 30-second deadline. Outstanding cleanup closes are
+  bounded by `wrapped_lease_cleanup_limit` (default 1024) and exposed as
+  `keyrack_wrapped_lease_cleanup_pending`; at the limit, new uses of wrapped keys
+  are refused as unavailable (retryable) instead of queued. The handle is whatever the issuing
   provider returned for that open: possessing it is not a grant. A planted
   wrapped descriptor that does not name a journaled envelope is still refused
   without talking to the provider. Export, rotation and destroy of wrapped

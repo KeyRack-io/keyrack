@@ -195,7 +195,11 @@ server drain leaves of it. Outcomes are counted in
 `keyrack_wrapped_lease_cleanup_total` by `outcome` — `scheduled`,
 `closed_after_return`, `close_failed`, `abandoned` — and each log record names
 the key, version, provider, object and context digest, never material. A close
-that fails within the request is retried once by the owner.
+that fails within the request is retried once by the owner; a close that
+panics in the provider is recorded as `close_failed`. Outstanding closes are
+bounded by `wrapped_lease_cleanup_limit` (default 1024) and exposed as
+`keyrack_wrapped_lease_cleanup_pending`: at the limit, new uses of wrapped keys
+are refused as unavailable, and retryable, rather than queued.
 
 Re-encrypt that involves a wrapped version holds at most one lease: the source
 is opened, decrypts and is closed before the destination opens, and a failed
