@@ -104,7 +104,7 @@ skip = [
     { name = "matchit", version = "=0.7.3" },
     # r-efi@5.3.0 is required by getrandom@0.3.4.
     { name = "r-efi", version = "=5.3.0" },
-    # rand@0.8.6 is required by async-nats@0.38.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-service@0.5.0, keyrack-vault@0.5.0, nkeys@0.4.5, nuid@0.5.0, num-bigint-dig@0.8.6, sqlx-postgres@0.8.6, tokio-websockets@0.10.1, tower@0.4.13.
+    # rand@0.8.6 is required by async-nats@0.47.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-service@0.5.0, keyrack-vault@0.5.0, nkeys@0.4.5, nuid@0.5.0, num-bigint-dig@0.8.6, sqlx-postgres@0.8.6, tokio-websockets@0.10.1, tower@0.4.13.
     { name = "rand", version = "=0.8.6" },
     # rand_chacha@0.3.1 is required by rand@0.8.6.
     { name = "rand_chacha", version = "=0.3.1" },
@@ -116,7 +116,7 @@ skip = [
     { name = "sha2", version = "=0.10.9" },
     # socket2@0.5.10 is required by tonic@0.12.3, tonic@0.13.1.
     { name = "socket2", version = "=0.5.10" },
-    # thiserror@1.0.69 is required by async-nats@0.38.0, metrics-exporter-prometheus@0.16.2.
+    # thiserror@1.0.69 is required by async-nats@0.47.0, metrics-exporter-prometheus@0.16.2.
     { name = "thiserror", version = "=1.0.69" },
     # thiserror-impl@1.0.69 is required by thiserror@1.0.69.
     { name = "thiserror-impl", version = "=1.0.69" },
