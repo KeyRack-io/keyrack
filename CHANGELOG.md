@@ -503,6 +503,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 - Refresh the locked TLS and advisory set for RUSTSEC-2026-0381, RUSTSEC-2026-0382,
   RUSTSEC-2026-0385 and RUSTSEC-2026-0386; upgrade async-nats to 0.47.0.
 
+- Upgrade software P-256/P-384 ECDSA to the 0.14 dependency family, resolving
+  RUSTSEC-2026-0387 while retaining DER signatures and pre-hash behavior.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave
