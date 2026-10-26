@@ -1,0 +1,31 @@
+name: ECDSA compatibility
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  ecdsa-compatibility:
+    name: ECDSA cross-version compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            conformance/ecdsa-compatibility -> target
+      - run: python3 scripts/test-ecdsa-compatibility.py
+      - name: Existing software-provider tests
+        run: cargo test --locked -p keyrack-core --lib provider::software::tests
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ecdsa-compatibility
+          path: target/proofs/ecdsa-compatibility/
+          if-no-files-found: error
