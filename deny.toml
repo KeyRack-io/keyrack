@@ -8,72 +8,21 @@ unmaintained = "all"
 unused-ignored-advisory = "deny"
 # Baseline exceptions require review; new advisory IDs and yanks still fail.
 ignore = [
-    # anyhow@1.0.102: Unsoundness in `Error::downcast_mut()`
-    # Upgrade to >=1.0.103 (try `cargo update -p anyhow`)
-    { id = "RUSTSEC-2026-0190", reason = "Existing locked anyhow@1.0.102: Unsoundness in `Error::downcast_mut()`. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # crossbeam-epoch@0.9.18: Invalid pointer dereference in `fmt::Pointer` impl for `Atomic` and `Shared` when the underlying pointer is invalid
-    # Upgrade to >=0.9.20 (try `cargo update -p crossbeam-epoch`)
-    { id = "RUSTSEC-2026-0204", reason = "Existing locked crossbeam-epoch@0.9.18: Invalid pointer dereference in `fmt::Pointer` impl for `Atomic` and `Shared` when the underlying pointer is invalid. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # cryptoki@0.12.0: Out-of-bounds read when decoding CKA_ALLOWED_MECHANISMS
-    # Upgrade to >=0.10.1, <0.11.0 OR >=0.11.1, <0.12.0 OR >=0.12.1 (try `cargo update -p cryptoki`)
-    { id = "RUSTSEC-2026-0286", reason = "Existing locked cryptoki@0.12.0: Out-of-bounds read when decoding CKA_ALLOWED_MECHANISMS. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # h2@0.4.13: h2 unbounded empty DATA frames
-    # Upgrade to >=0.4.16 (try `cargo update -p h2`)
-    { id = "RUSTSEC-2026-0258", reason = "Existing locked h2@0.4.13: h2 unbounded empty DATA frames. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # instant@0.1.13: `instant` is unmaintained
-    # No safe upgrade is available!
-    { id = "RUSTSEC-2024-0384", reason = "Existing locked instant@0.1.13: `instant` is unmaintained. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
+    # Temporary until the p256/p384 0.14 migration, before 0.5.0.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via p256/p384 0.13. Reachable only in software-backend P-256/P-384 ECDSA. No 0.5.x fix; removed by the p256/p384 0.14 migration PR before 0.5.0." },
     # rsa@0.9.10: Marvin Attack: potential key recovery through timing sidechannels
     # No safe upgrade is available!
     # No fixed release is available. Software-backend RSA private-key operations are not
     # constant-time; production RSA keys belong on PKCS#11.
     { id = "RUSTSEC-2023-0071", reason = "No fixed release is available. Software-backend RSA private-key operations are not constant-time; production RSA keys belong on PKCS#11." },
-    # rustls@0.23.40: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries
-    # Upgrade to >=0.23.45 (try `cargo update -p rustls`)
-    { id = "RUSTSEC-2026-0285", reason = "Existing locked rustls@0.23.40: TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # rustls@0.23.40: `Debug` impls for client session values expose TLS secrets
-    # Upgrade to >=0.23.46 (try `cargo update -p rustls`)
-    { id = "RUSTSEC-2026-0346", reason = "Existing locked rustls@0.23.40: `Debug` impls for client session values expose TLS secrets. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # rustls@0.23.40: Brotli certificate decompression can allocate up to 1 GiB before authentication
-    # Upgrade to >=0.23.46 (try `cargo update -p rustls`)
-    { id = "RUSTSEC-2026-0348", reason = "Existing locked rustls@0.23.40: Brotli certificate decompression can allocate up to 1 GiB before authentication. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # rustls@0.23.40: Unauthenticated ServerHello can downgrade later connections to classical key exchange
-    # Upgrade to >=0.23.46 (try `cargo update -p rustls`)
-    { id = "RUSTSEC-2026-0349", reason = "Existing locked rustls@0.23.40: Unauthenticated ServerHello can downgrade later connections to classical key exchange. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
     # rustls-pemfile@2.2.0: rustls-pemfile is unmaintained
     # No safe upgrade is available!
     # Unmaintained, with no open vulnerability. Replace rustls-pemfile after 0.5.0.
     { id = "RUSTSEC-2025-0134", reason = "Unmaintained, with no open vulnerability. Replace rustls-pemfile after 0.5.0." },
-    # rustls-webpki@0.102.8: CRLs not considered authoritative by Distribution Point due to faulty matching logic
-    # Upgrade to >=0.103.10 (try `cargo update -p rustls-webpki`)
-    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
-    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
-    { id = "RUSTSEC-2026-0049", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
-    # rustls-webpki@0.102.8: Name constraints for URI names were incorrectly accepted
-    # Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (try `cargo update -p rustls-webpki`)
-    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
-    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
-    { id = "RUSTSEC-2026-0098", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
-    # rustls-webpki@0.102.8: Name constraints were accepted for certificates asserting a wildcard name
-    # Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6 (try `cargo update -p rustls-webpki`)
-    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
-    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
-    { id = "RUSTSEC-2026-0099", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
-    # rustls-webpki@0.102.8: Reachable panic in certificate revocation list parsing
-    # Upgrade to >=0.103.13, <0.104.0-alpha.1 OR >=0.104.0-alpha.7 (try `cargo update -p rustls-webpki`)
-    # Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a
-    # misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0.
-    { id = "RUSTSEC-2026-0104", reason = "Only async-nats 0.38 uses rustls-webpki@0.102.8. These findings require CRLs or a misissued CA. Upgrade async-nats to 0.47 or later after 0.5.0." },
     # unsafe-libyaml@0.2.11: unsafe-libyaml is unmaintained
     # No safe upgrade is available!
     # Unmaintained, with no open vulnerability. Replace unsafe-libyaml after 0.5.0.
     { id = "RUSTSEC-2024-0449", reason = "Unmaintained, with no open vulnerability. Replace unsafe-libyaml after 0.5.0." },
-    # metrics@0.24.5: Yanked release
-    # Replace the yanked version in a dependency-update change.
-    { crate = "metrics@0.24.5", reason = "Existing locked metrics@0.24.5: Yanked release. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
-    # spin@0.9.8: Yanked release
-    # Replace the yanked version in a dependency-update change.
-    { crate = "spin@0.9.8", reason = "Existing locked spin@0.9.8: Yanked release. Dependency remediation remains outstanding; this exception does not establish that the code path is unreachable." },
 ]
 
 [licenses]
@@ -100,20 +49,19 @@ multiple-versions = "deny"
 
 # Only the older locked versions are exempt; new duplicate versions still fail.
 skip = [
+    # tokio-websockets@0.10.1 via async-nats@0.47 requires this compatibility
+    # package; it re-exports webpki-roots@1.0.11, with no independent root store.
+    { name = "webpki-roots", version = "=0.26.11" },
     # arrayvec@0.5.2 is required by pretty@0.12.5.
     { name = "arrayvec", version = "=0.5.2" },
     # axum@0.7.9 is required by keyrack-cedar-pdp@0.5.0, keyrack-service@0.5.0, tonic@0.12.3.
     { name = "axum", version = "=0.7.9" },
     # axum-core@0.4.5 is required by axum@0.7.9.
     { name = "axum-core", version = "=0.4.5" },
-    # bitflags@1.3.2 is required by inotify@0.10.2, kqueue-sys@1.0.4.
-    { name = "bitflags", version = "=1.3.2" },
     # block-buffer@0.10.4 is required by digest@0.10.7.
     { name = "block-buffer", version = "=0.10.4" },
     # const-oid@0.9.6 is required by der@0.7.10, digest@0.10.7, rsa@0.9.10, x509-cert@0.2.5.
     { name = "const-oid", version = "=0.9.6" },
-    # core-foundation@0.9.4 is required by security-framework@2.11.1.
-    { name = "core-foundation", version = "=0.9.4" },
     # cpufeatures@0.2.17 is required by aes@0.8.4, curve25519-dalek@4.1.3, keccak@0.1.6, polyval@0.6.2, sha1@0.10.6, sha2@0.10.9.
     { name = "cpufeatures", version = "=0.2.17" },
     # crypto-common@0.1.6 is required by aead@0.5.2, cipher@0.4.4, digest@0.10.7, universal-hash@0.5.1.
@@ -142,11 +90,9 @@ skip = [
     { name = "indexmap", version = "=1.9.3" },
     # matchit@0.7.3 is required by axum@0.7.9.
     { name = "matchit", version = "=0.7.3" },
-    # openssl-probe@0.1.6 is required by rustls-native-certs@0.7.3.
-    { name = "openssl-probe", version = "=0.1.6" },
     # r-efi@5.3.0 is required by getrandom@0.3.4.
     { name = "r-efi", version = "=5.3.0" },
-    # rand@0.8.6 is required by async-nats@0.38.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-service@0.5.0, keyrack-vault@0.5.0, nkeys@0.4.5, nuid@0.5.0, num-bigint-dig@0.8.6, sqlx-postgres@0.8.6, tokio-websockets@0.10.1, tower@0.4.13.
+    # rand@0.8.6 is required by async-nats@0.47.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-service@0.5.0, keyrack-vault@0.5.0, nkeys@0.4.5, nuid@0.5.0, num-bigint-dig@0.8.6, sqlx-postgres@0.8.6, tokio-websockets@0.10.1, tower@0.4.13.
     { name = "rand", version = "=0.8.6" },
     # rand_chacha@0.3.1 is required by rand@0.8.6.
     { name = "rand_chacha", version = "=0.3.1" },
@@ -154,17 +100,11 @@ skip = [
     { name = "rand_core", version = "=0.6.4" },
     # redox_syscall@0.5.18 is required by parking_lot_core@0.9.12.
     { name = "redox_syscall", version = "=0.5.18" },
-    # rustls-native-certs@0.7.3 is required by async-nats@0.38.0.
-    { name = "rustls-native-certs", version = "=0.7.3" },
-    # rustls-webpki@0.102.8 is required by async-nats@0.38.0.
-    { name = "rustls-webpki", version = "=0.102.8" },
-    # security-framework@2.11.1 is required by rustls-native-certs@0.7.3.
-    { name = "security-framework", version = "=2.11.1" },
     # sha2@0.10.9 is required by ed25519-dalek@2.2.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-surface-contract@0.1.0, keyrack-vault@0.5.0, p256@0.13.2, p384@0.13.1, rsa@0.9.10, sqlx-core@0.8.6, sqlx-macros-core@0.8.6, sqlx-postgres@0.8.6.
     { name = "sha2", version = "=0.10.9" },
     # socket2@0.5.10 is required by tonic@0.12.3, tonic@0.13.1.
     { name = "socket2", version = "=0.5.10" },
-    # thiserror@1.0.69 is required by async-nats@0.38.0, metrics-exporter-prometheus@0.16.2.
+    # thiserror@1.0.69 is required by async-nats@0.47.0, metrics-exporter-prometheus@0.16.2.
     { name = "thiserror", version = "=1.0.69" },
     # thiserror-impl@1.0.69 is required by thiserror@1.0.69.
     { name = "thiserror-impl", version = "=1.0.69" },
