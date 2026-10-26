@@ -162,6 +162,9 @@ storage:
 Pure-Rust cryptography. Key material lives in process memory and is zeroized
 on drop. Not for production HSM-grade security.
 
+Software-backend RSA private-key operations are not constant-time. Production
+RSA keys belong on PKCS#11.
+
 ```yaml
 provider:
   type: software
