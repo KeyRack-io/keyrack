@@ -44,12 +44,25 @@ struct Controls {
     released: Mutex<bool>,
     changed: Condvar,
     closed: AtomicUsize,
+    hold_migration_result: AtomicBool,
+    migration_entered: tokio::sync::Notify,
+    migration_calls: AtomicUsize,
+    migration_native_closed: AtomicUsize,
 }
 
 impl Controls {
     fn release(&self) {
         *self.released.lock().unwrap() = true;
         self.changed.notify_all();
+    }
+}
+
+// Always release test-only blocking gates on assertion failure as well as success.
+struct ReleaseGate(Arc<Controls>);
+impl Drop for ReleaseGate {
+    fn drop(&mut self) {
+        self.0.hold_migration_result.store(false, Ordering::SeqCst);
+        self.0.release();
     }
 }
 
@@ -168,6 +181,52 @@ impl CryptoProvider for Instrumented {
         .await
         .expect("native open thread")
     }
+    async fn rewrap_wrapped_key(
+        &self,
+        old: &WrappingContext,
+        old_parent: &KeyHandle,
+        envelope: &[u8],
+        new: &WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> CoreResult<Vec<u8>> {
+        let (inner, controls) = (self.inner.clone(), self.controls.clone());
+        let (old, old_parent, envelope, new, new_parent) = (
+            old.clone(),
+            old_parent.clone(),
+            envelope.to_vec(),
+            new.clone(),
+            new_parent.clone(),
+        );
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            controls.migration_calls.fetch_add(1, Ordering::SeqCst);
+            let result = runtime.block_on(inner.rewrap_wrapped_key(
+                &old,
+                &old_parent,
+                &envelope,
+                &new,
+                &new_parent,
+            ));
+            if result.is_ok() {
+                // Native success requires explicit original-session cleanup.
+                // Hold its response before the service can stage the journal.
+                controls
+                    .migration_native_closed
+                    .fetch_add(1, Ordering::SeqCst);
+                if controls.hold_migration_result.load(Ordering::SeqCst) {
+                    controls.migration_entered.notify_one();
+                    let mut released = controls.released.lock().unwrap();
+                    while !*released {
+                        released = controls.changed.wait(released).unwrap();
+                    }
+                }
+            }
+            result
+        })
+        .await
+        .expect("native migration response thread")
+    }
+
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> CoreResult<WrappedKeyClosure> {
         let result = self.inner.close_wrapped_key(lease).await;
         if result.is_ok() {
@@ -418,18 +477,105 @@ impl Service {
         else {
             panic!("wrapped child required")
         };
-        let operation = material
-            .wrapped_material_ref()
-            .as_str()
-            .strip_prefix("creation:")
-            .unwrap()
-            .parse()
-            .unwrap();
-        self.state
-            .storage
-            .read_creation_envelope(operation)
+        self.envelope_reference(material.wrapped_material_ref().as_str())
             .await
             .unwrap()
+    }
+    async fn envelope_reference(&self, reference: &str) -> CoreResult<Vec<u8>> {
+        if let Some(operation) = reference.strip_prefix("creation:") {
+            self.state
+                .storage
+                .read_creation_envelope(operation.parse().unwrap())
+                .await
+        } else {
+            let (operation, version) = reference
+                .strip_prefix("migration:")
+                .unwrap()
+                .split_once(':')
+                .unwrap();
+            self.state
+                .storage
+                .read_migration_envelope(operation.parse().unwrap(), version.parse().unwrap())
+                .await
+        }
+    }
+    async fn rotate(&self, rest: bool, key: &str) -> KeyRecord {
+        if rest {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/keys/{key}/actions-rotate", self.rest))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "root rotation: {status} {body}");
+        } else {
+            self.client()
+                .await
+                .rotate_key(proto::RotateKeyRequest { key_id: key.into() })
+                .await
+                .expect("root rotation");
+        }
+        self.record(key).await
+    }
+    async fn migrate(
+        &self,
+        rest: bool,
+        key: &str,
+        parent: Option<&str>,
+        operation: uuid::Uuid,
+    ) -> KeyRecord {
+        if rest {
+            let response = reqwest::Client::new().post(format!("{}/v1/keys/{key}/rewrap", self.rest))
+                .json(&serde_json::json!({"operation_id":operation.to_string(), "new_parent_key_id":parent.unwrap_or("")}))
+                .send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert!(status.is_success(), "migration: {status} {text}");
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["operation_id"], operation.to_string());
+        } else {
+            let result = self
+                .client()
+                .await
+                .rewrap_key(proto::RewrapKeyRequest {
+                    key_id: key.into(),
+                    new_parent_key_id: parent.unwrap_or("").into(),
+                    operation_id: operation.to_string(),
+                })
+                .await
+                .expect("gRPC migration")
+                .into_inner();
+            assert_eq!(result.operation_id, operation.to_string());
+        }
+        self.record(key).await
+    }
+    fn native_object_count() -> usize {
+        // Observe the already initialized module without initializing/finalizing
+        // it independently or changing the service's recovery state.
+        let module =
+            cryptoki::context::Pkcs11::new(std::env::var("KMS_PKCS11_LIB").unwrap()).unwrap();
+        let label = std::env::var("KMS_PKCS11_TOKEN_LABEL").unwrap();
+        let slot = module
+            .get_slots_with_token()
+            .unwrap()
+            .into_iter()
+            .find(|slot| module.get_token_info(*slot).unwrap().label() == label)
+            .unwrap();
+        let session = module.open_rw_session_no_drop(slot).unwrap();
+        let pin = cryptoki::types::AuthPin::new(std::env::var("KMS_PKCS11_PIN").unwrap().into());
+        match session.login(cryptoki::session::UserType::User, Some(&pin)) {
+            Ok(())
+            | Err(cryptoki::error::Error::Pkcs11(
+                cryptoki::error::RvError::UserAlreadyLoggedIn,
+                _,
+            )) => (),
+            Err(error) => panic!("native observer login: {error}"),
+        }
+        let count = session.find_objects(&[]).unwrap().len();
+        session.close().unwrap();
+        count
     }
     async fn roundtrip(&self, rest: bool, key: &str) {
         let blob = self.encrypt(rest, key).await.unwrap();
@@ -769,5 +915,421 @@ async fn native_wrapped_process_restart_retains_child_usability() {
         );
         // wait_with_output has waited for the first process to terminate before
         // the next phase opens the same persistent metadata and token.
+    }
+}
+
+fn wrapped_material(
+    version: &keyrack_core::key::KeyVersionRecord,
+) -> &keyrack_core::material::ParentWrappedMaterial {
+    let KeyMaterial::ParentWrapped(material) = &version.material else {
+        panic!("wrapped version required")
+    };
+    material
+}
+
+fn wrapping_context(
+    record: &KeyRecord,
+    version: &keyrack_core::key::KeyVersionRecord,
+    parent: &KeyRecord,
+) -> WrappingContext {
+    let material = wrapped_material(version);
+    WrappingContext {
+        version: material.wrapping_context_version(),
+        child: keyrack_core::wrapping::VersionedKeyId::new(record.lid, version.version_number)
+            .unwrap(),
+        parent: material.parent(),
+        parent_spec: parent.key_spec.clone(),
+        child_spec: record.key_spec.clone(),
+        key_format: material.key_format().clone(),
+        purpose: keyrack_core::wrapping::WrappingKeyPurpose::EncryptDecrypt,
+        provider_ref: material.provider_ref().clone(),
+        security_domain: material.security_domain().clone(),
+        mechanism: material.mechanism().clone(),
+        public_material_sha256: None,
+    }
+}
+
+async fn append_retained_version(
+    service: &Service,
+    child: &KeyRecord,
+    parent: &KeyRecord,
+) -> KeyRecord {
+    // Seed retained-version coverage through the real creation driver and native
+    // closure verifier. This does not expose wrapped-key rotation as an API.
+    use keyrack_core::creation::{creation_correlation, CreationOwner, CreationRequest};
+    use keyrack_core::creation_driver::{
+        A2CreationDriver, CreationProgress, WrappingCreationProvider,
+    };
+    use keyrack_core::key::KeyVersionRecord;
+    use keyrack_core::material::ParentWrappedMaterial;
+    use keyrack_core::wrapping::{
+        VersionedKeyId, WrappedKeyFormat, WrappedKeyLifecycle, WrappingContextVersion,
+    };
+    let operation = uuid::Uuid::new_v4();
+    let attempt = uuid::Uuid::new_v4();
+    let mut record = child.clone();
+    record.occ_version += 1;
+    record.current_key_version += 1;
+    record.updated_at = chrono::Utc::now();
+    for version in &mut record.key_versions {
+        version.is_primary = false;
+    }
+    record.key_versions.push(KeyVersionRecord {
+        version_number: record.current_key_version,
+        material: KeyMaterial::ParentWrapped(
+            ParentWrappedMaterial::new(
+                ProviderRef::new(PROVIDER),
+                identifier(DOMAIN),
+                VersionedKeyId::new(parent.lid, parent.current_key_version).unwrap(),
+                WrappingContextVersion::V1,
+                WrappedKeyFormat::RawSecret,
+                identifier(CONTEXT_DERIVED_WRAPPING_MECHANISM),
+                identifier(&format!("creation:{operation}")),
+            )
+            .unwrap(),
+        ),
+        created_at: chrono::Utc::now(),
+        is_primary: true,
+    });
+    let mut request = CreationRequest {
+        operation,
+        attempt,
+        owner: CreationOwner {
+            instance: uuid::Uuid::new_v4(),
+            generation: 1,
+        },
+        correlation: creation_correlation(operation, attempt),
+        record,
+        expected_key_occ: Some(child.occ_version),
+        expected_parent_occ: parent.occ_version,
+        parent_spec: parent.key_spec.clone(),
+        context_bytes: vec![],
+    };
+    request.context_bytes = request.context().unwrap().canonical_bytes().unwrap();
+    let provider = service
+        .state
+        .providers
+        .resolve(&ProviderRef::new(PROVIDER))
+        .unwrap()
+        .provider;
+    let adapter = WrappingCreationProvider::new(
+        provider,
+        parent
+            .primary_version()
+            .unwrap()
+            .resident_handle()
+            .unwrap()
+            .clone(),
+        WrappedKeyLifecycle::SessionObject,
+    )
+    .unwrap();
+    match A2CreationDriver::new(service.state.storage.clone(), Arc::new(adapter))
+        .run(request)
+        .await
+        .unwrap()
+    {
+        CreationProgress::Committed(record) => *record,
+        CreationProgress::Pending(reason) => {
+            panic!("native retained-version creation pending: {reason:?}")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_grpc_rest_rewrap_and_reparent_retained_versions() {
+    let service = Service::start(storage()).await;
+    for rest in [false, true] {
+        for aes128 in [false, true] {
+            let parent = service.create(rest, None, false).await;
+            let other = service.create(rest, None, false).await;
+            let child = service.create(rest, Some(&parent), aes128).await;
+            let sibling = service.create(rest, Some(&parent), aes128).await;
+            let first_ciphertext = service.encrypt(rest, &child).await.unwrap();
+            let old_parent = service.record(&parent).await;
+            let original =
+                append_retained_version(&service, &service.record(&child).await, &old_parent).await;
+            let second_ciphertext = service.encrypt(rest, &child).await.unwrap();
+            assert_eq!(original.key_versions.len(), 2);
+            let original_reference = wrapped_material(original.primary_version().unwrap())
+                .wrapped_material_ref()
+                .as_str()
+                .to_owned();
+            let old_ciphertext = service.envelope(&child).await;
+            let parent_v2 = service.rotate(rest, &parent).await;
+            assert_eq!(parent_v2.current_key_version, 2);
+            // Rotation alone leaves child envelopes bound to the old version.
+            assert!(service
+                .record(&child)
+                .await
+                .key_versions
+                .iter()
+                .all(|v| wrapped_material(v).parent().version.get() == 1));
+            service.decrypt(rest, &child, &first_ciphertext).await;
+            service.decrypt(rest, &child, &second_ciphertext).await;
+            let baseline = Service::native_object_count();
+            let operation = uuid::Uuid::new_v4();
+            let rewrapped = service.migrate(rest, &child, None, operation).await;
+            assert_eq!(
+                Service::native_object_count(),
+                baseline,
+                "migration leaked native session objects"
+            );
+            assert_eq!(rewrapped.parent_lid, Some(old_parent.lid));
+            assert!(rewrapped.key_versions.iter().all(|v| wrapped_material(v)
+                .parent()
+                .version
+                .get()
+                == 2));
+            service.decrypt(rest, &child, &first_ciphertext).await;
+            service.decrypt(rest, &child, &second_ciphertext).await;
+            let old_reference_error = service
+                .envelope_reference(&original_reference)
+                .await
+                .unwrap_err();
+            assert!(
+                old_reference_error
+                    .to_string()
+                    .contains("Query returned no rows"),
+                "{old_reference_error}"
+            );
+            let calls = service.controls.migration_calls.load(Ordering::SeqCst);
+            let replayed = service.migrate(rest, &child, None, operation).await;
+            assert_eq!(
+                serde_json::to_value(&replayed).unwrap(),
+                serde_json::to_value(&rewrapped).unwrap()
+            );
+            assert_eq!(
+                service.controls.migration_calls.load(Ordering::SeqCst),
+                calls,
+                "committed replay repeated native effects"
+            );
+            let new_envelope = service.envelope(&child).await;
+            let old_context =
+                wrapping_context(&original, original.primary_version().unwrap(), &old_parent);
+            let new_context =
+                wrapping_context(&rewrapped, rewrapped.primary_version().unwrap(), &parent_v2);
+            let old_handle = old_parent
+                .primary_version()
+                .unwrap()
+                .resident_handle()
+                .unwrap();
+            let new_handle = parent_v2
+                .primary_version()
+                .unwrap()
+                .resident_handle()
+                .unwrap();
+            let wrong = service
+                .native
+                .open_wrapped_key(&old_context, old_handle, &new_envelope)
+                .await
+                .unwrap_err();
+            assert!(
+                wrong.to_string().contains("child unwrap"),
+                "new envelope accepted old parent/version: {wrong}"
+            );
+            let wrong = service
+                .native
+                .open_wrapped_key(&new_context, old_handle, &new_envelope)
+                .await
+                .unwrap_err();
+            assert!(
+                wrong.to_string().contains("child unwrap"),
+                "new context accepted old parent key: {wrong}"
+            );
+            // An independently copied old envelope remains recoverable while
+            // the old parent exists; database erasure cannot revoke that copy.
+            let retained = service
+                .native
+                .open_wrapped_key(&old_context, old_handle, &old_ciphertext)
+                .await
+                .unwrap();
+            service.native.close_wrapped_key(&retained).await.unwrap();
+            let valid = service
+                .native
+                .open_wrapped_key(&new_context, new_handle, &new_envelope)
+                .await
+                .unwrap();
+            service.native.close_wrapped_key(&valid).await.unwrap();
+            service
+                .migrate(rest, &sibling, None, uuid::Uuid::new_v4())
+                .await;
+            let sibling_envelope = service.envelope(&sibling).await;
+            *service.controls.replacement.lock().unwrap() = Some(sibling_envelope);
+            service
+                .encrypt(rest, &child)
+                .await
+                .expect_err("migrated sibling envelope must be context-bound");
+            assert!(service
+                .controls
+                .errors
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("child unwrap"));
+            *service.controls.replacement.lock().unwrap() = None;
+            service.decrypt(rest, &child, &second_ciphertext).await;
+            let other_v2 = service.rotate(rest, &other).await;
+            let before_reparent = Service::native_object_count();
+            let reparented = service
+                .migrate(rest, &child, Some(&other), uuid::Uuid::new_v4())
+                .await;
+            assert_eq!(reparented.parent_lid, Some(other_v2.lid));
+            assert!(reparented
+                .key_versions
+                .iter()
+                .all(|v| wrapped_material(v).parent().lid == other_v2.lid
+                    && wrapped_material(v).parent().version.get() == 2));
+            assert_eq!(Service::native_object_count(), before_reparent);
+            service.decrypt(rest, &child, &first_ciphertext).await;
+            service.decrypt(rest, &child, &second_ciphertext).await;
+            service.roundtrip(rest, &child).await;
+            assert!(
+                service
+                    .envelope_reference(
+                        wrapped_material(rewrapped.primary_version().unwrap())
+                            .wrapped_material_ref()
+                            .as_str()
+                    )
+                    .await
+                    .is_err(),
+                "superseded migration envelope retained"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_grpc_rest_migration_cancellation_retains_journal() {
+    use keyrack_core::migration::MigrationPhase;
+    let service = Service::start(storage()).await;
+    for rest in [false, true] {
+        let parent = service.create(rest, None, false).await;
+        let other = service.create(rest, None, false).await;
+        let child = service.create(rest, Some(&parent), false).await;
+        let original = service.record(&child).await;
+        let ciphertext = service.encrypt(rest, &child).await.unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let baseline = Service::native_object_count();
+        let closed_before = service
+            .controls
+            .migration_native_closed
+            .load(Ordering::SeqCst);
+        service
+            .controls
+            .hold_migration_result
+            .store(true, Ordering::SeqCst);
+        *service.controls.released.lock().unwrap() = false;
+        let _release_on_exit = ReleaseGate(service.controls.clone());
+        let entered = service.controls.migration_entered.notified();
+        let request = if rest {
+            let url = format!("{}/v1/keys/{child}/rewrap", service.rest);
+            let destination = other.clone();
+            tokio::spawn(async move {
+                let error = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .unwrap()
+                    .post(url)
+                    .json(&serde_json::json!({
+                        "operation_id": operation.to_string(),
+                        "new_parent_key_id": destination,
+                    }))
+                    .send()
+                    .await
+                    .expect_err("REST migration client timeout");
+                assert!(error.is_timeout(), "{error}");
+            })
+        } else {
+            let mut client = service.client().await;
+            let mut input = tonic::Request::new(proto::RewrapKeyRequest {
+                key_id: child.clone(),
+                new_parent_key_id: other.clone(),
+                operation_id: operation.to_string(),
+            });
+            input.set_timeout(Duration::from_secs(1));
+            tokio::spawn(async move {
+                let error = client
+                    .rewrap_key(input)
+                    .await
+                    .expect_err("gRPC migration deadline");
+                assert!(
+                    matches!(
+                        error.code(),
+                        tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+                    ),
+                    "{error}"
+                );
+            })
+        };
+        tokio::time::timeout(PATIENCE, entered)
+            .await
+            .expect("native cleanup completed before cancellation");
+        assert_eq!(
+            service
+                .controls
+                .migration_native_closed
+                .load(Ordering::SeqCst),
+            closed_before + 1
+        );
+        assert_eq!(
+            Service::native_object_count(),
+            baseline,
+            "native temporaries survived returned rewrap result"
+        );
+        request.await.unwrap();
+        let journal = service
+            .state
+            .storage
+            .get_migration(operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.phase,
+            MigrationPhase::Reserved,
+            "held response must not have staged envelopes"
+        );
+        assert_eq!(service.record(&child).await.parent_lid, original.parent_lid);
+        let old_parent = service.record(&parent).await;
+        let fenced = keyrack_service::domain::rotate_key(&service.state, &old_parent.lid, &parent)
+            .await
+            .err()
+            .expect("migration fences parent rotation");
+        assert!(
+            matches!(
+                fenced,
+                keyrack_service::domain::DomainError::ProviderUnavailable(_)
+            ),
+            "{fenced:?}"
+        );
+        service
+            .controls
+            .hold_migration_result
+            .store(false, Ordering::SeqCst);
+        service.controls.release();
+        let committed = tokio::time::timeout(
+            PATIENCE,
+            service.migrate(rest, &child, Some(&other), operation),
+        )
+        .await
+        .expect("same-intent retry resolves migration");
+        assert_eq!(committed.parent_lid, Some(other.parse().unwrap()));
+        assert_eq!(
+            service
+                .state
+                .storage
+                .get_migration(operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            MigrationPhase::Committed
+        );
+        assert_eq!(Service::native_object_count(), baseline);
+        service.decrypt(rest, &child, &ciphertext).await;
+        service.roundtrip(rest, &child).await;
     }
 }

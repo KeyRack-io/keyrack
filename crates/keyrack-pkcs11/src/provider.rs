@@ -1290,6 +1290,28 @@ impl CryptoProvider for Pkcs11Provider {
             .await
     }
 
+    async fn rewrap_wrapped_key(
+        &self,
+        old_context: &keyrack_core::wrapping::WrappingContext,
+        old_parent: &KeyHandle,
+        envelope: &[u8],
+        new_context: &keyrack_core::wrapping::WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> Result<Vec<u8>> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .rewrap(
+                self.clone(),
+                old_context,
+                old_parent,
+                envelope,
+                new_context,
+                new_parent,
+            )
+            .await
+    }
+
     async fn check_readiness(&self) -> Result<()> {
         // Cancellation cannot stop a native PKCS#11 call. The task owns the
         // permit until that call actually exits, preventing overlapping probes

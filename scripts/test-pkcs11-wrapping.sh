@@ -64,6 +64,8 @@ service_tests=(
     native_wrapped_grpc_rest_cancellation_closes_original_lease
     native_wrapped_provider_reconstruction_retains_child_usability
     native_wrapped_process_restart_retains_child_usability
+    native_wrapped_grpc_rest_rewrap_and_reparent_retained_versions
+    native_wrapped_grpc_rest_migration_cancellation_retains_journal
 )
 service_listing=$(cargo test --locked -p keyrack-service --test softhsm_wrapped_service -- --ignored --list)
 for service_test in "${service_tests[@]}"; do

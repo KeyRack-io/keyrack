@@ -13,9 +13,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 - Qualified hardware custody for wrapped children. The experimental, explicitly
   configured SoftHSM profile exercises native PKCS#11 wrapping in a software
   token loaded into KeyRack's process; no hardware token is qualified.
-- Export, rotation and destruction of wrapped material remain refused. Shared
-  service rewrap integration is not yet available; rotating a resident root
-  does not automatically migrate its existing children.
+- Export, rotation and destruction of wrapped material remain refused.
+  Rotating a resident root does not automatically migrate its existing children;
+  an explicit same-provider rewrap is required.
 - The crypto worker remains a provisional harness that the service does not use.
 - Cross-provider unwrap is not implemented.
 - REST/gRPC gaps and feature gates remain as listed in
@@ -54,8 +54,8 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   retain their reservations. Readers keep access through commit and erasure.
   The committed result records exact parent versions, references and encrypted
   envelope digests and is returned unchanged on retry.
-  Only the software provider currently implements the new provider primitive;
-  it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
+  The software provider and the explicitly selected native SoftHSM profile
+  implement the primitive. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
 - Experimental native PKCS#11 wrapping selected explicitly with
   `pkcs11:aes256-cbc-sha256-kw:v1`. The provider derives a temporary KEK from a
   domain-separated digest of the complete wrapping context and uses AES-KW;
@@ -66,7 +66,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   implicit and legacy defaults; an ordinary entry may use the same token.
   SoftHSM is a software token, not a hardware custody boundary, and raw PIN
   holders remain trusted. Operator guidance records these limits and the
-  construction's 64-bit AES-KW integrity bound.
+  construction's 64-bit AES-KW integrity bound. Rewrap and reparent derive the
+  old and new KEKs in one owned session, use a sensitive temporary child with
+  no use permissions, and return the new envelope only after confirmed original
+  session cleanup. Unconfirmed cleanup refuses further wrapping until process
+  restart.
 
 - **Rotate a wrapped child.** `RotateKey` and REST
   `POST /v1/keys/{key_id}/actions-rotate` on a child wrapped under its parent

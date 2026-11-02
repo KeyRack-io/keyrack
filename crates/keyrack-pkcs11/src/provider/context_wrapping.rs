@@ -82,6 +82,7 @@ impl Profile {
                 WrappingOperation::Generate,
                 WrappingOperation::Open,
                 WrappingOperation::Close,
+                WrappingOperation::Rewrap,
             ] {
                 tuples.push(WrappingCapability {
                     parent_spec: KeySpec::Aes256,
@@ -150,6 +151,26 @@ impl Profile {
             public_material_sha256: None,
         })
     }
+
+    fn validate_rewrap(
+        &self,
+        old: &WrappingContext,
+        old_parent: &KeyHandle,
+        new: &WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> Result<()> {
+        self.validate(old, old_parent, WrappingOperation::Rewrap)?;
+        self.validate(new, new_parent, WrappingOperation::Rewrap)?;
+        let mut allowed = old.clone();
+        allowed.parent = new.parent;
+        allowed.parent_spec = new.parent_spec.clone();
+        if allowed != *new {
+            return Err(failure(
+                "rewrap changes fields other than the exact parent identity/spec",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct Entry {
@@ -194,6 +215,8 @@ pub(super) struct ContextWrapping {
     state: Mutex<State>,
     #[cfg(test)]
     next_fault: Mutex<Option<native::Fault>>,
+    #[cfg(test)]
+    next_migration_pause: Mutex<Option<Arc<native::MigrationPause>>>,
 }
 
 impl ContextWrapping {
@@ -212,6 +235,8 @@ impl ContextWrapping {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             next_fault: Mutex::new(None),
+            #[cfg(test)]
+            next_migration_pause: Mutex::new(None),
         }))
     }
 
@@ -371,6 +396,55 @@ impl ContextWrapping {
                 },
                 context_sha256: lease.context_sha256(),
             })
+        })
+        .await
+    }
+
+    pub(super) async fn rewrap(
+        self: &Arc<Self>,
+        provider: Pkcs11Provider,
+        old: &WrappingContext,
+        old_parent: &KeyHandle,
+        envelope: &[u8],
+        new: &WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> Result<Vec<u8>> {
+        native::ensure_cleanup_confirmed(&provider.module)?;
+        self.profile
+            .validate_rewrap(old, old_parent, new, new_parent)?;
+        if envelope.len() != FRAME.len() + key_size(&old.child_spec)? + 8
+            || !envelope.starts_with(FRAME)
+        {
+            return Err(failure("invalid context-derived rewrap frame or length"));
+        }
+        let (old, old_parent, new, new_parent, wrapped) = (
+            old.clone(),
+            old_parent.clone(),
+            new.clone(),
+            new_parent.clone(),
+            envelope[FRAME.len()..].to_vec(),
+        );
+        // This blocking task owns the original session even if its async caller
+        // disappears. No independently usable lease or intermediate is returned.
+        self.serialized(move |engine, _state| {
+            let mut owner = native::Owner::new(&provider)?;
+            #[cfg(test)]
+            {
+                owner.fault = engine.next_fault.lock().unwrap().take();
+                owner.migration_pause = engine.next_migration_pause.lock().unwrap().take();
+            }
+            let bytes = owner.rewrap_closed(
+                &engine.profile,
+                &old,
+                &old_parent,
+                &new,
+                &new_parent,
+                &wrapped,
+            )?;
+            let mut envelope = FRAME.to_vec();
+            envelope.extend(bytes);
+            native::ensure_cleanup_confirmed(&provider.module)?;
+            Ok(envelope)
         })
         .await
     }

@@ -68,6 +68,13 @@ async fn object_count(provider: &Pkcs11Provider) -> usize {
         .unwrap()
 }
 
+struct ReleaseMigration(Arc<native::MigrationPause>);
+impl Drop for ReleaseMigration {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 async fn generate(
     provider: &Pkcs11Provider,
     parent: &KeyHandle,
@@ -151,7 +158,7 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
         .as_slice()
         .eq(b"ordinary semantics"));
     let provider = configured(&config);
-    assert_eq!(provider.wrapping_capabilities().tuples().len(), 6);
+    assert_eq!(provider.wrapping_capabilities().tuples().len(), 8);
     assert!(provider
         .capabilities()
         .key_specs
@@ -327,6 +334,18 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
         );
         let mut migrated = FRAME.to_vec();
         migrated.extend(migrated_raw);
+        let api_migrated = provider
+            .rewrap_wrapped_key(&context, &parent, &first_bytes, &destination, &wrong_parent)
+            .await
+            .unwrap();
+        assert_eq!(
+            api_migrated, migrated,
+            "deterministic native KW preserves the same child"
+        );
+        assert!(ordinary
+            .rewrap_wrapped_key(&context, &parent, &first_bytes, &destination, &wrong_parent)
+            .await
+            .is_err());
         let migrated_lease = provider
             .open_wrapped_key(&destination, &wrong_parent, &migrated)
             .await
@@ -339,6 +358,58 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             .as_slice()
             .eq(b"wrapped application data"));
         provider.close_wrapped_key(&migrated_lease).await.unwrap();
+        // Pause with a real temporary child and old KEK already in the token.
+        let pause = Arc::new(native::MigrationPause::default());
+        let release = ReleaseMigration(Arc::clone(&pause));
+        *engine.next_migration_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        let baseline = object_count(&provider).await;
+        let (cloned_provider, old, old_parent, old_bytes, new, new_parent) = (
+            provider.clone(),
+            context.clone(),
+            parent.clone(),
+            first_bytes.clone(),
+            destination.clone(),
+            wrong_parent.clone(),
+        );
+        let cancelled = tokio::spawn(async move {
+            cloned_provider
+                .rewrap_wrapped_key(&old, &old_parent, &old_bytes, &new, &new_parent)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), pause.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            object_count(&provider).await,
+            baseline + 2,
+            "temporary migration child and old KEK exist"
+        );
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        release.0.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            engine.serialized(|_, _| Ok(())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            object_count(&provider).await,
+            baseline,
+            "cancelled migration owner completed cleanup"
+        );
+        let retried = provider
+            .rewrap_wrapped_key(&context, &parent, &first_bytes, &destination, &wrong_parent)
+            .await
+            .unwrap();
+        assert_eq!(retried, migrated);
+        // Separately retained old envelopes remain usable under the old parent.
+        let old_again = provider
+            .open_wrapped_key(&context, &parent, &first_bytes)
+            .await
+            .unwrap();
+        provider.close_wrapped_key(&old_again).await.unwrap();
         let mut rejected_destination = destination.clone();
         rejected_destination.child.version = NonZeroU64::new(2).unwrap();
         let mut refused_owner = native::Owner::new(&provider).unwrap();
@@ -356,6 +427,30 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             refused_owner.closed,
             "refused migration also explicitly closes its original session"
         );
+        assert!(provider
+            .rewrap_wrapped_key(
+                &context,
+                &parent,
+                &first_bytes,
+                &rejected_destination,
+                &wrong_parent
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("other than the exact parent"));
+        let mut changed_domain = destination.clone();
+        changed_domain.security_domain = identifier("foreign-domain");
+        assert!(provider
+            .rewrap_wrapped_key(
+                &context,
+                &parent,
+                &first_bytes,
+                &changed_domain,
+                &wrong_parent
+            )
+            .await
+            .is_err());
         let mut corrupt = first_bytes[FRAME.len()..].to_vec();
         corrupt[0] ^= 1;
         let baseline = object_count(&provider).await;

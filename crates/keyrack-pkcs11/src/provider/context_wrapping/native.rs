@@ -54,6 +54,36 @@ pub(super) struct Owner {
     pub(super) close_attempts: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     pub(super) release_close_failure: Option<Box<Owner>>,
+    #[cfg(test)]
+    pub(super) migration_pause: Option<Arc<MigrationPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct MigrationPause {
+    pub(super) entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl MigrationPause {
+    #[cfg(feature = "softhsm-tests")]
+    pub(super) fn release(&self) {
+        let mut released = self.released.lock().unwrap();
+        *released = true;
+        self.changed.notify_all();
+    }
+
+    fn arrive(&self) {
+        self.entered.notify_one();
+        let released = self.released.lock().unwrap();
+        drop(
+            self.changed
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +251,8 @@ impl Owner {
             close_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             release_close_failure: None,
+            #[cfg(test)]
+            migration_pause: None,
         };
         match owner
             .session()?
@@ -404,10 +436,8 @@ impl Owner {
         Ok(())
     }
 
-    /// Private native mechanics awaiting the shared migration contract. Returns
-    /// only wrapped bytes, after explicit original-session closure; no receipt
-    /// type or migration publication is invented here.
-    #[allow(dead_code)]
+    /// Return wrapped bytes only after explicit original-session closure.
+    /// Migration publication and replay decisions belong to the caller's journal.
     pub(super) fn rewrap_closed(
         &mut self,
         profile: &Profile,
@@ -421,24 +451,7 @@ impl Owner {
         let label = label.as_str();
         let outcome = (|| {
             ensure_cleanup_confirmed(&self.module)?;
-            profile.validate(
-                old,
-                old_parent,
-                keyrack_core::wrapping::WrappingOperation::Open,
-            )?;
-            profile.validate(
-                new,
-                new_parent,
-                keyrack_core::wrapping::WrappingOperation::Generate,
-            )?;
-            let mut allowed = old.clone();
-            allowed.parent = new.parent;
-            allowed.parent_spec = new.parent_spec.clone();
-            if allowed != *new {
-                return Err(failure(
-                    "rewrap changes fields other than the exact parent identity/spec",
-                ));
-            }
+            profile.validate_rewrap(old, old_parent, new, new_parent)?;
             if old.child_spec != new.child_spec || wrapped.len() != key_size(&old.child_spec)? + 8 {
                 return Err(failure(
                     "rewrap must preserve child algorithm and exact envelope length",
@@ -457,6 +470,10 @@ impl Owner {
                     map_pkcs11_error("temporary migration child unwrap (not retried)", &e)
                 })?;
             unwrapped_policy(session, child, size, label, Role::Migration)?;
+            #[cfg(test)]
+            if let Some(pause) = &self.migration_pause {
+                pause.arrive();
+            }
             let new_kek = derive(session, new_parent, new, label)?;
             let output = session
                 .wrap_key(&Mechanism::AesKeyWrap, new_kek, child)
