@@ -31,6 +31,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- Deletion scheduling refuses keys with wrapped versions, wrapped dependents or
+  creation-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
+  blocking-kind counts. Logical-only children remain allowed. Scheduling and the
+  authoritative destruction claim share the SQLite/PostgreSQL dependency query.
+
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.

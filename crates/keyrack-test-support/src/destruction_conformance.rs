@@ -6,7 +6,7 @@
 use crate::creation_conformance::fixture;
 use crate::fixtures::unique_test_key_record;
 use keyrack_core::creation::same_json;
-use keyrack_core::destruction::DestructionClaim;
+use keyrack_core::destruction::{DestructionClaim, DestructionDependencies};
 use keyrack_core::key::{KeyRecord, KeyState, ProviderRef};
 use keyrack_core::storage::StorageBackend;
 
@@ -166,6 +166,28 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                     .unwrap();
             }
         }
+        assert_eq!(
+            store.destruction_dependencies(&parent.lid).await.unwrap(),
+            DestructionDependencies {
+                own_parent_wrapped_versions: 0,
+                dependent_parent_wrapped_versions: u64::from(phase == 3),
+                creation_journal_rows: 1,
+            },
+            "creation phase {phase} must retain its journal dependency",
+        );
+        if phase == 3 {
+            assert_eq!(
+                store
+                    .destruction_dependencies(&request.record.lid)
+                    .await
+                    .unwrap(),
+                DestructionDependencies {
+                    own_parent_wrapped_versions: 1,
+                    dependent_parent_wrapped_versions: 0,
+                    creation_journal_rows: 1,
+                },
+            );
+        }
         let mut pending = due(parent);
         pending.occ_version += 1;
         store.update_key(&pending).await.unwrap();
@@ -191,6 +213,14 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
     request.expected_key_occ = Some(child.occ_version);
     request.context_bytes = request.context().unwrap().canonical_bytes().unwrap();
     store.reserve_creation(&request).await.unwrap();
+    assert_eq!(
+        store.destruction_dependencies(&child.lid).await.unwrap(),
+        DestructionDependencies {
+            creation_journal_rows: 1,
+            ..DestructionDependencies::default()
+        },
+        "a journal pins the child even before publishing its wrapped version",
+    );
     let mut pending = due(child);
     pending.occ_version += 1;
     store.update_key(&pending).await.unwrap();
@@ -198,6 +228,121 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
         .claim_destruction(&pending.lid, pending.occ_version, chrono::Utc::now())
         .await
         .is_err());
+}
+
+pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageBackend) {
+    let (mut parent, request) = fixture();
+    let other_material = fixture().1.record.key_versions[0].material.clone();
+    // Include historical own material, including an imported self-reference.
+    // It counts only as own material, not again as an other-key dependency.
+    for (number, material) in [
+        (2, request.record.key_versions[0].material.clone()),
+        (3, other_material.clone()),
+    ] {
+        let mut historical = parent.key_versions[0].clone();
+        historical.version_number = number;
+        historical.is_primary = false;
+        historical.material = material;
+        parent.key_versions.push(historical);
+    }
+    store.create_key(&parent).await.unwrap();
+    store.reserve_creation(&request).await.unwrap();
+    // Two other keys contain three versions dependent on this parent. Neither
+    // logical parent links nor current-version selection determine the count.
+    for versions in [1, 2] {
+        let mut child = unique_test_key_record(KeyState::Enabled);
+        child.parent_lid = None;
+        child.key_versions[0].material = request.record.key_versions[0].material.clone();
+        if versions == 2 {
+            let mut historical = child.key_versions[0].clone();
+            historical.version_number = 2;
+            historical.is_primary = false;
+            child.key_versions.push(historical);
+        }
+        store.create_key(&child).await.unwrap();
+    }
+    let mut logical_child = unique_test_key_record(KeyState::Enabled);
+    logical_child.parent_lid = Some(parent.lid);
+    store.create_key(&logical_child).await.unwrap();
+    let mut unrelated = unique_test_key_record(KeyState::Enabled);
+    unrelated.key_versions[0].material = other_material;
+    store.create_key(&unrelated).await.unwrap();
+
+    let expected = DestructionDependencies {
+        own_parent_wrapped_versions: 2,
+        dependent_parent_wrapped_versions: 3,
+        creation_journal_rows: 1,
+    };
+    let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
+    assert_eq!(counts, expected);
+    assert!(!counts.is_empty());
+    let summary = counts.summary();
+    assert_eq!(
+        summary,
+        "own_parent_wrapped_versions=2, dependent_parent_wrapped_versions=3, creation_journal_rows=1"
+    );
+    for other in [&request.record.lid, &logical_child.lid, &unrelated.lid] {
+        assert!(!summary.contains(&other.to_string()));
+    }
+    let mut pending = due(parent);
+    pending.occ_version += 1;
+    store.update_key(&pending).await.unwrap();
+    let error = store
+        .claim_destruction(&pending.lid, pending.occ_version, chrono::Utc::now())
+        .await
+        .unwrap_err();
+    // Dependency reporting precedes the narrower resident-history validation.
+    assert!(error.to_string().contains(&summary));
+    assert!(same_json(&store.get_key(&pending.lid).await.unwrap(), &pending).unwrap());
+    assert!(store
+        .destruction_dependencies(&unique_test_key_record(KeyState::Enabled).lid)
+        .await
+        .is_err());
+}
+
+pub async fn dependency_snapshot_is_rechecked_at_claim(store: &dyn StorageBackend) {
+    let (parent, request) = fixture();
+    store.create_key(&parent).await.unwrap();
+    assert!(store
+        .destruction_dependencies(&parent.lid)
+        .await
+        .unwrap()
+        .is_empty());
+    // Scheduling is not a destruction claim. An imported edge arriving after
+    // scheduling must be observed by the claim's transaction, even at the same OCC.
+    let mut pending = due(parent);
+    pending.occ_version += 1;
+    store.update_key(&pending).await.unwrap();
+    store.create_key(&request.record).await.unwrap();
+    let expected = DestructionDependencies {
+        dependent_parent_wrapped_versions: 1,
+        ..DestructionDependencies::default()
+    };
+    assert_eq!(
+        store.destruction_dependencies(&pending.lid).await.unwrap(),
+        expected
+    );
+    assert!(store
+        .claim_destruction(&pending.lid, pending.occ_version, chrono::Utc::now())
+        .await
+        .is_err());
+    assert!(same_json(&store.get_key(&pending.lid).await.unwrap(), &pending).unwrap());
+
+    // A logical parent link on resident material alone creates no dependency.
+    let parent = due(unique_test_key_record(KeyState::Enabled));
+    store.create_key(&parent).await.unwrap();
+    let mut child = unique_test_key_record(KeyState::Enabled);
+    child.parent_lid = Some(parent.lid);
+    store.create_key(&child).await.unwrap();
+    assert_eq!(
+        store.destruction_dependencies(&parent.lid).await.unwrap(),
+        DestructionDependencies::default()
+    );
+    assert!(store
+        .claim_destruction(&parent.lid, parent.occ_version, chrono::Utc::now())
+        .await
+        .unwrap()
+        .is_some());
 }
 
 pub async fn raw_wrapped_edges_and_new_references(store: &dyn StorageBackend) {
@@ -280,6 +425,20 @@ macro_rules! destruction_conformance_tests {
             async fn raw_wrapped_edges_and_new_references() {
                 $crate::destruction_conformance::raw_wrapped_edges_and_new_references(&$create)
                     .await;
+            }
+            #[tokio::test]
+            async fn dependency_counts_cover_all_material_and_kinds() {
+                $crate::destruction_conformance::dependency_counts_cover_all_material_and_kinds(
+                    &$create,
+                )
+                .await;
+            }
+            #[tokio::test]
+            async fn dependency_snapshot_is_rechecked_at_claim() {
+                $crate::destruction_conformance::dependency_snapshot_is_rechecked_at_claim(
+                    &$create,
+                )
+                .await;
             }
         }
     };

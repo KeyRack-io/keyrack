@@ -6,6 +6,24 @@ revocation.
 
 ## Execution contract
 
+`ScheduleKeyDeletion` refuses before changing the lifecycle when the key has any
+`ParentWrapped` version, another key has a `ParentWrapped` version naming it as
+parent, or any creation-journal row names it as parent or child. This applies to
+the domain/library, gRPC and REST paths. gRPC returns `FAILED_PRECONDITION`; REST
+returns HTTP 409 with `FailedPrecondition`. The diagnostic contains counts named
+`own_parent_wrapped_versions`, `dependent_parent_wrapped_versions` and
+`creation_journal_rows`, never the LIDs of other keys. Counts cover all versions
+and all journal phases; a row matching both journal roles counts once. Logical
+`parent_lid` relationships alone do not block scheduling.
+
+Scheduling and claiming share `StorageBackend::destruction_dependencies` and
+the backend's transaction query. Scheduling is an early observation, not a
+reservation: a dependency introduced after scheduling still causes the claim to
+refuse. The authoritative recheck remains under the same writer fence as claim
+insertion. Unsupported storage implementations fail closed; cache wrappers must
+query the underlying store. Dependency scans currently visit persisted key
+histories, so this check adds database work to scheduling.
+
 1. The reaper's scan result is only a candidate. `claim_destruction` re-reads the
    record under the storage writer lock and checks its OCC, due PendingDeletion
    state and entire resident version history. Empty/duplicate/malformed histories
@@ -75,6 +93,13 @@ wrapping references and terminal resurrection denial. Backend-specific tests add
 independent connections/pools, restart/reconnect and injected transaction rollback.
 Service tests pause a provider call while REST/gRPC cancellation and another reaper
 compete, and exercise cancellation-first and partial-provider-failure outcomes.
+The `integration::deletion_dependencies` tests cover each scheduling refusal on
+gRPC and REST, the domain path, unchanged records after refusal, and logical-only
+children. Reverted controls remove the shared scheduling check and require each
+of the eight surface refusal tests to fail on its own assertion.
+
+Dependent-data-loss override intent is outside this release. There is no flag to
+bypass these checks or erase journal rows to make a key eligible.
 
 ```sh
 cargo test -p keyrack-sqlite

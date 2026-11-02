@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::{creation, map_sql, SqliteStorage};
-use keyrack_core::destruction::{completed_record, invalid, prepare_claim, DestructionClaim};
+use keyrack_core::destruction::{
+    completed_record, invalid, prepare_claim, DestructionClaim, DestructionDependencies,
+};
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::{KeyMaterial, KeyRecord, KeyState};
 use keyrack_core::lid::Lid;
@@ -48,7 +50,56 @@ fn save_key(conn: &Connection, record: &KeyRecord, expected: u64) -> Result<()> 
     Ok(())
 }
 
+/// Caller holds the same writer transaction as creation and destruction claims.
+fn dependencies(conn: &Connection, lid: &Lid) -> Result<DestructionDependencies> {
+    creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
+    let journals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM creation_journal WHERE parent_lid=?1 OR child_lid=?1",
+            [lid.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|e| map_sql(&e))?;
+    let mut counts = DestructionDependencies {
+        creation_journal_rows: u64::try_from(journals)
+            .map_err(|_| invalid("dependency count out of range"))?,
+        ..DestructionDependencies::default()
+    };
+    // Include imported/legacy material without requiring a creation journal.
+    let mut statement = conn
+        .prepare("SELECT lid,record_json,occ_version FROM keys")
+        .map_err(|e| map_sql(&e))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| map_sql(&e))?;
+    for row in rows {
+        let (indexed_lid, json, occ) = row.map_err(|e| map_sql(&e))?;
+        let record: KeyRecord =
+            serde_json::from_str(&json).map_err(|_| invalid("invalid persisted key"))?;
+        if record.lid.to_string() != indexed_lid
+            || u64::try_from(occ).ok() != Some(record.occ_version)
+        {
+            return Err(invalid("key row binding mismatch"));
+        }
+        counts.include_record(lid, &record)?;
+    }
+    Ok(counts)
+}
+
 impl SqliteStorage {
+    pub(super) fn destruction_dependency_counts(
+        &self,
+        lid: &Lid,
+    ) -> Result<DestructionDependencies> {
+        self.creation_tx(|conn| dependencies(conn, lid))
+    }
+
     pub(super) fn destruction_claim(
         &self,
         lid: &Lid,
@@ -61,22 +112,9 @@ impl SqliteStorage {
                 [lid.to_string()], |row| row.get(0)).map_err(|e| map_sql(&e))?;
             if exists { return Ok(None); }
             let record = creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
+            let counts = dependencies(conn, lid)?;
+            if !counts.is_empty() { return Err(invalid(&counts.summary())); }
             let record = prepare_claim(record, expected, now)?;
-            let referenced: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM creation_journal WHERE parent_lid=?1 OR child_lid=?1)",
-                [lid.to_string()], |row| row.get(0)).map_err(|e| map_sql(&e))?;
-            if referenced { return Err(invalid("key is referenced by a creation or envelope")); }
-            // Also protect imported/legacy wrapped records not in the journal.
-            // Correctness-first scan; an indexed material-edge table is later work.
-            let mut statement = conn.prepare("SELECT record_json FROM keys").map_err(|e| map_sql(&e))?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|e| map_sql(&e))?;
-            for row in rows {
-                let other: KeyRecord = serde_json::from_str(&row.map_err(|e| map_sql(&e))?)
-                    .map_err(|_| invalid("invalid persisted key"))?;
-                if other.key_versions.iter().any(|v| matches!(&v.material,
-                    KeyMaterial::ParentWrapped(m) if m.parent().lid == *lid)) {
-                    return Err(invalid("key is referenced by wrapped material"));
-                }
-            }
             let json = serde_json::to_string(&record).map_err(|_| invalid("claim serialization"))?;
             conn.execute("INSERT INTO destruction_journal(lid,operation_id,record_json,completed) VALUES(?1,?2,?3,0)",
                 params![lid.to_string(), operation.to_string(), json]).map_err(|e| map_sql(&e))?;

@@ -645,6 +645,9 @@ async fn schedule_key_deletion(
             .get("grace_period_days")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(7);
+        crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
+            .await
+            .map_err(|error| error.to_rest_error())?;
         record
             .transition_to(keyrack_core::key::KeyState::PendingDeletion)
             .map_err(|(f, t)| transition_err(f, t))?;

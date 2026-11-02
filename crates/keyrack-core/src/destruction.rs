@@ -6,12 +6,60 @@
 //! claim is never released by timeout, cancellation, crash, or provider error.
 
 use crate::error::{KeyRackError, Result};
-use crate::key::{KeyRecord, KeyState};
+use crate::key::{KeyMaterial, KeyRecord, KeyState};
+use crate::lid::Lid;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub fn invalid(message: &str) -> KeyRackError {
     KeyRackError::Storage(format!("destruction: {message}"))
+}
+
+/// Counts that block destruction, without disclosing dependent key identities.
+/// Every stored version and every journal phase counts, including historical
+/// material and completed creation journals. Logical `parent_lid` is not an edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DestructionDependencies {
+    pub own_parent_wrapped_versions: u64,
+    pub dependent_parent_wrapped_versions: u64,
+    pub creation_journal_rows: u64,
+}
+
+impl DestructionDependencies {
+    pub fn is_empty(&self) -> bool {
+        self.own_parent_wrapped_versions == 0
+            && self.dependent_parent_wrapped_versions == 0
+            && self.creation_journal_rows == 0
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "own_parent_wrapped_versions={}, dependent_parent_wrapped_versions={}, creation_journal_rows={}",
+            self.own_parent_wrapped_versions,
+            self.dependent_parent_wrapped_versions,
+            self.creation_journal_rows,
+        )
+    }
+
+    /// Shared material counting for storage implementors scanning a consistent
+    /// snapshot. A version belongs to the own OR other-key category, never both.
+    pub fn include_record(&mut self, lid: &Lid, record: &KeyRecord) -> Result<()> {
+        for version in &record.key_versions {
+            if let KeyMaterial::ParentWrapped(material) = &version.material {
+                let count = if record.lid == *lid {
+                    &mut self.own_parent_wrapped_versions
+                } else if material.parent().lid == *lid {
+                    &mut self.dependent_parent_wrapped_versions
+                } else {
+                    continue;
+                };
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("dependency count overflow"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Execution ticket issued only after committing a fresh destruction claim.

@@ -1523,6 +1523,9 @@ impl KeyService for KeyServiceImpl {
             } else {
                 req.grace_period_days
             };
+            crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
+                .await
+                .map_err(|error| error.to_grpc_status())?;
             record
                 .transition_to(keyrack_core::key::KeyState::PendingDeletion)
                 .map_err(|(from, to)| {
