@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
@@ -214,7 +214,7 @@ struct WrappingScope {
 }
 
 /// The wrapping profile this provider implements, one tuple per operation it
-/// can actually perform. `Rewrap` is absent because it is not implemented.
+/// can actually perform.
 fn software_wrapping_capabilities() -> WrappingCapabilities {
     let mechanism = WrappingIdentifier::new(SOFTWARE_WRAPPING_MECHANISM)
         .expect("software wrapping mechanism is a valid identifier");
@@ -222,6 +222,7 @@ fn software_wrapping_capabilities() -> WrappingCapabilities {
         WrappingOperation::Generate,
         WrappingOperation::Open,
         WrappingOperation::Close,
+        WrappingOperation::Rewrap,
     ]
     .into_iter()
     .map(|operation| WrappingCapability {
@@ -1146,7 +1147,7 @@ impl CryptoProvider for SoftwareProvider {
         }
     }
 
-    /// One profile, declared for the three operations it implements.
+    /// One profile, declared for the four operations it implements.
     ///
     /// Declaring these activates parent-wrapped child keys on this provider. It
     /// asserts no containment: the parent, the envelope and the unwrapped child
@@ -1202,6 +1203,51 @@ impl CryptoProvider for SoftwareProvider {
             ));
         }
         self.retain_child(context, child, envelope, None)
+    }
+
+    async fn rewrap_wrapped_key(
+        &self,
+        old_context: &WrappingContext,
+        old_parent: &KeyHandle,
+        envelope: &[u8],
+        new_context: &WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> Result<Vec<u8>> {
+        if old_context.provider_ref != new_context.provider_ref {
+            return Err(KeyRackError::Provider(
+                "cross-provider wrapped-key migration is not supported".into(),
+            ));
+        }
+        if old_context.security_domain != new_context.security_domain {
+            return Err(KeyRackError::Provider(
+                "cross-security-domain wrapped-key migration is not supported".into(),
+            ));
+        }
+        let old_aad = self.admit(old_context, old_parent, WrappingOperation::Rewrap)?;
+        let new_aad = self.admit(new_context, new_parent, WrappingOperation::Rewrap)?;
+        let mut permitted = old_context.clone();
+        permitted.parent = new_context.parent;
+        permitted.parent_spec.clone_from(&new_context.parent_spec);
+        if &permitted != new_context {
+            return Err(KeyRackError::Provider(
+                "rewrap must preserve every child and wrapping-profile binding".into(),
+            ));
+        }
+        if envelope.len() != SOFTWARE_ENVELOPE_BYTES {
+            return Err(KeyRackError::Provider(
+                "wrapped material is not a software AES-256-GCM envelope".into(),
+            ));
+        }
+        // No object/lease is inserted and there is no suspension point. The
+        // local plaintext is zeroized on success, error or unwind, and only
+        // ciphertext is returned to the service. Software is still not custody.
+        let child = Zeroizing::new(self.open_under_parent(old_parent, envelope, &old_aad)?);
+        if child.len() != 32 {
+            return Err(KeyRackError::Provider(
+                "unwrapped child is not an AES-256 key".into(),
+            ));
+        }
+        self.seal_under_parent(new_parent, &child, &new_aad)
     }
 
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {

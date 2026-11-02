@@ -342,6 +342,12 @@ async fn an_undeclared_tuple_is_refused_for_every_operation() {
             .unwrap_err()
             .to_string();
         assert!(open.contains("refused"), "{open}");
+        for (old, new) in [(&changed, &ctx), (&ctx, &changed)] {
+            assert!(provider
+                .rewrap_wrapped_key(old, &parent, &envelope, new, &parent)
+                .await
+                .is_err());
+        }
     }
 }
 
@@ -475,12 +481,13 @@ async fn the_declared_profile_covers_only_the_operations_implemented() {
     let ctx = context(&parent);
     let capabilities = provider.wrapping_capabilities();
 
-    // One profile, declared for exactly the three operations that exist.
-    assert_eq!(capabilities.tuples().len(), 3);
+    // One profile, declared for exactly the four operations that exist.
+    assert_eq!(capabilities.tuples().len(), 4);
     for operation in [
         WrappingOperation::Generate,
         WrappingOperation::Open,
         WrappingOperation::Close,
+        WrappingOperation::Rewrap,
     ] {
         assert_eq!(
             capabilities.require(&WrappingCapability::requested(
@@ -491,15 +498,6 @@ async fn the_declared_profile_covers_only_the_operations_implemented() {
             Ok(())
         );
     }
-    // Rewrap is not implemented, so it is not declared and cannot be requested.
-    assert_eq!(
-        capabilities.require(&WrappingCapability::requested(
-            &ctx,
-            WrappingOperation::Rewrap,
-            WrappedKeyLifecycle::SessionObject
-        )),
-        Err(WrappingError::UnsupportedCapability)
-    );
     // The lifetime declared is the one that is true. A caller that needs a
     // journaled temporary object in a backend is refused, not downgraded.
     assert_eq!(
@@ -521,7 +519,7 @@ async fn the_declared_profile_covers_only_the_operations_implemented() {
 }
 
 #[tokio::test]
-async fn a_provider_without_the_profile_refuses_all_three_operations() {
+async fn a_provider_without_the_profile_refuses_wrapping_operations() {
     let provider = InMemoryProvider::new();
     let parent = provider.generate_key(&KeySpec::Aes256).await.unwrap();
     let ctx = context(&parent);
@@ -529,6 +527,13 @@ async fn a_provider_without_the_profile_refuses_all_three_operations() {
     assert!(provider.wrapping_capabilities().tuples().is_empty());
     let error = provider
         .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not supported by this provider"), "{error}");
+
+    let error = provider
+        .rewrap_wrapped_key(&ctx, &parent, &[0; ENVELOPE_BYTES], &ctx, &parent)
         .await
         .unwrap_err()
         .to_string();
@@ -546,4 +551,202 @@ async fn a_provider_without_the_profile_refuses_all_three_operations() {
     assert!(SoftwareProvider::new()
         .wrapping_closure_verifier()
         .is_some());
+}
+
+#[tokio::test]
+async fn rewrap_and_reparent_preserve_every_versions_ciphertext() {
+    let (provider, old_parent, original) = parented().await;
+    let rotated_parent = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+    let other_parent = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+    for version in 1..=3 {
+        let old = WrappingContext {
+            child: VersionedKeyId::new(original.child.lid, version).unwrap(),
+            ..original.clone()
+        };
+        let generated = provider
+            .generate_wrapped_key(&old, &old_parent, &binding(&old))
+            .await
+            .unwrap();
+        let ciphertext = provider
+            .encrypt(
+                generated.lease.handle(),
+                b"payload before migration",
+                b"aad",
+            )
+            .await
+            .unwrap()
+            .ciphertext;
+        provider.close_wrapped_key(&generated.lease).await.unwrap();
+        let rotated = WrappingContext {
+            parent: VersionedKeyId::new(old.parent.lid, 4).unwrap(),
+            ..old.clone()
+        };
+        let rewrapped = provider
+            .rewrap_wrapped_key(
+                &old,
+                &old_parent,
+                &generated.envelope,
+                &rotated,
+                &rotated_parent,
+            )
+            .await
+            .unwrap();
+        // New material cannot be opened with the original authenticated context,
+        // even if the caller supplies the new resident parent handle.
+        assert!(provider
+            .open_wrapped_key(&old, &rotated_parent, &rewrapped)
+            .await
+            .is_err());
+        assert!(provider
+            .open_wrapped_key(&rotated, &old_parent, &rewrapped)
+            .await
+            .is_err());
+        let lease = provider
+            .open_wrapped_key(&rotated, &rotated_parent, &rewrapped)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .decrypt(lease.handle(), &ciphertext, b"aad")
+                .await
+                .unwrap()
+                .expose(),
+            b"payload before migration"
+        );
+        provider.close_wrapped_key(&lease).await.unwrap();
+
+        let reparented_context = WrappingContext {
+            parent: VersionedKeyId::new(Lid::from_bytes([12; 32]), 1).unwrap(),
+            ..rotated.clone()
+        };
+        let reparented = provider
+            .rewrap_wrapped_key(
+                &rotated,
+                &rotated_parent,
+                &rewrapped,
+                &reparented_context,
+                &other_parent,
+            )
+            .await
+            .unwrap();
+        assert!(provider
+            .open_wrapped_key(&rotated, &other_parent, &reparented)
+            .await
+            .is_err());
+        let lease = provider
+            .open_wrapped_key(&reparented_context, &other_parent, &reparented)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .decrypt(lease.handle(), &ciphertext, b"aad")
+                .await
+                .unwrap()
+                .expose(),
+            b"payload before migration"
+        );
+        provider.close_wrapped_key(&lease).await.unwrap();
+
+        // Erasing old storage copies is the commit protocol's responsibility.
+        // Keeping an original envelope AND its parent still permits opening it;
+        // rewrap itself cannot cryptographically revoke retained copies.
+        let retained = provider
+            .open_wrapped_key(&old, &old_parent, &generated.envelope)
+            .await
+            .unwrap();
+        provider.close_wrapped_key(&retained).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rewrap_refuses_cross_domain_and_changes_to_the_child_binding() {
+    let (provider, parent, ctx) = parented().await;
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
+    provider.close_wrapped_key(&generated.lease).await.unwrap();
+    let mut changed = ctx.clone();
+    changed.provider_ref = ProviderRef::new("another-provider");
+    let error = provider
+        .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &changed, &parent)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cross-provider"), "{error}");
+    let mut changed = ctx.clone();
+    changed.security_domain = name("another-domain");
+    let error = provider
+        .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &changed, &parent)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cross-security-domain"), "{error}");
+
+    let mut child = ctx.clone();
+    child.child.lid = Lid::from_bytes([8; 32]);
+    let mut version = ctx.clone();
+    version.child = VersionedKeyId::new(ctx.child.lid, 2).unwrap();
+    for changed in [child, version] {
+        let error = provider
+            .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &changed, &parent)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("preserve every child"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn rewrap_authenticates_old_material_and_is_safe_to_repeat() {
+    let (provider, parent, ctx) = parented().await;
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
+    provider.close_wrapped_key(&generated.lease).await.unwrap();
+    let mut tampered = generated.envelope.clone();
+    tampered[20] ^= 1;
+    for bad in [tampered, vec![], generated.envelope[..59].to_vec()] {
+        assert!(provider
+            .rewrap_wrapped_key(&ctx, &parent, &bad, &ctx, &parent)
+            .await
+            .is_err());
+    }
+    let other = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+    assert!(provider
+        .rewrap_wrapped_key(&ctx, &other, &generated.envelope, &ctx, &parent)
+        .await
+        .is_err());
+
+    let first = provider
+        .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &ctx, &parent)
+        .await
+        .unwrap();
+    let second = provider
+        .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &ctx, &parent)
+        .await
+        .unwrap();
+    let a = provider
+        .open_wrapped_key(&ctx, &parent, &first)
+        .await
+        .unwrap();
+    let b = provider
+        .open_wrapped_key(&ctx, &parent, &second)
+        .await
+        .unwrap();
+    let ciphertext = provider
+        .encrypt(a.handle(), b"same child", b"")
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .decrypt(b.handle(), &ciphertext.ciphertext, b"")
+            .await
+            .unwrap()
+            .expose(),
+        b"same child"
+    );
+    provider.close_wrapped_key(&a).await.unwrap();
+    provider.close_wrapped_key(&b).await.unwrap();
 }

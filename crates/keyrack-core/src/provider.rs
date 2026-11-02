@@ -515,6 +515,43 @@ pub trait CryptoProvider: Send + Sync {
         ))
     }
 
+    /// Rewrap the same child version under another exact resident parent.
+    ///
+    /// The caller resolves both handles from the parent versions in their
+    /// contexts. Only the parent identity/version and parent spec may change:
+    /// child identity/version, purpose, format, provider, security domain,
+    /// mechanism and all other context fields must remain identical. Providers
+    /// must independently require both exact `Rewrap` capability tuples and
+    /// authenticate the old context before sealing under the new context.
+    /// Cross-provider and cross-security-domain requests are refused.
+    ///
+    /// Only the new envelope crosses this boundary. A token implementation
+    /// must keep the child inside the token throughout unwrap and wrap; there
+    /// is no plaintext export or software fallback. Success means every
+    /// intermediate object has been explicitly cleaned up. The implementation
+    /// owns cleanup even if its caller is cancelled, and must leave no durable
+    /// independently usable child after a crash. Providers unable to establish
+    /// these properties must not advertise `Rewrap`.
+    ///
+    /// This operation does not mutate either parent or consume the old
+    /// envelope. It must be safe to repeat after an interrupted or lost call;
+    /// randomized wrapping may produce different bytes for the same intent.
+    /// The service journals and atomically publishes all version envelopes,
+    /// then erases its old copies. Rewrapping cannot revoke an independently
+    /// retained original envelope while its original parent still exists.
+    async fn rewrap_wrapped_key(
+        &self,
+        _old_context: &crate::wrapping::WrappingContext,
+        _old_parent: &KeyHandle,
+        _envelope: &[u8],
+        _new_context: &crate::wrapping::WrappingContext,
+        _new_parent: &KeyHandle,
+    ) -> Result<Vec<u8>> {
+        Err(crate::error::KeyRackError::Provider(
+            "rewrapping keys not supported by this provider".into(),
+        ))
+    }
+
     /// Close the exact object named by `lease`, idempotently.
     ///
     /// Repeating this for an already-closed lease must return the same fact
