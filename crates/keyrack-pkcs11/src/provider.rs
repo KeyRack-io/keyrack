@@ -39,13 +39,15 @@ use keyrack_core::provider::{
 use keyrack_core::sensitive::Sensitive;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 #[cfg(feature = "native-a2-conformance")]
 pub(crate) mod native_a2;
+
+pub(crate) mod context_wrapping;
 
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
 const P256_OID_DER: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
@@ -298,6 +300,10 @@ impl Gate {
 /// Keeping it here means concurrent failures collapse into one attempt
 /// instead of one per provider.
 struct SharedModule {
+    // Sticky for this process/module lifetime. Ordinary providers are unaffected;
+    // reconstruction and module recovery cannot reopen wrapping admission after
+    // an ambiguous native close. Only process restart clears the registry.
+    wrapping_cleanup_unconfirmed: AtomicBool,
     lib_path: String,
     ctx: Pkcs11,
     /// Advanced by each successful reinitialization. A caller that saw a
@@ -531,6 +537,7 @@ fn shared_module(lib_path: &str) -> Result<Arc<SharedModule>> {
         .map_err(|e| KeyRackError::Provider(format!("C_Initialize: {e}")))?;
 
     let module = Arc::new(SharedModule {
+        wrapping_cleanup_unconfirmed: AtomicBool::new(false),
         lib_path: lib_path.to_owned(),
         ctx,
         generation: AtomicU64::new(0),
@@ -568,6 +575,7 @@ pub struct Pkcs11Provider {
     slot: Arc<RwLock<cryptoki::slot::Slot>>,
     readiness_gate: Arc<tokio::sync::Semaphore>,
     pin: Zeroizing<String>,
+    wrapping: Option<Arc<context_wrapping::ContextWrapping>>,
 }
 
 impl Pkcs11Provider {
@@ -614,7 +622,36 @@ impl Pkcs11Provider {
             slot: Arc::new(RwLock::new(slot)),
             readiness_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pin: Zeroizing::new(config.pin.clone()),
+            wrapping: None,
         })
+    }
+
+    /// Explicit experimental wrapping entry. The native startup self-test and
+    /// its original-session cleanup must pass before capabilities are published.
+    /// Service configuration requires this entry to be distinct from the default.
+    pub fn new_with_wrapping(
+        config: &Pkcs11ProviderConfig,
+        provider_ref: keyrack_core::key::ProviderRef,
+        mechanism: keyrack_core::wrapping::WrappingIdentifier,
+        security_domain: keyrack_core::wrapping::WrappingIdentifier,
+    ) -> Result<Self> {
+        if mechanism.as_str() != context_wrapping::CONTEXT_DERIVED_WRAPPING_MECHANISM {
+            return Err(KeyRackError::Provider(
+                "unsupported explicit PKCS#11 wrapping mechanism".into(),
+            ));
+        }
+        // Refuse a poisoned wrapping module before the ordinary constructor's
+        // readiness/recovery path can touch an unresolved native session.
+        let module = shared_module(&config.lib_path)?;
+        context_wrapping::ensure_cleanup_confirmed(&module)?;
+        let mut provider = Self::new(config)?;
+        provider.wrapping = Some(context_wrapping::ContextWrapping::new(
+            &provider,
+            provider_ref,
+            mechanism,
+            security_domain,
+        )?);
+        Ok(provider)
     }
 
     fn current_slot(&self) -> Result<cryptoki::slot::Slot> {
@@ -1202,6 +1239,57 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
 
 #[async_trait]
 impl CryptoProvider for Pkcs11Provider {
+    fn wrapping_capabilities(&self) -> keyrack_core::wrapping::WrappingCapabilities {
+        self.wrapping
+            .as_ref()
+            .map_or_else(Default::default, |engine| engine.capabilities())
+    }
+
+    fn wrapping_closure_verifier(
+        &self,
+    ) -> Option<Arc<dyn keyrack_core::creation::A2ClosureVerifier>> {
+        self.wrapping
+            .as_ref()
+            .map(|engine| Arc::clone(engine) as Arc<dyn keyrack_core::creation::A2ClosureVerifier>)
+    }
+
+    async fn generate_wrapped_key(
+        &self,
+        context: &keyrack_core::wrapping::WrappingContext,
+        parent: &KeyHandle,
+        creation: &keyrack_core::creation::CreationBinding,
+    ) -> Result<keyrack_core::provider::GeneratedWrappedKey> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .generate(self.clone(), context, parent, creation)
+            .await
+    }
+
+    async fn open_wrapped_key(
+        &self,
+        context: &keyrack_core::wrapping::WrappingContext,
+        parent: &KeyHandle,
+        envelope: &[u8],
+    ) -> Result<keyrack_core::provider::WrappedKeyLease> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .open(self.clone(), context, parent, envelope)
+            .await
+    }
+
+    async fn close_wrapped_key(
+        &self,
+        lease: &keyrack_core::provider::WrappedKeyLease,
+    ) -> Result<keyrack_core::provider::WrappedKeyClosure> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .close(lease)
+            .await
+    }
+
     async fn check_readiness(&self) -> Result<()> {
         // Cancellation cannot stop a native PKCS#11 call. The task owns the
         // permit until that call actually exits, preventing overlapping probes
@@ -1225,6 +1313,9 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
+        if self.wrapping.is_some() {
+            return context_wrapping::ContextWrapping::generate_root(self.clone(), spec).await;
+        }
         let spec_owned = spec.clone();
         let label = uuid::Uuid::new_v4().to_string();
         let label_for_closure = label.clone();
@@ -1263,6 +1354,9 @@ impl CryptoProvider for Pkcs11Provider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<EncryptOutput> {
+        if let Some(engine) = &self.wrapping {
+            return engine.encrypt(handle, plaintext, aad).await;
+        }
         let label = handle.key_id.clone();
         let plaintext = plaintext.to_vec();
         let aad = aad.to_vec();
@@ -1277,6 +1371,9 @@ impl CryptoProvider for Pkcs11Provider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
+        if let Some(engine) = &self.wrapping {
+            return engine.decrypt(handle, ciphertext, aad).await;
+        }
         let label = handle.key_id.clone();
         let ciphertext = ciphertext.to_vec();
         let aad = aad.to_vec();
@@ -1326,6 +1423,11 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        if self.wrapping.is_some() && handle.key_id.starts_with("kr-cbc-") {
+            return Err(KeyRackError::Provider(
+                "wrapped leases must close through their original session owner".into(),
+            ));
+        }
         let label = handle.key_id.clone();
 
         self.run(move |session| destroy_objects_by_label(session, &label))
@@ -1347,7 +1449,7 @@ impl CryptoProvider for Pkcs11Provider {
         ];
         let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
 
-        ProviderCapabilities {
+        let mut capabilities = ProviderCapabilities {
             provider_name: "pkcs11".into(),
             key_specs: vec![
                 KeySpecCapability {
@@ -1371,7 +1473,17 @@ impl CryptoProvider for Pkcs11Provider {
             supports_atomic_data_key: false,
             supports_atomic_re_encrypt: false,
             supports_key_import: false,
+        };
+        if self.wrapping.is_some() {
+            capabilities
+                .key_specs
+                .retain(|entry| entry.key_spec == KeySpec::Aes256);
+            capabilities.key_specs.push(KeySpecCapability {
+                key_spec: KeySpec::Aes128,
+                operations: vec![Encrypt, Decrypt, GenerateDataKey, ReEncrypt],
+            });
         }
+        capabilities
     }
 }
 

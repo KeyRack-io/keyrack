@@ -24,6 +24,20 @@ fi
 # Fail before creating a token if the native owner test was removed, renamed or
 # ignored. A successful cargo invocation that ran no test is not conformance.
 native_test=provider::native_a2::tests::native_a2_soft_hsm
+provider_test=provider::context_wrapping::tests::context_wrapped_provider_roundtrip_swap_restart_and_exact_closure
+derived_test=context_derived_soft_hsm_strict_policy_and_cleanup
+derived_listing=$(cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
+    --test context_derived_probe -- --list)
+[[ $(printf '%s\n' "$derived_listing" | grep -Fxc "$derived_test: test") == 1 ]] || {
+    echo "Expected context-derived policy test missing." >&2
+    exit 1
+}
+derived_ignored=$(cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
+    --test context_derived_probe -- --ignored --list)
+if printf '%s\n' "$derived_ignored" | grep -Fq "$derived_test: test"; then
+    echo "Context-derived policy test must not be ignored." >&2
+    exit 1
+fi
 native_listing=$(cargo test --locked -p keyrack-pkcs11 \
     --features softhsm-tests,native-a2-conformance --lib -- --list)
 [[ $(printf '%s\n' "$native_listing" | grep -Fxc "$native_test: test") == 1 ]] || {
@@ -36,6 +50,29 @@ if printf '%s\n' "$native_ignored" | grep -Fq "$native_test: test"; then
     echo "Native A2 conformance test must not be ignored." >&2
     exit 1
 fi
+[[ $(printf '%s\n' "$native_listing" | grep -Fxc "$provider_test: test") == 1 ]] || {
+    echo "Expected context-wrapped provider test missing." >&2
+    exit 1
+}
+if printf '%s\n' "$native_ignored" | grep -Fq "$provider_test: test"; then
+    echo "Context-wrapped provider test must not be ignored." >&2
+    exit 1
+fi
+service_tests=(
+    native_wrapped_grpc_rest_roundtrip_and_envelope_swap_refusal
+    native_wrapped_context_fields_and_parent_version_are_bound
+    native_wrapped_grpc_rest_cancellation_closes_original_lease
+    native_wrapped_provider_reconstruction_retains_child_usability
+    native_wrapped_process_restart_retains_child_usability
+)
+service_listing=$(cargo test --locked -p keyrack-service --test softhsm_wrapped_service -- --ignored --list)
+for service_test in "${service_tests[@]}"; do
+    [[ $(printf '%s\n' "$service_listing" | grep -Fxc "$service_test: test") == 1 ]] || {
+        echo "Expected ignored native service test missing: $service_test" >&2
+        exit 1
+    }
+done
+
 for cleanup_test in \
     provider::native_a2::adapter::tests::failed_open_preserves_original_error_after_successful_close \
     provider::native_a2::adapter::tests::failed_open_reports_failed_close_and_original_error_without_retry; do
@@ -84,3 +121,20 @@ cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
 # or token-wide login race with the earlier direct-mechanism probe.
 cargo test --locked -p keyrack-pkcs11 --features softhsm-tests,native-a2-conformance \
     --lib "$native_test" -- --exact --nocapture --test-threads=1
+
+# Independent process, same fresh fixture; every object here is session-only.
+cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
+    --test context_derived_probe "$derived_test" -- --exact --nocapture --test-threads=1
+
+cargo test --locked -p keyrack-pkcs11 --features softhsm-tests,native-a2-conformance \
+    --lib "$provider_test" -- --exact --nocapture --test-threads=1
+
+for service_test in "${service_tests[@]}"; do
+    cargo test --locked -p keyrack-service --test softhsm_wrapped_service \
+        "$service_test" -- --ignored --exact --nocapture --test-threads=1
+done
+
+# Mutate an isolated source copy, never production configuration. A direct-parent
+# AES-KW counterfactual must fail the exact service envelope-swap assertion.
+python3 -B -m unittest discover -s crates/keyrack-pkcs11/tests/support -p test_context_binding_control.py
+python3 crates/keyrack-pkcs11/tests/support/context_binding_control.py

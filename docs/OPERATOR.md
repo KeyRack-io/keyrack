@@ -89,8 +89,10 @@ child creation is refused everywhere.
 `software:aes-256-gcm:v1` is a development and conformance mechanism, and
 startup says so: the child is unwrapped into the service process's memory for
 the length of a lease, which is exactly as contained as the parent wrapping it.
-It gives you the hierarchy's shape, not its custody. No provider with a custody
-boundary implements the operations yet.
+It gives you the hierarchy's shape, not its custody. The experimental
+[context-derived SoftHSM profile](#experimental-context-derived-wrapping-profile)
+executes wrapping inside the software token; it does not establish a hardware
+custody boundary.
 
 Parent and child must be on the same provider: a wrapped child in another
 security domain is refused, not deferred. A parent must be enabled,
@@ -323,7 +325,9 @@ It does not preserve keys, repair old records, or provide a migration path.
 
 ### PKCS#11 (production)
 
-Delegates all cryptographic operations to an HSM via PKCS#11.
+Delegates cryptographic operations to a PKCS#11 token. SoftHSM is supported as
+a software token; its storage permissions and PIN protect keys, without a
+hardware boundary. No hardware token is qualified.
 
 ```yaml
 provider:
@@ -332,6 +336,92 @@ provider:
   token_label: "keyrack-production"
   pin_ref: "file:user-pin"
 ```
+
+#### Experimental context-derived wrapping profile
+
+`pkcs11:aes256-cbc-sha256-kw:v1` selects a dedicated provider entry for
+context-derived AES key wrapping. It is an explicit opt-in; no mechanism is
+negotiated or used as a fallback. Configuration must use a separate provider
+name for ordinary keys and derive-only wrapping roots, even when both entries
+use the same token:
+
+```yaml
+default_provider: token-ordinary
+providers:
+  - name: token-ordinary
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: keyrack-production
+    pin_ref: file:user-pin
+  - name: token-wrapping
+    type: pkcs11
+    lib_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: keyrack-production
+    pin_ref: file:user-pin
+wrapping:
+  - provider: token-wrapping
+    mechanism: pkcs11:aes256-cbc-sha256-kw:v1
+    security_domain: token-wrapping-domain
+```
+
+The wrapping entry **must not be the default provider**. Startup rejects an
+explicit default pointing to it, a sole named entry that becomes the implicit
+default, and the legacy single `provider:` configuration. Ordinary keys retain
+the ordinary entry's permissions; the wrapping entry creates derive-only
+AES-256 resident roots, which cannot encrypt or decrypt application data.
+Parent and child descriptors must name that same dedicated provider identity.
+Configuration validation alone does not qualify a token: startup must also
+complete the native derive/wrap/unwrap self-test, reject a wrong context, and
+read back `Sensitive=true` and `Extractable=false` on derived KEKs and opened
+children before declaring the capability. A failed self-test refuses startup.
+
+The mechanism hashes the complete canonical wrapping context, with a versioned
+domain separator, into 32 bytes. The token applies AES-CBC encrypt-data with a
+zero IV and no padding to those two blocks, producing a temporary AES-256 KEK
+for AES-KW. This is a bespoke construction under SHA-256 random-oracle and AES
+pseudorandom-permutation assumptions, not SP 800-108 and not a 256-bit PRF
+claim. Its conservative birthday bound is over AES's 128-bit block size;
+AES-KW has a 64-bit integrity check. Context binding depends on deriving the
+KEK from the full context, never wrapping directly under the resident parent.
+
+Derived KEKs are sensitive, non-extractable session objects with only
+wrap/unwrap permission; opened children are sensitive, non-extractable session
+objects with only encrypt/decrypt permission. The KEK is destroyed before an
+opened child is handed to a use lease, and the child is closed through the
+lease cleanup owner. Startup self-test objects, including its temporary parent,
+are session objects. Creation closure evidence requires the original creation
+session's exact binding and closure; ordinary lease cleanup does not establish
+that evidence.
+
+SoftHSM is a software token loaded into KeyRack's process. Its storage
+permissions and PIN protect keys; this code path does not establish hardware
+custody, and no hardware token is qualified. Anyone with the raw token PIN is
+trusted: SoftHSM does not enforce `CKA_DERIVE_TEMPLATE` to stop that identity
+from deriving an extractable KEK through another PKCS#11 client. An unwrap
+template does not remove that limitation.
+
+The native provider retains a volatile ownership ledger with a depth of 4,096
+entries. Every creation attempt and every ordinary open consumes an entry;
+closed and failed entries remain as evidence. Once full, it refuses new
+admission rather than evicting evidence. A fresh provider incarnation (normally
+a service restart) clears this ledger and its earlier closure/idempotence
+evidence. Restart never reconstructs a closure claim. Plan restarts around this
+availability limit; successful closes do not replenish the ledger.
+
+An unconfirmed native session close stops new wrapping work for every provider
+entry sharing that initialized module. The provider makes one close attempt;
+it preserves the error and never treats a destructor or later recovery as
+verified closure. This failure state survives provider reconstruction and
+module recovery. Restart the service process before admitting new wrapping
+work; earlier unresolved creation evidence remains unresolved. Existing owners
+can still attempt their owed cleanup, and ordinary provider operations retain
+their existing recovery behavior.
+
+Rotating a resident root creates a new version. Existing child envelopes stay
+bound to their exact old parent version until an explicit rewrap migrates them;
+rotation does not migrate them automatically. Shared service rewrap integration
+is not yet available. Export, rotation and destruction of wrapped material stay
+refused; this profile does not introduce dependent-data-loss deletion intent.
 
 #### When a token goes away and comes back
 

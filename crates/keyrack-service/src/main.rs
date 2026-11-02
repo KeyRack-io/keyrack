@@ -431,10 +431,16 @@ async fn build_provider(
                 token_label: label,
                 pin: resolved_pin.expose().to_string(),
             };
-            (
-                Arc::new(keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?),
-                keyrack_core::key::ProviderClass::Pkcs11,
-            )
+            let provider = match wrapping {
+                Some(profile) => keyrack_pkcs11::Pkcs11Provider::new_with_wrapping(
+                    &pkcs11_config,
+                    keyrack_core::key::ProviderRef::new(name),
+                    profile.mechanism.clone(),
+                    profile.security_domain.clone(),
+                )?,
+                None => keyrack_pkcs11::Pkcs11Provider::new(&pkcs11_config)?,
+            };
+            (Arc::new(provider), keyrack_core::key::ProviderClass::Pkcs11)
         }
         ProviderConfig::Kmip {
             host,

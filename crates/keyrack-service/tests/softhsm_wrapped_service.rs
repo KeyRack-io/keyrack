@@ -1,0 +1,773 @@
+// Copyright 2026 KeyRack Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Real-token service coverage. Run serially on the disposable fixture used by
+//! test-pkcs11-wrapping.sh. The fault adapter changes inputs only after storage
+//! validates its journal; every cryptographic operation still reaches `SoftHSM`.
+
+use base64::Engine;
+use keyrack_core::error::Result as CoreResult;
+use keyrack_core::key::{KeyMaterial, KeyRecord, KeySpec, ProviderClass, ProviderRef};
+use keyrack_core::provider::{
+    CryptoProvider, EncryptOutput, GeneratedWrappedKey, KeyHandle, ProviderCapabilities,
+    SigningAlgorithm, WrappedKeyClosure, WrappedKeyLease,
+};
+use keyrack_core::registry::{ProviderEntry, StaticProviderRegistry};
+use keyrack_core::sensitive::Sensitive;
+use keyrack_core::storage::StorageBackend;
+use keyrack_core::wrapping::{WrappingContext, WrappingIdentifier};
+use keyrack_pkcs11::{Pkcs11Provider, Pkcs11ProviderConfig, CONTEXT_DERIVED_WRAPPING_MECHANISM};
+use keyrack_service::hierarchy::{WrappingProfile, WrappingProfiles};
+use keyrack_service::proto::{self, key_service_client::KeyServiceClient};
+use keyrack_service::routing::ProviderRouter;
+use keyrack_service::state::ServiceState;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+const PROVIDER: &str = "token-wrapping";
+const DOMAIN: &str = "service-token-tests";
+const PATIENCE: Duration = Duration::from_secs(10);
+
+fn identifier(value: &str) -> WrappingIdentifier {
+    WrappingIdentifier::new(value).unwrap()
+}
+
+#[derive(Default)]
+struct Controls {
+    replacement: Mutex<Option<Vec<u8>>>,
+    mutation: Mutex<Option<&'static str>>,
+    errors: Mutex<Vec<String>>,
+    opened: Mutex<Vec<KeyHandle>>,
+    hold_open: AtomicBool,
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    changed: Condvar,
+    closed: AtomicUsize,
+}
+
+impl Controls {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+struct Instrumented {
+    inner: Arc<Pkcs11Provider>,
+    controls: Arc<Controls>,
+}
+
+#[async_trait::async_trait]
+impl CryptoProvider for Instrumented {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    fn wrapping_capabilities(&self) -> keyrack_core::wrapping::WrappingCapabilities {
+        self.inner.wrapping_capabilities()
+    }
+    fn wrapping_closure_verifier(
+        &self,
+    ) -> Option<Arc<dyn keyrack_core::creation::A2ClosureVerifier>> {
+        self.inner.wrapping_closure_verifier()
+    }
+    async fn generate_key(&self, spec: &KeySpec) -> CoreResult<KeyHandle> {
+        self.inner.generate_key(spec).await
+    }
+    async fn encrypt(
+        &self,
+        handle: &KeyHandle,
+        plain: &[u8],
+        aad: &[u8],
+    ) -> CoreResult<EncryptOutput> {
+        self.inner.encrypt(handle, plain, aad).await
+    }
+    async fn decrypt(
+        &self,
+        handle: &KeyHandle,
+        cipher: &[u8],
+        aad: &[u8],
+    ) -> CoreResult<Sensitive<Vec<u8>>> {
+        self.inner.decrypt(handle, cipher, aad).await
+    }
+    async fn sign(
+        &self,
+        handle: &KeyHandle,
+        algorithm: SigningAlgorithm,
+        message: &[u8],
+    ) -> CoreResult<Vec<u8>> {
+        self.inner.sign(handle, algorithm, message).await
+    }
+    async fn verify(
+        &self,
+        handle: &KeyHandle,
+        algorithm: SigningAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> CoreResult<bool> {
+        self.inner
+            .verify(handle, algorithm, message, signature)
+            .await
+    }
+    async fn generate_random(&self, length: usize) -> CoreResult<Sensitive<Vec<u8>>> {
+        self.inner.generate_random(length).await
+    }
+    async fn destroy_key(&self, handle: &KeyHandle) -> CoreResult<()> {
+        self.inner.destroy_key(handle).await
+    }
+    async fn generate_wrapped_key(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        creation: &keyrack_core::creation::CreationBinding,
+    ) -> CoreResult<GeneratedWrappedKey> {
+        self.inner
+            .generate_wrapped_key(context, parent, creation)
+            .await
+    }
+    async fn open_wrapped_key(
+        &self,
+        context: &WrappingContext,
+        parent: &KeyHandle,
+        envelope: &[u8],
+    ) -> CoreResult<WrappedKeyLease> {
+        let mut context = context.clone();
+        if let Some(field) = *self.controls.mutation.lock().unwrap() {
+            mutate(&mut context, field);
+            // These cases are legal canonical contexts, not parser rejection.
+            context
+                .canonical_bytes()
+                .expect("mutation remains canonical");
+        }
+        let envelope = self
+            .controls
+            .replacement
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| envelope.to_vec());
+        let (inner, controls, parent) = (self.inner.clone(), self.controls.clone(), parent.clone());
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let result = runtime.block_on(inner.open_wrapped_key(&context, &parent, &envelope));
+            match &result {
+                Ok(lease) => {
+                    controls.opened.lock().unwrap().push(lease.handle().clone());
+                    if controls.hold_open.load(Ordering::SeqCst) {
+                        controls.entered.notify_one();
+                        let mut released = controls.released.lock().unwrap();
+                        while !*released {
+                            released = controls.changed.wait(released).unwrap();
+                        }
+                    }
+                }
+                Err(error) => controls.errors.lock().unwrap().push(error.to_string()),
+            }
+            result
+        })
+        .await
+        .expect("native open thread")
+    }
+    async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> CoreResult<WrappedKeyClosure> {
+        let result = self.inner.close_wrapped_key(lease).await;
+        if result.is_ok() {
+            self.controls.closed.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+// V1 is the sole representable encoding. A public digest cannot be added to an
+// AES context: canonical validation forbids it. Both are parser/profile limits,
+// not independently testable legal single-field substitutions in this profile.
+fn mutate(context: &mut WrappingContext, field: &str) {
+    use keyrack_core::lid::Lid;
+    use keyrack_core::wrapping::{WrappedKeyFormat, WrappingKeyPurpose};
+    match field {
+        "child_lid" => context.child.lid = Lid::from_bytes([7; 32]),
+        "child_version" => context.child.version = 2.try_into().unwrap(),
+        "parent_lid" => context.parent.lid = Lid::from_bytes([8; 32]),
+        "parent_version" => context.parent.version = 2.try_into().unwrap(),
+        "parent_spec" => context.parent_spec = KeySpec::Aes128,
+        "child_spec" => context.child_spec = KeySpec::Aes128,
+        "key_format" => {
+            context.key_format = WrappedKeyFormat::ProviderNative(identifier("other-format"));
+        }
+        "purpose" => context.purpose = WrappingKeyPurpose::WrapUnwrap,
+        "provider_ref" => context.provider_ref = ProviderRef::new("other-provider"),
+        "security_domain" => context.security_domain = identifier("other-domain"),
+        "mechanism" => context.mechanism = identifier("other-mechanism"),
+        _ => panic!("unknown context field"),
+    }
+}
+
+struct Service {
+    state: Arc<ServiceState>,
+    native: Arc<Pkcs11Provider>,
+    controls: Arc<Controls>,
+    grpc: String,
+    rest: String,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.controls.release();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Service {
+    async fn start(storage: Arc<dyn StorageBackend>) -> Self {
+        std::env::var("SOFTHSM2_CONF").expect("isolated SoftHSM configuration required");
+        let config = Pkcs11ProviderConfig {
+            lib_path: std::env::var("KMS_PKCS11_LIB").expect("SoftHSM module required"),
+            token_label: std::env::var("KMS_PKCS11_TOKEN_LABEL")
+                .expect("disposable token required"),
+            pin: std::env::var("KMS_PKCS11_PIN").expect("disposable PIN required"),
+        };
+        let ordinary = Arc::new(Pkcs11Provider::new(&config).expect("ordinary token provider"));
+        let native = Arc::new(
+            Pkcs11Provider::new_with_wrapping(
+                &config,
+                ProviderRef::new(PROVIDER),
+                identifier(CONTEXT_DERIVED_WRAPPING_MECHANISM),
+                identifier(DOMAIN),
+            )
+            .expect("qualified context-derived provider"),
+        );
+        let controls = Arc::new(Controls::default());
+        let provider: Arc<dyn CryptoProvider> = Arc::new(Instrumented {
+            inner: native.clone(),
+            controls: controls.clone(),
+        });
+        let registry = StaticProviderRegistry::new(
+            [
+                (
+                    ProviderRef::new("ordinary"),
+                    ProviderEntry {
+                        provider: ordinary,
+                        class: ProviderClass::Pkcs11,
+                    },
+                ),
+                (
+                    ProviderRef::new(PROVIDER),
+                    ProviderEntry {
+                        provider,
+                        class: ProviderClass::Pkcs11,
+                    },
+                ),
+            ],
+            ProviderRef::new("ordinary"),
+        )
+        .unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let state = Arc::new(ServiceState {
+            storage,
+            providers: Arc::new(registry),
+            provider_router: ProviderRouter::new(vec![], ProviderRef::new("ordinary")).unwrap(),
+            pdp: Arc::new(keyrack_core::pdp::AlwaysAllow),
+            audit: Arc::new(keyrack_core::audit::FanoutSink::new(vec![])),
+            authn: Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
+                Box::new(keyrack_core::authn::InsecureAuthenticator),
+            ])),
+            metrics_handle: recorder.handle(),
+            max_plaintext_bytes: 4096,
+            legacy_compromised_key_decrypt: false,
+            nats_publisher: None,
+            lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
+            wrapping: WrappingProfiles::new([(
+                ProviderRef::new(PROVIDER),
+                WrappingProfile {
+                    mechanism: identifier(CONTEXT_DERIVED_WRAPPING_MECHANISM),
+                    security_domain: identifier(DOMAIN),
+                },
+            )]),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc = format!("http://{}", listener.local_addr().unwrap());
+        let server = proto::key_service_server::KeyServiceServer::new(
+            keyrack_service::grpc::KeyServiceImpl::new(state.clone()),
+        );
+        let grpc_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = format!("http://{}", listener.local_addr().unwrap());
+        let router = keyrack_service::rest::router(state.clone());
+        let rest_task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            state,
+            native,
+            controls,
+            grpc,
+            rest,
+            tasks: vec![grpc_task, rest_task],
+        }
+    }
+    async fn client(&self) -> KeyServiceClient<tonic::transport::Channel> {
+        KeyServiceClient::connect(self.grpc.clone()).await.unwrap()
+    }
+    async fn create(&self, rest: bool, parent: Option<&str>, aes128: bool) -> String {
+        if rest {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/keys", self.rest))
+                .json(&serde_json::json!({
+                    "key_spec": if aes128 {"AES_128"} else {"AES_256"},
+                    "backend_id": PROVIDER, "parent_key_id": parent,
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(status.is_success(), "REST create: {status} {body}");
+            body["lid"].as_str().expect("REST key id").to_owned()
+        } else {
+            self.client()
+                .await
+                .create_key(proto::CreateKeyRequest {
+                    key_spec: if aes128 {
+                        proto::KeySpec::Aes128
+                    } else {
+                        proto::KeySpec::Aes256
+                    }
+                    .into(),
+                    backend_id: Some(PROVIDER.into()),
+                    parent_key_id: parent.map(str::to_owned),
+                    ..Default::default()
+                })
+                .await
+                .expect("gRPC create")
+                .into_inner()
+                .metadata
+                .unwrap()
+                .key_id
+        }
+    }
+    async fn encrypt(&self, rest: bool, key: &str) -> Result<Vec<u8>, String> {
+        if rest {
+            let response = reqwest::Client::new().post(format!("{}/v1/keys/{key}/actions-encrypt", self.rest))
+                .json(&serde_json::json!({"plaintext": base64::engine::general_purpose::STANDARD.encode(b"native service data")}))
+                .send().await.unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            if !status.is_success() {
+                return Err(format!("{status}: {body}"));
+            }
+            Ok(base64::engine::general_purpose::STANDARD
+                .decode(body["ciphertext_blob"].as_str().unwrap())
+                .unwrap())
+        } else {
+            self.client()
+                .await
+                .encrypt(proto::EncryptRequest {
+                    key_id: key.into(),
+                    plaintext: b"native service data".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .map(|r| r.into_inner().ciphertext_blob)
+                .map_err(|e| e.to_string())
+        }
+    }
+    async fn decrypt(&self, rest: bool, key: &str, blob: &[u8]) {
+        let plain = if rest {
+            let response = reqwest::Client::new().post(format!("{}/v1/keys/{key}/actions-decrypt", self.rest))
+                .json(&serde_json::json!({"ciphertext_blob": base64::engine::general_purpose::STANDARD.encode(blob)}))
+                .send().await.unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(status.is_success(), "REST decrypt: {status} {body}");
+            base64::engine::general_purpose::STANDARD
+                .decode(body["plaintext"].as_str().unwrap())
+                .unwrap()
+        } else {
+            self.client()
+                .await
+                .decrypt(proto::DecryptRequest {
+                    key_id: key.into(),
+                    ciphertext_blob: blob.to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .expect("gRPC decrypt")
+                .into_inner()
+                .plaintext
+        };
+        assert_eq!(plain, b"native service data");
+    }
+    async fn record(&self, key: &str) -> KeyRecord {
+        self.state
+            .storage
+            .get_key(&key.parse().unwrap())
+            .await
+            .unwrap()
+    }
+    async fn envelope(&self, key: &str) -> Vec<u8> {
+        let record = self.record(key).await;
+        let KeyMaterial::ParentWrapped(material) = &record.primary_version().unwrap().material
+        else {
+            panic!("wrapped child required")
+        };
+        let operation = material
+            .wrapped_material_ref()
+            .as_str()
+            .strip_prefix("creation:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        self.state
+            .storage
+            .read_creation_envelope(operation)
+            .await
+            .unwrap()
+    }
+    async fn roundtrip(&self, rest: bool, key: &str) {
+        let blob = self.encrypt(rest, key).await.unwrap();
+        self.decrypt(rest, key, &blob).await;
+    }
+}
+
+fn storage() -> Arc<dyn StorageBackend> {
+    Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_grpc_rest_roundtrip_and_envelope_swap_refusal() {
+    let service = Service::start(storage()).await;
+    // The ordinary default entry shares the token but retains application-key
+    // permissions. Its resident key remains usable through both surfaces.
+    let ordinary = service
+        .client()
+        .await
+        .create_key(proto::CreateKeyRequest {
+            key_spec: proto::KeySpec::Aes256.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("ordinary default key creation")
+        .into_inner()
+        .metadata
+        .unwrap()
+        .key_id;
+    service.roundtrip(false, &ordinary).await;
+    service.roundtrip(true, &ordinary).await;
+    for rest in [false, true] {
+        let parent = service.create(rest, None, false).await;
+        for aes128 in [false, true] {
+            let first = service.create(rest, Some(&parent), aes128).await;
+            let second = service.create(rest, Some(&parent), aes128).await;
+            service.roundtrip(rest, &first).await;
+            service.roundtrip(rest, &second).await;
+            *service.controls.replacement.lock().unwrap() = Some(service.envelope(&second).await);
+            let error = service
+                .encrypt(rest, &first)
+                .await
+                .expect_err("swapped child must not open");
+            let native = service
+                .controls
+                .errors
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("native refusal reached");
+            assert!(
+                native.contains("context-derived child unwrap"),
+                "native cause: {native}; service: {error}"
+            );
+            *service.controls.replacement.lock().unwrap() = None;
+            service.roundtrip(rest, &first).await;
+            service.roundtrip(rest, &second).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_context_fields_and_parent_version_are_bound() {
+    let service = Service::start(storage()).await;
+    let parent = service.create(false, None, false).await;
+    let child = service.create(false, Some(&parent), false).await;
+    for rest in [false, true] {
+        for field in [
+            "child_lid",
+            "child_version",
+            "parent_lid",
+            "parent_version",
+            "parent_spec",
+            "child_spec",
+            "key_format",
+            "purpose",
+            "provider_ref",
+            "security_domain",
+            "mechanism",
+        ] {
+            service.roundtrip(rest, &child).await;
+            *service.controls.mutation.lock().unwrap() = Some(field);
+            let before = service.controls.errors.lock().unwrap().len();
+            let error = service.encrypt(rest, &child).await.expect_err(field);
+            let cause = {
+                let errors = service.controls.errors.lock().unwrap();
+                assert_eq!(
+                    errors.len(),
+                    before + 1,
+                    "{field}: native provider must refuse, not storage: {error}"
+                );
+                errors.last().unwrap().clone()
+            };
+            if matches!(
+                field,
+                "child_lid" | "child_version" | "parent_lid" | "parent_version"
+            ) {
+                assert!(
+                    cause.contains("context-derived child unwrap"),
+                    "{field}: {cause}"
+                );
+            } else {
+                assert!(
+                    cause.contains("context-derived PKCS#11 wrapping"),
+                    "{field}: {cause}"
+                );
+            }
+            *service.controls.mutation.lock().unwrap() = None;
+            service.roundtrip(rest, &child).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_grpc_rest_cancellation_closes_original_lease() {
+    let service = Service::start(storage()).await;
+    let parent = service.create(false, None, false).await;
+    let child = service.create(false, Some(&parent), false).await;
+    for rest in [false, true] {
+        service.roundtrip(rest, &child).await;
+        let before = service.state.lease_cleanup.counts();
+        *service.controls.released.lock().unwrap() = false;
+        service.controls.hold_open.store(true, Ordering::SeqCst);
+        let entered = service.controls.entered.notified();
+        let request = if rest {
+            let url = format!("{}/v1/keys/{child}/actions-encrypt", service.rest);
+            tokio::spawn(async move {
+                let error = reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .unwrap()
+                    .post(url)
+                    .json(&serde_json::json!({"plaintext":"aGVsbG8="}))
+                    .send()
+                    .await
+                    .expect_err("REST timeout");
+                assert!(error.is_timeout(), "{error}");
+            })
+        } else {
+            let mut client = service.client().await;
+            let mut input = tonic::Request::new(proto::EncryptRequest {
+                key_id: child.clone(),
+                plaintext: b"hello".to_vec(),
+                ..Default::default()
+            });
+            input.set_timeout(Duration::from_millis(500));
+            tokio::spawn(async move {
+                let error = client.encrypt(input).await.expect_err("gRPC deadline");
+                assert!(
+                    matches!(
+                        error.code(),
+                        tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+                    ),
+                    "{error}"
+                );
+            })
+        };
+        tokio::time::timeout(PATIENCE, entered)
+            .await
+            .expect("real native open must complete before cancellation");
+        let handle = service
+            .controls
+            .opened
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(service
+            .native
+            .encrypt(&handle, b"before close", b"aad")
+            .await
+            .is_ok());
+        let result = request.await;
+        service.controls.release();
+        service.controls.hold_open.store(false, Ordering::SeqCst);
+        result.unwrap();
+        tokio::time::timeout(PATIENCE, async {
+            loop {
+                let counts = service.state.lease_cleanup.counts();
+                if counts.closed_after_return > before.closed_after_return {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cleanup owner must close cancelled native lease");
+        assert!(
+            service
+                .native
+                .encrypt(&handle, b"after close", b"aad")
+                .await
+                .is_err(),
+            "closed native handle remains usable"
+        );
+        let counts = service.state.lease_cleanup.counts();
+        assert_eq!(counts.close_failed, before.close_failed);
+        assert_eq!(counts.abandoned, before.abandoned);
+        service.roundtrip(rest, &child).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_provider_reconstruction_retains_child_usability() {
+    // Reconstruct the provider and both service frontends over retained SQLite
+    // metadata. This is an in-process reconstruction, not a crash-recovery proof.
+    let storage = storage();
+    let service = Service::start(storage.clone()).await;
+    let parent = service.create(false, None, false).await;
+    let child = service.create(false, Some(&parent), false).await;
+    let blob = service.encrypt(false, &child).await.unwrap();
+    drop(service);
+    tokio::task::yield_now().await;
+    let service = Service::start(storage).await;
+    service.decrypt(false, &child, &blob).await;
+    service.decrypt(true, &child, &blob).await;
+    service.roundtrip(false, &child).await;
+    service.roundtrip(true, &child).await;
+}
+
+struct RestartDirectory(std::path::PathBuf);
+impl Drop for RestartDirectory {
+    fn drop(&mut self) {
+        // This directory is created exclusively for this test invocation.
+        std::fs::remove_dir_all(&self.0).expect("remove restart fixture directory");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the isolated native-token fixture; no mock fallback"]
+async fn native_wrapped_process_restart_retains_child_usability() {
+    const TEST: &str = "native_wrapped_process_restart_retains_child_usability";
+    const PHASE: &str = "KEYRACK_NATIVE_RESTART_PHASE";
+    const DIRECTORY: &str = "KEYRACK_NATIVE_RESTART_DIRECTORY";
+    if let Ok(phase) = std::env::var(PHASE) {
+        let directory =
+            std::path::PathBuf::from(std::env::var_os(DIRECTORY).expect("restart directory"));
+        let database =
+            Arc::new(keyrack_sqlite::SqliteStorage::open(directory.join("keys.sqlite")).unwrap());
+        let service = Service::start(database).await;
+        match phase.as_str() {
+            "create" => {
+                let parent = service.create(false, None, false).await;
+                let grpc_child = service.create(false, Some(&parent), false).await;
+                let rest_child = service.create(true, Some(&parent), true).await;
+                let grpc_ciphertext = service.encrypt(false, &grpc_child).await.unwrap();
+                let rest_ciphertext = service.encrypt(true, &rest_child).await.unwrap();
+                let record = serde_json::json!({
+                    "grpc_child": grpc_child,
+                    "rest_child": rest_child,
+                    "grpc_ciphertext": grpc_ciphertext,
+                    "rest_ciphertext": rest_ciphertext,
+                });
+                // Only identifiers and application ciphertext cross processes;
+                // wrapped envelopes remain in the durable creation journal.
+                std::fs::write(
+                    directory.join("ciphertexts.json"),
+                    serde_json::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            }
+            "read" => {
+                let record: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(directory.join("ciphertexts.json")).unwrap(),
+                )
+                .unwrap();
+                for (name, rest) in [("grpc", false), ("rest", true)] {
+                    let child = record[format!("{name}_child")].as_str().unwrap();
+                    let ciphertext: Vec<u8> =
+                        serde_json::from_value(record[format!("{name}_ciphertext")].clone())
+                            .unwrap();
+                    service.decrypt(rest, child, &ciphertext).await;
+                    service.roundtrip(rest, child).await;
+                }
+            }
+            other => panic!("unexpected restart phase: {other}"),
+        }
+        drop(service);
+        println!("NATIVE_PROCESS_RESTART_PHASE_COMPLETE:{phase}");
+        return;
+    }
+
+    // Do not initialize a provider in this process: no SharedModule, native
+    // session, provider registry or lease evidence can be shared by the phases.
+    let directory = RestartDirectory(
+        std::env::temp_dir().join(format!("keyrack-native-restart-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&directory.0).unwrap();
+    for phase in ["create", "read"] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PHASE, phase)
+            .env(DIRECTORY, &directory.0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start independent service process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut timed_out = false;
+        while child.try_wait().expect("poll service process").is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("kill timed-out service process");
+                timed_out = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let output = child.wait_with_output().expect("collect service process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out && output.status.success(),
+            "{phase} process failed (timed out: {timed_out}): {stdout} {stderr}"
+        );
+        assert_eq!(
+            stdout
+                .matches(&format!("NATIVE_PROCESS_RESTART_PHASE_COMPLETE:{phase}"))
+                .count(),
+            1,
+            "{phase} helper did not complete exactly once: {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "{phase} helper was skipped or mis-selected: {stdout}"
+        );
+        // wait_with_output has waited for the first process to terminate before
+        // the next phase opens the same persistent metadata and token.
+    }
+}

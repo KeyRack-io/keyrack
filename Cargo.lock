@@ -2804,10 +2804,12 @@ name = "keyrack-pkcs11"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "cryptoki",
  "keyrack-core",
  "keyrack-sqlite",
  "keyrack-test-support",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
