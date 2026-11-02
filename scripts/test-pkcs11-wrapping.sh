@@ -36,6 +36,20 @@ if printf '%s\n' "$native_ignored" | grep -Fq "$native_test: test"; then
     echo "Native A2 conformance test must not be ignored." >&2
     exit 1
 fi
+for cleanup_test in \
+    provider::native_a2::adapter::tests::failed_open_preserves_original_error_after_successful_close \
+    provider::native_a2::adapter::tests::failed_open_reports_failed_close_and_original_error_without_retry; do
+    [[ $(printf '%s\n' "$native_listing" | grep -Fxc "$cleanup_test: test") == 1 ]] || {
+        echo "Expected native cleanup regression missing: $cleanup_test" >&2
+        exit 1
+    }
+    if printf '%s\n' "$native_ignored" | grep -Fq "$cleanup_test: test"; then
+        echo "Native cleanup regression must not be ignored: $cleanup_test" >&2
+        exit 1
+    fi
+    cargo test --locked -p keyrack-pkcs11 --features softhsm-tests,native-a2-conformance \
+        --lib "$cleanup_test" -- --exact
+done
 if [[ -z "${KMS_PKCS11_LIB:-}" || ! -f "$KMS_PKCS11_LIB" ]]; then
     echo "Set KMS_PKCS11_LIB to the SoftHSM2 module." >&2
     exit 1
