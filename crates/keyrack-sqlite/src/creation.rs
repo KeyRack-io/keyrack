@@ -213,6 +213,16 @@ pub(super) fn guard_update(
     Ok(())
 }
 
+pub(super) fn committed_envelope(conn: &Connection, operation: Uuid) -> Result<Vec<u8>> {
+    let value = required_journal(conn, operation)?;
+    if value.phase != CreationPhase::Committed {
+        return Err(invalid("staged material is unavailable"));
+    }
+    let bytes = envelope(conn, operation)?;
+    validate_envelope(&value, &bytes)?;
+    Ok(bytes)
+}
+
 impl SqliteStorage {
     pub(super) fn creation_tx<T>(
         &self,
@@ -370,15 +380,7 @@ impl SqliteStorage {
     }
 
     pub(super) fn read_a2_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
-        self.with_conn(|conn| {
-            let value = required_journal(conn, operation)?;
-            if value.phase != CreationPhase::Committed {
-                return Err(invalid("staged material is unavailable"));
-            }
-            let bytes = envelope(conn, operation)?;
-            validate_envelope(&value, &bytes)?;
-            Ok(bytes)
-        })
+        self.with_conn(|conn| committed_envelope(conn, operation))
     }
 
     pub(super) fn recover_a2(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {

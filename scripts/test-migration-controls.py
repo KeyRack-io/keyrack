@@ -26,6 +26,11 @@ CONTROLS = [
     ("commit_occ", SQLITE + "migration.rs", "fn migration_commit(", "snapshots(conn,&value.request)?;", "", "migration::tests::migration_commit_rechecks_every_occ"),
     ("target_fence", SQLITE + "migration.rs", "fn snapshots(", "destruction::guard(conn, &record.lid)?;", "let _ = (destruction::guard, record);", "migration::tests::migration_reservation_checks_destruction_fence_independently"),
     ("parent_immutable", SQLITE + "migration.rs", "fn guard_update(", "if previous.parent_lid != next.parent_lid {", "if false && previous.parent_lid != next.parent_lid {", "tests::migration_deny_paths"),
+    ("stage_owner", SQLITE + "migration.rs", "fn migration_stage(", "value.require_owner(ownership)?;", "", "tests::migration_ownership_epoch_and_unknown_outcome"),
+    ("commit_owner", SQLITE + "migration.rs", "fn migration_commit(", "value.require_owner(ownership)?;", "", "tests::migration_ownership_epoch_and_unknown_outcome"),
+    ("stage_dispatch_epoch", SQLITE + "migration.rs", "fn migration_stage(", "if value.dispatch.as_ref().map(|d| d.epoch) != Some(ownership.epoch) {", "if false && value.dispatch.as_ref().map(|d| d.epoch) != Some(ownership.epoch) {", "tests::migration_ownership_epoch_and_unknown_outcome"),
+    ("dispatch_owner", "crates/keyrack-core/src/migration/wrapped.rs", "pub fn begin_dispatch(", "self.require_owner(ownership)?;", "", "tests::migration_ownership_epoch_and_unknown_outcome"),
+    ("unknown_outcome", "crates/keyrack-core/src/migration/wrapped.rs", "pub fn begin_dispatch(", "if self.dispatch.is_some_and(|dispatch| !dispatch.retry_safe) {", "if false && self.dispatch.is_some_and(|dispatch| !dispatch.retry_safe) {", "tests::migration_ownership_epoch_and_unknown_outcome"),
     ("creation_envelope_erasure", SQLITE + "migration.rs", "fn migration_commit(", "DELETE FROM creation_journal WHERE child_lid=?1 AND phase='committed'", "DELETE FROM creation_journal WHERE child_lid=?1 AND phase='committed' AND 0", "tests::migration_atomic_publication_and_retirement"),
     ("migration_envelope_erasure", SQLITE + "migration.rs", "fn migration_commit(", "DELETE FROM migration_envelopes WHERE operation_id IN", "DELETE FROM migration_envelopes WHERE 0 AND operation_id IN", "tests::migration_atomic_publication_and_retirement"),
 ]

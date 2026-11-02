@@ -89,7 +89,19 @@ ciphertext continue to resolve the stored key and its versions.
 `POST /v1/keys/{key_id}/rewrap` share the same operation. Omitting the new parent
 rewraps under the existing parent's current version, pinned at reservation.
 The REST body contains `operation_id` and optional `new_parent_key_id`; both
-surfaces return `metadata` and `operation_id`. Repeat the same non-nil UUID
+surfaces also accept `old_parent_key_id`, `expected_child_revision`,
+`expected_old_parent_revision`, `expected_new_parent_revision`, and
+`covered_versions`. Revisions are optional OCC assertions, never replacements
+for the reservation's snapshot checks. Omitted or empty `covered_versions`
+means all versions; a supplied set must contain every retained version exactly
+once. Order is canonicalized. Assertions, including whether they were supplied,
+bind the operation ID: adding, removing or changing one on a retry conflicts.
+Both surfaces return `metadata`, `operation_id` and a committed `result`
+receipt containing the child, old/new parent versions, and old/new envelope
+digests and references for every version. This receipt remains unchanged on
+replay even if ordinary metadata later changes. See the complete schema in
+[Wrapped-key migration](WRAPPED_KEY_MIGRATION.md).
+Repeat the same non-nil UUID
 with the same intent to recover an interrupted request; changing its intent
 is refused. Permission `kms:RewrapKey` is required separately on the child,
 the old parent and the new parent, even when the parents have the same LID.

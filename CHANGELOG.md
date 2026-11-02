@@ -42,6 +42,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   `parent_lid` and retires old envelopes atomically, releasing the old wrapping
   dependency. Generic parent mutation is refused. SQLite and PostgreSQL share
   conformance tests, with live PostgreSQL and reverted-fence controls in CI.
+  Caller OCC assertions and version coverage bind immutable intent. Ownership
+  epochs reject stale publishers, and unknown nonrepeatable provider outcomes
+  retain their reservations. Readers keep access through commit and erasure.
+  The committed result records exact parent versions, references and encrypted
+  envelope digests and is returned unchanged on retry.
   Only the software provider currently implements the new provider primitive;
   it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
 

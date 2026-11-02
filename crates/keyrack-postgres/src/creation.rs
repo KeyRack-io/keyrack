@@ -224,6 +224,17 @@ pub(super) async fn replace_key(
     Ok(())
 }
 
+pub(super) async fn committed_envelope(
+    connection: &mut PgConnection,
+    operation: Uuid,
+) -> Result<Vec<u8>> {
+    let stored = require_creation(connection, operation).await?;
+    if stored.journal.phase != CreationPhase::Committed {
+        return Err(invalid("creation envelope is not committed"));
+    }
+    stored.envelope.ok_or(invalid("missing committed envelope"))
+}
+
 impl PostgresStorage {
     pub(super) async fn creation_reserve(
         &self,
@@ -432,11 +443,7 @@ impl PostgresStorage {
 
     pub(super) async fn creation_read_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
         let mut connection = self.pool.acquire().await.map_err(database_error)?;
-        let stored = require_creation(&mut connection, operation).await?;
-        if stored.journal.phase != CreationPhase::Committed {
-            return Err(invalid("creation envelope is not committed"));
-        }
-        stored.envelope.ok_or(invalid("missing committed envelope"))
+        committed_envelope(&mut connection, operation).await
     }
 
     pub(super) async fn creation_recoverable(

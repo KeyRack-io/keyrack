@@ -8,7 +8,7 @@
 use crate::{domain::DomainError, state::ServiceState};
 use keyrack_core::key::{KeyMaterial, KeyRecord, KeyVersionRecord};
 use keyrack_core::lid::Lid;
-use keyrack_core::migration::{MigrationPhase, MigrationRequest};
+use keyrack_core::migration::{MigrationConditions, MigrationPhase, MigrationRequest};
 use keyrack_core::wrapping::{
     VersionedKeyId, WrappedKeyLifecycle, WrappingCapability, WrappingContext, WrappingKeyPurpose,
     WrappingOperation,
@@ -25,6 +25,27 @@ pub async fn prepare_migration(
     requested_parent: Option<Lid>,
     operation: Uuid,
 ) -> Result<MigrationRequest, DomainError> {
+    prepare_migration_with_conditions(
+        state,
+        child_lid,
+        requested_parent,
+        operation,
+        MigrationConditions::default(),
+    )
+    .await
+}
+
+/// Caller assertions are part of immutable intent, including optional presence.
+pub async fn prepare_migration_with_conditions(
+    state: &Arc<ServiceState>,
+    child_lid: Lid,
+    requested_parent: Option<Lid>,
+    operation: Uuid,
+    conditions: MigrationConditions,
+) -> Result<MigrationRequest, DomainError> {
+    let conditions = conditions
+        .canonicalize()
+        .map_err(|e| DomainError::InvalidArgument(e.to_string()))?;
     if operation.is_nil() {
         return Err(DomainError::InvalidArgument(
             "operation_id must be a non-nil UUID".into(),
@@ -38,6 +59,7 @@ pub async fn prepare_migration(
     {
         if journal.request.child.lid != child_lid
             || journal.request.requested_parent != requested_parent
+            || journal.request.conditions != conditions
         {
             return Err(DomainError::FailedPrecondition(
                 "operation_id already names different migration intent".into(),
@@ -68,6 +90,7 @@ pub async fn prepare_migration(
             .map_err(DomainError::from)?
     };
     MigrationRequest::new(operation, requested_parent, child, old_parent, new_parent)
+        .and_then(|request| request.with_conditions(conditions))
         .map_err(|error| DomainError::FailedPrecondition(error.to_string()))
 }
 
@@ -130,15 +153,15 @@ pub(crate) async fn read_envelope(
     ))
 }
 
-/// Execute or recover an authorized intent. Reserved retries may reproduce
-/// envelopes: the provider primitive has no durable usable-child side effect.
-/// Staged retries only commit. Committed retries return the original result.
+/// Execute or recover an authorized intent under a storage ownership epoch.
+/// Reserved retries repeat only providers explicitly declaring retry safety.
+/// Staged retries only commit. Committed retries read the original result.
 pub async fn rewrap_key(
     state: &Arc<ServiceState>,
     request: MigrationRequest,
 ) -> Result<KeyRecord, DomainError> {
-    // Coalesce retries within this process. Across instances the journal's
-    // first staged result wins; the pure provider primitive may be repeated.
+    // Coalesce retries within this process. Across instances ownership epochs
+    // fence stale publishers; a durable dispatch marker protects unknown effects.
     static OPERATIONS: OnceLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let serial = {
@@ -169,20 +192,22 @@ pub async fn rewrap_key(
     }
     let result = run_migration(state, &request).await;
     if result.is_err() {
-        // Another instance may have committed while this retry was reading an
-        // old envelope or completing a duplicate pure provider call. Its result
-        // wins; never turn a committed operation into a reported failure.
+        // A stale worker may READ an already committed result but must never
+        // stage or commit using the new owner's authority.
         if let Ok(Some(journal)) = state.storage.get_migration(request.operation).await {
             if journal.request.same_intent(&request).unwrap_or(false) {
-                if journal.phase != MigrationPhase::Reserved {
-                    return state
-                        .storage
-                        .commit_migration(request.operation)
-                        .await
-                        .map_err(DomainError::from);
+                if journal.phase == MigrationPhase::Committed {
+                    return Ok(journal.request.proposed);
                 }
                 return Err(DomainError::ProviderUnavailable(
-                    "migration remains reserved; retry the same operation ID".into(),
+                    if journal
+                        .dispatch
+                        .is_some_and(|dispatch| !dispatch.retry_safe)
+                    {
+                        "unknown migration provider outcome requires reconciliation; reservation retained".into()
+                    } else {
+                        "migration remains pending; retry the same operation ID".into()
+                    },
                 ));
             }
         }
@@ -212,10 +237,21 @@ async fn run_migration(
                 "operation_id already names different migration intent".into(),
             ));
         }
-        if journal.phase != MigrationPhase::Reserved {
+        if journal.phase == MigrationPhase::Committed {
+            return Ok(journal.request.proposed);
+        }
+        if journal.phase == MigrationPhase::Staged {
+            let owned = state
+                .storage
+                .claim_migration(request.operation, Uuid::new_v4(), journal.epoch)
+                .await
+                .map_err(DomainError::from)?;
             return state
                 .storage
-                .commit_migration(request.operation)
+                .commit_migration(
+                    request.operation,
+                    owned.ownership().map_err(DomainError::from)?,
+                )
                 .await
                 .map_err(DomainError::from);
         }
@@ -290,16 +326,39 @@ async fn run_migration(
         .reserve_migration(request)
         .await
         .map_err(DomainError::from)?;
+    if journal.phase == MigrationPhase::Committed {
+        return Ok(journal.request.proposed);
+    }
+    let journal = state
+        .storage
+        .claim_migration(request.operation, Uuid::new_v4(), journal.epoch)
+        .await
+        .map_err(DomainError::from)?;
+    let ownership = journal.ownership().map_err(DomainError::from)?;
     if journal.phase == MigrationPhase::Reserved {
-        let mut envelopes = Vec::with_capacity(prepared.len());
-        for (version, (provider, old_context, new_context, old_parent, new_parent)) in
-            request.child.key_versions.iter().zip(prepared)
-        {
+        // Resolve old envelopes before recording dispatch. Once the marker is
+        // durable, even a lost response before the first call is unknown for a
+        // non-repeatable provider and cannot release the reservation.
+        let mut old_envelopes = Vec::with_capacity(prepared.len());
+        for version in &request.child.key_versions {
             let KeyMaterial::ParentWrapped(material) = &version.material else {
                 unreachable!("validated wrapped version")
             };
-            let old_envelope =
-                read_envelope(state, material.wrapped_material_ref().as_str()).await?;
+            old_envelopes
+                .push(read_envelope(state, material.wrapped_material_ref().as_str()).await?);
+        }
+        let retry_safe = prepared
+            .iter()
+            .all(|(provider, ..)| provider.rewrap_is_retry_safe());
+        state
+            .storage
+            .begin_migration_dispatch(request.operation, ownership, retry_safe)
+            .await
+            .map_err(DomainError::from)?;
+        let mut envelopes = Vec::with_capacity(prepared.len());
+        for (old_envelope, (provider, old_context, new_context, old_parent, new_parent)) in
+            old_envelopes.into_iter().zip(prepared)
+        {
             envelopes.push(
                 provider
                     .rewrap_wrapped_key(
@@ -315,13 +374,13 @@ async fn run_migration(
         }
         state
             .storage
-            .stage_migration(request.operation, &envelopes)
+            .stage_migration(request.operation, ownership, &envelopes)
             .await
             .map_err(DomainError::from)?;
     }
     state
         .storage
-        .commit_migration(request.operation)
+        .commit_migration(request.operation, ownership)
         .await
         .map_err(DomainError::from)
 }

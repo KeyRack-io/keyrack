@@ -349,6 +349,9 @@ impl SoftwareProvider {
             .keys
             .read()
             .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+        if !keys.contains_key(&parent.key_id) {
+            return Err(KeyRackError::WrappingParentDestroyed);
+        }
         Self::get_material(&keys, parent, |m| match m {
             KeyMaterial::Aes256(k) => Some(gcm_decrypt::<Aes256Gcm>(k, envelope, aad)),
             _ => None,
@@ -1156,6 +1159,10 @@ impl CryptoProvider for SoftwareProvider {
     /// this declaration makes a software-wrapped child provider-contained.
     fn wrapping_capabilities(&self) -> WrappingCapabilities {
         software_wrapping_capabilities()
+    }
+
+    fn rewrap_is_retry_safe(&self) -> bool {
+        true
     }
 
     async fn generate_wrapped_key(

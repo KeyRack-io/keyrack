@@ -94,19 +94,53 @@ impl StorageBackend for CachingStorage {
     ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
         self.inner.get_migration(operation).await
     }
+    async fn claim_migration(
+        &self,
+        operation: uuid::Uuid,
+        owner: uuid::Uuid,
+        expected_epoch: u64,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner
+            .claim_migration(operation, owner, expected_epoch)
+            .await
+    }
+    async fn begin_migration_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        retry_safe: bool,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner
+            .begin_migration_dispatch(operation, ownership, retry_safe)
+            .await
+    }
+    async fn wrapped_key_snapshot(
+        &self,
+        lid: &Lid,
+        version: u64,
+    ) -> Result<keyrack_core::migration::WrappedKeySnapshot> {
+        self.inner.wrapped_key_snapshot(lid, version).await
+    }
     async fn stage_migration(
         &self,
         operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
         envelopes: &[Vec<u8>],
     ) -> Result<keyrack_core::migration::MigrationJournal> {
-        self.inner.stage_migration(operation, envelopes).await
+        self.inner
+            .stage_migration(operation, ownership, envelopes)
+            .await
     }
-    async fn commit_migration(&self, operation: uuid::Uuid) -> Result<KeyRecord> {
+    async fn commit_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
         let journal = self.inner.get_migration(operation).await?;
         if let Some(value) = &journal {
             self.invalidate(&value.request.child.lid).await;
         }
-        let result = self.inner.commit_migration(operation).await;
+        let result = self.inner.commit_migration(operation, ownership).await;
         if let Some(value) = &journal {
             self.invalidate(&value.request.child.lid).await;
         }
@@ -408,11 +442,20 @@ mod tests {
         cache
             .stage_migration(
                 request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&cache, request.operation)
+                    .await,
                 &keyrack_test_support::migration_conformance::envelopes(),
             )
             .await
             .unwrap();
-        cache.commit_migration(request.operation).await.unwrap();
+        cache
+            .commit_migration(
+                request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&cache, request.operation)
+                    .await,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             cache.get_key(&request.child.lid).await.unwrap().parent_lid,
             Some(request.new_parent.lid)

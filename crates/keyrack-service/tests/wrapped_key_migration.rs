@@ -57,6 +57,12 @@ struct ObservedProvider {
     paused: AtomicBool,
     entered: Semaphore,
     release: Semaphore,
+    retry_safe: AtomicBool,
+    fail_at_call: AtomicUsize,
+    open_paused: AtomicBool,
+    open_entered: Semaphore,
+    open_release: Semaphore,
+    decrypts: AtomicUsize,
 }
 impl ObservedProvider {
     fn new() -> Self {
@@ -66,6 +72,12 @@ impl ObservedProvider {
             paused: AtomicBool::new(false),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
+            retry_safe: AtomicBool::new(true),
+            fail_at_call: AtomicUsize::new(0),
+            open_paused: AtomicBool::new(false),
+            open_entered: Semaphore::new(0),
+            open_release: Semaphore::new(0),
+            decrypts: AtomicUsize::new(0),
         }
     }
 }
@@ -76,6 +88,9 @@ impl CryptoProvider for ObservedProvider {
     }
     fn wrapping_capabilities(&self) -> WrappingCapabilities {
         self.inner.wrapping_capabilities()
+    }
+    fn rewrap_is_retry_safe(&self) -> bool {
+        self.retry_safe.load(Ordering::SeqCst)
     }
     fn wrapping_closure_verifier(
         &self,
@@ -99,6 +114,7 @@ impl CryptoProvider for ObservedProvider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
+        self.decrypts.fetch_add(1, Ordering::SeqCst);
         self.inner.decrypt(handle, ciphertext, aad).await
     }
     async fn sign(
@@ -142,6 +158,10 @@ impl CryptoProvider for ObservedProvider {
         parent: &KeyHandle,
         envelope: &[u8],
     ) -> Result<WrappedKeyLease> {
+        if self.open_paused.swap(false, Ordering::SeqCst) {
+            self.open_entered.add_permits(1);
+            self.open_release.acquire().await.unwrap().forget();
+        }
         self.inner.open_wrapped_key(context, parent, envelope).await
     }
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {
@@ -155,14 +175,21 @@ impl CryptoProvider for ObservedProvider {
         new: &WrappingContext,
         new_parent: &KeyHandle,
     ) -> Result<Vec<u8>> {
-        self.rewraps.fetch_add(1, Ordering::SeqCst);
+        let call = self.rewraps.fetch_add(1, Ordering::SeqCst) + 1;
         if self.paused.load(Ordering::SeqCst) {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
         }
-        self.inner
+        let envelope = self
+            .inner
             .rewrap_wrapped_key(old, old_parent, envelope, new, new_parent)
-            .await
+            .await?;
+        if self.fail_at_call.load(Ordering::SeqCst) == call {
+            return Err(KeyRackError::ProviderUnavailable(
+                "injected lost provider reply after effect".into(),
+            ));
+        }
+        Ok(envelope)
     }
 }
 
@@ -531,17 +558,33 @@ async fn recovery_resumes_each_phase_and_committed_replay_is_idempotent() {
         let request = prepare_migration(&state, child.lid, Some(new.lid), operation)
             .await
             .unwrap();
-        state.storage.reserve_migration(&request).await.unwrap();
+        let reserved = state.storage.reserve_migration(&request).await.unwrap();
+        let ownership = state
+            .storage
+            .claim_migration(operation, Uuid::new_v4(), reserved.epoch)
+            .await
+            .unwrap()
+            .ownership()
+            .unwrap();
         if phase != MigrationPhase::Reserved {
+            state
+                .storage
+                .begin_migration_dispatch(operation, ownership, true)
+                .await
+                .unwrap();
             let bytes = envelopes(&state, &request).await;
             state
                 .storage
-                .stage_migration(operation, &bytes)
+                .stage_migration(operation, ownership, &bytes)
                 .await
                 .unwrap();
         }
         if phase == MigrationPhase::Committed {
-            state.storage.commit_migration(operation).await.unwrap();
+            state
+                .storage
+                .commit_migration(operation, ownership)
+                .await
+                .unwrap();
         }
         // Restart storage and the service, retaining the provider as an external
         // surviving backend. The software provider itself is not persistent.
@@ -878,4 +921,403 @@ async fn archived_creation_replay_cannot_restore_old_parent_in_the_cache() {
         .read_creation_envelope(operation)
         .await
         .is_err());
+}
+
+async fn destroy_resident_parent(state: &Arc<ServiceState>, parent: &KeyRecord) {
+    let mut due = state.storage.get_key_for_use(&parent.lid).await.unwrap();
+    due.transition_to(KeyState::PendingDeletion).unwrap();
+    due.scheduled_deletion_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    state.storage.update_key(&due).await.unwrap();
+    let claim = state
+        .storage
+        .claim_destruction(&due.lid, due.occ_version, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("all old envelope dependencies retired");
+    let provider = state
+        .providers
+        .resolve(&ProviderRef::new("default"))
+        .unwrap()
+        .provider;
+    for version in &claim.record().key_versions {
+        provider
+            .destroy_key(version.resident_handle().unwrap())
+            .await
+            .unwrap();
+    }
+    state.storage.complete_destruction(claim).await.unwrap();
+}
+
+async fn wait_for_reads(reads: &AtomicUsize, minimum: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while reads.load(Ordering::SeqCst) < minimum {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained versions remain readable while phase is held");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_versions_decrypt_continuously_in_reserve_stage_commit_and_after_erasure() {
+    let (state, provider, child, old, new) = fixture().await;
+    let child = append_version(&state, &child, &old).await;
+    let child = append_version(&state, &child, &old).await;
+    let ciphertexts = ciphertexts(&state, &child).await;
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    let reserved = state.storage.reserve_migration(&request).await.unwrap();
+    let ownership = state
+        .storage
+        .claim_migration(request.operation, Uuid::new_v4(), reserved.epoch)
+        .await
+        .unwrap()
+        .ownership()
+        .unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reader = tokio::spawn({
+        let state = state.clone();
+        let child = child.clone();
+        let ciphertexts = ciphertexts.clone();
+        let reads = reads.clone();
+        let stopped = stopped.clone();
+        async move {
+            while !stopped.load(Ordering::SeqCst) {
+                // Deliberately retain the original descriptor throughout commit.
+                assert_decrypts(&state, &child, &ciphertexts).await;
+                reads.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    wait_for_reads(&reads, 8).await;
+    state
+        .storage
+        .begin_migration_dispatch(request.operation, ownership, true)
+        .await
+        .unwrap();
+    let replacement = envelopes(&state, &request).await;
+    state
+        .storage
+        .stage_migration(request.operation, ownership, &replacement)
+        .await
+        .unwrap();
+    let before = reads.load(Ordering::SeqCst);
+    wait_for_reads(&reads, before + 8).await;
+    state
+        .storage
+        .commit_migration(request.operation, ownership)
+        .await
+        .unwrap();
+    destroy_resident_parent(&state, &old).await;
+    let before = reads.load(Ordering::SeqCst);
+    wait_for_reads(&reads, before + 8).await;
+    stopped.store(true, Ordering::SeqCst);
+    reader
+        .await
+        .expect("no read failed across publication or erasure");
+    assert!(provider.decrypts.load(Ordering::SeqCst) >= 24 * 3);
+    assert_decrypts(&state, &child, &ciphertexts).await;
+    for version in &child.key_versions {
+        assert!(read_envelope(&state, version).await.is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_paused_before_open_survives_commit_and_parent_destruction_on_both_paths() {
+    for two_key in [false, true] {
+        let (state, provider, child, old, new) = fixture().await;
+        let ciphertexts = ciphertexts(&state, &child).await;
+        provider.open_paused.store(true, Ordering::SeqCst);
+        let before = provider.decrypts.load(Ordering::SeqCst);
+        let reader = tokio::spawn({
+            let state = state.clone();
+            let child = child.clone();
+            let ciphertext = ciphertexts[0].clone();
+            async move {
+                let crypto = state
+                    .providers
+                    .resolve(&ProviderRef::new("default"))
+                    .unwrap()
+                    .provider;
+                let decrypt_provider = crypto.clone();
+                let version = child.primary_version().unwrap();
+                if two_key {
+                    domain::with_usable_handles(
+                        &state,
+                        domain::VersionUse {
+                            record: &child,
+                            version,
+                            provider: &crypto,
+                        },
+                        domain::VersionUse {
+                            record: &child,
+                            version,
+                            provider: &crypto,
+                        },
+                        |handle| async move {
+                            decrypt_provider
+                                .decrypt(&handle, &ciphertext, b"aad")
+                                .await
+                                .map_err(DomainError::from)
+                        },
+                        |_handle, plaintext| async move { Ok(plaintext.expose().clone()) },
+                    )
+                    .await
+                } else {
+                    domain::with_usable_handle(
+                        &state,
+                        &child,
+                        version,
+                        &crypto,
+                        |handle| async move {
+                            decrypt_provider
+                                .decrypt(&handle, &ciphertext, b"aad")
+                                .await
+                                .map(|v| v.expose().clone())
+                                .map_err(DomainError::from)
+                        },
+                    )
+                    .await
+                }
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.open_entered.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+            .await
+            .unwrap();
+        rewrap_key(&state, request).await.unwrap();
+        destroy_resident_parent(&state, &old).await;
+        provider.open_release.add_permits(1);
+        assert_eq!(reader.await.unwrap().unwrap(), b"original payload");
+        assert_eq!(
+            provider.decrypts.load(Ordering::SeqCst) - before,
+            1,
+            "the caller crypto operation must never be replayed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restoring_pre_migration_database_after_parent_destruction_fails_explicitly() {
+    let path = std::env::temp_dir().join(format!("keyrack-restore-{}.sqlite", Uuid::new_v4()));
+    let backup = path.with_extension("backup.sqlite");
+    let provider = Arc::new(ObservedProvider::new());
+    let state = service_state(
+        Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap()),
+        provider.clone(),
+    );
+    let old = domain::create_key(&state, input(None)).await.unwrap();
+    let new = domain::create_key(&state, input(None)).await.unwrap();
+    let child = domain::create_key(&state, input(Some(&old))).await.unwrap();
+    let child = append_version(&state, &child, &old).await;
+    let ciphertexts = ciphertexts(&state, &child).await;
+    drop(state);
+    std::fs::copy(&path, &backup).unwrap();
+    let state = service_state(
+        Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap()),
+        provider.clone(),
+    );
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    rewrap_key(&state, request).await.unwrap();
+    destroy_resident_parent(&state, &old).await;
+    assert_decrypts(&state, &child, &ciphertexts).await;
+    drop(state);
+    // Restore only the database. The provider is deliberately retained, so its
+    // completed destruction survives restore just as an external backend would.
+    let restored = service_state(
+        Arc::new(keyrack_sqlite::SqliteStorage::open(&backup).unwrap()),
+        provider,
+    );
+    for (version, ciphertext) in child.key_versions.iter().zip(&ciphertexts) {
+        let crypto = restored
+            .providers
+            .resolve(&ProviderRef::new("default"))
+            .unwrap()
+            .provider;
+        let decrypt = crypto.clone();
+        let error =
+            domain::with_usable_handle(&restored, &child, version, &crypto, |handle| async move {
+                decrypt
+                    .decrypt(&handle, ciphertext, b"aad")
+                    .await
+                    .map_err(DomainError::from)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, DomainError::FailedPrecondition(message) if message == "wrapping parent destroyed"),
+            "unexpected restore result: {error:?}"
+        );
+    }
+    drop(restored);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(backup).unwrap();
+}
+
+#[tokio::test]
+async fn unknown_nonrepeatable_provider_outcome_retains_reservation_without_redispatch() {
+    let (state, provider, child, _old, new) = fixture().await;
+    let ciphertexts = ciphertexts(&state, &child).await;
+    provider.retry_safe.store(false, Ordering::SeqCst);
+    provider.fail_at_call.store(1, Ordering::SeqCst);
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(rewrap_key(&state, request.clone()).await.is_err());
+    assert_eq!(provider.rewraps.load(Ordering::SeqCst), 1);
+    assert_decrypts(&state, &child, &ciphertexts).await;
+    assert!(rewrap_key(&state, request.clone()).await.is_err());
+    assert_eq!(
+        provider.rewraps.load(Ordering::SeqCst),
+        1,
+        "unknown native effect must not be repeated blindly"
+    );
+    assert_eq!(
+        state
+            .storage
+            .get_migration(request.operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        MigrationPhase::Reserved
+    );
+    assert!(matches!(
+        state
+            .storage
+            .check_migration_fence(&request.old_parent.lid)
+            .await,
+        Err(KeyRackError::ProviderUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn partial_repeatable_provider_failure_preserves_every_reader_until_recovery() {
+    let (state, provider, child, old, new) = fixture().await;
+    let child = append_version(&state, &child, &old).await;
+    let child = append_version(&state, &child, &old).await;
+    let ciphertexts = ciphertexts(&state, &child).await;
+    provider.fail_at_call.store(2, Ordering::SeqCst);
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(rewrap_key(&state, request.clone()).await.is_err());
+    assert_eq!(provider.rewraps.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        state
+            .storage
+            .get_key_for_use(&child.lid)
+            .await
+            .unwrap()
+            .parent_lid,
+        Some(old.lid)
+    );
+    assert_decrypts(&state, &child, &ciphertexts).await;
+    provider.fail_at_call.store(0, Ordering::SeqCst);
+    let committed = rewrap_key(&state, request).await.unwrap();
+    assert_eq!(provider.rewraps.load(Ordering::SeqCst), 5);
+    assert_decrypts(&state, &committed, &ciphertexts).await;
+}
+
+#[tokio::test]
+async fn metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_migration() {
+    for staged in [false, true] {
+        let (state, _provider, child, old, new) = fixture().await;
+        let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+            .await
+            .unwrap();
+        let reserved = state.storage.reserve_migration(&request).await.unwrap();
+        let ownership = state
+            .storage
+            .claim_migration(request.operation, Uuid::new_v4(), reserved.epoch)
+            .await
+            .unwrap()
+            .ownership()
+            .unwrap();
+        if staged {
+            state
+                .storage
+                .begin_migration_dispatch(request.operation, ownership, true)
+                .await
+                .unwrap();
+            let replacement = envelopes(&state, &request).await;
+            state
+                .storage
+                .stage_migration(request.operation, ownership, &replacement)
+                .await
+                .unwrap();
+        }
+        for record in [&child, &old, &new] {
+            let mut metadata = record.clone();
+            metadata.description = "ordinary update while migration pending".into();
+            metadata.occ_version += 1;
+            assert!(matches!(
+                state.storage.update_key(&metadata).await,
+                Err(KeyRackError::ProviderUnavailable(_))
+            ));
+            let key_id = record.lid.to_string();
+            assert!(matches!(
+                domain::enable_key(&state, &key_id).await,
+                Err(DomainError::ProviderUnavailable(_))
+            ));
+            assert!(matches!(
+                domain::disable_key(&state, &record.lid, &key_id).await,
+                Err(KeyRackError::ProviderUnavailable(_))
+            ));
+            assert!(matches!(
+                domain::schedule_key_deletion(&state, &key_id, 7).await,
+                Err(DomainError::ProviderUnavailable(_))
+            ));
+            assert!(matches!(
+                domain::cancel_key_deletion(&state, &key_id).await,
+                Err(DomainError::ProviderUnavailable(_))
+            ));
+        }
+        let alias_name = format!("alias/migration-{}", Uuid::new_v4());
+        let mut alias = keyrack_core::storage::AliasRecord {
+            alias_name: alias_name.clone(),
+            target_lid: child.lid,
+            created_at: chrono::Utc::now(),
+        };
+        state.storage.create_alias(&alias).await.unwrap();
+        assert_eq!(
+            state.storage.resolve_alias(&alias_name).await.unwrap(),
+            child.lid
+        );
+        state.storage.delete_alias(&alias_name).await.unwrap();
+        alias.target_lid = new.lid;
+        state.storage.create_alias(&alias).await.unwrap();
+        assert_eq!(
+            state.storage.resolve_alias(&alias_name).await.unwrap(),
+            new.lid
+        );
+        let pending = state
+            .storage
+            .get_migration(request.operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending.request.child.lid, child.lid,
+            "alias retargeting cannot change a LID-addressed migration"
+        );
+        let result = rewrap_key(&state, request).await.unwrap();
+        assert_eq!(result.lid, child.lid);
+        assert_eq!(
+            state.storage.resolve_alias(&alias_name).await.unwrap(),
+            new.lid
+        );
+    }
 }

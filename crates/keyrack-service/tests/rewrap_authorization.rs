@@ -142,15 +142,27 @@ async fn request(
     let target = parent
         .map(|record| record.lid.to_string())
         .unwrap_or_default();
+    request_body(
+        state,
+        &child.lid.to_string(),
+        serde_json::json!({"operation_id": operation, "new_parent_key_id": target}),
+        rest,
+    )
+    .await
+}
+
+async fn request_body(
+    state: &Arc<ServiceState>,
+    child_id: &str,
+    body: serde_json::Value,
+    rest: bool,
+) -> (u16, serde_json::Value) {
     if rest {
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(format!("/v1/keys/{}/rewrap", child.lid))
+            .uri(format!("/v1/keys/{child_id}/rewrap"))
             .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({"operation_id": operation, "new_parent_key_id": target})
-                    .to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .unwrap();
         let response = keyrack_service::rest::router(state.clone())
             .oneshot(request)
@@ -160,27 +172,66 @@ async fn request(
         let bytes = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
-        (code, serde_json::from_slice(&bytes).unwrap())
+        (
+            code,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"error":String::from_utf8_lossy(&bytes)})),
+        )
     } else {
+        let string = |name: &str| body[name].as_str().unwrap_or_default().to_owned();
         let response = keyrack_service::grpc::KeyServiceImpl::new(state.clone())
             .rewrap_key(tonic::Request::new(proto::RewrapKeyRequest {
-                key_id: child.lid.to_string(),
-                new_parent_key_id: target,
-                operation_id: operation.into(),
+                key_id: child_id.into(),
+                new_parent_key_id: string("new_parent_key_id"),
+                operation_id: string("operation_id"),
+                old_parent_key_id: string("old_parent_key_id"),
+                expected_child_revision: body["expected_child_revision"].as_u64(),
+                expected_old_parent_revision: body["expected_old_parent_revision"].as_u64(),
+                expected_new_parent_revision: body["expected_new_parent_revision"].as_u64(),
+                covered_versions: body["covered_versions"]
+                    .as_array()
+                    .map(|values| values.iter().map(|v| v.as_u64().unwrap()).collect())
+                    .unwrap_or_default(),
             }))
             .await;
         match response {
             Ok(response) => {
-                let result = response.into_inner();
+                let response = response.into_inner();
+                let result = response
+                    .result
+                    .expect("successful response carries terminal receipt");
                 (
                     200,
-                    serde_json::json!({"operation_id":result.operation_id, "parent":result.metadata.unwrap().parent_key_id}),
+                    serde_json::json!({
+                        "operation_id":response.operation_id,
+                        "parent":response.metadata.unwrap().parent_key_id,
+                        "result": {
+                            "operation_id":result.operation_id,
+                            "child":result.child,
+                            "old_parent":result.old_parent,
+                            "old_parent_versions":result.old_parent_versions,
+                            "new_parent":result.new_parent,
+                            "new_parent_version":result.new_parent_version,
+                            "digest_algorithm":result.digest_algorithm,
+                            "versions":result.versions.into_iter().map(|v| serde_json::json!({
+                                "version":v.version, "old_parent_version":v.old_parent_version,
+                                "new_parent_version":v.new_parent_version,
+                                "old_envelope_digest":v.old_envelope_digest,
+                                "new_envelope_digest":v.new_envelope_digest,
+                                "old_reference":v.old_reference,"new_reference":v.new_reference,
+                            })).collect::<Vec<_>>()
+                        }
+                    }),
                 )
             }
             Err(error) => (
                 match error.code() {
                     tonic::Code::PermissionDenied => 403,
                     tonic::Code::InvalidArgument => 400,
+                    tonic::Code::FailedPrecondition
+                    | tonic::Code::Aborted
+                    | tonic::Code::AlreadyExists => 409,
+                    tonic::Code::Unavailable => 503,
                     _ => 500,
                 },
                 serde_json::json!({"error":error.message()}),
@@ -188,6 +239,7 @@ async fn request(
         }
     }
 }
+
 #[tokio::test]
 async fn both_surfaces_deny_missing_permission_on_either_parent_before_reservation() {
     for rest in [false, true] {
@@ -427,4 +479,293 @@ async fn committed_replay_authorizes_fresh_parent_metadata_beyond_cache_ttl() {
             .0,
         403
     );
+}
+
+fn intent_body(
+    child: &KeyRecord,
+    old: &KeyRecord,
+    new: &KeyRecord,
+    operation: uuid::Uuid,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id":operation.to_string(),
+        "old_parent_key_id":old.lid.to_string(),
+        "new_parent_key_id":new.lid.to_string(),
+        "expected_child_revision":child.occ_version,
+        "expected_old_parent_revision":old.occ_version,
+        "expected_new_parent_revision":new.occ_version,
+        "covered_versions":[1],
+    })
+}
+
+#[tokio::test]
+async fn every_caller_intent_field_is_bound_on_both_surfaces() {
+    for rest in [false, true] {
+        let (state, _, _) = state(None, false);
+        let old = create(&state, None).await;
+        let new = create(&state, None).await;
+        let other = create(&state, None).await;
+        let child = create(&state, Some(&old)).await;
+        let other_child = create(&state, Some(&old)).await;
+        let operation = uuid::Uuid::new_v4();
+        let original = intent_body(&child, &old, &new, operation);
+        let first = request_body(&state, &child.lid.to_string(), original.clone(), rest).await;
+        assert_eq!(first.0, 200, "rest={rest}: {}", first.1);
+        // A caller that lost the first reply receives exactly the same receipt.
+        let retry = request_body(&state, &child.lid.to_string(), original.clone(), rest).await;
+        assert_eq!(retry.0, 200);
+        assert_eq!(retry.1["result"], first.1["result"]);
+        assert_eq!(
+            request_body(&state, &other_child.lid.to_string(), original.clone(), rest)
+                .await
+                .0,
+            409,
+            "child must bind intent"
+        );
+        for (field, value) in [
+            (
+                "old_parent_key_id",
+                serde_json::json!(other.lid.to_string()),
+            ),
+            (
+                "new_parent_key_id",
+                serde_json::json!(other.lid.to_string()),
+            ),
+            (
+                "expected_child_revision",
+                serde_json::json!(child.occ_version + 1),
+            ),
+            (
+                "expected_old_parent_revision",
+                serde_json::json!(old.occ_version + 1),
+            ),
+            (
+                "expected_new_parent_revision",
+                serde_json::json!(new.occ_version + 1),
+            ),
+            ("covered_versions", serde_json::json!([1, 2])),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            let result = request_body(&state, &child.lid.to_string(), changed, rest).await;
+            assert_eq!(result.0, 409, "{field} rest={rest}: {}", result.1);
+        }
+        for field in [
+            "old_parent_key_id",
+            "new_parent_key_id",
+            "expected_child_revision",
+            "expected_old_parent_revision",
+            "expected_new_parent_revision",
+            "covered_versions",
+        ] {
+            let mut changed = original.clone();
+            changed.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                request_body(&state, &child.lid.to_string(), changed, rest)
+                    .await
+                    .0,
+                409,
+                "presence of {field} binds intent"
+            );
+        }
+        assert_eq!(
+            request_body(&state, &child.lid.to_string(), original, rest)
+                .await
+                .1["result"],
+            first.1["result"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn initial_occ_and_covered_version_assertions_refuse_without_reservation() {
+    for rest in [false, true] {
+        let (state, _, _) = state(None, false);
+        let old = create(&state, None).await;
+        let new = create(&state, None).await;
+        let child = create(&state, Some(&old)).await;
+        for (field, value) in [
+            ("old_parent_key_id", serde_json::json!(new.lid.to_string())),
+            (
+                "expected_child_revision",
+                serde_json::json!(child.occ_version + 1),
+            ),
+            (
+                "expected_old_parent_revision",
+                serde_json::json!(old.occ_version + 1),
+            ),
+            (
+                "expected_new_parent_revision",
+                serde_json::json!(new.occ_version + 1),
+            ),
+            ("covered_versions", serde_json::json!([2])),
+            ("covered_versions", serde_json::json!([1, 1])),
+        ] {
+            let operation = uuid::Uuid::new_v4();
+            let mut body = intent_body(&child, &old, &new, operation);
+            let expected_status = if value == serde_json::json!([1, 1]) {
+                400
+            } else {
+                409
+            };
+            body[field] = value;
+            let result = request_body(&state, &child.lid.to_string(), body, rest).await;
+            assert_eq!(
+                result.0, expected_status,
+                "{field} rest={rest}: {}",
+                result.1
+            );
+            assert!(state
+                .storage
+                .get_migration(operation)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_receipt_binds_envelopes_and_survives_lost_reply_and_later_changes() {
+    for rest in [false, true] {
+        let (state, _, _) = state(None, false);
+        let old = create(&state, None).await;
+        let new = create(&state, None).await;
+        let child = create(&state, Some(&old)).await;
+        let keyrack_core::key::KeyMaterial::ParentWrapped(material) =
+            &child.key_versions[0].material
+        else {
+            panic!("wrapped fixture")
+        };
+        let old_reference = material.wrapped_material_ref().as_str().to_owned();
+        let creation: uuid::Uuid = old_reference
+            .strip_prefix("creation:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let original_bytes = state
+            .storage
+            .read_creation_envelope(creation)
+            .await
+            .unwrap();
+        let operation = uuid::Uuid::new_v4();
+        let body = intent_body(&child, &old, &new, operation);
+        let (code, response) =
+            request_body(&state, &child.lid.to_string(), body.clone(), rest).await;
+        assert_eq!(code, 200, "{response}");
+        let result = response["result"].clone();
+        assert_eq!(result["operation_id"], operation.to_string());
+        assert_eq!(result["child"], child.lid.to_string());
+        assert_eq!(result["old_parent"], old.lid.to_string());
+        assert_eq!(result["old_parent_versions"], serde_json::json!([1]));
+        assert_eq!(result["new_parent"], new.lid.to_string());
+        assert_eq!(result["new_parent_version"], 1);
+        assert_eq!(result["digest_algorithm"], "blake3");
+        assert_eq!(result["versions"].as_array().unwrap().len(), 1);
+        let entry = &result["versions"][0];
+        assert_eq!(entry["version"], 1);
+        assert_eq!(entry["old_parent_version"], 1);
+        assert_eq!(entry["new_parent_version"], 1);
+        assert_eq!(entry["old_reference"], old_reference);
+        assert_eq!(entry["new_reference"], format!("migration:{operation}:1"));
+        assert_eq!(
+            entry["old_envelope_digest"],
+            blake3::hash(&original_bytes).to_hex().as_str()
+        );
+        let new_bytes = state
+            .storage
+            .read_migration_envelope(operation, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            entry["new_envelope_digest"],
+            blake3::hash(&new_bytes).to_hex().as_str()
+        );
+        assert!(state
+            .storage
+            .read_creation_envelope(creation)
+            .await
+            .is_err());
+        // Drop the first response, change ordinary metadata, then recover by ID.
+        drop(response);
+        let mut updated = state.storage.get_key(&child.lid).await.unwrap();
+        updated.description = "changed after commit".into();
+        updated.occ_version += 1;
+        state.storage.update_key(&updated).await.unwrap();
+        let replay = request_body(&state, &child.lid.to_string(), body, rest).await;
+        assert_eq!(replay.0, 200, "{}", replay.1);
+        assert_eq!(replay.1["result"], result);
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_validation() {
+    for rest in [false, true] {
+        let (state, _, _) = state(None, false);
+        let old_parent = create(&state, None).await;
+        let new_parent = create(&state, None).await;
+        let child = create(&state, Some(&old_parent)).await;
+        let operation = uuid::Uuid::new_v4();
+        let migration = keyrack_service::migration::prepare_migration(
+            &state,
+            child.lid,
+            Some(new_parent.lid),
+            operation,
+        )
+        .await
+        .unwrap();
+        state.storage.reserve_migration(&migration).await.unwrap();
+        for record in [&child, &old_parent, &new_parent] {
+            for action in ["enable", "disable", "schedule-deletion", "cancel-deletion"] {
+                if rest {
+                    let request = axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/keys/{}/actions-{action}", record.lid))
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap();
+                    let response = keyrack_service::rest::router(state.clone())
+                        .oneshot(request)
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 503, "{action} on {}", record.lid);
+                } else {
+                    let service = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+                    let key_id = record.lid.to_string();
+                    let response = match action {
+                        "enable" => service
+                            .enable_key(tonic::Request::new(proto::EnableKeyRequest { key_id }))
+                            .await
+                            .map(|_| ()),
+                        "disable" => service
+                            .disable_key(tonic::Request::new(proto::DisableKeyRequest { key_id }))
+                            .await
+                            .map(|_| ()),
+                        "schedule-deletion" => service
+                            .schedule_key_deletion(tonic::Request::new(
+                                proto::ScheduleKeyDeletionRequest {
+                                    key_id,
+                                    grace_period_days: 7,
+                                },
+                            ))
+                            .await
+                            .map(|_| ()),
+                        "cancel-deletion" => service
+                            .cancel_key_deletion(tonic::Request::new(
+                                proto::CancelKeyDeletionRequest { key_id },
+                            ))
+                            .await
+                            .map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        response.unwrap_err().code(),
+                        tonic::Code::Unavailable,
+                        "{action} on {}",
+                        record.lid
+                    );
+                }
+            }
+        }
+    }
 }
