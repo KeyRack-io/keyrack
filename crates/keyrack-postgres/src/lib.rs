@@ -272,6 +272,10 @@ impl StorageBackend for PostgresStorage {
         self.creation_recoverable(after, limit).await
     }
 
+    async fn withdraw_creation(&self, operation: Uuid) -> Result<()> {
+        self.creation_withdraw(operation).await
+    }
+
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         self.create_key_guarded(record).await
     }

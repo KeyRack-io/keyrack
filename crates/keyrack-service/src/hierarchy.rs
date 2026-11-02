@@ -44,6 +44,7 @@ use crate::domain::DomainError;
 use crate::state::ServiceState;
 use keyrack_core::creation::{creation_correlation, CreationOwner, CreationRequest};
 use keyrack_core::creation_driver::{A2CreationDriver, CreationProgress, WrappingCreationProvider};
+use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{
     Exportability, KeyMaterial, KeyRecord, KeySpec, KeyState, KeyVersionRecord, ProviderRef,
 };
@@ -192,13 +193,69 @@ pub async fn create_wrapped_child(
     let parent_provider = parent_provider_ref(&parent)?;
     refuse_cross_domain(provider_name, parent_provider)?;
 
-    let parent_version = parent
+    record.provider_ref = Some(provider_name.clone());
+    record.provider_class = entry.class;
+    record.key_versions = Vec::new();
+    let version = journaled_version(provider_name, entry, profile, &parent, record, None)?;
+
+    let progress = version.run(state).await.map_err(DomainError::from)?;
+
+    match progress {
+        CreationProgress::Committed(record) => Ok(*record),
+        // Not a failure and not a success: the attempt owns durable state that
+        // only reconciliation may resolve. Retrying the same call would be a
+        // second attempt, which is why this does not retry itself.
+        CreationProgress::Pending(reason) => Err(DomainError::ProviderUnavailable(format!(
+            "child creation is unresolved ({reason:?}); it requires reconciliation \
+             and must not be assumed to have failed"
+        ))),
+    }
+}
+
+/// One wrapped version ready for the creation journal, and the adapter that
+/// owns its provider object from before Generate until that object is closed.
+struct JournaledVersion {
+    request: CreationRequest,
+    driver: WrappingCreationProvider,
+}
+
+impl JournaledVersion {
+    async fn run(self, state: &ServiceState) -> keyrack_core::error::Result<CreationProgress> {
+        A2CreationDriver::new(Arc::clone(&state.storage), Arc::new(self.driver))
+            .run(self.request)
+            .await
+    }
+}
+
+/// Propose `record`'s next version, wrapped under the parent's current one.
+///
+/// `record` carries the versions it already has, none for a creation, and
+/// `expected_key_occ` is the snapshot those versions were read at, `None` for a
+/// creation. The parent's current version is named in the descriptor and its
+/// handle given to the provider, so the version wraps under exactly what the
+/// journal rechecks.
+fn journaled_version(
+    provider_name: &ProviderRef,
+    entry: &ProviderEntry,
+    profile: &WrappingProfile,
+    parent: &KeyRecord,
+    mut record: KeyRecord,
+    expected_key_occ: Option<u64>,
+) -> Result<JournaledVersion, DomainError> {
+    let parent_handle = parent
         .primary_version()
-        .ok_or_else(|| DomainError::FailedPrecondition("parent has no primary version".into()))?;
-    let parent_handle = parent_version
+        .ok_or_else(|| DomainError::FailedPrecondition("parent has no primary version".into()))?
         .resident_handle()
         .map_err(DomainError::from)?
         .clone();
+    let version_number = record
+        .key_versions
+        .iter()
+        .map(|v| v.version_number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| DomainError::FailedPrecondition("key version number exhausted".into()))?;
 
     let operation = Uuid::new_v4();
     let attempt = Uuid::new_v4();
@@ -214,16 +271,29 @@ pub async fn create_wrapped_child(
     )
     .map_err(|e| DomainError::InvalidArgument(format!("invalid wrapped material: {e}")))?;
 
-    record.occ_version = 1;
-    record.current_key_version = 1;
-    record.provider_ref = Some(provider_name.clone());
-    record.provider_class = entry.class;
-    record.key_versions = vec![KeyVersionRecord {
-        version_number: 1,
+    let created_at = match expected_key_occ {
+        None => record.created_at,
+        Some(_) => chrono::Utc::now(),
+    };
+    record.occ_version = match expected_key_occ {
+        None => 1,
+        Some(occ) => occ
+            .checked_add(1)
+            .ok_or_else(|| DomainError::FailedPrecondition("key OCC exhausted".into()))?,
+    };
+    if expected_key_occ.is_some() {
+        record.updated_at = created_at;
+    }
+    for version in &mut record.key_versions {
+        version.is_primary = false;
+    }
+    record.key_versions.push(KeyVersionRecord {
+        version_number,
         material: KeyMaterial::ParentWrapped(material),
-        created_at: record.created_at,
+        created_at,
         is_primary: true,
-    }];
+    });
+    record.current_key_version = version_number;
 
     let mut request = CreationRequest {
         operation,
@@ -231,7 +301,7 @@ pub async fn create_wrapped_child(
         owner: creation_owner(),
         correlation: creation_correlation(operation, attempt),
         record,
-        expected_key_occ: None,
+        expected_key_occ,
         expected_parent_occ: parent.occ_version,
         parent_spec: parent.key_spec.clone(),
         context_bytes: Vec::new(),
@@ -241,12 +311,12 @@ pub async fn create_wrapped_child(
         .and_then(|context| {
             context
                 .canonical_bytes()
-                .map_err(|e| keyrack_core::error::KeyRackError::Other(e.to_string()))
+                .map_err(|e| KeyRackError::Other(e.to_string()))
         })
         .map_err(DomainError::from)?;
 
     // The provider is asked for the whole profile before anything is created:
-    // a child that cannot later be opened and closed must not exist.
+    // a version that cannot later be opened and closed must not exist.
     let driver = WrappingCreationProvider::new(
         Arc::clone(&entry.provider),
         parent_handle,
@@ -257,22 +327,7 @@ pub async fn create_wrapped_child(
             "provider '{provider_name}' cannot wrap child keys: {e}"
         ))
     })?;
-
-    let progress = A2CreationDriver::new(Arc::clone(&state.storage), Arc::new(driver))
-        .run(request)
-        .await
-        .map_err(DomainError::from)?;
-
-    match progress {
-        CreationProgress::Committed(record) => Ok(*record),
-        // Not a failure and not a success: the attempt owns durable state that
-        // only reconciliation may resolve. Retrying the same call would be a
-        // second attempt, which is why this does not retry itself.
-        CreationProgress::Pending(reason) => Err(DomainError::ProviderUnavailable(format!(
-            "child creation is unresolved ({reason:?}); it requires reconciliation \
-             and must not be assumed to have failed"
-        ))),
-    }
+    Ok(JournaledVersion { request, driver })
 }
 
 /// A child must be exactly what a wrapped version can durably represent.

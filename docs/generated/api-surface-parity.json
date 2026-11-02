@@ -4,7 +4,7 @@
   "source_sha256": {
     "conformance/api-surface/contract.json": "b3c43471dc4fe97d58c23c584a4fca19aa371cf50c434d109ecfc85286145f04",
     "crates/keyrack-service/src/bin/keyrack-softhsm-init.rs": "9671d4404992421733f72a59397e0f5bfe08a1b89311f2cf2c5ec28f45a07529",
-    "crates/keyrack-service/src/cache.rs": "cd41a7b5e82c9174813014d38d47b46298f3bab4de39b6ca51e5ef36d6937eb4",
+    "crates/keyrack-service/src/cache.rs": "86fa3f3d05304b5e6a851f9f07c8f80663381ffb0e7ad7392e33d606dac43422",
     "crates/keyrack-service/src/cert_reload.rs": "a0735d26327cf703f041d03965dcaa2e33e31662bcab99be890eea205ca898d6",
     "crates/keyrack-service/src/compromise.rs": "55150daeb0580bd286c9c0827af7457a600f3f4d1611b1cdb9f2a05370232a31",
     "crates/keyrack-service/src/config.rs": "4d4681b579ab81c9e2e930685d42602dbb1b472dbb8c7f6acd973b7a33b76fb9",
@@ -12,7 +12,7 @@
     "crates/keyrack-service/src/deferred_provider.rs": "019b5a19f21f439741eef28d0fee4e694927859e97ac17cfbe35d51dcdc7f065",
     "crates/keyrack-service/src/domain.rs": "95fe6b8ef8a55e75d39b279dad6cab6532390cf7f66cdd227a9b0feea841368f",
     "crates/keyrack-service/src/grpc.rs": "286493cc5df19478bd87c6bd9f8f63b55baefc43f35ed0394fe72b28a311c7ba",
-    "crates/keyrack-service/src/hierarchy.rs": "61b8abdfd3378e29e737e08f0559eee42c4506dab22be95a158e1f954440cb4c",
+    "crates/keyrack-service/src/hierarchy.rs": "8f4cde63f509a738d2cf4107f68c4fef39e7254c0c890493f7ed3796939614c5",
     "crates/keyrack-service/src/hsm_registration.rs": "04c9fbcdbf76de33f1bfe38068d953161b3a094d11129b7f337b00f9f8afc205",
     "crates/keyrack-service/src/identity_input.rs": "e7d8e657a3db28587eee96690e18781987e9fc21747ec8bf046d00e49123030b",
     "crates/keyrack-service/src/lease.rs": "cfcc25b1b1d94e5e6bf00f7413d77a42307ffcf23ce6a13f576830f105d7764d",
