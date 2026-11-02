@@ -106,7 +106,17 @@ cargo test -p keyrack-sqlite
 cargo test -p keyrack-service
 # Against a disposable database; never a deployment database:
 cargo test -p keyrack-postgres --features live-tests
+# New or empty directory outside disposable build storage; retain it as evidence:
+python3 scripts/test-deletion-scheduling-controls.py --output /path/to/deletion-controls
 ```
+
+The control runner copies the current source into a disposable directory, verifies
+all ten baseline tests, then removes only the shared scheduling refusal in that
+copy. It requires eight surface refusals and the domain refusal to fail for
+unexpected successful scheduling, while the logical-only positive still passes.
+The checkout is never edited. Source hashes, commands, logs and the result remain
+in `--output`; a nonempty output directory is refused. `CARGO_TARGET_DIR` is
+honored, and `--timeout` bounds each Cargo invocation (default 1,800 seconds).
 
 These are implementation tests, not a new Tamarin proof or a production hierarchy
 qualification. Existing ignored live-provider tests remain separate invocations.
