@@ -498,6 +498,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   every pull request and push to main. Dependency exceptions are recorded in
   `deny.toml`; external sources are restricted to crates.io.
 
+### Dependency maintenance
+
+- Refresh the locked TLS and advisory set for RUSTSEC-2026-0381, RUSTSEC-2026-0382,
+  RUSTSEC-2026-0385 and RUSTSEC-2026-0386; upgrade async-nats to 0.47.0.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave
