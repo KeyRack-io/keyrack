@@ -32,6 +32,43 @@ def child_environment(root: Path, inherited: dict[str, str]) -> dict[str, str]:
     return environment
 
 
+def counterfactual_sources(native: str, engine: str) -> tuple[str, str]:
+    native = replace_once(native, "Attribute::Wrap(matches!(role, Role::Kek)),",
+                          "Attribute::Wrap(matches!(role, Role::Kek | Role::Parent)),")
+    native = replace_once(native, "Attribute::Unwrap(matches!(role, Role::Kek)),",
+                          "Attribute::Unwrap(matches!(role, Role::Kek | Role::Parent)),")
+    start = native.index("fn derive(")
+    end = native.index("fn unwrapped_policy(", start)
+    native = native[:start] + """fn derive(
+    _session: &Session, parent: ObjectHandle, _context: &WrappingContext, _label: &str,
+) -> Result<ObjectHandle> {
+    Ok(parent)
+}
+
+""" + native[end:]
+    native = replace_once(native, "for key in [child, kek] {", "for key in [child] {")
+    native = replace_once(native, "let destroyed = session.destroy_object(kek);",
+                          "let destroyed: cryptoki::error::Result<()> = Ok(());")
+    engine = replace_once(engine, "native::self_test(provider, &profile)?;",
+                          "let _ = provider; // Counterfactual source only: bypass admission.")
+    # Removing derivation and startup admission makes these exact items unused.
+    # Keep CI's -D warnings intact; allow only mutation-induced warnings in the
+    # isolated copy, never in production source or global compiler flags.
+    for anchor, lint in [
+        ("use cryptoki::mechanism::ekdf::AesCbcDeriveParams;", "unused_imports"),
+        ("    Kek,", "dead_code"),
+        ("fn context_digest(", "dead_code"),
+        ("    fn known_answer(", "dead_code"),
+        ("pub(super) fn self_test(", "dead_code"),
+        ("fn self_test_observed(", "dead_code"),
+    ]:
+        indent = anchor[:len(anchor) - len(anchor.lstrip())]
+        native = replace_once(native, anchor, f"{indent}#[allow({lint})]\n" + anchor)
+    engine = replace_once(engine, "    fn self_test_context(",
+                          "    #[allow(dead_code)]\n    fn self_test_context(")
+    return native, engine
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[4]
     native_path = Path("crates/keyrack-pkcs11/src/provider/context_wrapping/native.rs")
@@ -40,25 +77,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="keyrack-context-control-") as temporary:
         copied = Path(temporary) / "source"
         shutil.copytree(root, copied, ignore=shutil.ignore_patterns(".git", "target", "__pycache__"))
-        native = originals[native_path].decode()
-        native = replace_once(native, "Attribute::Wrap(matches!(role, Role::Kek)),",
-                              "Attribute::Wrap(matches!(role, Role::Kek | Role::Parent)),")
-        native = replace_once(native, "Attribute::Unwrap(matches!(role, Role::Kek)),",
-                              "Attribute::Unwrap(matches!(role, Role::Kek | Role::Parent)),")
-        start = native.index("fn derive(")
-        end = native.index("fn unwrapped_policy(", start)
-        native = native[:start] + """fn derive(
-    _session: &Session, parent: ObjectHandle, _context: &WrappingContext, _label: &str,
-) -> Result<ObjectHandle> {
-    Ok(parent)
-}
-
-""" + native[end:]
-        native = replace_once(native, "for key in [child, kek] {", "for key in [child] {")
-        native = replace_once(native, "let destroyed = session.destroy_object(kek);",
-                              "let destroyed: cryptoki::error::Result<()> = Ok(());")
-        engine = replace_once(originals[engine_path].decode(), "native::self_test(provider, &profile)?;",
-                              "let _ = provider; // Counterfactual source only: bypass admission.")
+        native, engine = counterfactual_sources(originals[native_path].decode(),
+                                               originals[engine_path].decode())
         (copied / native_path).write_text(native)
         (copied / engine_path).write_text(engine)
         command = ["cargo", "test", "--locked", "-p", "keyrack-service", "--test", "softhsm_wrapped_service",
