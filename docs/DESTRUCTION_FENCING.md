@@ -14,7 +14,13 @@ returns HTTP 409 with `FailedPrecondition`. The diagnostic contains counts named
 `own_parent_wrapped_versions`, `dependent_parent_wrapped_versions` and
 `creation_journal_rows`, never the LIDs of other keys. Counts cover all versions
 and all journal phases; a row matching both journal roles counts once. Logical
-`parent_lid` relationships alone do not block scheduling.
+`parent_lid` relationships alone do not block scheduling. Successful gRPC and REST
+schedule responses include `logical_only_children`: the number of direct
+persisted child records whose versions all contain resident material, observed
+by the same admission query. Each child counts once, regardless of lifecycle
+state or version count; grandchildren and actual wrapped dependencies are not
+included. The count is informational, not a reservation or approval of data loss.
+
 
 Scheduling and claiming share `StorageBackend::destruction_dependencies` and
 the backend's transaction query. Scheduling is an early observation, not a
@@ -120,3 +126,8 @@ honored, and `--timeout` bounds each Cargo invocation (default 1,800 seconds).
 
 These are implementation tests, not a new Tamarin proof or a production hierarchy
 qualification. Existing ignored live-provider tests remain separate invocations.
+
+The same runner separately replaces the shared logical-only count and each
+transport's reported count with zero. The count assertion must fail for its
+specific domain, gRPC or REST response while all refusal tests keep passing.
+A final restored run must pass, with hashes and diagnostics retained in the receipt.

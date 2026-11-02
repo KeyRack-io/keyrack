@@ -171,39 +171,71 @@ async fn domain_refuses_each_dependency_kind_without_mutation() {
 #[tokio::test]
 async fn logical_only_children_allow_scheduling_on_every_surface() {
     for surface in ["domain", "grpc", "rest"] {
-        let (state, _, _) = build_test_state();
-        let (parent, request) = creation_conformance::fixture();
-        let mut child = request.record;
-        child.key_versions[0].material = parent.key_versions[0].material.clone();
-        state.storage.create_key(&parent).await.unwrap();
-        state.storage.create_key(&child).await.unwrap();
-        let key = parent.lid.to_string();
-        match surface {
-            "domain" => {
-                domain::schedule_key_deletion(&state, &key, 7)
-                    .await
-                    .unwrap();
+        for count in [0_u64, 2] {
+            let (state, _, _) = build_test_state();
+            let (parent, _) = creation_conformance::fixture();
+            state.storage.create_key(&parent).await.unwrap();
+            let mut children = Vec::new();
+            for _ in 0..count {
+                let mut child = creation_conformance::fixture().1.record;
+                child.parent_lid = Some(parent.lid);
+                child.key_versions[0].material = parent.key_versions[0].material.clone();
+                // A child is counted once, not once per resident version.
+                let mut historical = child.key_versions[0].clone();
+                historical.version_number = 2;
+                historical.is_primary = false;
+                child.key_versions.push(historical);
+                state.storage.create_key(&child).await.unwrap();
+                children.push(child);
             }
-            "grpc" => {
-                keyrack_service::grpc::KeyServiceImpl::new(state.clone())
-                    .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
-                        key_id: key,
-                        grace_period_days: 7,
-                    }))
-                    .await
-                    .unwrap();
+            let key = parent.lid.to_string();
+            match surface {
+                "domain" => {
+                    let observation = domain::ensure_deletion_can_be_scheduled(&state, &parent.lid)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        observation.logical_only_children, count,
+                        "logical-only child count must match admission"
+                    );
+                    domain::schedule_key_deletion(&state, &key, 7)
+                        .await
+                        .unwrap();
+                }
+                "grpc" => {
+                    let response = keyrack_service::grpc::KeyServiceImpl::new(state.clone())
+                        .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+                            key_id: key,
+                            grace_period_days: 7,
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert_eq!(
+                        response.logical_only_children, count,
+                        "gRPC logical-only child count must match admission"
+                    );
+                }
+                _ => {
+                    let (status, body) = rest_schedule(state.clone(), &key).await;
+                    assert_eq!(status, 200);
+                    assert_eq!(
+                        body["logical_only_children"].as_u64(),
+                        Some(count),
+                        "REST logical-only child count must match admission: {body}"
+                    );
+                }
             }
-            _ => {
-                assert_eq!(rest_schedule(state.clone(), &key).await.0, 200);
+            assert_eq!(
+                state.storage.get_key(&parent.lid).await.unwrap().state,
+                KeyState::PendingDeletion
+            );
+            for child in children {
+                assert_eq!(
+                    state.storage.get_key(&child.lid).await.unwrap().state,
+                    KeyState::Enabled
+                );
             }
         }
-        assert_eq!(
-            state.storage.get_key(&parent.lid).await.unwrap().state,
-            KeyState::PendingDeletion
-        );
-        assert_eq!(
-            state.storage.get_key(&child.lid).await.unwrap().state,
-            KeyState::Enabled
-        );
     }
 }

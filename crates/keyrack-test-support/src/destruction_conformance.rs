@@ -169,6 +169,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
         assert_eq!(
             store.destruction_dependencies(&parent.lid).await.unwrap(),
             DestructionDependencies {
+                logical_only_children: 0,
                 own_parent_wrapped_versions: 0,
                 dependent_parent_wrapped_versions: u64::from(phase == 3),
                 creation_journal_rows: 1,
@@ -182,6 +183,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                     .await
                     .unwrap(),
                 DestructionDependencies {
+                    logical_only_children: 0,
                     own_parent_wrapped_versions: 1,
                     dependent_parent_wrapped_versions: 0,
                     creation_journal_rows: 1,
@@ -269,6 +271,7 @@ pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageB
     store.create_key(&unrelated).await.unwrap();
 
     let expected = DestructionDependencies {
+        logical_only_children: 1,
         own_parent_wrapped_versions: 2,
         dependent_parent_wrapped_versions: 3,
         creation_journal_rows: 1,
@@ -298,6 +301,68 @@ pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageB
         .destruction_dependencies(&unique_test_key_record(KeyState::Enabled).lid)
         .await
         .is_err());
+}
+
+pub async fn logical_only_children_are_direct_resident_records(store: &dyn StorageBackend) {
+    let (parent, request) = fixture();
+    store.create_key(&parent).await.unwrap();
+    assert_eq!(
+        store
+            .destruction_dependencies(&parent.lid)
+            .await
+            .unwrap()
+            .logical_only_children,
+        0
+    );
+    let mut first_child = None;
+    for state in [KeyState::Enabled, KeyState::Destroyed] {
+        let mut child = unique_test_key_record(state);
+        child.parent_lid = Some(parent.lid);
+        let mut historical = child.key_versions[0].clone();
+        historical.version_number = 2;
+        historical.is_primary = false;
+        child.key_versions.push(historical);
+        store.create_key(&child).await.unwrap();
+        first_child.get_or_insert(child.lid);
+    }
+    let mut grandchild = unique_test_key_record(KeyState::Enabled);
+    grandchild.parent_lid = first_child;
+    store.create_key(&grandchild).await.unwrap();
+    store
+        .create_key(&unique_test_key_record(KeyState::Enabled))
+        .await
+        .unwrap();
+    let mut empty_child = unique_test_key_record(KeyState::Enabled);
+    empty_child.parent_lid = Some(parent.lid);
+    empty_child.key_versions.clear();
+    store.create_key(&empty_child).await.unwrap();
+    let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
+    assert_eq!(
+        counts.logical_only_children, 2,
+        "count records once, not versions or descendants"
+    );
+    assert!(
+        counts.is_empty(),
+        "logical-only children do not block destruction"
+    );
+    assert_eq!(
+        counts.summary(),
+        DestructionDependencies::default().summary()
+    );
+
+    // A direct logical link with wrapped material is not a logical-only child,
+    // even when its current version is provider-resident.
+    let mut mixed_child = unique_test_key_record(KeyState::Enabled);
+    mixed_child.parent_lid = Some(parent.lid);
+    let mut wrapped = request.record.key_versions[0].clone();
+    wrapped.version_number = 2;
+    wrapped.is_primary = false;
+    mixed_child.key_versions.push(wrapped);
+    store.create_key(&mixed_child).await.unwrap();
+    let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
+    assert_eq!(counts.logical_only_children, 2);
+    assert_eq!(counts.dependent_parent_wrapped_versions, 1);
+    assert!(!counts.is_empty());
 }
 
 pub async fn dependency_snapshot_is_rechecked_at_claim(store: &dyn StorageBackend) {
@@ -336,7 +401,10 @@ pub async fn dependency_snapshot_is_rechecked_at_claim(store: &dyn StorageBacken
     store.create_key(&child).await.unwrap();
     assert_eq!(
         store.destruction_dependencies(&parent.lid).await.unwrap(),
-        DestructionDependencies::default()
+        DestructionDependencies {
+            logical_only_children: 1,
+            ..DestructionDependencies::default()
+        }
     );
     assert!(store
         .claim_destruction(&parent.lid, parent.occ_version, chrono::Utc::now())
@@ -429,6 +497,13 @@ macro_rules! destruction_conformance_tests {
             #[tokio::test]
             async fn dependency_counts_cover_all_material_and_kinds() {
                 $crate::destruction_conformance::dependency_counts_cover_all_material_and_kinds(
+                    &$create,
+                )
+                .await;
+            }
+            #[tokio::test]
+            async fn logical_only_children_are_direct_resident_records() {
+                $crate::destruction_conformance::logical_only_children_are_direct_resident_records(
                     &$create,
                 )
                 .await;

@@ -645,7 +645,7 @@ async fn schedule_key_deletion(
             .get("grace_period_days")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(7);
-        crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
+        let dependencies = crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
             .await
             .map_err(|error| error.to_rest_error())?;
         record
@@ -661,7 +661,9 @@ async fn schedule_key_deletion(
             .update_key(&record)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&record))
+        let Json(mut response) = key_json(&record);
+        response["logical_only_children"] = serde_json::json!(dependencies.logical_only_children);
+        Ok(Json(response))
     })
     .await
 }

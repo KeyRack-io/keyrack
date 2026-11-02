@@ -15,11 +15,15 @@ pub fn invalid(message: &str) -> KeyRackError {
     KeyRackError::Storage(format!("destruction: {message}"))
 }
 
-/// Counts that block destruction, without disclosing dependent key identities.
+/// Dependency counts without disclosing dependent key identities.
 /// Every stored version and every journal phase counts, including historical
-/// material and completed creation journals. Logical `parent_lid` is not an edge.
+/// material and completed creation journals. Logical-only children are reported
+/// separately and do not block destruction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DestructionDependencies {
+    /// Direct persisted child records with nonempty, entirely provider-resident
+    /// version histories, including terminal records whose metadata link remains.
+    pub logical_only_children: u64,
     pub own_parent_wrapped_versions: u64,
     pub dependent_parent_wrapped_versions: u64,
     pub creation_journal_rows: u64,
@@ -44,6 +48,19 @@ impl DestructionDependencies {
     /// Shared material counting for storage implementors scanning a consistent
     /// snapshot. A version belongs to the own OR other-key category, never both.
     pub fn include_record(&mut self, lid: &Lid, record: &KeyRecord) -> Result<()> {
+        if record.lid != *lid
+            && record.parent_lid == Some(*lid)
+            && !record.key_versions.is_empty()
+            && record
+                .key_versions
+                .iter()
+                .all(|version| matches!(version.material, KeyMaterial::ProviderResident { .. }))
+        {
+            self.logical_only_children = self
+                .logical_only_children
+                .checked_add(1)
+                .ok_or_else(|| invalid("dependency count overflow"))?;
+        }
         for version in &record.key_versions {
             if let KeyMaterial::ParentWrapped(material) = &version.material {
                 let count = if record.lid == *lid {

@@ -1008,12 +1008,12 @@ pub async fn disable_key(
 pub async fn ensure_deletion_can_be_scheduled(
     state: &Arc<ServiceState>,
     lid: &Lid,
-) -> Result<(), DomainError> {
+) -> Result<keyrack_core::destruction::DestructionDependencies, DomainError> {
     let dependencies = state.storage.destruction_dependencies(lid).await?;
     if !dependencies.is_empty() {
         return Err(DomainError::FailedPrecondition(dependencies.summary()));
     }
-    Ok(())
+    Ok(dependencies)
 }
 
 pub async fn schedule_key_deletion(
