@@ -34,7 +34,7 @@ use keyrack_core::provider::{CryptoProvider, KeyHandle, WrappedKeyClosure, Wrapp
 use keyrack_core::wrapping::WrappingContext;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
@@ -119,6 +119,18 @@ pub(crate) struct LeaseGuard {
     handle: KeyHandle,
     subject: LeaseSubject,
     in_flight: Option<CloseTask>,
+    slot: Option<Slot>,
+}
+
+/// One admitted use, counted against [`LeaseCleanup::limit`] from before its
+/// open until its close is answered or its cleanup reaches a final outcome.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let left = self.0.fetch_sub(1, Ordering::SeqCst) - 1;
+        publish_slots(left);
+    }
 }
 
 impl LeaseGuard {
@@ -169,15 +181,20 @@ impl LeaseGuard {
     }
 }
 
-/// One close attempt, run as its own task so that a panic in the provider is
-/// a failed attempt rather than the end of the cleanup task that must record
-/// an outcome.
+/// One close attempt, run as its own task on the owner so that a panic in the
+/// provider is a failed attempt rather than the end of the cleanup task that
+/// must record an outcome. Once the owner has stopped, no attempt starts.
 async fn attempt_close(
+    owner: &LeaseCleanup,
     provider: Arc<dyn CryptoProvider>,
     lease: WrappedKeyLease,
 ) -> Result<WrappedKeyClosure> {
-    tokio::spawn(async move { provider.close_wrapped_key(&lease).await })
-        .await
+    let Some(task) = owner.spawn(async move { provider.close_wrapped_key(&lease).await }) else {
+        return Err(KeyRackError::ProviderUnavailable(
+            "wrapped lease cleanup has stopped".into(),
+        ));
+    };
+    task.await
         .unwrap_or_else(|error| Err(close_did_not_finish(&error)))
 }
 
@@ -194,6 +211,11 @@ fn publish_pending(len: usize) {
     metrics::gauge!("keyrack_wrapped_lease_cleanup_pending").set(len as f64);
 }
 
+fn publish_slots(len: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!("keyrack_wrapped_lease_slots_in_use").set(len as f64);
+}
+
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
@@ -202,6 +224,7 @@ impl Drop for LeaseGuard {
                 lease,
                 &self.subject,
                 self.in_flight.take(),
+                self.slot.take(),
             );
         }
     }
@@ -215,11 +238,14 @@ struct Counters {
     abandoned: AtomicU64,
 }
 
+type Pending = BTreeMap<u64, (LeaseSubject, Option<Slot>)>;
+
 struct Inner {
     stopped: AtomicBool,
     next: AtomicU64,
     limit: usize,
-    pending: Mutex<BTreeMap<u64, LeaseSubject>>,
+    occupied: Arc<AtomicUsize>,
+    pending: Mutex<Pending>,
     counters: Counters,
 }
 
@@ -241,8 +267,9 @@ impl Default for LeaseCleanup {
 }
 
 impl LeaseCleanup {
-    /// An owner that refuses new wrapped-key uses while `limit` closes are
-    /// outstanding.
+    /// An owner that admits at most `limit` wrapped-key uses at once, counting
+    /// each from before its open until its close is answered or its cleanup
+    /// reaches a final outcome.
     #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
@@ -251,16 +278,32 @@ impl LeaseCleanup {
                 stopped: AtomicBool::new(false),
                 next: AtomicU64::new(0),
                 limit,
+                occupied: Arc::new(AtomicUsize::new(0)),
                 pending: Mutex::new(BTreeMap::new()),
                 counters: Counters::default(),
             }),
         }
     }
 
-    /// The outstanding-close limit this owner was created with.
+    /// The most wrapped-key uses this owner admits at once.
     #[must_use]
     pub fn limit(&self) -> usize {
         self.inner.limit
+    }
+
+    /// Admit one use, or `None` at the limit. Checking and counting are one
+    /// atomic step, so concurrent admissions cannot pass the limit together.
+    fn reserve(&self) -> Option<Slot> {
+        let limit = self.inner.limit;
+        let before = self
+            .inner
+            .occupied
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()?;
+        publish_slots(before + 1);
+        Some(Slot(Arc::clone(&self.inner.occupied)))
     }
 
     /// Open a wrapped child for one use.
@@ -269,9 +312,11 @@ impl LeaseCleanup {
     /// cancelled, so a lease it produces after the request has gone is still
     /// owned, and closed.
     ///
-    /// Refused as unavailable while [`limit`](Self::limit) closes are pending:
-    /// a client can cancel requests at will, and every cancelled use leaves a
-    /// close behind, so new uses wait for the backlog instead of growing it.
+    /// Refused as unavailable, before anything is opened, while
+    /// [`limit`](Self::limit) uses are admitted. A use stays admitted through
+    /// its open, its operation, its close and any cleanup after cancellation,
+    /// because a client can cancel at will and every cancelled use leaves an
+    /// open or a close running. Closes are never refused.
     pub(crate) async fn open(
         &self,
         provider: Arc<dyn CryptoProvider>,
@@ -280,12 +325,12 @@ impl LeaseCleanup {
         envelope: Vec<u8>,
         used: LeaseUse,
     ) -> Result<LeaseGuard> {
-        if self.pending() >= self.inner.limit {
+        let Some(slot) = self.reserve() else {
             return Err(KeyRackError::ProviderUnavailable(format!(
-                "wrapped lease cleanup backlog is at its limit of {}; retry later",
+                "wrapped lease limit of {} uses is reached; retry later",
                 self.inner.limit
             )));
-        }
+        };
         let (answer, answered) = tokio::sync::oneshot::channel();
         let owner = self.clone();
         let opening = self.spawn(async move {
@@ -299,6 +344,7 @@ impl LeaseCleanup {
                     provider,
                     owner,
                     in_flight: None,
+                    slot: Some(slot),
                 });
             // A guard nobody received is dropped here, which schedules its close.
             drop(answer.send(opened));
@@ -330,10 +376,11 @@ impl LeaseCleanup {
         self.pending_map().len()
     }
 
-    /// What counts against [`limit`](Self::limit).
+    /// What counts against [`limit`](Self::limit): uses admitted and not yet
+    /// closed or given a final cleanup outcome.
     #[must_use]
     pub fn occupied(&self) -> usize {
-        self.pending()
+        self.inner.occupied.load(Ordering::SeqCst)
     }
 
     /// Stop the owner at `deadline`.
@@ -353,10 +400,12 @@ impl LeaseCleanup {
             publish_pending(0);
             taken
         };
-        for subject in abandoned.values() {
-            self.record(CleanupOutcome::Abandoned, subject, None);
+        let count = abandoned.len();
+        for (subject, slot) in abandoned.into_values() {
+            drop(slot);
+            self.record(CleanupOutcome::Abandoned, &subject, None);
         }
-        abandoned.len()
+        count
     }
 
     /// Run `work` on the owner, or `None` once it has stopped or outside a
@@ -375,18 +424,20 @@ impl LeaseCleanup {
 
     /// Take over a close the request can no longer await: watch `in_flight`
     /// if one was already running, otherwise close. One retry follows a
-    /// failure.
+    /// failure, unless the owner has stopped by then. The use's slot is held
+    /// until the close has a final outcome.
     fn detach(
         &self,
         provider: Arc<dyn CryptoProvider>,
         lease: WrappedKeyLease,
         subject: &LeaseSubject,
         in_flight: Option<CloseTask>,
+        slot: Option<Slot>,
     ) {
         let id = self.inner.next.fetch_add(1, Ordering::SeqCst);
         {
             let mut pending = self.pending_map();
-            pending.insert(id, subject.clone());
+            pending.insert(id, (subject.clone(), slot));
             publish_pending(pending.len());
         }
         let owner = self.clone();
@@ -395,11 +446,11 @@ impl LeaseCleanup {
                 Some(task) => task
                     .await
                     .unwrap_or_else(|error| Err(close_did_not_finish(&error))),
-                None => attempt_close(Arc::clone(&provider), lease.clone()).await,
+                None => attempt_close(&owner, Arc::clone(&provider), lease.clone()).await,
             };
             let result = match first {
                 Ok(closure) => Ok(closure),
-                Err(_) => attempt_close(provider, lease).await,
+                Err(_) => attempt_close(&owner, provider, lease).await,
             };
             owner.settle(id, result);
         });
@@ -410,11 +461,12 @@ impl LeaseCleanup {
         }
     }
 
+    /// Remove a pending close, releasing its slot.
     fn take_pending(&self, id: u64) -> Option<LeaseSubject> {
         let mut pending = self.pending_map();
-        let subject = pending.remove(&id);
+        let taken = pending.remove(&id);
         publish_pending(pending.len());
-        subject
+        taken.map(|(subject, _slot)| subject)
     }
 
     fn settle(&self, id: u64, result: Result<WrappedKeyClosure>) {
@@ -434,7 +486,7 @@ impl LeaseCleanup {
         }
     }
 
-    fn pending_map(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, LeaseSubject>> {
+    fn pending_map(&self) -> std::sync::MutexGuard<'_, Pending> {
         self.inner
             .pending
             .lock()
@@ -498,21 +550,30 @@ mod tests {
     #[tokio::test]
     async fn drain_abandons_what_is_still_pending_after_its_tasks_finish() {
         let owner = LeaseCleanup::default();
+        let slot = owner.reserve();
         owner.pending_map().insert(
             0,
-            LeaseSubject {
-                key_id: "lid_test".into(),
-                version: 1,
-                provider: "default".into(),
-                object: "object".into(),
-                context_sha256: [0; 32],
-            },
+            (
+                LeaseSubject {
+                    key_id: "lid_test".into(),
+                    version: 1,
+                    provider: "default".into(),
+                    object: "object".into(),
+                    context_sha256: [0; 32],
+                },
+                slot,
+            ),
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let abandoned = owner.drain(deadline).await;
         assert_eq!(
-            (abandoned, owner.counts().abandoned, owner.pending()),
-            (1, 1, 0)
+            (
+                abandoned,
+                owner.counts().abandoned,
+                owner.pending(),
+                owner.occupied()
+            ),
+            (1, 1, 0, 0)
         );
     }
 }

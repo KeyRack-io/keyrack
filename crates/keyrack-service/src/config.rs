@@ -138,10 +138,12 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub wrapping: Vec<WrappingProfileConfig>,
 
-    /// Most wrapped-child lease closes that may be outstanding after the
-    /// requests that opened them were cancelled. At the limit, new uses of
-    /// wrapped keys are refused as unavailable, and retryable, until the
-    /// backlog drains. Must be at least 1.
+    /// Most wrapped-key uses that may hold a lease at once, counting each
+    /// from before its open until its close returns or its cleanup reaches a
+    /// final outcome, including closes left behind by cancelled requests. At
+    /// the limit, new uses of wrapped keys are refused as unavailable, and
+    /// retryable, before anything is opened; closes are never refused. Must
+    /// be at least 1.
     #[serde(default = "default_wrapped_lease_cleanup_limit")]
     pub wrapped_lease_cleanup_limit: usize,
 }
