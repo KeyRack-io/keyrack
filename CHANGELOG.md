@@ -45,6 +45,24 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   Only the software provider currently implements the new provider primitive;
   it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
 
+- **Rotate a wrapped child.** `RotateKey` and REST
+  `POST /v1/keys/{key_id}/actions-rotate` on a child wrapped under its parent
+  add a version generated already wrapped under the parent's current version,
+  journaled exactly like creation. Older versions keep the parent versions they
+  name and keep decrypting. Rotating a parent does not rewrap its children; it
+  queues their rotation jobs, and `RewrapKey` moves existing versions. A
+  rotation racing a migration ends with every version under the new parent, or
+  is refused as retryable. A stale read is retried a bounded number of times.
+  Concurrent rotations of one key are serialised in a process and refused as
+  retryable across processes. An interrupted attempt that never reached the
+  provider is withdrawn by the next rotation. One that may hold a provider
+  object refuses rotation until it is reconciled. The creation journal now
+  refuses a version that names anything other than the parent's current
+  version, or a parent other than the record's. A history mixing resident and
+  wrapped versions is still refused. SQLite and PostgreSQL share conformance
+  tests, including recovery at each journal phase, with live PostgreSQL and
+  reverted-fence controls in CI. See [rotation](docs/KEY_ROTATION.md#rotating-a-wrapped-child).
+
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.
@@ -128,8 +146,8 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   are never refused. The handle is whatever the issuing
   provider returned for that open: possessing it is not a grant. A planted
   wrapped descriptor that does not name a journaled envelope is still refused
-  without talking to the provider. Export, rotation and destroy of wrapped
-  material stay refused — those are different lifecycles.
+  without talking to the provider. Export and destroy of wrapped material stay
+  refused — those are different lifecycles.
 - **Wrapping is activated per provider in configuration.** A new `wrapping:`
   block names the provider, the mechanism and the security domain. It is absent
   by default, and then creating a key with a parent is refused everywhere:

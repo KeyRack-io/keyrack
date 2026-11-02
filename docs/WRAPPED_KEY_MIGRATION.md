@@ -58,10 +58,25 @@ provider's resident parent material to remain available: the in-memory software
 provider does not make its resident keys persistent across a process exit.
 
 While reserved or staged, writes affecting the child or either parent are
-refused as retryable. This includes child rotation: it never publishes a version
-under the old parent during migration. Creation and destruction use the same
-writer fence. Existing unsupported wrapped-child rotation remains unsupported
-outside a migration; this operation does not add that lifecycle.
+refused as retryable. Creation and destruction use the same writer fence.
+
+Child rotation (`RotateKey` on a wrapped child) adds a version through the
+creation journal, wrapped under the parent's current version. Against a
+migration of the child or either parent, whichever reservation the writer
+lock admits first wins:
+
+- A migration reserved or staged first refuses the rotation as retryable
+  before any provider call.
+- A rotation reserved first refuses the migration as retryable. After the
+  rotation publishes, a retried migration moves every version, including it.
+- A migration that commits after the rotation read the child leaves the
+  rotation's snapshot stale. The rotation re-reads and wraps under the new
+  parent's current version; after a bounded number of re-reads it is refused
+  as an OCC conflict.
+
+A rotation never publishes a version under the old parent after a migration
+commits. Rotating a parent does not rewrap its children; that is this
+operation.
 
 `parent_lid` changes only through migration. Logical key identity remains stable;
 future hierarchy resolution observes the new parent. Existing rule definitions,

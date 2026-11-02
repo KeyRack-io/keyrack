@@ -114,6 +114,7 @@ impl CreationRequest {
             || record.key_usage != KeyUsage::EncryptDecrypt
             || !matches!(record.key_spec, KeySpec::Aes128 | KeySpec::Aes256)
             || record.lid == material.parent().lid
+            || record.parent_lid != Some(material.parent().lid)
             || record.occ_version == 0
             || record.occ_version > i64::MAX as u64
             || self.expected_parent_occ > i64::MAX as u64
@@ -163,6 +164,13 @@ impl CreationRequest {
             || parent.key_spec != self.parent_spec
         {
             return Err(invalid("parent snapshot is no longer eligible"));
+        }
+        // A new version is wrapped under what the parent encrypts with now;
+        // older parent versions only ever open what was wrapped under them.
+        if material.parent().version.get() != parent.current_key_version {
+            return Err(invalid(
+                "new version must wrap under the parent's current version",
+            ));
         }
         let parent_version = parent
             .get_version(material.parent().version.get())

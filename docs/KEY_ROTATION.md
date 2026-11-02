@@ -90,10 +90,36 @@ Steps:
 7. Publish NATS rotation event (if configured).
 8. Audit event emitted.
 
-**REST caveat**: The REST endpoint `POST /v1/keys/:key_id/actions-rotate`
-performs the core rotation (new version, primary flip, persist) but does
-**not** create descendant rotation jobs and does **not** publish NATS
-events. Use the gRPC `RotateKey` RPC for full cascade behavior.
+The REST endpoint `POST /v1/keys/:key_id/actions-rotate` and the gRPC
+`RotateKey` RPC share one implementation, including descendant jobs and the
+NATS event.
+
+### Rotating a Wrapped Child
+
+A child whose versions are wrapped under its parent rotates through the same
+journal that created it, in place of steps 3–5:
+
+1. The new version is generated already wrapped under the parent's **current**
+   version, and journaled exactly like a creation. The journal refuses a
+   version naming any other parent version.
+2. Older versions are untouched. Each keeps the parent version it names, so
+   existing ciphertext keeps decrypting.
+3. If the child or its parent changed after it was read — for example the
+   parent rotated, or a [migration](WRAPPED_KEY_MIGRATION.md) committed — the
+   attempt is withdrawn before publication and retried on a fresh read, a
+   bounded number of times.
+
+Rotating a parent does **not** rewrap its children. It creates their rotation
+jobs; rotating a child adds a version under the parent's new version, and
+`RewrapKey` moves a child's existing versions.
+
+One rotation of a key runs per process at a time; a concurrent request is
+refused as retryable (`UNAVAILABLE`, HTTP 503). A rotation keeps running if
+its caller disconnects. An earlier attempt that never reached the provider, or
+whose provider object is confirmed closed, is withdrawn by the next rotation.
+An attempt that may still hold a provider object refuses further rotation of
+the key until it is reconciled. If another instance owns that attempt, the
+refusal is retryable, because that attempt may still be running.
 
 ### Cascade: Rotation Jobs for Descendants
 
