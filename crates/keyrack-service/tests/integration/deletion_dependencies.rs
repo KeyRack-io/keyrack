@@ -8,7 +8,6 @@ use keyrack_test_support::creation_conformance;
 
 #[derive(Clone, Copy)]
 enum Blocker {
-    OwnWrappedVersion,
     DependentWrappedVersion,
     ParentJournal,
     ChildJournal,
@@ -17,7 +16,6 @@ enum Blocker {
 impl Blocker {
     fn count(self) -> &'static str {
         match self {
-            Self::OwnWrappedVersion => "own_parent_wrapped_versions=1",
             Self::DependentWrappedVersion => "dependent_parent_wrapped_versions=1",
             Self::ParentJournal | Self::ChildJournal => "creation_journal_rows=1",
         }
@@ -29,10 +27,6 @@ async fn fixture(blocker: Blocker) -> (Arc<ServiceState>, KeyRecord, String) {
     let (parent, mut request) = creation_conformance::fixture();
     state.storage.create_key(&parent).await.unwrap();
     let (target, other) = match blocker {
-        Blocker::OwnWrappedVersion => {
-            state.storage.create_key(&request.record).await.unwrap();
-            (request.record, parent.lid.to_string())
-        }
         Blocker::DependentWrappedVersion => {
             state.storage.create_key(&request.record).await.unwrap();
             (parent, request.record.lid.to_string())
@@ -73,6 +67,7 @@ async fn grpc_refusal(blocker: Blocker) {
     let service = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
     let error = service
         .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            allow_dependent_data_loss: false,
             key_id: target.lid.to_string(),
             grace_period_days: 7,
         }))
@@ -117,10 +112,6 @@ async fn rest_refusal(blocker: Blocker) {
 }
 
 #[tokio::test]
-async fn grpc_refuses_own_wrapped_version() {
-    grpc_refusal(Blocker::OwnWrappedVersion).await;
-}
-#[tokio::test]
 async fn grpc_refuses_dependent_wrapped_version() {
     grpc_refusal(Blocker::DependentWrappedVersion).await;
 }
@@ -131,10 +122,6 @@ async fn grpc_refuses_parent_creation_journal() {
 #[tokio::test]
 async fn grpc_refuses_child_creation_journal() {
     grpc_refusal(Blocker::ChildJournal).await;
-}
-#[tokio::test]
-async fn rest_refuses_own_wrapped_version() {
-    rest_refusal(Blocker::OwnWrappedVersion).await;
 }
 #[tokio::test]
 async fn rest_refuses_dependent_wrapped_version() {
@@ -152,7 +139,6 @@ async fn rest_refuses_child_creation_journal() {
 #[tokio::test]
 async fn domain_refuses_each_dependency_kind_without_mutation() {
     for blocker in [
-        Blocker::OwnWrappedVersion,
         Blocker::DependentWrappedVersion,
         Blocker::ParentJournal,
         Blocker::ChildJournal,
@@ -205,6 +191,7 @@ async fn logical_only_children_allow_scheduling_on_every_surface() {
                 "grpc" => {
                     let response = keyrack_service::grpc::KeyServiceImpl::new(state.clone())
                         .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+                            allow_dependent_data_loss: false,
                             key_id: key,
                             grace_period_days: 7,
                         }))

@@ -139,6 +139,7 @@ jobs:
             destruction_conformance::creation_references_fence_destruction
             destruction_conformance::raw_wrapped_edges_and_new_references
             destruction_conformance::dependency_counts_cover_all_material_and_kinds
+            destruction_conformance::logical_only_children_are_direct_resident_records
             destruction_conformance::dependency_snapshot_is_rechecked_at_claim
           )
           listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
@@ -146,6 +147,57 @@ jobs:
             grep -Fxq "${test_name}: test" <<< "$listing"
             cargo test -p keyrack-postgres --features live-tests --test conformance "$test_name" -- --exact
           done
+
+      - name: Run deletion approval persistence and erasure regressions (no zero-test pass)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            override_snapshot_survives_reconnect_cancel_clears_it_and_parent_loss_preserves_child
+            dependent_appearing_after_approval_refuses_claim_without_changing_pending_state
+            wrapped_child_destruction_erases_only_owned_envelopes
+            generic_schedule_change_does_not_reuse_override_approval
+            failed_completion_rolls_back_wrapped_envelope_erasure
+            migrated_child_erasure_removes_all_version_envelopes
+            nonterminal_migration_roles_refuse_even_with_override
+            schedule_reports_logical_children_from_its_admission_snapshot
+          )
+          listing=$(cargo test --locked -p keyrack-postgres --features live-tests --test deletion_overrides -- --list)
+          for test_name in "${tests[@]}"; do
+            grep -Fxq "${test_name}: test" <<< "$listing"
+          done
+          cargo test --locked -p keyrack-postgres --features live-tests --test deletion_overrides
+
+  deletion-dependencies:
+    name: Dependency-aware deletion matrix and reverted refusals
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run gRPC and REST deletion matrices (no zero-test pass)
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing=$(cargo test --locked -p keyrack-service --test integration -- --list)
+          for test_name in dependency_override_event_surface_matrix override_requires_its_own_permission_on_both_surfaces refusal_is_audited_and_counted_without_destroying_material destroyed_parent_is_explicit_and_child_envelopes_can_be_erased_on_both_surfaces migration_journals_refuse_all_roles_and_overrides_on_both_surfaces rest_rejects_non_boolean_data_loss_intent; do
+            grep -Fxq "deletion_override::${test_name}: test" <<< "$listing"
+          done
+          cargo test --locked -p keyrack-service --test integration deletion_
+      - name: Revert scheduling refusals
+        run: python3 scripts/test-deletion-scheduling-controls.py --output "${{ runner.temp }}/deletion-scheduling"
+      - name: Revert approval and claim refusals
+        run: python3 scripts/test-deletion-approval-controls.py --output "${{ runner.temp }}/deletion-approval"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deletion-refusal-controls
+          path: |
+            ${{ runner.temp }}/deletion-scheduling/
+            ${{ runner.temp }}/deletion-approval/
+          if-no-files-found: error
 
   docker:
     name: Docker build

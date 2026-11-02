@@ -82,6 +82,46 @@ impl CachingStorage {
 
 #[async_trait::async_trait]
 impl StorageBackend for CachingStorage {
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        // Dependencies include other keys and journals; never serve cache data.
+        self.inner.destruction_dependencies(lid).await
+    }
+    async fn schedule_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        allow: bool,
+    ) -> Result<keyrack_core::destruction::ScheduledDeletion> {
+        self.invalidate(lid).await;
+        let result = self
+            .inner
+            .schedule_destruction(lid, expected_occ, at, allow)
+            .await;
+        self.invalidate(lid).await;
+        result
+    }
+    async fn cancel_destruction(&self, lid: &Lid, expected_occ: u64) -> Result<KeyRecord> {
+        self.invalidate(lid).await;
+        let result = self.inner.cancel_destruction(lid, expected_occ).await;
+        self.invalidate(lid).await;
+        result
+    }
+    async fn deletion_intent(
+        &self,
+        lid: &Lid,
+    ) -> Result<Option<keyrack_core::destruction::DeletionIntent>> {
+        self.inner.deletion_intent(lid).await
+    }
+    async fn destroyed_wrapping_parents(
+        &self,
+        lid: &Lid,
+    ) -> Result<Vec<keyrack_core::destruction::DestroyedWrappingParent>> {
+        self.inner.destroyed_wrapping_parents(lid).await
+    }
     async fn reserve_migration(
         &self,
         request: &keyrack_core::migration::MigrationRequest,
@@ -157,13 +197,7 @@ impl StorageBackend for CachingStorage {
         self.inner.check_migration_fence(lid).await
     }
 
-    async fn destruction_dependencies(
-        &self,
-        lid: &Lid,
-    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
-        // Dependencies include other keys and journals; never serve cache data.
-        self.inner.destruction_dependencies(lid).await
-    }
+
 
     async fn claim_destruction(
         &self,

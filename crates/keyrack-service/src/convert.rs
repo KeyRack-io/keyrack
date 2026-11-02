@@ -226,6 +226,7 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
         .collect();
 
     proto::KeyMetadata {
+        wrapping_parent_destroyed_versions: Vec::new(),
         key_id: record.lid.to_string(),
         key_spec: key_spec_to_proto(&record.key_spec).into(),
         key_usage: key_usage_to_proto(record.key_usage).into(),
@@ -291,6 +292,7 @@ pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status 
         KeyRackError::OptimisticConcurrencyConflict { .. } => tonic::Status::aborted(msg),
         KeyRackError::InvalidStateTransition { .. }
         | KeyRackError::KeyDestructionFenced(_)
+        | KeyRackError::DeletionDependencyRefused { .. }
         | KeyRackError::WrappingParentDestroyed
         | KeyRackError::MigrationIntentConflict { .. }
         | KeyRackError::OperationNotPermitted { .. }

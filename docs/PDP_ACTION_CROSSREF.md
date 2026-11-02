@@ -71,10 +71,43 @@ Internal domain functions still require their caller's authorization/audit envel
 | `EnableKey` | `kms:EnableKey` | Yes |
 | `DisableKey` | `kms:DisableKey` | Yes |
 | `ScheduleKeyDeletion` | `kms:ScheduleKeyDeletion` | Yes |
+| `ScheduleKeyDeletion` (data-loss override) | `kms:ScheduleKeyDeletionWithDependentDataLoss` | New in 0.5.0 |
 | `CancelKeyDeletion` | `kms:CancelKeyDeletion` | Yes |
 | `RotateKey` | `kms:RotateKey` | Yes |
 | `RewrapKey` (child and both parents) | `kms:RewrapKey` | New in 0.5.0 |
 | `ReportKeyCompromise` | `kms:ReportKeyCompromise` | **No** |
+
+### Deletion overrides require a second permission
+
+Both gRPC `ScheduleKeyDeletion` and REST scheduling always require
+`kms:ScheduleKeyDeletion`. When the decoded request sets
+`allow_dependent_data_loss: true`, they also require
+`kms:ScheduleKeyDeletionWithDependentDataLoss` on the same key, even if the
+current dependency set is empty. The second action does not replace the first
+and is not a separate callable operation. Direct domain/storage callers remain
+responsible for their own authorization envelope.
+
+Each check has a distinct PDP request ID and enforces the usual response
+correlation, version and obligation contract. The override request context
+contains `allow_dependent_data_loss: true` and `operation_request_id` to identify
+the outer operation. A denial, indeterminate result or PDP failure on either
+check prevents scheduling. The secondary refusal is audited under
+`kms:ScheduleKeyDeletionWithDependentDataLoss`; the overall schedule audit
+records `allow_dependent_data_loss` as well.
+
+The permission authorizes loss of the wrapped dependents captured by storage
+when scheduling, not arbitrary dependents added later. The claim rechecks that
+snapshot under the writer fence. Nonterminal creation and migration journals
+cannot be overridden. Cancellation removes the approval; deletion never
+recursively deletes or migrates dependents. See the
+[destruction contract](DESTRUCTION_FENCING.md).
+
+Exact-action policies and custom Cedar schemas must explicitly declare and
+grant `kms:ScheduleKeyDeletionWithDependentDataLoss` where needed. Existing
+unrestricted-action grants also grant this action. The bundled Cedar engine's
+context/entity limitation described above still applies: use an exact-action
+grant on the intended resources rather than relying on the new context flag
+for a policy condition.
 
 ### RewrapKey authorizes three roles
 
@@ -168,25 +201,22 @@ not cancel the admitted task; a process crash may leave an unresolved attempt.
 
 ## Background worker actions (no RPC — internal only)
 
-These actions are emitted by KeyRack's background workers, not by
-user-facing RPCs. They appear in audit logs and PDP authorization
-calls but are not invoked by external clients.
+These actions identify background events rather than user-facing RPCs.
+In particular, destruction claim refusal is an audit event, not another
+permission that an external client can invoke; scheduling authorization
+precedes the worker claim.
 
 | Trigger | Action string | In contract §7.1? |
 |---------|---------------|-------------------|
 | Hierarchy cascade disable | `kms:CascadeDisable` | **No** |
 | Rotation job expiry worker | `kms:RotationJobExpired` | **No** |
 | Scheduled key destruction worker | `kms:KeyDestroyed` | **No** |
+| Destruction claim refusal | `kms:KeyDestructionRefused` | New in 0.5.0 |
 
-## Summary
+## Action registry maintenance
 
-- **40 actions** match PDP Service Contract v1.0 §7.1 exactly.
-- **4 actions** are KeyRack additions not yet in the contract:
-  - `kms:ReportKeyCompromise` — user-facing RPC, added post-contract
-  - `kms:CascadeDisable` — background worker
-  - `kms:RotationJobExpired` — background worker
-  - `kms:KeyDestroyed` — background worker
-
-**Recommendation:** Register all 4 in the PDP action registry to avoid
-`INDETERMINATE` with `reason_code=UNKNOWN_ACTION`. Propose adding them
-to PDP Service Contract §7.1 in the next vocabulary minor bump.
+Keep custom PDP registries and schemas aligned with the authorization actions
+above, including directional ReEncrypt, RewrapKey and the separate deletion
+override. An unknown permission may produce `INDETERMINATE` with
+`reason_code=UNKNOWN_ACTION`. Audit-only worker event names do not grant API
+permissions and should not be treated as substitutes for scheduling authority.

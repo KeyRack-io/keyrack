@@ -222,6 +222,8 @@ message KeyMetadata {
   // Whether the logical key is or has ever been marked compromised.
   // Applies to every version and remains true after lifecycle transitions.
   bool has_compromise_history = 18;
+  // Wrapped versions whose parent material was destroyed, on all metadata responses.
+  repeated uint64 wrapping_parent_destroyed_versions = 19;
 }
 
 message KeyVersionMetadata {
@@ -473,6 +475,9 @@ message DisableKeyResponse {
 message ScheduleKeyDeletionRequest {
   string key_id = 1;
   uint32 grace_period_days = 2;
+  // Requires independent kms:ScheduleKeyDeletionWithDependentDataLoss permission.
+  // The server snapshots approved dependents; callers cannot supply a snapshot.
+  bool allow_dependent_data_loss = 3;
 }
 
 message ScheduleKeyDeletionResponse {

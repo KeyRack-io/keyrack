@@ -43,6 +43,8 @@ mod compromised_domain;
 mod deletion_dependencies;
 #[path = "integration/lifecycle_metadata.rs"]
 mod lifecycle_metadata;
+#[path = "integration/deletion_override.rs"]
+mod deletion_override;
 use tonic::Request;
 
 use base64::Engine as _;
@@ -1704,16 +1706,18 @@ async fn mixed_material_lifecycle_refuses_before_resident_sibling_side_effects()
     assert_eq!(after.occ_version, nonexportable.occ_version);
     assert_eq!(after.exportability, nonexportable.exportability);
 
-    // Admission now refuses wrapped history before changing lifecycle state.
+    // The stale primary flags make this synthetic history invalid. Admission
+    // validates all versions before any resident material can be destroyed.
     let status = svc
         .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            allow_dependent_data_loss: false,
             key_id: key_id.clone(),
             grace_period_days: 7,
         }))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains("own_parent_wrapped_versions=1"));
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert!(status.message().contains("invalid material history"));
     assert_eq!(
         state.storage.get_key(&lid).await.unwrap().occ_version,
         nonexportable.occ_version
@@ -6778,6 +6782,7 @@ async fn seed_keys_in_three_states(
     .expect("disable_key");
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: pending.clone(),
         grace_period_days: 7,
     }))
@@ -7219,6 +7224,7 @@ async fn get_key_material_refused_once_deletion_scheduled() {
     );
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7261,6 +7267,7 @@ async fn get_key_material_refused_after_reaper_destroys_key() {
 
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7317,6 +7324,7 @@ async fn deletion_reaper_destroys_provider_material() {
     assert_eq!(handles.len(), 2, "expected two key versions after rotation");
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7377,6 +7385,7 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
 
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7444,6 +7453,7 @@ async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_c
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7504,6 +7514,7 @@ async fn cancellation_before_destruction_claim_has_no_provider_effect() {
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7578,6 +7589,7 @@ async fn destruction_pins_provider_across_runtime_registry_replacement() {
         .collect();
     state.storage.update_key(&record).await.unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7642,6 +7654,7 @@ async fn unknown_provider_on_later_version_prevents_all_destruction_effects() {
     record.occ_version += 1;
     state.storage.update_key(&record).await.unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7678,6 +7691,7 @@ async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
     .await
     .unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7717,6 +7731,7 @@ async fn re_encrypt_refused_when_source_state_forbids_decrypt() {
     let dst = create_aes_key(&svc).await;
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: src.clone(),
         grace_period_days: 7,
     }))

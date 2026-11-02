@@ -265,10 +265,12 @@ pub async fn all_writer_fences(store: &dyn StorageBackend) {
         version.is_primary = true;
         update.key_versions.push(version);
         retryable(store.update_key(&update).await);
-        retryable(
-            store
-                .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
-                .await,
+        assert!(
+            matches!(
+                store.claim_destruction(&record.lid, record.occ_version, chrono::Utc::now()).await,
+                Err(KeyRackError::DeletionDependencyRefused { reason, .. }) if reason == "in_flight_journal"
+            ),
+            "destruction must report the in-flight journal refusal"
         );
     }
     let rotate = next_creation(&request.child, &creations[1]);

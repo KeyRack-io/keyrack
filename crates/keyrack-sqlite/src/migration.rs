@@ -584,7 +584,8 @@ mod tests {
                 store
                     .claim_destruction(&due.lid, due.occ_version, chrono::Utc::now())
                     .await,
-                Err(KeyRackError::ProviderUnavailable(_))
+                Err(KeyRackError::DeletionDependencyRefused { ref reason, .. })
+                    if reason == "in_flight_journal"
             ),
             "migration journal alone must block target destruction"
         );

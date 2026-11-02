@@ -31,6 +31,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- Deletion scheduling and claiming share the SQLite/PostgreSQL dependency query,
+  with gRPC `FAILED_PRECONDITION` / HTTP 409 and blocking-kind counts on refusal.
+  Logical-only children remain allowed. The dependency-aware deletion contract
+  below adds explicit data-loss approval and wrapped-child envelope destruction.
+
 - **Rewrap and reparent every version of a wrapped key.** `RewrapKey` and REST
   `POST /v1/keys/{key_id}/rewrap` share one synchronous primitive and a required
   operation UUID. Omit `new_parent_key_id` to use the current parent's current
@@ -76,11 +81,6 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   is deprecated and retains its compatibility meaning: compromise history
   reports `Compromised` even after the live lifecycle advances to destruction.
   Operation eligibility is unchanged; see [SPEC §7.2](docs/SPEC.md#72-valid-transitions).
-- Deletion scheduling refuses keys with wrapped versions, wrapped dependents or
-  creation- or nonterminal migration-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
-  blocking-kind counts. Logical-only children remain allowed. Scheduling and the
-  authoritative destruction claim share the SQLite/PostgreSQL dependency query.
-
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.
@@ -637,6 +637,22 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   counted once per direct persisted child with resident material by the shared
   admission query. Logical-only links remain nonblocking; the count is an
   observation and does not reserve future dependencies.
+
+### Dependency-aware deletion
+
+- Add `allow_dependent_data_loss` to gRPC and REST scheduling, requiring the
+  separate `kms:ScheduleKeyDeletionWithDependentDataLoss` permission alongside
+  ordinary scheduling. SQLite/PostgreSQL atomically persist the intent and
+  approved dependent-edge snapshot; cancellation clears both. Claims recheck
+  under the writer fence and refuse new dependents or any nonterminal creation
+  or migration journal, with an audit event and refusal metric. Logical-only
+  children remain nonblocking; old pending records acquire no override.
+- Support deleting wrapped children by erasing their stored envelopes. Approved
+  parent destruction leaves dependent keys and envelopes alone, records affected
+  versions in fresh `wrapping_parent_destroyed_versions` metadata on key
+  responses, and makes subsequent opens fail with `wrapping parent destroyed`.
+  The assurance covers KeyRack's own keys, versions, wrapped edges and journals;
+  existing permanent-claim and recovery limitations remain.
 
 ## [0.4.0] — 2026-08-30
 

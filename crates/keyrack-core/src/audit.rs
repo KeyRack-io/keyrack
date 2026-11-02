@@ -96,6 +96,8 @@ pub enum AuditAction {
     DisableKey,
     #[serde(rename = "kms:ScheduleKeyDeletion")]
     ScheduleKeyDeletion,
+    #[serde(rename = "kms:ScheduleKeyDeletionWithDependentDataLoss")]
+    ScheduleKeyDeletionWithDependentDataLoss,
     #[serde(rename = "kms:CancelKeyDeletion")]
     CancelKeyDeletion,
     #[serde(rename = "kms:ReportKeyCompromise")]
@@ -196,6 +198,8 @@ pub enum AuditAction {
     RotationJobExpired,
     #[serde(rename = "kms:KeyDestroyed")]
     KeyDestroyed,
+    #[serde(rename = "kms:KeyDestructionRefused")]
+    KeyDestructionRefused,
     /// Outcome of the provider-side material delete performed by the deletion
     /// worker. Audited separately from `KeyDestroyed` (the record transition)
     /// so an operator can tell "`KeyRack` says destroyed" from "the backend
@@ -1061,6 +1065,8 @@ mod tests {
             AuditAction::EnableKey,
             AuditAction::DisableKey,
             AuditAction::ScheduleKeyDeletion,
+            AuditAction::ScheduleKeyDeletionWithDependentDataLoss,
+            AuditAction::KeyDestructionRefused,
             AuditAction::CancelKeyDeletion,
             AuditAction::RotateKey,
             AuditAction::RewrapKey,

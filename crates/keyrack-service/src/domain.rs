@@ -34,8 +34,8 @@
 //!   [`enforce_state_for_key_op`], [`enforce_born_exportable`],
 //!   [`enforce_no_child_under_exportable_parent`], [`generate_key_lid_from_attrs`],
 //!   [`explain_routing`] — are genuinely called by both `grpc.rs` and `rest.rs`.
-//! - [`disable_key`] is genuinely shared: it is the single implementation behind
-//!   both surfaces' `DisableKey` handler.
+//! - [`disable_key`], deletion scheduling and cancellation are shared by both
+//!   surfaces; deletion intent is captured atomically by storage.
 //! - Most of the remaining **full lifecycle functions here have no callers at
 //!   all** (`create_key`, `rotate_key`, `list_keys`, the alias/tag/HSM/rotation-job
 //!   functions, and the whole [`crypto`] submodule). They are `pub` in a library
@@ -68,6 +68,7 @@
 //! themselves — `ops` is the real structural choke point for both surfaces.
 
 use crate::state::ServiceState;
+use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{KeyMaterial, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord};
 use keyrack_core::lid::Lid;
 use keyrack_core::provider::{CryptoProvider, KeyHandle};
@@ -115,9 +116,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             KeyRackError::Storage(msg) if msg.contains("not found") => {
                 Self::NotFound(e.to_string())
             }
-            KeyRackError::InvalidStateTransition { .. }
-            | KeyRackError::KeyDestructionFenced(_)
-            | KeyRackError::WrappingParentDestroyed
+            KeyRackError::DeletionDependencyRefused { .. }
             | KeyRackError::MigrationIntentConflict { .. }
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
@@ -126,7 +125,10 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             | KeyRackError::DepthLimitExceeded { .. }
             | KeyRackError::CycleDetected { .. } => Self::InvalidArgument(e.to_string()),
             KeyRackError::ProviderUnavailable(_) => Self::ProviderUnavailable(e.to_string()),
-            KeyRackError::OptimisticConcurrencyConflict { .. } => Self::Core(e),
+            KeyRackError::OptimisticConcurrencyConflict { .. }
+            | KeyRackError::InvalidStateTransition { .. }
+            | KeyRackError::KeyDestructionFenced(_)
+            | KeyRackError::WrappingParentDestroyed => Self::Core(e),
             _ => Self::Internal(e.to_string()),
         }
     }
@@ -151,6 +153,7 @@ impl DomainError {
                     }
                     KeyRackError::InvalidStateTransition { .. }
                     | KeyRackError::KeyDestructionFenced(_)
+                    | KeyRackError::DeletionDependencyRefused { .. }
                     | KeyRackError::WrappingParentDestroyed
                     | KeyRackError::MigrationIntentConflict { .. }
                     | KeyRackError::OperationNotPermitted { .. }
@@ -185,6 +188,9 @@ impl DomainError {
                     KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
                     KeyRackError::OptimisticConcurrencyConflict { .. } => {
                         (StatusCode::CONFLICT, "OccConflict")
+                    }
+                    KeyRackError::DeletionDependencyRefused { .. } => {
+                        (StatusCode::CONFLICT, "FailedPrecondition")
                     }
                     KeyRackError::KeyDestructionFenced(_) => {
                         (StatusCode::CONFLICT, "KeyDestructionFenced")
@@ -1018,17 +1024,15 @@ pub async fn disable_key(
     })
 }
 
-/// Admission check shared by the library, gRPC and REST scheduling paths.
-/// This observation does not reserve destruction: the storage claim repeats the
-/// same dependency query under its writer fence immediately before claiming.
+/// Advisory admission check for callers inspecting ordinary deletion eligibility.
+/// Scheduling captures its own observation atomically in storage; the claim
+/// repeats the same dependency query under its writer fence before claiming.
 pub async fn ensure_deletion_can_be_scheduled(
     state: &Arc<ServiceState>,
     lid: &Lid,
 ) -> Result<keyrack_core::destruction::DestructionDependencies, DomainError> {
     let dependencies = state.storage.destruction_dependencies(lid).await?;
-    if !dependencies.is_empty() {
-        return Err(DomainError::FailedPrecondition(dependencies.summary()));
-    }
+    dependencies.approval(false).map_err(DomainError::from)?;
     Ok(dependencies)
 }
 
@@ -1037,29 +1041,36 @@ pub async fn schedule_key_deletion(
     key_id: &str,
     grace_period_days: u32,
 ) -> Result<KeyRecord, DomainError> {
+    Ok(
+        schedule_key_deletion_with_intent(state, key_id, grace_period_days, false)
+            .await?
+            .record,
+    )
+}
+
+/// Atomic storage admission captures the approved dependency snapshot. The
+/// caller must authorize dependent data loss separately before setting `allow`.
+pub async fn schedule_key_deletion_with_intent(
+    state: &Arc<ServiceState>,
+    key_id: &str,
+    grace_period_days: u32,
+    allow: bool,
+) -> Result<keyrack_core::destruction::ScheduledDeletion, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state
-        .storage
-        .get_key_for_use(&lid)
-        .await
-        .map_err(DomainError::from)?;
+    let record = state.storage.get_key_for_use(&lid).await?;
     let days = if grace_period_days == 0 {
         7
     } else {
         grace_period_days
     };
-    ensure_deletion_can_be_scheduled(state, &lid).await?;
-    record
-        .transition_to(KeyState::PendingDeletion)
-        .map_err(|(f, t)| transition_err(f, t))?;
-    record.scheduled_deletion_at =
-        Some(chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
+    let at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(i64::from(days)))
+        .ok_or_else(|| DomainError::InvalidArgument("deletion date is out of range".into()))?;
     state
         .storage
-        .update_key(&record)
+        .schedule_destruction(&lid, record.occ_version, at, allow)
         .await
-        .map_err(DomainError::from)?;
-    Ok(record)
+        .map_err(DomainError::from)
 }
 
 pub async fn cancel_key_deletion(
@@ -1067,31 +1078,17 @@ pub async fn cancel_key_deletion(
     key_id: &str,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
-    state
-        .storage
-        .check_migration_fence(&lid)
-        .await
-        .map_err(DomainError::from)?;
-    let mut record = state
-        .storage
-        .get_key_for_use(&lid)
-        .await
-        .map_err(DomainError::from)?;
+    let record = state.storage.get_key_for_use(&lid).await?;
     if record.state != KeyState::PendingDeletion {
         return Err(DomainError::FailedPrecondition(
             "can only cancel deletion from PendingDeletion".into(),
         ));
     }
-    record
-        .transition_to(KeyState::Disabled)
-        .map_err(|(f, t)| transition_err(f, t))?;
-    record.scheduled_deletion_at = None;
     state
         .storage
-        .update_key(&record)
+        .cancel_destruction(&lid, record.occ_version)
         .await
-        .map_err(DomainError::from)?;
-    Ok(record)
+        .map_err(DomainError::from)
 }
 
 pub async fn report_key_compromise(
@@ -1260,10 +1257,7 @@ async fn prepare_wrapped(
         .storage
         .wrapped_key_snapshot(lid, version_number)
         .await
-        .map_err(|error| match error {
-            keyrack_core::error::KeyRackError::WrappingParentDestroyed => DomainError::from(error),
-            _ => DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()),
-        })?;
+        .map_err(DomainError::from)?;
     let record = snapshot.record;
     let parent = snapshot.parent;
     if parent.state == KeyState::Destroyed {

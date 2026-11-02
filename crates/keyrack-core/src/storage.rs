@@ -72,6 +72,47 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Read all destruction blockers in one consistent storage snapshot. Count
+    /// material versions and all parent/child creation journal rows, not logical
+    /// parent links. This is advisory: claim MUST recheck under its writer fence.
+    /// Unsupported implementations fail closed, never return empty counts.
+    async fn destruction_dependencies(
+        &self,
+        _lid: &Lid,
+    ) -> Result<crate::destruction::DestructionDependencies> {
+        Err(crate::destruction::invalid("dependency query unsupported"))
+    }
+    /// Atomically schedule with a server-observed approved dependency snapshot.
+    /// The logical-only child count comes from that same fenced observation.
+    async fn schedule_destruction(
+        &self,
+        _lid: &Lid,
+        _expected_occ: u64,
+        _at: chrono::DateTime<chrono::Utc>,
+        _allow: bool,
+    ) -> Result<crate::destruction::ScheduledDeletion> {
+        Err(crate::destruction::invalid("atomic scheduling unsupported"))
+    }
+    async fn cancel_destruction(&self, _lid: &Lid, _expected_occ: u64) -> Result<KeyRecord> {
+        Err(crate::destruction::invalid(
+            "atomic cancellation unsupported",
+        ))
+    }
+    async fn deletion_intent(
+        &self,
+        _lid: &Lid,
+    ) -> Result<Option<crate::destruction::DeletionIntent>> {
+        Err(crate::destruction::invalid("deletion intent unsupported"))
+    }
+    async fn destroyed_wrapping_parents(
+        &self,
+        _lid: &Lid,
+    ) -> Result<Vec<crate::destruction::DestroyedWrappingParent>> {
+        Err(crate::destruction::invalid(
+            "wrapping parent status unsupported",
+        ))
+    }
+
     /// Migration methods are atomic writer-fenced transactions. Unsupported backends fail closed.
     async fn reserve_migration(
         &self,
@@ -168,12 +209,7 @@ pub trait StorageBackend: Send + Sync {
     /// migrations naming the key as child/source/target, not logical parent links.
     /// This is advisory: claim MUST recheck under its writer fence.
     /// Unsupported implementations fail closed, never return empty counts.
-    async fn destruction_dependencies(
-        &self,
-        _lid: &Lid,
-    ) -> Result<crate::destruction::DestructionDependencies> {
-        Err(crate::destruction::invalid("dependency query unsupported"))
-    }
+
 
     /// Commit a one-shot resident destruction fence before any provider effect.
     /// Re-read state, due time, OCC and full material history in the transaction;

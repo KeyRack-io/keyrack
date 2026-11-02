@@ -696,7 +696,8 @@ async fn cancellation_retains_the_fence_and_retry_finishes_the_migration() {
                 .claim_destruction(&parent.lid, parent.occ_version, chrono::Utc::now())
                 .await
                 .unwrap_err(),
-            KeyRackError::ProviderUnavailable(_)
+            KeyRackError::DeletionDependencyRefused { ref reason, .. }
+                if reason == "in_flight_journal"
         ));
     }
     assert_eq!(

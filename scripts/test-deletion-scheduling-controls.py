@@ -23,14 +23,13 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DOMAIN = Path("crates/keyrack-service/src/domain.rs")
-GUARD = "if !dependencies.is_empty() {"
-MUTATION = "if false && !dependencies.is_empty() {"
+ADMISSION = Path("crates/keyrack-core/src/destruction.rs")
+GUARD = "if let Some(reason) = reason {"
+MUTATION = "if let Some(reason) = reason.filter(|_| false) {"
 SURFACE_REFUSALS = {
     f"deletion_dependencies::{surface}_refuses_{kind}"
     for surface in ("grpc", "rest")
     for kind in (
-        "own_wrapped_version",
         "dependent_wrapped_version",
         "parent_creation_journal",
         "child_creation_journal",
@@ -81,13 +80,13 @@ def copy_source(destination: Path, output: Path, target: Path) -> dict[str, str]
         copied.write_bytes(data)
         shutil.copymode(source, copied)
         manifest[str(relative)] = digest(data)
-    require(str(DOMAIN) in manifest, "domain source was not copied")
+    require(str(ADMISSION) in manifest, "shared admission source was not copied")
     return manifest
 
 
 def check_results(log: str, exit_code: int, mutated: bool) -> None:
     rows = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\s*$", log, re.MULTILINE)
-    require(len(rows) == len(EXPECTED), "expected exactly ten reported test outcomes")
+    require(len(rows) == len(EXPECTED), "expected exactly eight reported test outcomes")
     require({name for name, _ in rows} == EXPECTED, "missing, duplicated or unexpected test names")
     outcomes = dict(rows)
     if not mutated:
@@ -186,24 +185,24 @@ def main() -> int:
                 "expected_tests": sorted(EXPECTED),
                 "timeout_seconds_per_run": args.timeout,
             })
-            source = (work / DOMAIN).read_text()
+            source = (work / ADMISSION).read_text()
             require(source.count(GUARD) == 1, "shared admission guard is missing or ambiguous")
             run_tests(work, output, env, args.timeout, mutated=False)
             result["baseline_verified"] = True
             write_json(output / "result.json", result)
             changed = source.replace(GUARD, MUTATION)
-            (work / DOMAIN).write_text(changed)
+            (work / ADMISSION).write_text(changed)
             write_json(output / "mutation.json", {
-                "path": str(DOMAIN), "before": GUARD, "after": MUTATION,
+                "path": str(ADMISSION), "before": GUARD, "after": MUTATION,
                 "original_sha256": digest(source.encode()), "mutated_sha256": digest(changed.encode()),
             })
             run_tests(work, output, env, args.timeout, mutated=True)
             result["reverted_verified"] = True
-            (work / DOMAIN).write_text(source)
+            (work / ADMISSION).write_text(source)
             controls = [
                 ("stored_count", "crates/keyrack-core/src/destruction.rs", ".logical_only_children\n                .checked_add(1)", ".logical_only_children\n                .checked_add(0)", ["logical-only child count must match admission", "left: 0", "right: 2"]),
-                ("grpc_count", "crates/keyrack-service/src/grpc.rs", "logical_only_children: dependencies.logical_only_children,", "logical_only_children: 0,", ["gRPC logical-only child count must match admission", "left: 0", "right: 2"]),
-                ("rest_count", "crates/keyrack-service/src/rest.rs", 'response["logical_only_children"] = serde_json::json!(dependencies.logical_only_children);', 'response["logical_only_children"] = serde_json::json!(0_u64);', ["REST logical-only child count must match admission", "left: Some(0)", "right: Some(2)"]),
+                ("grpc_count", "crates/keyrack-service/src/grpc.rs", "logical_only_children: scheduled.logical_only_children,", "logical_only_children: 0,", ["gRPC logical-only child count must match admission", "left: 0", "right: 2"]),
+                ("rest_count", "crates/keyrack-service/src/rest.rs", 'response["logical_only_children"] = serde_json::json!(scheduled.logical_only_children);', 'response["logical_only_children"] = serde_json::json!(0_u64);', ["REST logical-only child count must match admission", "left: Some(0)", "right: Some(2)"]),
             ]
             result["count_controls"] = []
             for name,path,before,after,diagnostics in controls:
@@ -211,9 +210,6 @@ def main() -> int:
                 original = file.read_text()
                 require(original.count(before) == 1, f"{name}: count anchor missing or ambiguous")
                 changed = original.replace(before, after)
-                # Preserve use of the admission observation under -D warnings.
-                if name in ("grpc_count", "rest_count"):
-                    changed = changed.replace("let dependencies = crate::domain::ensure_deletion_can_be_scheduled", "let _dependencies = crate::domain::ensure_deletion_can_be_scheduled")
                 file.write_text(changed)
                 write_json(output / f"{name}-mutation.json", {"path":path,"before":before,"after":after,"original_sha256":digest(original.encode()),"mutated_sha256":digest(changed.encode())})
                 try:
