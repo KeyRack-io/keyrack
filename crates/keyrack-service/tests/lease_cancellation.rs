@@ -867,6 +867,196 @@ async fn wrapped_use_is_refused_while_the_cleanup_backlog_is_full() {
         .expect("uses resume once the backlog is below the limit");
 }
 
+/// Decrypt `blob` under `key` over gRPC with `timeout`, ignoring the answer.
+fn spawn_decrypt(
+    service: &Service,
+    key: &KeyRecord,
+    blob: &[u8],
+    timeout: Duration,
+) -> tokio::task::JoinHandle<Result<(), tonic::Status>> {
+    let (grpc, lid, blob) = (service.grpc.clone(), key.lid.to_string(), blob.to_vec());
+    tokio::spawn(async move {
+        let mut client = KeyServiceClient::connect(grpc).await.unwrap();
+        let mut request = tonic::Request::new(proto::DecryptRequest {
+            key_id: lid,
+            ciphertext_blob: blob,
+            ..Default::default()
+        });
+        request.set_timeout(timeout);
+        client.decrypt(request).await.map(|_| ())
+    })
+}
+
+/// The most use leases the provider ever had open at once.
+fn peak_open_leases(events: &[Event]) -> usize {
+    let (mut open, mut peak) = (HashSet::new(), 0);
+    for event in events {
+        match event {
+            Event::Opened { object, .. } => {
+                open.insert(object.clone());
+                peak = peak.max(open.len());
+            }
+            Event::Closed { object, ok: true } => {
+                open.remove(object);
+            }
+            Event::Closed { .. } => {}
+        }
+    }
+    peak
+}
+
+/// A burst of uses cancelled while their opens are still running must not
+/// get past the limit: the limit counts admitted opens, not only the closes
+/// they later leave behind, so one more use is refused even though no lease
+/// exists yet and nothing is pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_cancelled_uses_never_exceeds_the_limit() {
+    const LIMIT: usize = 4;
+    let service = Service::start_with_limit(LIMIT).await;
+    let key = service.child().await;
+    let blob = service.encrypt(&key).await;
+    let from = service.controls.events().len();
+    let opens = service.controls.opens_started.load(Ordering::SeqCst);
+
+    let peak = Arc::new(AtomicUsize::new(0));
+    let sampling = Arc::new(AtomicBool::new(true));
+    let sampler = {
+        let (state, peak, sampling) = (
+            Arc::clone(&service.state),
+            Arc::clone(&peak),
+            Arc::clone(&sampling),
+        );
+        tokio::spawn(async move {
+            while sampling.load(Ordering::SeqCst) {
+                peak.fetch_max(state.lease_cleanup.occupied(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+
+    service.controls.open_gate.hold();
+    let burst: Vec<_> = (0..LIMIT)
+        .map(|_| spawn_decrypt(&service, &key, &blob, Duration::from_millis(300)))
+        .collect();
+    for request in burst {
+        let status = request
+            .await
+            .unwrap()
+            .expect_err("cancelled by its deadline");
+        assert!(
+            matches!(
+                status.code(),
+                tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+            ),
+            "{status:?}"
+        );
+    }
+    let all_opening = tokio::time::timeout(PATIENCE, async {
+        while service.controls.opens_started.load(Ordering::SeqCst) - opens < LIMIT {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        all_opening.is_ok(),
+        "every use in the burst reached an open"
+    );
+    assert_eq!(
+        service.state.lease_cleanup.pending(),
+        0,
+        "no lease exists yet, so no close is pending"
+    );
+
+    let status = spawn_decrypt(&service, &key, &blob, Duration::from_secs(2))
+        .await
+        .unwrap()
+        .expect_err("refused while the burst's opens are in flight");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_eq!(
+        service.controls.opens_started.load(Ordering::SeqCst) - opens,
+        LIMIT,
+        "the refused use opens nothing"
+    );
+
+    service.controls.open_gate.release();
+    let settled = tokio::time::timeout(PATIENCE, async {
+        while service.state.lease_cleanup.occupied() > 0
+            || service.state.lease_cleanup.counts().closed_after_return < LIMIT as u64
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    sampling.store(false, Ordering::SeqCst);
+    sampler.await.unwrap();
+    assert!(
+        settled.is_ok(),
+        "every lease of the burst is closed afterwards"
+    );
+    let peak = peak.load(Ordering::SeqCst);
+    let provider_peak = peak_open_leases(&service.controls.events()[from..]);
+    assert!(
+        peak <= LIMIT && provider_peak <= LIMIT,
+        "occupancy {peak} and open leases {provider_peak} stay within the limit of {LIMIT}"
+    );
+    spawn_decrypt(&service, &key, &blob, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("uses resume once the burst is closed");
+}
+
+/// A close abandoned at the drain deadline that then fails is not retried:
+/// the owner has stopped, and the abandoned record stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_failing_after_shutdown_is_not_retried() {
+    let service = Service::start().await;
+    let object = cancel_with_close_pending(&service).await;
+    service
+        .controls
+        .fail_next_close
+        .store(true, Ordering::SeqCst);
+
+    let report =
+        keyrack_service::shutdown::drain(&service.state, async {}, Duration::from_millis(300))
+            .await;
+    assert_eq!(report.cleanups_abandoned, 1, "{report:?}");
+    let closes = service.controls.closes_started.load(Ordering::SeqCst);
+    service.controls.close_gate.release();
+
+    let failed = tokio::time::timeout(PATIENCE, async {
+        while !service
+            .controls
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::Closed { object: o, ok: false } if *o == object))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(failed.is_ok(), "the abandoned close failed in the provider");
+    let retried = tokio::time::timeout(Duration::from_secs(1), async {
+        while service.controls.closes_started.load(Ordering::SeqCst) == closes {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let counts = service.state.lease_cleanup.counts();
+    assert!(
+        retried.is_err(),
+        "no close is attempted after shutdown has returned: {counts:?}"
+    );
+    assert_eq!(
+        (
+            counts.abandoned,
+            counts.close_failed,
+            counts.closed_after_return
+        ),
+        (1, 0, 0),
+        "the abandoned record stands: {counts:?}"
+    );
+}
+
 /// A close that panics in the provider still settles: it is recorded as a
 /// failed cleanup, and nothing is left pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
