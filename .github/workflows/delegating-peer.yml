@@ -1,0 +1,25 @@
+name: Delegating peer identity
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  delegated-peer:
+    name: Delegating peer identity controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/test-delegating-peer-controls.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: delegating-peer-controls
+          path: target/proofs/delegating-peer/
+          if-no-files-found: error
