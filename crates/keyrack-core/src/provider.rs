@@ -534,8 +534,10 @@ pub trait CryptoProvider: Send + Sync {
     /// these properties must not advertise `Rewrap`.
     ///
     /// This operation does not mutate either parent or consume the old
-    /// envelope. It must be safe to repeat after an interrupted or lost call;
-    /// randomized wrapping may produce different bytes for the same intent.
+    /// envelope. Automatic repetition after an interrupted or lost call requires
+    /// [`rewrap_is_retry_safe`](Self::rewrap_is_retry_safe); otherwise an unknown
+    /// outcome retains the reservation until correlated provider reconciliation.
+    /// Randomized wrapping may produce different bytes for the same intent.
     /// The service journals and atomically publishes all version envelopes,
     /// then erases its old copies. Rewrapping cannot revoke an independently
     /// retained original envelope while its original parent still exists.
@@ -550,6 +552,15 @@ pub trait CryptoProvider: Send + Sync {
         Err(crate::error::KeyRackError::Provider(
             "rewrapping keys not supported by this provider".into(),
         ))
+    }
+
+    /// Whether repeating an interrupted migration batch is safe without
+    /// provider-side reconciliation. Default false: a capability declaration
+    /// alone does not establish idempotence or cleanup after an unknown outcome.
+    /// A true implementation must leave no durable independently usable child
+    /// and must not consume or mutate either parent or the source envelope.
+    fn rewrap_is_retry_safe(&self) -> bool {
+        false
     }
 
     /// Close the exact object named by `lease`, idempotently.

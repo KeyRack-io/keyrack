@@ -1448,6 +1448,11 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
+            state
+                .storage
+                .check_migration_fence(&lid)
+                .await
+                .map_err(convert::error_to_status)?;
             let mut record = state
                 .storage
                 .get_key_for_use(&lid)
@@ -1513,6 +1518,11 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
+            state
+                .storage
+                .check_migration_fence(&lid)
+                .await
+                .map_err(convert::error_to_status)?;
             let mut record = state
                 .storage
                 .get_key_for_use(&lid)
@@ -1557,6 +1567,11 @@ impl KeyService for KeyServiceImpl {
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
+            state
+                .storage
+                .check_migration_fence(&lid)
+                .await
+                .map_err(convert::error_to_status)?;
             let mut record = state
                 .storage
                 .get_key_for_use(&lid)
@@ -1658,19 +1673,49 @@ impl KeyService for KeyServiceImpl {
         let request_id = Self::request_id(&request);
         let principal = self.principal(&request).await?;
         let req = request.into_inner();
-        let record = ops::execute_rewrap(
+        let outcome = ops::execute_rewrap_with_options(
             &self.state,
             principal,
             request_id,
             req.key_id,
             req.new_parent_key_id,
             req.operation_id.clone(),
+            ops::RewrapOptions {
+                old_parent_key_id: req.old_parent_key_id,
+                expected_child_revision: req.expected_child_revision,
+                expected_old_parent_revision: req.expected_old_parent_revision,
+                expected_new_parent_revision: req.expected_new_parent_revision,
+                covered_versions: req.covered_versions,
+            },
         )
         .await
         .map_err(|error| error.to_grpc_status())?;
         Ok(Response::new(proto::RewrapKeyResponse {
-            metadata: Some(convert::key_record_to_metadata(&record)),
+            metadata: Some(convert::key_record_to_metadata(&outcome.record)),
             operation_id: req.operation_id,
+            result: Some(proto::WrappedKeyMigrationResult {
+                operation_id: outcome.result.operation_id.to_string(),
+                child: outcome.result.child.to_string(),
+                old_parent: outcome.result.old_parent.to_string(),
+                old_parent_versions: outcome.result.old_parent_versions,
+                new_parent: outcome.result.new_parent.to_string(),
+                new_parent_version: outcome.result.new_parent_version,
+                digest_algorithm: outcome.result.digest_algorithm,
+                versions: outcome
+                    .result
+                    .versions
+                    .into_iter()
+                    .map(|version| proto::WrappedKeyMigrationVersionResult {
+                        version: version.version,
+                        old_parent_version: version.old_parent_version,
+                        new_parent_version: version.new_parent_version,
+                        old_envelope_digest: version.old_envelope_digest,
+                        new_envelope_digest: version.new_envelope_digest,
+                        old_reference: version.old_reference,
+                        new_reference: version.new_reference,
+                    })
+                    .collect(),
+            }),
         }))
     }
 

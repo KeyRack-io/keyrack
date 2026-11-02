@@ -434,6 +434,43 @@ pub async fn execute_rewrap(
     new_parent_id: String,
     operation_id: String,
 ) -> Result<keyrack_core::key::KeyRecord, crate::domain::DomainError> {
+    execute_rewrap_with_options(
+        state,
+        principal,
+        request_id,
+        child_id,
+        new_parent_id,
+        operation_id,
+        RewrapOptions::default(),
+    )
+    .await
+    .map(|outcome| outcome.record)
+}
+
+/// Caller assertions form part of immutable operation intent, including absence.
+#[derive(Debug, Default, Clone)]
+pub struct RewrapOptions {
+    pub old_parent_key_id: String,
+    pub expected_child_revision: Option<u64>,
+    pub expected_old_parent_revision: Option<u64>,
+    pub expected_new_parent_revision: Option<u64>,
+    pub covered_versions: Vec<u64>,
+}
+
+pub struct RewrapOutcome {
+    pub record: keyrack_core::key::KeyRecord,
+    pub result: keyrack_core::migration::MigrationResult,
+}
+
+pub async fn execute_rewrap_with_options(
+    state: &Arc<ServiceState>,
+    principal: Principal,
+    request_id: String,
+    child_id: String,
+    new_parent_id: String,
+    operation_id: String,
+    options: RewrapOptions,
+) -> Result<RewrapOutcome, crate::domain::DomainError> {
     let mut ctx = OpContext::key(AuditAction::RewrapKey, principal, &child_id);
     ctx.request_id = request_id;
     emit_rewrap_audit(state, &ctx, &operation_id, AuditResult::Attempt).await?;
@@ -448,7 +485,7 @@ pub async fn execute_rewrap(
         // This permit stays with the task, never the request future.
         let _slot = slot;
         let start = Instant::now();
-        let result = rewrap_authorized(&state, &ctx, &new_parent_id, &operation_id).await;
+        let result = rewrap_authorized(&state, &ctx, &new_parent_id, &operation_id, options).await;
         let (outcome, label) = match &result {
             Ok(_) => (AuditResult::Success, "success"),
             Err(crate::domain::DomainError::PermissionDenied(_)) => (AuditResult::Denied, "denied"),
@@ -471,7 +508,8 @@ async fn rewrap_authorized(
     ctx: &OpContext,
     new_parent_id: &str,
     operation_id: &str,
-) -> Result<keyrack_core::key::KeyRecord, crate::domain::DomainError> {
+    options: RewrapOptions,
+) -> Result<RewrapOutcome, crate::domain::DomainError> {
     use crate::domain::DomainError;
     use keyrack_core::lid::Lid;
     use keyrack_core::pdp::AttributeValue;
@@ -496,8 +534,31 @@ async fn rewrap_authorized(
             "operation_id must be a non-nil UUID".into(),
         ));
     }
-    let migration =
-        crate::migration::prepare_migration(state, child, new_parent, operation).await?;
+    let expected_old_parent = if options.old_parent_key_id.is_empty() {
+        None
+    } else {
+        Some(
+            options
+                .old_parent_key_id
+                .parse::<Lid>()
+                .map_err(|_| DomainError::InvalidArgument("invalid old_parent_key_id".into()))?,
+        )
+    };
+    let conditions = keyrack_core::migration::MigrationConditions {
+        expected_child_occ: options.expected_child_revision,
+        expected_old_parent_occ: options.expected_old_parent_revision,
+        expected_new_parent_occ: options.expected_new_parent_revision,
+        expected_old_parent,
+        covered_versions: if options.covered_versions.is_empty() {
+            None
+        } else {
+            Some(options.covered_versions)
+        },
+    };
+    let migration = crate::migration::prepare_migration_with_conditions(
+        state, child, new_parent, operation, conditions,
+    )
+    .await?;
     let scope = ctx
         .principal
         .attributes
@@ -567,7 +628,22 @@ async fn rewrap_authorized(
             }
         })?;
     }
-    crate::migration::rewrap_key(state, migration).await
+    let record = crate::migration::rewrap_key(state, migration).await?;
+    let journal = state
+        .storage
+        .get_migration(operation)
+        .await
+        .map_err(DomainError::from)?
+        .ok_or_else(|| DomainError::Internal("committed migration receipt missing".into()))?;
+    if journal.phase != keyrack_core::migration::MigrationPhase::Committed {
+        return Err(DomainError::Internal(
+            "migration has no committed terminal result".into(),
+        ));
+    }
+    let result = journal
+        .result
+        .ok_or_else(|| DomainError::Internal("committed migration receipt missing".into()))?;
+    Ok(RewrapOutcome { record, result })
 }
 
 async fn emit_rewrap_audit(

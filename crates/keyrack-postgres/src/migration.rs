@@ -8,8 +8,8 @@ use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::{KeyMaterial, KeyRecord};
 use keyrack_core::lid::Lid;
 use keyrack_core::migration::{
-    migration_busy, migration_invalid as invalid, MigrationJournal, MigrationPhase,
-    MigrationRequest,
+    migration_busy, migration_invalid as invalid, MigrationJournal, MigrationOwnership,
+    MigrationPhase, MigrationRequest, WrappedKeySnapshot,
 };
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
@@ -114,6 +114,7 @@ async fn required(conn: &mut PgConnection, operation: Uuid) -> Result<MigrationJ
 }
 
 async fn save(conn: &mut PgConnection, value: &MigrationJournal) -> Result<()> {
+    value.validate()?;
     sqlx::query(
         "UPDATE kr_migration_journal SET journal_json=$1,committed=$2 WHERE operation_id=$3",
     )
@@ -142,6 +143,41 @@ async fn snapshots(conn: &mut PgConnection, request: &MigrationRequest) -> Resul
     request.validate_snapshots(&child, &old, &new)
 }
 
+async fn envelope_ref(conn: &mut PgConnection, reference: &str) -> Result<Vec<u8>> {
+    if let Some(operation) = reference.strip_prefix("creation:") {
+        let operation: Uuid = operation
+            .parse()
+            .map_err(|_| invalid("invalid creation envelope reference"))?;
+        return crate::creation::committed_envelope(conn, operation).await;
+    }
+    if let Some((operation, version)) = reference
+        .strip_prefix("migration:")
+        .and_then(|v| v.split_once(':'))
+    {
+        let operation: Uuid = operation
+            .parse()
+            .map_err(|_| invalid("invalid migration envelope reference"))?;
+        let version: u64 = version
+            .parse()
+            .map_err(|_| invalid("invalid migration version"))?;
+        let value = required(conn, operation).await?;
+        if value.phase != MigrationPhase::Committed {
+            return Err(invalid("migration envelope is not committed"));
+        }
+        let bytes: Vec<u8> = sqlx::query_scalar(
+            "SELECT envelope FROM kr_migration_envelopes WHERE operation_id=$1 AND version=$2",
+        )
+        .bind(operation.to_string())
+        .bind(version.to_string())
+        .fetch_one(conn)
+        .await
+        .map_err(database_error)?;
+        value.verify_envelope(version, &bytes)?;
+        return Ok(bytes);
+    }
+    Err(invalid("unknown wrapped envelope reference"))
+}
+
 impl PostgresStorage {
     pub(super) async fn migration_reserve(
         &self,
@@ -164,11 +200,7 @@ impl PostgresStorage {
                 return Err(migration_busy());
             }
         }
-        let value = MigrationJournal {
-            request: request.clone(),
-            phase: MigrationPhase::Reserved,
-            envelope_digests: Vec::new(),
-        };
+        let value = MigrationJournal::reserved(request.clone());
         sqlx::query("INSERT INTO kr_migration_journal(operation_id,child_lid,old_parent_lid,new_parent_lid,committed,journal_json) VALUES($1,$2,$3,$4,false,$5)")
             .bind(request.operation.to_string()).bind(request.child.lid.to_string()).bind(request.old_parent.lid.to_string()).bind(request.new_parent.lid.to_string())
             .bind(serde_json::to_value(&value).map_err(|_|invalid("journal encoding"))?).execute(&mut *tx).await.map_err(database_error)?;
@@ -181,16 +213,81 @@ impl PostgresStorage {
         load(&mut conn, operation).await
     }
 
+    pub(super) async fn migration_claim(
+        &self,
+        operation: Uuid,
+        owner: Uuid,
+        expected_epoch: u64,
+    ) -> Result<MigrationJournal> {
+        let mut tx = write_transaction(&self.pool).await?;
+        let mut value = required(&mut tx, operation).await?;
+        value.claim(owner, expected_epoch)?;
+        save(&mut tx, &value).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(value)
+    }
+
+    pub(super) async fn migration_dispatch(
+        &self,
+        operation: Uuid,
+        ownership: MigrationOwnership,
+        retry_safe: bool,
+    ) -> Result<MigrationJournal> {
+        let mut tx = write_transaction(&self.pool).await?;
+        let mut value = required(&mut tx, operation).await?;
+        value.begin_dispatch(ownership, retry_safe)?;
+        save(&mut tx, &value).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(value)
+    }
+
+    pub(super) async fn migration_snapshot(
+        &self,
+        lid: &Lid,
+        version: u64,
+    ) -> Result<WrappedKeySnapshot> {
+        let mut tx = write_transaction(&self.pool).await?;
+        let record = load_key(&mut tx, lid)
+            .await?
+            .ok_or(KeyRackError::KeyNotFound(*lid))?;
+        let entry = record
+            .get_version(version)
+            .ok_or_else(|| invalid("wrapped version absent"))?;
+        let KeyMaterial::ParentWrapped(material) = &entry.material else {
+            return Err(invalid("version is not wrapped"));
+        };
+        let envelope = envelope_ref(&mut tx, material.wrapped_material_ref().as_str()).await?;
+        let parent = load_key(&mut tx, &material.parent().lid)
+            .await?
+            .ok_or(KeyRackError::WrappingParentDestroyed)?;
+        if parent.state == keyrack_core::key::KeyState::Destroyed {
+            return Err(KeyRackError::WrappingParentDestroyed);
+        }
+        tx.commit().await.map_err(database_error)?;
+        Ok(WrappedKeySnapshot {
+            record,
+            parent,
+            envelope,
+        })
+    }
+
     pub(super) async fn migration_stage(
         &self,
         operation: Uuid,
+        ownership: MigrationOwnership,
         envelopes: &[Vec<u8>],
     ) -> Result<MigrationJournal> {
         let mut tx = write_transaction(&self.pool).await?;
         let mut value = required(&mut tx, operation).await?;
+        value.require_owner(ownership)?;
         value.validate_envelopes(envelopes)?;
         if value.phase != MigrationPhase::Reserved {
             return Ok(value);
+        }
+        if value.dispatch.as_ref().map(|d| d.epoch) != Some(ownership.epoch) {
+            return Err(invalid(
+                "provider dispatch belongs to another ownership epoch",
+            ));
         }
         snapshots(&mut tx, &value.request).await?;
         for (version, envelope) in value.request.proposed.key_versions.iter().zip(envelopes) {
@@ -204,9 +301,14 @@ impl PostgresStorage {
         Ok(value)
     }
 
-    pub(super) async fn migration_commit(&self, operation: Uuid) -> Result<KeyRecord> {
+    pub(super) async fn migration_commit(
+        &self,
+        operation: Uuid,
+        ownership: MigrationOwnership,
+    ) -> Result<KeyRecord> {
         let mut tx = write_transaction(&self.pool).await?;
         let mut value = required(&mut tx, operation).await?;
+        value.require_owner(ownership)?;
         if value.phase == MigrationPhase::Committed {
             return Ok(value.request.proposed);
         }
@@ -234,6 +336,15 @@ impl PostgresStorage {
             .map_err(database_error)?;
             value.verify_envelope(version.version_number, &bytes)?;
         }
+        let mut old_envelopes = Vec::new();
+        for version in &value.request.child.key_versions {
+            let KeyMaterial::ParentWrapped(material) = &version.material else {
+                return Err(invalid("resident child version"));
+            };
+            old_envelopes
+                .push(envelope_ref(&mut tx, material.wrapped_material_ref().as_str()).await?);
+        }
+        value.result = Some(value.terminal_result(&old_envelopes)?);
         sqlx::query("INSERT INTO kr_retired_creation_journal(operation_id,journal_json) SELECT operation_id,journal_json FROM kr_creation_journal WHERE child_lid=$1 AND phase='committed'")
             .bind(value.request.child.lid.to_string()).execute(&mut *tx).await.map_err(database_error)?;
         sqlx::query("DELETE FROM kr_creation_journal WHERE child_lid=$1 AND phase='committed'")

@@ -416,7 +416,7 @@ mod migration_postgres {
     use keyrack_core::creation::same_json;
     use keyrack_core::migration::MigrationPhase;
     use keyrack_core::storage::StorageBackend;
-    use keyrack_test_support::migration_conformance::{envelopes, seeded};
+    use keyrack_test_support::migration_conformance::{envelopes, seeded, test_owner};
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
 
@@ -438,7 +438,11 @@ mod migration_postgres {
             MigrationPhase::Reserved
         );
         second
-            .stage_migration(request.operation, &envelopes())
+            .stage_migration(
+                request.operation,
+                test_owner(&second, request.operation).await,
+                &envelopes(),
+            )
             .await
             .unwrap();
         drop(second);
@@ -461,7 +465,12 @@ mod migration_postgres {
         let function = format!("{trigger}_fn");
         sqlx::query(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected migration commit failure'; END; $$")).execute(&pool).await.unwrap();
         sqlx::query(&format!("CREATE TRIGGER {trigger} BEFORE UPDATE ON kr_migration_journal FOR EACH ROW WHEN (NEW.operation_id='{}' AND NEW.committed) EXECUTE FUNCTION {function}()",request.operation)).execute(&pool).await.unwrap();
-        let result = third.commit_migration(request.operation).await;
+        let result = third
+            .commit_migration(
+                request.operation,
+                test_owner(&third, request.operation).await,
+            )
+            .await;
         sqlx::query(&format!("DROP TRIGGER {trigger} ON kr_migration_journal"))
             .execute(&pool)
             .await
@@ -494,11 +503,23 @@ mod migration_postgres {
                 .await
                 .is_ok());
         }
-        third.commit_migration(request.operation).await.unwrap();
+        third
+            .commit_migration(
+                request.operation,
+                test_owner(&third, request.operation).await,
+            )
+            .await
+            .unwrap();
         drop(third);
         let fourth = PostgresStorage::connect(&url).await.unwrap();
         assert!(same_json(
-            &fourth.commit_migration(request.operation).await.unwrap(),
+            &fourth
+                .commit_migration(
+                    request.operation,
+                    test_owner(&fourth, request.operation).await
+                )
+                .await
+                .unwrap(),
             &request.proposed
         )
         .unwrap());
@@ -568,9 +589,11 @@ mod rotation_postgres {
 
     #[tokio::test]
     async fn rotation_and_migration_fences() {
-        keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
-            arc_store().await,
-            arc_store().await,
+        Box::pin(
+            keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
+                arc_store().await,
+                arc_store().await,
+            ),
         )
         .await;
     }

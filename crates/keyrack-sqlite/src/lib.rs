@@ -145,15 +145,43 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
         self.migration_get(operation)
     }
+    async fn claim_migration(
+        &self,
+        operation: uuid::Uuid,
+        owner: uuid::Uuid,
+        expected_epoch: u64,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_claim(operation, owner, expected_epoch)
+    }
+    async fn begin_migration_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        retry_safe: bool,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_dispatch(operation, ownership, retry_safe)
+    }
+    async fn wrapped_key_snapshot(
+        &self,
+        lid: &Lid,
+        version: u64,
+    ) -> Result<keyrack_core::migration::WrappedKeySnapshot> {
+        self.migration_snapshot(lid, version)
+    }
     async fn stage_migration(
         &self,
         operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
         envelopes: &[Vec<u8>],
     ) -> Result<keyrack_core::migration::MigrationJournal> {
-        self.migration_stage(operation, envelopes)
+        self.migration_stage(operation, ownership, envelopes)
     }
-    async fn commit_migration(&self, operation: uuid::Uuid) -> Result<KeyRecord> {
-        self.migration_commit(operation)
+    async fn commit_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
+        self.migration_commit(operation, ownership)
     }
     async fn read_migration_envelope(
         &self,

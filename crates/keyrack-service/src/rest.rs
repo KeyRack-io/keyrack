@@ -588,6 +588,11 @@ async fn enable_key(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
+        state
+            .storage
+            .check_migration_fence(&lid)
+            .await
+            .map_err(map_core_err)?;
         let mut record = state
             .storage
             .get_key_for_use(&lid)
@@ -637,6 +642,11 @@ async fn schedule_key_deletion(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
+        state
+            .storage
+            .check_migration_fence(&lid)
+            .await
+            .map_err(map_core_err)?;
         let mut record = state
             .storage
             .get_key_for_use(&lid)
@@ -675,6 +685,11 @@ async fn cancel_key_deletion(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
+        state
+            .storage
+            .check_migration_fence(&lid)
+            .await
+            .map_err(map_core_err)?;
         let mut record = state
             .storage
             .get_key_for_use(&lid)
@@ -764,6 +779,13 @@ struct RewrapKeyRequest {
     operation_id: String,
     #[serde(default)]
     new_parent_key_id: String,
+    #[serde(default)]
+    old_parent_key_id: String,
+    expected_child_revision: Option<u64>,
+    expected_old_parent_revision: Option<u64>,
+    expected_new_parent_revision: Option<u64>,
+    #[serde(default)]
+    covered_versions: Vec<u64>,
 }
 
 async fn rewrap_key(
@@ -774,19 +796,36 @@ async fn rewrap_key(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
-    let record = ops::execute_rewrap(
+    let outcome = ops::execute_rewrap_with_options(
         &state,
         principal,
         request_id,
         key_id,
         body.new_parent_key_id,
         body.operation_id.clone(),
+        ops::RewrapOptions {
+            old_parent_key_id: body.old_parent_key_id,
+            expected_child_revision: body.expected_child_revision,
+            expected_old_parent_revision: body.expected_old_parent_revision,
+            expected_new_parent_revision: body.expected_new_parent_revision,
+            covered_versions: body.covered_versions,
+        },
     )
     .await
     .map_err(|error| error.to_rest_error())?;
     Ok(Json(serde_json::json!({
-        "metadata": KeyResponse::from(&record),
+        "metadata": KeyResponse::from(&outcome.record),
         "operation_id": body.operation_id,
+        "result": {
+            "operation_id": outcome.result.operation_id.to_string(),
+            "child": outcome.result.child.to_string(),
+            "old_parent": outcome.result.old_parent.to_string(),
+            "old_parent_versions": outcome.result.old_parent_versions,
+            "new_parent": outcome.result.new_parent.to_string(),
+            "new_parent_version": outcome.result.new_parent_version,
+            "digest_algorithm": outcome.result.digest_algorithm,
+            "versions": outcome.result.versions,
+        },
     })))
 }
 

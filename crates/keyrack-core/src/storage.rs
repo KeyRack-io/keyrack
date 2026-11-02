@@ -89,16 +89,60 @@ pub trait StorageBackend: Send + Sync {
             "transactional migration unsupported",
         ))
     }
+    /// Take ownership by compare-and-swap; increments the durable epoch.
+    async fn claim_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: uuid::Uuid,
+        _expected_epoch: u64,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Persist a possibly unknown provider effect before dispatch, fenced by ownership.
+    /// An unfinished nonrepeatable effect refuses another dispatch and retains the
+    /// reservation for provider-specific reconciliation.
+    async fn begin_migration_dispatch(
+        &self,
+        _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
+        _retry_safe: bool,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Read the current descriptor, parent and validated envelope atomically under
+    /// the migration writer protocol; never combine cached metadata with new bytes.
+    async fn wrapped_key_snapshot(
+        &self,
+        _lid: &Lid,
+        _version: u64,
+    ) -> Result<crate::migration::WrappedKeySnapshot> {
+        Err(crate::migration::migration_invalid(
+            "atomic wrapped-key snapshot unsupported",
+        ))
+    }
+    /// Publish all staged bytes under the current ownership epoch. The dispatch
+    /// marker must belong to this epoch; stale owners fail even on terminal retries.
     async fn stage_migration(
         &self,
         _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
         _envelopes: &[Vec<u8>],
     ) -> Result<crate::migration::MigrationJournal> {
         Err(crate::migration::migration_invalid(
             "transactional migration unsupported",
         ))
     }
-    async fn commit_migration(&self, _operation: uuid::Uuid) -> Result<KeyRecord> {
+    /// Atomically switch every version, persist the immutable terminal receipt,
+    /// and erase old envelopes. Ownership is checked before any idempotent return.
+    async fn commit_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
         Err(crate::migration::migration_invalid(
             "transactional migration unsupported",
         ))

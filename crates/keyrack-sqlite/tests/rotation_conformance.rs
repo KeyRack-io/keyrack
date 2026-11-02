@@ -69,9 +69,11 @@ async fn withdraw_semantics() {
 
 #[tokio::test]
 async fn rotation_and_migration_fences() {
-    keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
-        in_memory(),
-        in_memory(),
+    Box::pin(
+        keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
+            in_memory(),
+            in_memory(),
+        ),
     )
     .await;
 }
