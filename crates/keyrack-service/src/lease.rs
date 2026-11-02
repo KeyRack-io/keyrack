@@ -330,6 +330,12 @@ impl LeaseCleanup {
         self.pending_map().len()
     }
 
+    /// What counts against [`limit`](Self::limit).
+    #[must_use]
+    pub fn occupied(&self) -> usize {
+        self.pending()
+    }
+
     /// Stop the owner at `deadline`.
     ///
     /// Work already handed over, and work handed over while waiting, gets
