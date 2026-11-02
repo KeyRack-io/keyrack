@@ -181,6 +181,10 @@ impl CryptoProvider for Instrumented {
         .await
         .expect("native open thread")
     }
+    fn rewrap_is_retry_safe(&self) -> bool {
+        self.inner.rewrap_is_retry_safe()
+    }
+
     async fn rewrap_wrapped_key(
         &self,
         old: &WrappingContext,
@@ -526,31 +530,139 @@ impl Service {
         parent: Option<&str>,
         operation: uuid::Uuid,
     ) -> KeyRecord {
-        if rest {
-            let response = reqwest::Client::new().post(format!("{}/v1/keys/{key}/rewrap", self.rest))
-                .json(&serde_json::json!({"operation_id":operation.to_string(), "new_parent_key_id":parent.unwrap_or("")}))
-                .send().await.unwrap();
+        let receipt = if rest {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/keys/{key}/rewrap", self.rest))
+                .json(&serde_json::json!({
+                    "operation_id": operation.to_string(),
+                    "new_parent_key_id": parent.unwrap_or(""),
+                }))
+                .send()
+                .await
+                .unwrap();
             let status = response.status();
             let text = response.text().await.unwrap();
             assert!(status.is_success(), "migration: {status} {text}");
             let body: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(body["operation_id"], operation.to_string());
+            let mut encoded = body["result"].clone();
+            // REST uses textual LIDs; the storage record serializes their bytes.
+            for field in ["child", "old_parent", "new_parent"] {
+                let lid: keyrack_core::lid::Lid = encoded[field].as_str().unwrap().parse().unwrap();
+                encoded[field] = serde_json::to_value(lid).unwrap();
+            }
+            let receipt: keyrack_core::migration::MigrationResult =
+                serde_json::from_value(encoded).expect("terminal migration receipt");
+            assert_eq!(body["metadata"]["lid"], receipt.child.to_string());
+            assert_eq!(
+                body["metadata"]["parent_lid"],
+                receipt.new_parent.to_string()
+            );
+            receipt
         } else {
-            let result = self
+            let response = self
                 .client()
                 .await
                 .rewrap_key(proto::RewrapKeyRequest {
                     key_id: key.into(),
                     new_parent_key_id: parent.unwrap_or("").into(),
                     operation_id: operation.to_string(),
+                    ..Default::default()
                 })
                 .await
                 .expect("gRPC migration")
                 .into_inner();
-            assert_eq!(result.operation_id, operation.to_string());
-        }
-        self.record(key).await
+            assert_eq!(response.operation_id, operation.to_string());
+            let metadata = response.metadata.expect("original committed metadata");
+            let result = response.result.expect("terminal migration receipt");
+            assert_eq!(metadata.key_id, result.child);
+            assert_eq!(
+                metadata.parent_key_id.as_deref(),
+                Some(result.new_parent.as_str())
+            );
+            keyrack_core::migration::MigrationResult {
+                operation_id: result.operation_id.parse().unwrap(),
+                child: result.child.parse().unwrap(),
+                old_parent: result.old_parent.parse().unwrap(),
+                old_parent_versions: result.old_parent_versions,
+                new_parent: result.new_parent.parse().unwrap(),
+                new_parent_version: result.new_parent_version,
+                digest_algorithm: result.digest_algorithm,
+                versions: result
+                    .versions
+                    .into_iter()
+                    .map(|v| keyrack_core::migration::MigrationVersionResult {
+                        version: v.version,
+                        old_parent_version: v.old_parent_version,
+                        new_parent_version: v.new_parent_version,
+                        old_envelope_digest: v.old_envelope_digest,
+                        new_envelope_digest: v.new_envelope_digest,
+                        old_reference: v.old_reference,
+                        new_reference: v.new_reference,
+                    })
+                    .collect(),
+            }
+        };
+        assert_eq!(receipt.operation_id, operation);
+        assert_eq!(receipt.child.to_string(), key);
+        let journal = self
+            .state
+            .storage
+            .get_migration(operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.phase,
+            keyrack_core::migration::MigrationPhase::Committed
+        );
+        assert_eq!(journal.result.as_ref(), Some(&receipt));
+        journal.request.proposed
     }
+
+    async fn refuse_changed_migration_assertion(
+        &self,
+        rest: bool,
+        key: &str,
+        parent: &str,
+        operation: uuid::Uuid,
+    ) {
+        // Same logical destination but newly supplied optional assertion is a
+        // different immutable intent, even after the original operation commits.
+        if rest {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/keys/{key}/rewrap", self.rest))
+                .json(&serde_json::json!({
+                    "operation_id": operation.to_string(),
+                    "old_parent_key_id": parent,
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+            assert!(body.contains("different migration intent"), "{body}");
+        } else {
+            let error = self
+                .client()
+                .await
+                .rewrap_key(proto::RewrapKeyRequest {
+                    key_id: key.into(),
+                    operation_id: operation.to_string(),
+                    old_parent_key_id: parent.into(),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("changed assertion presence must refuse");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("different migration intent"),
+                "{error}"
+            );
+        }
+    }
+
     fn native_object_count() -> usize {
         // Observe the already initialized module without initializing/finalizing
         // it independently or changing the service's recovery state.
@@ -1055,6 +1167,17 @@ async fn native_wrapped_grpc_rest_rewrap_and_reparent_retained_versions() {
                 .wrapped_material_ref()
                 .as_str()
                 .to_owned();
+            let mut old_envelopes = Vec::new();
+            for version in &original.key_versions {
+                old_envelopes.push(
+                    service
+                        .envelope_reference(
+                            wrapped_material(version).wrapped_material_ref().as_str(),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
             let old_ciphertext = service.envelope(&child).await;
             let parent_v2 = service.rotate(rest, &parent).await;
             assert_eq!(parent_v2.current_key_version, 2);
@@ -1093,7 +1216,54 @@ async fn native_wrapped_grpc_rest_rewrap_and_reparent_retained_versions() {
                     .contains("Query returned no rows"),
                 "{old_reference_error}"
             );
+            let terminal = service
+                .state
+                .storage
+                .get_migration(operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(terminal.digest_algorithm, "blake3");
+            assert_eq!(terminal.old_parent, old_parent.lid);
+            assert_eq!(terminal.new_parent, parent_v2.lid);
+            assert_eq!(terminal.old_parent_versions, vec![1]);
+            assert_eq!(terminal.new_parent_version, 2);
+            assert_eq!(terminal.versions.len(), original.key_versions.len());
+            for (index, version) in terminal.versions.iter().enumerate() {
+                assert_eq!(version.version, original.key_versions[index].version_number);
+                assert_eq!(version.old_parent_version, 1);
+                assert_eq!(version.new_parent_version, 2);
+                assert_eq!(
+                    version.old_reference,
+                    wrapped_material(&original.key_versions[index])
+                        .wrapped_material_ref()
+                        .as_str()
+                );
+                assert_eq!(
+                    version.new_reference,
+                    wrapped_material(&rewrapped.key_versions[index])
+                        .wrapped_material_ref()
+                        .as_str()
+                );
+                assert_eq!(
+                    version.old_envelope_digest,
+                    blake3::hash(&old_envelopes[index]).to_hex().as_str()
+                );
+                let current = service
+                    .envelope_reference(&version.new_reference)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    version.new_envelope_digest,
+                    blake3::hash(&current).to_hex().as_str()
+                );
+            }
             let calls = service.controls.migration_calls.load(Ordering::SeqCst);
+            service
+                .refuse_changed_migration_assertion(rest, &child, &parent, operation)
+                .await;
             let replayed = service.migrate(rest, &child, None, operation).await;
             assert_eq!(
                 serde_json::to_value(&replayed).unwrap(),
@@ -1185,6 +1355,24 @@ async fn native_wrapped_grpc_rest_rewrap_and_reparent_retained_versions() {
             service.decrypt(rest, &child, &first_ciphertext).await;
             service.decrypt(rest, &child, &second_ciphertext).await;
             service.roundtrip(rest, &child).await;
+            let calls = service.controls.migration_calls.load(Ordering::SeqCst);
+            let old_result = service.migrate(rest, &child, None, operation).await;
+            assert_eq!(old_result.parent_lid, Some(old_parent.lid));
+            assert_eq!(
+                service.controls.migration_calls.load(Ordering::SeqCst),
+                calls
+            );
+            assert_eq!(
+                service
+                    .state
+                    .storage
+                    .get_migration(operation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .result,
+                Some(terminal)
+            );
             assert!(
                 service
                     .envelope_reference(
@@ -1213,6 +1401,7 @@ async fn native_wrapped_grpc_rest_migration_cancellation_retains_journal() {
         let ciphertext = service.encrypt(rest, &child).await.unwrap();
         let operation = uuid::Uuid::new_v4();
         let baseline = Service::native_object_count();
+        let calls_before = service.controls.migration_calls.load(Ordering::SeqCst);
         let closed_before = service
             .controls
             .migration_native_closed
@@ -1248,6 +1437,7 @@ async fn native_wrapped_grpc_rest_migration_cancellation_retains_journal() {
                 key_id: child.clone(),
                 new_parent_key_id: other.clone(),
                 operation_id: operation.to_string(),
+                ..Default::default()
             });
             input.set_timeout(Duration::from_secs(1));
             tokio::spawn(async move {
@@ -1329,6 +1519,11 @@ async fn native_wrapped_grpc_rest_migration_cancellation_retains_journal() {
             MigrationPhase::Committed
         );
         assert_eq!(Service::native_object_count(), baseline);
+        assert_eq!(
+            service.controls.migration_calls.load(Ordering::SeqCst),
+            calls_before + 1,
+            "same-operation retry duplicated the admitted native effect"
+        );
         service.decrypt(rest, &child, &ciphertext).await;
         service.roundtrip(rest, &child).await;
     }

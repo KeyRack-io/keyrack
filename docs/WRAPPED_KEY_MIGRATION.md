@@ -99,7 +99,7 @@ binding receipt, not a signature or a proof of token custody.
 | Combination | Support |
 | --- | --- |
 | Same explicit provider and security domain, software AES-256 parent and AES-256 child | Implemented with `software:aes-256-gcm:v1`. |
-| Native PKCS#11 profile through Worker | Pending Worker's integration and profile qualification; not enabled by this PR. Child unwrap and rewrap must remain inside the token. |
+| Explicit native PKCS#11 profile, AES-256 derive-only roots and AES-128/256 children | Experimental `pkcs11:aes256-cbc-sha256-kw:v1`, qualified at startup and tested with SoftHSM 2.7.0. Unwrap, derivation and rewrap stay inside the software token; no hardware token is qualified. |
 | Cross-provider or cross-security-domain | Explicitly refused; no transport or software fallback. |
 | Wrapped child as destination parent, or a cycle | Refused; only a resident wrapping parent is eligible. |
 | Scheduled, destroyed, compromised or otherwise ineligible parent | Refused. This slice conservatively requires both parents and the child to be enabled, uncompromised and non-exportable. |
@@ -128,6 +128,12 @@ provider return means intermediate objects have been cleaned up. Only encrypted
 envelopes cross this interface. `rewrap_is_retry_safe()` defaults to false;
 software explicitly returns true because repeating its local zeroized
 transformation has no durable child effect and consumes neither parent nor input.
+The qualified native profile explicitly returns true because its temporary
+KEKs and child are session objects, and neither parent nor source envelope is
+consumed. This is a durable retry-safety promise, not a readiness indication.
+An unconfirmed native close still blocks all subsequent wrapping effects and
+output until process restart; the capability does not bypass that runtime fence.
+The provider returns new envelope bytes only after its original session closes.
 A token capability declaration alone never authorizes blind repetition.
 
 ## Recovery, ownership and cancellation
@@ -161,8 +167,8 @@ batch. For a nonrepeatable native effect with an unknown outcome, the reservatio
 and source-parent destruction block remain until correlated reconciliation.
 Takeover does not clear that marker. The service does not retry that native effect,
 accept stale output, or provide an administrative flag that declares it safe.
-Worker/native integration must supply qualified outcome/cleanup reconciliation
-before that profile is enabled. A nonrepeatable batch that successfully reaches
+A future nonrepeatable provider must supply correlated outcome/cleanup
+reconciliation before that profile is enabled. A nonrepeatable batch that successfully reaches
 Staged is recoverable without repeating its effects.
 
 **There is no operation-cancel API after reservation.** Cancelling an HTTP/gRPC

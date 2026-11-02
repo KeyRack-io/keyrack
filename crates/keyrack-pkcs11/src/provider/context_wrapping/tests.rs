@@ -145,6 +145,7 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
     let config = config();
     let ordinary = Pkcs11Provider::new(&config).unwrap();
     assert!(ordinary.wrapping_capabilities().tuples().is_empty());
+    assert!(!ordinary.rewrap_is_retry_safe());
     let ordinary_root = ordinary.generate_key(&KeySpec::Aes256).await.unwrap();
     let ordinary_cipher = ordinary
         .encrypt(&ordinary_root, b"ordinary semantics", b"aad")
@@ -159,6 +160,7 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
         .eq(b"ordinary semantics"));
     let provider = configured(&config);
     assert_eq!(provider.wrapping_capabilities().tuples().len(), 8);
+    assert!(provider.rewrap_is_retry_safe());
     assert!(provider
         .capabilities()
         .key_specs
@@ -526,10 +528,27 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
         .unwrap_err();
     assert!(release_error.to_string().contains("process restart"));
     assert!(
+        provider.rewrap_is_retry_safe(),
+        "cleanup uncertainty must not poison durable retry semantics"
+    );
+    assert!(
         release_migration.closed,
         "real rewrap and original close finished before release fence"
     );
     assert_eq!(object_count(&provider).await, before_release);
+    for _ in 0..2 {
+        assert!(provider
+            .rewrap_wrapped_key(&context, &parent, &bytes, &context, &parent)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("process restart"));
+        assert_eq!(
+            object_count(&provider).await,
+            before_release,
+            "retry qualification cannot bypass the pre-effect cleanup fence"
+        );
+    }
     let attempts = {
         let mut state = engine.state.lock().unwrap();
         [&generated.lease, &failed_open].map(|lease| {
@@ -633,6 +652,11 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
         .module
         .recover(provider.module.generation())
         .permits_retry());
+    assert!(
+        provider.rewrap_is_retry_safe(),
+        "repeatability remains a profile property across ordinary recovery"
+    );
+    assert!(!ordinary.rewrap_is_retry_safe());
     assert_eq!(object_count(&provider).await, live_count - 1);
     assert!(provider
         .wrapping_closure_verifier()

@@ -1290,6 +1290,15 @@ impl CryptoProvider for Pkcs11Provider {
             .await
     }
 
+    fn rewrap_is_retry_safe(&self) -> bool {
+        // Only the startup-qualified profile uses session-only intermediates
+        // without consuming either parent or the source envelope. This durable
+        // semantic promise is not readiness: recording a transient cleanup fence
+        // as false would permanently block journal recovery after process restart.
+        // Every call independently refuses effects/output while that fence is set.
+        self.wrapping.is_some()
+    }
+
     async fn rewrap_wrapped_key(
         &self,
         old_context: &keyrack_core::wrapping::WrappingContext,

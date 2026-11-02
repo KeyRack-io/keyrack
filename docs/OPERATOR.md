@@ -425,9 +425,19 @@ Omit `new_parent_key_id` (or use an empty string) to select the existing parent'
 current version; set it to another resident root to reparent within the same
 provider. Both parents must be derive-only roots in the configured security
 domain; existing ordinary-use roots are refused. The service pins that
-destination version when it reserves the operation, migrates every retained child version, and publishes all replacement
-envelopes atomically. Application ciphertext and child key material do not
-change.
+destination version when it reserves the operation, migrates every retained
+child version, and publishes all replacement envelopes atomically. Application
+ciphertext and child key material do not change.
+
+Optional old-parent, OCC-revision and covered-version assertions are part of
+immutable operation intent, including whether each assertion was supplied. A
+covered-version set must include every retained child version. Preserve those
+assertions, parent selection and `operation_id` exactly on retries; changing even
+an omitted assertion into an explicit matching value is a different intent and
+is refused. The committed result binds every old/new parent version, envelope
+reference and BLAKE3 digest. It is a durable binding receipt, not a signature or
+independent proof of token custody; later retries return that original result.
+See [wrapped-key migration](WRAPPED_KEY_MIGRATION.md) for the full schema.
 
 Migration unwraps the child only into a temporary token session object. That
 object is sensitive and extractable solely for token wrapping, with encrypt,
@@ -435,8 +445,8 @@ decrypt, derive, sign and verify disabled. Derived KEKs remain non-extractable.
 The original session must close successfully before the provider returns wrapped
 bytes; no plaintext key leaves the token. Cancellation does not cancel native
 cleanup. An interrupted operation retains its journal fence: retry with the
-same `operation_id` and destination to finish the original intent, rather than
-starting a new operation. A committed retry returns the recorded result without
+same `operation_id` and complete caller intent to finish the original operation,
+rather than starting a new one. A committed retry returns the recorded result without
 repeating native effects.
 
 Commit erases the service's old envelopes. It cannot retire copies already
