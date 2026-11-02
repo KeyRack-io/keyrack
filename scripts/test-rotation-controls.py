@@ -18,9 +18,10 @@ SQLITE = "crates/keyrack-sqlite/src/"
 POSTGRES = "crates/keyrack-postgres/src/creation.rs"
 SERVICE = "crates/keyrack-service/src/"
 
-SQLITE_ROTATION = ("keyrack-sqlite", (), "rotation_conformance")
-SERVICE_ROTATION = ("keyrack-service", (), "wrapped_child_rotation")
-POSTGRES_ROTATION = ("keyrack-postgres", ("--features", "live-tests"), "conformance")
+SQLITE_ROTATION = ("keyrack-sqlite", (), "rotation_conformance", None)
+SERVICE_ROTATION = ("keyrack-service", (), "wrapped_child_rotation", None)
+# Repeated runs accumulate keys in one database; unrelated tests in this binary expect a first-page listing.
+POSTGRES_ROTATION = ("keyrack-postgres", ("--features", "live-tests"), "conformance", "rotation_postgres::")
 
 # Each mutation is bounded to one function and leaves the code warning-free.
 # Compilation failures and zero-test runs never count as successful controls.
@@ -98,10 +99,10 @@ def main():
         shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(".git", "target", "__pycache__"), copy_function=shutil.copy)
 
         def run(name, suite, test=None):
-            package, features, target = suite
+            package, features, target, scope = suite
             command = ["cargo", "test", "--locked", "--offline", "-p", package, *features, "--test", target,
                        "--target-dir", str(args.target_dir.resolve()), "--"]
-            command += [test, "--exact", "--nocapture"] if test else ["--nocapture"]
+            command += [test, "--exact", "--nocapture"] if test else [*([scope] if scope else []), "--nocapture"]
             with (output / f"{name}.log").open("w") as log:
                 result = subprocess.run(command, cwd=copy, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=900)
             text = (output / f"{name}.log").read_text()
