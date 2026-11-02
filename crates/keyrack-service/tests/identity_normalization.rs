@@ -119,7 +119,9 @@ fn state() -> (Arc<ServiceState>, Arc<CountingPdp>) {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, pdp)
 }

@@ -187,6 +187,40 @@ async fn a_closed_lease_stops_operating_and_closes_idempotently() {
     assert_eq!(first, second);
 }
 
+#[tokio::test]
+async fn a_predicted_next_lease_cannot_close_material_that_is_not_yet_issued() {
+    let (provider, parent, ctx) = parented().await;
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
+    let issued = generated.lease.object().as_str();
+    let (prefix, n) = issued.rsplit_once('-').expect("issued object identity");
+    let next = n.parse::<u64>().expect("issued counter") + 1;
+    let predicted = format!("{prefix}-{next}");
+    let predicted_lease = WrappedKeyLease::new(
+        KeyHandle {
+            key_id: predicted.clone(),
+            key_spec: KeySpec::Aes256,
+        },
+        name(&predicted),
+        &ctx,
+    )
+    .unwrap();
+    assert!(
+        provider.close_wrapped_key(&predicted_lease).await.is_err(),
+        "a lease that was never issued must not certify closure"
+    );
+    provider
+        .encrypt(generated.lease.handle(), b"still live", b"aad")
+        .await
+        .expect("the real child must still operate after a predicted close");
+    provider
+        .close_wrapped_key(&generated.lease)
+        .await
+        .expect("the real lease still closes");
+}
+
 /// Idempotent close is bounded by what the provider still remembers, and the
 /// boundary is an error rather than a success. A caller that is told "closed"
 /// about an object nobody can account for would be entitled to conclude the

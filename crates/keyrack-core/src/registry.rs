@@ -65,8 +65,11 @@ pub trait ProviderRegistry: Send + Sync {
     fn default_ref(&self) -> &ProviderRef;
 
     /// Resolve the effective provider for a specific key version, applying
-    /// the `version -> record -> default` precedence for resident material.
-    /// Missing versions and parent-wrapped material fail before provider lookup.
+    /// the `version -> record -> default` precedence.
+    ///
+    /// Missing versions fail before lookup. Wrapped material still resolves:
+    /// the descriptor names the backend that must open a lease. Obtaining a
+    /// usable handle is a later step, not this one.
     fn resolve_for_version(
         &self,
         record: &KeyRecord,
@@ -75,7 +78,6 @@ pub trait ProviderRegistry: Send + Sync {
         let version = record
             .get_version(version_number)
             .ok_or(KeyRackError::KeyNotFound(record.lid))?;
-        version.resident_handle()?;
         match version.provider_ref().or(record.provider_ref.as_ref()) {
             Some(name) => self.resolve(name),
             None => Ok(self.default_entry()),
