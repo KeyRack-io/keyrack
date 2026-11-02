@@ -38,3 +38,4 @@ pub mod fixtures;
 pub mod service_conformance;
 
 pub mod migration_conformance;
+pub mod rotation_conformance;
