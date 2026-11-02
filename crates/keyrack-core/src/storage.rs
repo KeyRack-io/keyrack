@@ -72,6 +72,51 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Migration methods are atomic writer-fenced transactions. Unsupported backends fail closed.
+    async fn reserve_migration(
+        &self,
+        _request: &crate::migration::MigrationRequest,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn get_migration(
+        &self,
+        _operation: uuid::Uuid,
+    ) -> Result<Option<crate::migration::MigrationJournal>> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn stage_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _envelopes: &[Vec<u8>],
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn commit_migration(&self, _operation: uuid::Uuid) -> Result<KeyRecord> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn read_migration_envelope(
+        &self,
+        _operation: uuid::Uuid,
+        _version: u64,
+    ) -> Result<Vec<u8>> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Refuse before provider-side mutation if any logical identity is reserved.
+    async fn check_migration_fence(&self, _lid: &Lid) -> Result<()> {
+        Ok(())
+    }
+
     /// Commit a one-shot resident destruction fence before any provider effect.
     /// Re-read state, due time, OCC and full material history in the transaction;
     /// reject all parent/child creation references. All writers must honor the

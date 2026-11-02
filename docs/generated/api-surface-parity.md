@@ -57,6 +57,7 @@ Export and import are not controlled by that feature.
 | `RegisterNamespace` | Declared stub; see limitation | — | Unimplemented namespace registry: The handler logs and echoes the name without storing a namespace. The namespace registry is not implemented. |
 | `ReportKeyCompromise` | Handler available | `POST /v1/keys/:key_id/actions-report-compromise` |  |
 | `RevokeKeyExportability` | Handler available | — | Intentional gap: The 0.4.0 exportability API intentionally exposes this operation only through gRPC (CHANGELOG: key export API, gRPC only). |
+| `RewrapKey` | Handler available | `POST /v1/keys/:key_id/rewrap` |  |
 | `RotateKey` | Handler available | `POST /v1/keys/:key_id/actions-rotate` |  |
 | `ScheduleKeyDeletion` | Handler available | `POST /v1/keys/:key_id/actions-schedule-deletion` |  |
 | `SetKeyRotationPolicy` | Handler available | — | Existing REST gap: Rotation settings/history are exposed by this gRPC handler; the REST facade has no corresponding route. |

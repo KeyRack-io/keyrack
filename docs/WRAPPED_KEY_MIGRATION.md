@@ -28,12 +28,14 @@ return means intermediate objects have been removed. The operation must be
 safe to repeat after a lost response, with no durable independently usable
 child left behind. No token implementation is enabled by this change.
 
-The new envelope authenticates the new context and rejects the old context.
+When the parent binding changes, the new envelope authenticates the new context
+and rejects the old context. A rewrap already at the current parent version
+retains the same context; context rejection does not distinguish identical input.
 Deleting the service's original envelope does not revoke a separately retained
 copy while its original parent still exists. Database deletion also does not
 erase backups, database recovery logs or material previously exported elsewhere.
 
-## Service and storage protocol (implementation in progress)
+## Service and storage protocol
 
 One logical key and a required operation UUID identify the operation. Omitting
 the new parent means rewrap under the existing parent's current version; naming
@@ -51,6 +53,9 @@ uses the durable envelopes and performs no new cryptography. Commit atomically
 switches every version and `parent_lid`, removes old envelope bytes and retires
 old active dependency references. Committed recovery returns the original result.
 A client retries the same request and operation ID after an interrupted call.
+The journal persists across service/storage restarts. Recovery requires the
+provider's resident parent material to remain available: the in-memory software
+provider does not make its resident keys persistent across a process exit.
 
 While reserved or staged, writes affecting the child or either parent are
 refused as retryable. This includes child rotation: it never publishes a version
@@ -62,6 +67,14 @@ outside a migration; this operation does not add that lifecycle.
 future hierarchy resolution observes the new parent. Existing rule definitions,
 keys and ciphertext are not implicitly rewritten by a hierarchy rule change.
 
-The implementation PR is stacked on #45. Rebase onto main after #45 merges;
-do not merge the migration PR until its API parity, storage parity, recovery,
-authorization and reverted-fence controls pass.
+Within one process, retries of the same operation share a serial execution
+slot. Across processes, repeating the pure provider primitive is safe and the
+first staged envelopes win. Once committed, later duplicate results cannot
+replace the published envelopes. Existing crypto operations are not drained by
+this storage fence. API tasks are bounded at 64 per process and retain their
+audit outcome ownership after client cancellation; at capacity callers receive
+a retryable refusal. A process crash can leave an attempt without an outcome.
+
+`scripts/test-migration-controls.py` removes each storage fence in a disposable
+source copy and requires a named assertion failure, then reruns restored tests.
+The migration CI job also executes live PostgreSQL conformance and recovery.

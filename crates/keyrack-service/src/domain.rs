@@ -1180,17 +1180,10 @@ async fn prepare_usable(
                 .clone(),
         )),
         KeyMaterial::ParentWrapped(material) => {
-            let operation = material
-                .wrapped_material_ref()
-                .as_str()
-                .strip_prefix("creation:")
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
-            let envelope = state
-                .storage
-                .read_creation_envelope(operation)
-                .await
-                .map_err(|_| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
+            let envelope =
+                crate::migration::read_envelope(state, material.wrapped_material_ref().as_str())
+                    .await
+                    .map_err(|_| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
             let parent = state
                 .storage
                 .get_key(&material.parent().lid)
@@ -1399,6 +1392,11 @@ pub async fn rotate_key(
     key_id: &str,
 ) -> Result<RotateKeyResult, DomainError> {
     let lid = *lid;
+    state
+        .storage
+        .check_migration_fence(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut record = state
         .storage
         .get_key_for_use(&lid)

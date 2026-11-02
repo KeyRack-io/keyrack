@@ -34,6 +34,7 @@
 
 mod creation;
 mod destruction;
+mod migration;
 
 use async_trait::async_trait;
 use keyrack_core::creation::{
@@ -133,6 +134,10 @@ async fn initialize_schema(pool: &PgPool) -> Result<()> {
         .execute(CREATE_TABLES)
         .await
         .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+    (&mut *transaction)
+        .execute(migration::SCHEMA)
+        .await
+        .map_err(|e| KeyRackError::Storage(format!("migration schema: {e}")))?;
     transaction
         .commit()
         .await
@@ -150,6 +155,44 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
+    async fn reserve_migration(
+        &self,
+        request: &keyrack_core::migration::MigrationRequest,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_reserve(request).await
+    }
+    async fn get_migration(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
+        self.migration_get(operation).await
+    }
+    async fn stage_migration(
+        &self,
+        operation: uuid::Uuid,
+        envelopes: &[Vec<u8>],
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_stage(operation, envelopes).await
+    }
+    async fn commit_migration(&self, operation: uuid::Uuid) -> Result<KeyRecord> {
+        self.migration_commit(operation).await
+    }
+    async fn read_migration_envelope(
+        &self,
+        operation: uuid::Uuid,
+        version: u64,
+    ) -> Result<Vec<u8>> {
+        self.migration_read(operation, version).await
+    }
+    async fn check_migration_fence(&self, lid: &Lid) -> Result<()> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(creation::database_error)?;
+        migration::guard(&mut connection, lid).await
+    }
+
     async fn claim_destruction(
         &self,
         lid: &Lid,

@@ -39,6 +39,7 @@ pub mod hsm_registration;
 pub mod identity_input;
 pub mod lease;
 pub mod metrics;
+pub mod migration;
 pub mod ops;
 pub mod pdp_grpc;
 pub mod pdp_http;

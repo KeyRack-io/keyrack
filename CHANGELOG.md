@@ -31,6 +31,20 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- **Rewrap and reparent every version of a wrapped key.** `RewrapKey` and REST
+  `POST /v1/keys/{key_id}/rewrap` share one synchronous primitive and a required
+  operation UUID. Omit `new_parent_key_id` to use the current parent's current
+  version; name a different resident parent to reparent. Both require the same
+  provider and security domain. `kms:RewrapKey` is authorized separately on the
+  child and both parents, with attempt and outcome audit events. Reservation
+  pins the target version and fences conflicting writes; staged envelopes and
+  all-version commit recover through the same operation ID. Commit changes
+  `parent_lid` and retires old envelopes atomically, releasing the old wrapping
+  dependency. Generic parent mutation is refused. SQLite and PostgreSQL share
+  conformance tests, with live PostgreSQL and reverted-fence controls in CI.
+  Only the software provider currently implements the new provider primitive;
+  it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
+
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.

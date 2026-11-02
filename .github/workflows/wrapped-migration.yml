@@ -1,0 +1,52 @@
+name: Wrapped-key migration
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "fix/**", "handback/**"]
+  push:
+    branches: [main]
+
+jobs:
+  migration:
+    name: Migration PostgreSQL parity and reverted fences
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: keyrack_test
+          POSTGRES_PASSWORD: disposable_ci_only
+          POSTGRES_DB: keyrack_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keyrack_test -d keyrack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://keyrack_test:disposable_ci_only@127.0.0.1:5432/keyrack_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo fetch --locked
+      - name: Live PostgreSQL migration and recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
+          for test in migration_atomic_publication_and_retirement migration_all_writer_fences migration_creation_and_occ_preempt migration_deny_paths; do
+            grep -Fxq "$test: test" <<< "$listing"
+          done
+          cargo test -p keyrack-postgres --features live-tests --test conformance migration -- --nocapture
+      - name: Revert each storage fence in a disposable source copy
+        run: python3 scripts/test-migration-controls.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-fence-controls
+          path: target/proofs/migration/
+          if-no-files-found: error

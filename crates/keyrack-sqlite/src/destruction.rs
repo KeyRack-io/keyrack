@@ -60,6 +60,7 @@ impl SqliteStorage {
             let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM destruction_journal WHERE lid=?1)",
                 [lid.to_string()], |row| row.get(0)).map_err(|e| map_sql(&e))?;
             if exists { return Ok(None); }
+            crate::migration::guard(conn, lid)?;
             let record = creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
             let record = prepare_claim(record, expected, now)?;
             let referenced: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM creation_journal WHERE parent_lid=?1 OR child_lid=?1)",

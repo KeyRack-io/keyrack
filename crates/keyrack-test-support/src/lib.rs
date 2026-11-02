@@ -36,3 +36,5 @@ pub mod creation_conformance;
 pub mod destruction_conformance;
 pub mod fixtures;
 pub mod service_conformance;
+
+pub mod migration_conformance;

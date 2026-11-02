@@ -28,6 +28,7 @@
 
 mod creation;
 mod destruction;
+mod migration;
 
 use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
@@ -81,6 +82,8 @@ impl SqliteStorage {
             Connection::open(path).map_err(|e| KeyRackError::Storage(format!("open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(migration::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         conn.execute_batch(creation::SCHEMA)
             .map_err(|e| map_sql(&e))?;
         Ok(Self {
@@ -94,6 +97,8 @@ impl SqliteStorage {
             .map_err(|e| KeyRackError::Storage(format!("open in-memory: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+        conn.execute_batch(migration::SCHEMA)
+            .map_err(|e| map_sql(&e))?;
         conn.execute_batch(creation::SCHEMA)
             .map_err(|e| map_sql(&e))?;
         Ok(Self {
@@ -128,6 +133,39 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for SqliteStorage {
+    async fn reserve_migration(
+        &self,
+        request: &keyrack_core::migration::MigrationRequest,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_reserve(request)
+    }
+    async fn get_migration(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
+        self.migration_get(operation)
+    }
+    async fn stage_migration(
+        &self,
+        operation: uuid::Uuid,
+        envelopes: &[Vec<u8>],
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_stage(operation, envelopes)
+    }
+    async fn commit_migration(&self, operation: uuid::Uuid) -> Result<KeyRecord> {
+        self.migration_commit(operation)
+    }
+    async fn read_migration_envelope(
+        &self,
+        operation: uuid::Uuid,
+        version: u64,
+    ) -> Result<Vec<u8>> {
+        self.migration_read(operation, version)
+    }
+    async fn check_migration_fence(&self, lid: &Lid) -> Result<()> {
+        self.with_conn(|conn| migration::guard(conn, lid))
+    }
+
     async fn claim_destruction(
         &self,
         lid: &Lid,
@@ -217,6 +255,7 @@ impl StorageBackend for SqliteStorage {
             .map_err(|_| keyrack_core::creation::invalid("key OCC out of range"))?;
 
         self.creation_tx(|conn| {
+            migration::guard_record(conn, record)?;
             creation::guard_create(conn, &record.lid)?;
             destruction::guard_write(conn, record)?;
             conn.execute(
@@ -280,6 +319,7 @@ impl StorageBackend for SqliteStorage {
                     "cannot clear a key's compromise history".into(),
                 ));
             }
+            migration::guard_update(conn, &previous, record)?;
             creation::guard_update(conn, &previous, record)?;
             destruction::guard_update(conn, record)?;
             let rows = conn
@@ -830,5 +870,6 @@ mod tests {
 
     keyrack_test_support::storage_conformance_tests!(SqliteStorage::in_memory().unwrap());
     keyrack_test_support::creation_conformance_tests!(SqliteStorage::in_memory().unwrap());
+    keyrack_test_support::migration_conformance_tests!(SqliteStorage::in_memory().unwrap());
     keyrack_test_support::destruction_conformance_tests!(SqliteStorage::in_memory().unwrap());
 }

@@ -36,6 +36,8 @@ service KeyService {
   rpc CancelKeyDeletion(CancelKeyDeletionRequest) returns (CancelKeyDeletionResponse);
   rpc ReportKeyCompromise(ReportKeyCompromiseRequest) returns (ReportKeyCompromiseResponse);
   rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
+  // Atomically rewrap every version, optionally under a different resident parent.
+  rpc RewrapKey(RewrapKeyRequest) returns (RewrapKeyResponse);
 
   // ── Key versions ──────────────────────────────────────────────────
 
@@ -488,6 +490,20 @@ message RotateKeyRequest {
 message RotateKeyResponse {
   KeyMetadata metadata = 1;
   uint32 new_version = 2;
+}
+
+// The operation ID is a caller-generated UUID. Reuse it with the same intent
+// to recover a lost response or interrupted migration. An empty new parent
+// means the existing parent's current version at reservation.
+message RewrapKeyRequest {
+  string key_id = 1;
+  string new_parent_key_id = 2;
+  string operation_id = 3;
+}
+
+message RewrapKeyResponse {
+  KeyMetadata metadata = 1;
+  string operation_id = 2;
 }
 
 // ═══════════════════════════════════════════════════════════════════

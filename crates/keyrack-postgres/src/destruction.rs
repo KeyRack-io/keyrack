@@ -50,6 +50,7 @@ impl PostgresStorage {
             tx.commit().await.map_err(database_error)?;
             return Ok(None);
         }
+        crate::migration::guard(&mut tx, lid).await?;
         let record = load_key(&mut tx, lid)
             .await?
             .ok_or(KeyRackError::KeyNotFound(*lid))?;

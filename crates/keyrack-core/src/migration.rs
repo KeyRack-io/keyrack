@@ -28,6 +28,9 @@ use crate::canon::CanonicalizationVersion;
 use crate::lid::Lid;
 use serde::{Deserialize, Serialize};
 
+mod wrapped;
+pub use wrapped::*;
+
 /// Action to take for a single key during migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

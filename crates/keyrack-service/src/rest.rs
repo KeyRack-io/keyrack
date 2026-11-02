@@ -136,6 +136,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/keys", get(list_keys).post(create_key))
         .route("/v1/keys/:key_id", get(get_key).put(update_key))
         .route("/v1/keys/:key_id/describe", get(describe_key))
+        .route("/v1/keys/:key_id/rewrap", post(rewrap_key))
         .route("/v1/keys/:key_id/actions-enable", post(enable_key))
         .route("/v1/keys/:key_id/actions-disable", post(disable_key))
         .route(
@@ -755,6 +756,38 @@ async fn rotate_key(
         Ok(key_json(&outcome.record))
     })
     .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RewrapKeyRequest {
+    operation_id: String,
+    #[serde(default)]
+    new_parent_key_id: String,
+}
+
+async fn rewrap_key(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key_id): Path<String>,
+    Json(body): Json<RewrapKeyRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let request_id = ops::extract_request_id_rest(&headers);
+    let principal = ops::extract_principal_rest(&state, &headers).await?;
+    let record = ops::execute_rewrap(
+        &state,
+        principal,
+        request_id,
+        key_id,
+        body.new_parent_key_id,
+        body.operation_id.clone(),
+    )
+    .await
+    .map_err(|error| error.to_rest_error())?;
+    Ok(Json(serde_json::json!({
+        "metadata": KeyResponse::from(&record),
+        "operation_id": body.operation_id,
+    })))
 }
 
 async fn import_key(

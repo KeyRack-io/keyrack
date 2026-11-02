@@ -1651,6 +1651,29 @@ impl KeyService for KeyServiceImpl {
         .await
     }
 
+    async fn rewrap_key(
+        &self,
+        request: Request<proto::RewrapKeyRequest>,
+    ) -> Result<Response<proto::RewrapKeyResponse>, Status> {
+        let request_id = Self::request_id(&request);
+        let principal = self.principal(&request).await?;
+        let req = request.into_inner();
+        let record = ops::execute_rewrap(
+            &self.state,
+            principal,
+            request_id,
+            req.key_id,
+            req.new_parent_key_id,
+            req.operation_id.clone(),
+        )
+        .await
+        .map_err(|error| error.to_grpc_status())?;
+        Ok(Response::new(proto::RewrapKeyResponse {
+            metadata: Some(convert::key_record_to_metadata(&record)),
+            operation_id: req.operation_id,
+        }))
+    }
+
     // ── Key versions ────────────────────────────────────────────────
 
     async fn list_key_versions(

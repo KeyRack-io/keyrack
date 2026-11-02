@@ -675,12 +675,14 @@ async fn apply_rule_change(
             .as_ref()
             .map(std::string::ToString::to_string);
 
-        // TODO(crypto): This only updates `parent_lid` metadata in the
-        // database. A full rule-change migration must also rewrap the key
-        // material under the new parent's wrapping key, which requires a
-        // CryptoProvider. The CLI currently only has direct storage access;
-        // cryptographic rewrap will be wired once the CLI gains gRPC client
-        // support to keyrack-service (which owns the CryptoProvider).
+        // Only the service's journaled RewrapKey operation may change ancestry.
+        // A direct-storage rule plan cannot supply its authorization or fences.
+        if record.parent_lid != new_parent_lid {
+            tracing::error!(lid = %key_lid,
+                "parent changes require service RewrapKey with an operation ID; direct-storage apply refused");
+            errors += 1;
+            continue;
+        }
         let mut updated = record.clone();
         updated.parent_lid = new_parent_lid;
         updated.occ_version += 1;
@@ -760,6 +762,12 @@ async fn rollback_rule_change(
         }
 
         let old_parent_lid = entry.old_parent_lid.as_ref().and_then(|s| s.parse().ok());
+        if record.parent_lid != old_parent_lid {
+            tracing::error!(lid = %key_lid,
+                "parent changes require service RewrapKey with an operation ID; direct-storage rollback refused");
+            errors += 1;
+            continue;
+        }
         let mut reverted = record.clone();
         reverted.parent_lid = old_parent_lid;
         reverted.occ_version += 1;

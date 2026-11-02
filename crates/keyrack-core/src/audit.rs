@@ -102,6 +102,8 @@ pub enum AuditAction {
     ReportKeyCompromise,
     #[serde(rename = "kms:RotateKey")]
     RotateKey,
+    #[serde(rename = "kms:RewrapKey")]
+    RewrapKey,
     #[serde(rename = "kms:ImportKeyMaterial")]
     ImportKeyMaterial,
 
@@ -253,6 +255,8 @@ pub enum EventType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditResult {
+    /// A migration was requested; this is neither authorization nor success.
+    Attempt,
     Success,
     Denied,
     Error,
@@ -1059,6 +1063,7 @@ mod tests {
             AuditAction::ScheduleKeyDeletion,
             AuditAction::CancelKeyDeletion,
             AuditAction::RotateKey,
+            AuditAction::RewrapKey,
             AuditAction::ImportKeyMaterial,
             AuditAction::GetKey,
             AuditAction::DescribeKey,

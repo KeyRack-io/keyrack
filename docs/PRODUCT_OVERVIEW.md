@@ -72,8 +72,13 @@ rotation tooling. The capability gap is universal.
 - Version coexistence: old versions remain available for decryption subject to
   key state and authorization. Applications migrate their data; job completion
   does not prove that all ciphertext has migrated or retire old versions.
-- Rotation policy settings can be stored; automatic policy scheduling and
-  cryptographic child rewrapping are not implemented.
+- Rotation policy settings can be stored; automatic policy scheduling is not
+  implemented.
+- Explicit `RewrapKey` rewraps every version of a wrapped child under the
+  parent's current version, or reparents it to another resident wrapping key.
+  The software mechanism supports same-provider, same-security-domain moves
+  with one atomic journaled switch. Native token rewrap requires a provider
+  implementation and qualification; cross-provider migration is refused.
 
 **Pluggable Crypto Providers**
 - Software (RustCrypto): development, non-regulated workloads
