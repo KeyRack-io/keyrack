@@ -28,6 +28,12 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- Key and version metadata expose `lifecycle_state` and
+  `has_compromise_history` over gRPC and REST. The existing gRPC version `state`
+  is deprecated and retains its compatibility meaning: compromise history
+  reports `Compromised` even after the live lifecycle advances to destruction.
+  Operation eligibility is unchanged; see [SPEC §7.2](docs/SPEC.md#72-valid-transitions).
+
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.

@@ -39,6 +39,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "integration/compromised_domain.rs"]
 mod compromised_domain;
+#[path = "integration/lifecycle_metadata.rs"]
+mod lifecycle_metadata;
 use tonic::Request;
 
 use base64::Engine as _;

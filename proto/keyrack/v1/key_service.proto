@@ -215,17 +215,30 @@ message KeyMetadata {
   bool exportable = 15;
   // Timestamp of the first successful export (write-once latch).
   optional google.protobuf.Timestamp first_exported_at = 16;
+  // Current lifecycle state of the logical key, identical to state.
+  KeyState lifecycle_state = 17;
+  // Whether the logical key is or has ever been marked compromised.
+  // Applies to every version and remains true after lifecycle transitions.
+  bool has_compromise_history = 18;
 }
 
 message KeyVersionMetadata {
   uint32 version = 1;
   google.protobuf.Timestamp created_at = 2;
-  // Lifecycle state of the owning logical key. A version has no lifecycle of
-  // its own: retention is reported by is_primary, not by this field.
-  KeyState state = 3;
+  // Deprecated compatibility projection: COMPROMISED whenever the owning key
+  // has compromise history; otherwise its current lifecycle state. This can
+  // remain COMPROMISED after the key is disabled, pending deletion or destroyed.
+  // Use lifecycle_state and has_compromise_history instead. A version has no
+  // lifecycle of its own; retention is reported by is_primary.
+  KeyState state = 3 [deprecated = true];
   // Whether this version is the current primary for encrypt and sign.
-  // Retained non-primary versions stay usable for decrypt and rewrap.
+  // Retention alone does not determine decrypt or rewrap eligibility.
   bool is_primary = 4;
+  // Current lifecycle state of the owning logical key, without history overlay.
+  KeyState lifecycle_state = 5;
+  // Whether the owning logical key is or has ever been marked compromised.
+  // Applies equally to primary and retained versions.
+  bool has_compromise_history = 6;
 }
 
 // Lineage entry for hierarchy queries (§5.5).
@@ -982,4 +995,3 @@ message ImportKeyRequest {
 message ImportKeyResponse {
   KeyMetadata metadata = 1;
 }
-
