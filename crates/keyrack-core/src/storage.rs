@@ -72,6 +72,17 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Read all destruction blockers in one consistent storage snapshot. Count
+    /// material versions and all parent/child creation journal rows, not logical
+    /// parent links. This is advisory: claim MUST recheck under its writer fence.
+    /// Unsupported implementations fail closed, never return empty counts.
+    async fn destruction_dependencies(
+        &self,
+        _lid: &Lid,
+    ) -> Result<crate::destruction::DestructionDependencies> {
+        Err(crate::destruction::invalid("dependency query unsupported"))
+    }
+
     /// Commit a one-shot resident destruction fence before any provider effect.
     /// Re-read state, due time, OCC and full material history in the transaction;
     /// reject all parent/child creation references. All writers must honor the
@@ -339,6 +350,7 @@ mod tests {
         let mut record = make_test_record(KeyState::PendingDeletion);
         record.scheduled_deletion_at = Some(chrono::Utc::now());
         store.create_key(&record).await.unwrap();
+        assert!(store.destruction_dependencies(&record.lid).await.is_err());
         assert!(store
             .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
             .await

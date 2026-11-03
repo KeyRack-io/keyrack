@@ -1002,6 +1002,20 @@ pub async fn disable_key(
     })
 }
 
+/// Admission check shared by the library, gRPC and REST scheduling paths.
+/// This observation does not reserve destruction: the storage claim repeats the
+/// same dependency query under its writer fence immediately before claiming.
+pub async fn ensure_deletion_can_be_scheduled(
+    state: &Arc<ServiceState>,
+    lid: &Lid,
+) -> Result<keyrack_core::destruction::DestructionDependencies, DomainError> {
+    let dependencies = state.storage.destruction_dependencies(lid).await?;
+    if !dependencies.is_empty() {
+        return Err(DomainError::FailedPrecondition(dependencies.summary()));
+    }
+    Ok(dependencies)
+}
+
 pub async fn schedule_key_deletion(
     state: &Arc<ServiceState>,
     key_id: &str,
@@ -1018,6 +1032,7 @@ pub async fn schedule_key_deletion(
     } else {
         grace_period_days
     };
+    ensure_deletion_can_be_scheduled(state, &lid).await?;
     record
         .transition_to(KeyState::PendingDeletion)
         .map_err(|(f, t)| transition_err(f, t))?;

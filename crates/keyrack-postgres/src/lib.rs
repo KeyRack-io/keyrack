@@ -150,6 +150,13 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        self.destruction_dependency_counts(lid).await
+    }
+
     async fn claim_destruction(
         &self,
         lid: &Lid,
