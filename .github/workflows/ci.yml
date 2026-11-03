@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    # Long-lived integration branches receive PRs that never target main
-    # directly, so restricting to main leaves that work unverified.
-    branches: [main, "feat/**", "fix/**", "handback/**"]
+    # Run required checks for every PR, including dependency stacks.
 
 env:
   CARGO_TERM_COLOR: always
