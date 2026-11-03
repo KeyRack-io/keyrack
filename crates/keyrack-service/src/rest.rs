@@ -45,6 +45,10 @@ struct KeyVersionResponse {
     version_number: u64,
     created_at: chrono::DateTime<chrono::Utc>,
     is_primary: bool,
+    /// Current lifecycle state of the owning logical key.
+    lifecycle_state: keyrack_core::key::KeyState,
+    /// Logical-key compromise history, shared by every version.
+    has_compromise_history: bool,
 }
 
 /// Tenant-safe key response DTO.
@@ -55,6 +59,9 @@ struct KeyVersionResponse {
 struct KeyResponse {
     lid: String,
     state: keyrack_core::key::KeyState,
+    /// Explicit live lifecycle; `state` is retained with the same meaning.
+    lifecycle_state: keyrack_core::key::KeyState,
+    has_compromise_history: bool,
     key_spec: keyrack_core::key::KeySpec,
     key_usage: keyrack_core::key::KeyUsage,
     origin: keyrack_core::key::KeyOrigin,
@@ -88,6 +95,8 @@ impl From<&KeyRecord> for KeyResponse {
         Self {
             lid: r.lid.to_string(),
             state: r.state,
+            lifecycle_state: r.state,
+            has_compromise_history: r.has_compromise_history(),
             key_spec: r.key_spec.clone(),
             key_usage: r.key_usage,
             origin: r.origin,
@@ -112,6 +121,8 @@ impl From<&KeyRecord> for KeyResponse {
                     version_number: v.version_number,
                     created_at: v.created_at,
                     is_primary: v.is_primary,
+                    lifecycle_state: r.state,
+                    has_compromise_history: r.has_compromise_history(),
                 })
                 .collect(),
         }

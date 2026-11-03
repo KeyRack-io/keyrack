@@ -230,6 +230,8 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
         key_spec: key_spec_to_proto(&record.key_spec).into(),
         key_usage: key_usage_to_proto(record.key_usage).into(),
         state: key_state_to_proto(&record.state).into(),
+        lifecycle_state: key_state_to_proto(&record.state).into(),
+        has_compromise_history: record.has_compromise_history(),
         origin: match record.origin {
             keyrack_core::key::KeyOrigin::KeyRack => proto::KeyOrigin::Keyrack.into(),
             keyrack_core::key::KeyOrigin::External => proto::KeyOrigin::External.into(),
@@ -251,19 +253,11 @@ pub fn key_record_to_metadata(record: &KeyRecord) -> proto::KeyMetadata {
     }
 }
 
-/// Lifecycle state to report for a version of `record`.
+/// Compatibility projection for the deprecated version `state` field.
 ///
-/// A `KeyVersionRecord` carries no lifecycle state of its own, so the state a
-/// version reports is the owning logical key's. Being non-primary is an ordinal
-/// fact about rotation order, not a policy state: retained versions of a healthy
-/// key stay usable for decrypt and as a rewrap source, and `is_primary` reports
-/// retention separately.
-///
-/// Compromise history is surfaced as `Compromised` even where the live state has
-/// moved on, so a version can never read as usable while [`KeyRecord::permits_decrypt`]
-/// refuses it.
-///
-/// [`KeyRecord::permits_decrypt`]: keyrack_core::key::KeyRecord::permits_decrypt
+/// Compromise history overrides the live lifecycle, even after destruction.
+/// New clients use `lifecycle_state` and `has_compromise_history` separately;
+/// operation eligibility continues to be checked against the stored key record.
 fn version_state(record: &keyrack_core::key::KeyRecord) -> keyrack_core::key::KeyState {
     if record.has_compromise_history() {
         keyrack_core::key::KeyState::Compromised
@@ -273,6 +267,7 @@ fn version_state(record: &keyrack_core::key::KeyRecord) -> keyrack_core::key::Ke
 }
 
 #[allow(clippy::cast_possible_truncation)]
+#[allow(deprecated)] // Populate the legacy wire field for existing clients.
 pub fn key_version_to_proto(
     record: &keyrack_core::key::KeyRecord,
     v: &keyrack_core::key::KeyVersionRecord,
@@ -282,6 +277,8 @@ pub fn key_version_to_proto(
         created_at: Some(datetime_to_timestamp(&v.created_at)),
         state: key_state_to_proto(&version_state(record)).into(),
         is_primary: v.is_primary,
+        lifecycle_state: key_state_to_proto(&record.state).into(),
+        has_compromise_history: record.has_compromise_history(),
     }
 }
 

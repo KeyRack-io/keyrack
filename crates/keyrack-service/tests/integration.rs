@@ -41,6 +41,8 @@ use std::sync::{Arc, Mutex};
 mod compromised_domain;
 #[path = "integration/deletion_dependencies.rs"]
 mod deletion_dependencies;
+#[path = "integration/lifecycle_metadata.rs"]
+mod lifecycle_metadata;
 use tonic::Request;
 
 use base64::Engine as _;

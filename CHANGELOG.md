@@ -31,6 +31,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- Key and version metadata expose `lifecycle_state` and
+  `has_compromise_history` over gRPC and REST. The existing gRPC version `state`
+  is deprecated and retains its compatibility meaning: compromise history
+  reports `Compromised` even after the live lifecycle advances to destruction.
+  Operation eligibility is unchanged; see [SPEC §7.2](docs/SPEC.md#72-valid-transitions).
 - Deletion scheduling refuses keys with wrapped versions, wrapped dependents or
   creation-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
   blocking-kind counts. Logical-only children remain allowed. Scheduling and the

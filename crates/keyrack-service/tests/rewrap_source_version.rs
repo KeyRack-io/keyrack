@@ -12,8 +12,12 @@
 //! state, which is how a rewrap that went pending during an outage was refused
 //! after the healthy key rotated underneath it.
 //!
-//! The state assertions here are written in the terms a rewrap consumer uses,
-//! not in terms of the enum, via [`consumer_accepts_source`].
+//! These compatibility assertions deliberately retain a legacy consumer's
+//! interpretation of the deprecated version `state` field. New consumers use
+//! `lifecycle_state` and `has_compromise_history`; the lifecycle metadata matrix
+//! covers those fields separately from operation eligibility.
+
+#![allow(deprecated)] // Regression coverage for legacy KeyVersionMetadata.state consumers.
 
 use base64::Engine as _;
 use keyrack_service::proto;
