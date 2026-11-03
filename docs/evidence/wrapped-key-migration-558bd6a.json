@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-11-04",
+  "source_commit": "558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec",
+  "source_tree": "2ebfb752f7a53cb4e63c1fbc63ee200b164705db",
+  "contract_url": "https://github.com/KeyRack-io/keyrack/blob/558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec/docs/WRAPPED_KEY_MIGRATION.md",
+  "ci_checkout_commit": "ed4dccb0c92ff952bd2cc84da85e05ca311f27fb",
+  "ci_checkout_tree": "2ebfb752f7a53cb4e63c1fbc63ee200b164705db",
+  "ci_base_commit": "8f45f83f212fb21ec3db9b0fe086499248636ea9",
+  "ci_event": "pull_request",
+  "ci_runs": [
+    {
+      "name": "CI",
+      "id": 41475420166,
+      "head_sha": "558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec",
+      "conclusion": "success",
+      "url": "https://github.com/KeyRack-io/keyrack/actions/runs/41475420166"
+    },
+    {
+      "name": "REST and gRPC surface parity",
+      "id": 41475419914,
+      "head_sha": "558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec",
+      "conclusion": "success",
+      "url": "https://github.com/KeyRack-io/keyrack/actions/runs/41475419914"
+    },
+    {
+      "name": "Wrapped-key migration",
+      "id": 41475419960,
+      "head_sha": "558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec",
+      "conclusion": "success",
+      "url": "https://github.com/KeyRack-io/keyrack/actions/runs/41475419960"
+    }
+  ],
+  "artifact": {
+    "id": 13157377884,
+    "name": "migration-fence-controls",
+    "sha256": "1f8954814f7c817093dc18aa747eea7969f9e986a57fbd840dc5e3d316a3c5d0",
+    "url": "https://github.com/KeyRack-io/keyrack/actions/runs/41475419960/artifacts/13157377884"
+  },
+  "fence_control_receipt": {
+    "status": "passed",
+    "source_sha256": {
+      "crates/keyrack-core/src/migration/wrapped.rs": "fef2689299fe187f45a69f311cf95c7c4c3b6a653b4e2bce8d8bdc44934ec092",
+      "crates/keyrack-sqlite/src/creation.rs": "b050c8298d2d7d0cd1a0dd6d0eb4c7dbbe1993f2cf2973941815ceff3b22b7d2",
+      "crates/keyrack-sqlite/src/destruction.rs": "ff43047074654975c5b64f75f7944f88fffd36004a53017edfa5b2d5f1e6ce59",
+      "crates/keyrack-sqlite/src/lib.rs": "4439c7c63b7235b35c5c9e1ee9605992324fe6851c633f5143382a0af2a5f64d",
+      "crates/keyrack-sqlite/src/migration.rs": "e39f87fb4c26ac3f9d7207f4d7b07c06e5c6d30628b56badc6ecf4807ae7b144"
+    },
+    "controls": [
+      {
+        "name": "writer",
+        "test": "tests::migration_all_writer_fences",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "creation",
+        "test": "tests::migration_all_writer_fences",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "destruction",
+        "test": "migration::tests::migration_blocks_due_unreferenced_target_destruction",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "pending_creation",
+        "test": "tests::migration_creation_and_occ_preempt",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "overlapping_migration",
+        "test": "tests::migration_all_writer_fences",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "reservation_occ",
+        "test": "tests::migration_creation_and_occ_preempt",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "commit_occ",
+        "test": "migration::tests::migration_commit_rechecks_every_occ",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "target_fence",
+        "test": "migration::tests::migration_reservation_checks_destruction_fence_independently",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "parent_immutable",
+        "test": "tests::migration_deny_paths",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "stage_owner",
+        "test": "tests::migration_ownership_epoch_and_unknown_outcome",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "commit_owner",
+        "test": "tests::migration_ownership_epoch_and_unknown_outcome",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "stage_dispatch_epoch",
+        "test": "tests::migration_ownership_epoch_and_unknown_outcome",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "dispatch_owner",
+        "test": "tests::migration_ownership_epoch_and_unknown_outcome",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "unknown_outcome",
+        "test": "tests::migration_ownership_epoch_and_unknown_outcome",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "creation_envelope_erasure",
+        "test": "tests::migration_atomic_publication_and_retirement",
+        "exit_code": 101,
+        "grade": "synthetic"
+      },
+      {
+        "name": "migration_envelope_erasure",
+        "test": "tests::migration_atomic_publication_and_retirement",
+        "exit_code": 101,
+        "grade": "synthetic"
+      }
+    ]
+  }
+}
