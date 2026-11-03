@@ -82,6 +82,14 @@ impl CachingStorage {
 
 #[async_trait::async_trait]
 impl StorageBackend for CachingStorage {
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        // Dependencies include other keys and journals; never serve cache data.
+        self.inner.destruction_dependencies(lid).await
+    }
+
     async fn claim_destruction(
         &self,
         lid: &Lid,

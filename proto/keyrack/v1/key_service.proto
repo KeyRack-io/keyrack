@@ -463,6 +463,10 @@ message ScheduleKeyDeletionRequest {
 message ScheduleKeyDeletionResponse {
   KeyMetadata metadata = 1;
   google.protobuf.Timestamp deletion_date = 2;
+  // Direct persisted children with exclusively resident material, observed by
+  // the admission query. Counted once per child, regardless of lifecycle state;
+  // these logical links do not block deletion and are not a reservation.
+  uint64 logical_only_children = 3;
 }
 
 message CancelKeyDeletionRequest {

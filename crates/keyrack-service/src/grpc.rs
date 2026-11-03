@@ -1523,6 +1523,9 @@ impl KeyService for KeyServiceImpl {
             } else {
                 req.grace_period_days
             };
+            let dependencies = crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
+                .await
+                .map_err(|error| error.to_grpc_status())?;
             record
                 .transition_to(keyrack_core::key::KeyState::PendingDeletion)
                 .map_err(|(from, to)| {
@@ -1536,6 +1539,7 @@ impl KeyService for KeyServiceImpl {
                 .await
                 .map_err(convert::error_to_status)?;
             Ok(Response::new(proto::ScheduleKeyDeletionResponse {
+                logical_only_children: dependencies.logical_only_children,
                 metadata: Some(convert::key_record_to_metadata(&record)),
                 deletion_date: record
                     .scheduled_deletion_at

@@ -31,6 +31,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- Deletion scheduling refuses keys with wrapped versions, wrapped dependents or
+  creation-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
+  blocking-kind counts. Logical-only children remain allowed. Scheduling and the
+  authoritative destruction claim share the SQLite/PostgreSQL dependency query.
+
 - Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
   URI SANs on the delegating client certificate. Any listed SAN may match;
   `required_sans` and the existing singular `required_san` are mutually exclusive.
@@ -580,6 +585,13 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 - Upgrade software P-256/P-384 ECDSA to the 0.14 dependency family, resolving
   RUSTSEC-2026-0387 while retaining DER signatures and pre-hash behavior.
+
+### Deletion scheduling responses
+
+- Report `logical_only_children` in successful gRPC and REST deletion schedules,
+  counted once per direct persisted child with resident material by the shared
+  admission query. Logical-only links remain nonblocking; the count is an
+  observation and does not reserve future dependencies.
 
 ## [0.4.0] — 2026-08-30
 
