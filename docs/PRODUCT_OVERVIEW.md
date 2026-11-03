@@ -4,8 +4,9 @@
 
 KeyRack is the coordination layer for cryptographic key lifecycle
 management. It tracks logical key relationships and coordinates
-rotation jobs while applications migrate their data. Logical ancestry
-does not imply cryptographic wrapping.
+rotation jobs while applications migrate their data. Ancestry implies
+cryptographic wrapping only for children created under a `wrapping:` profile,
+and in 0.5.0 that wrapping is software, not custody.
 
 KeyRack does not replace your HSM, Vault, or cloud KMS. It sits above
 them. It answers "what depends on this key?" and handles the
@@ -46,9 +47,16 @@ rotation tooling. The capability gap is universal.
 ### FOSS Core
 
 **Key Lifecycle Coordination**
-- Logical key hierarchies with parent-child dependency tracking. Wrapped-child
-  creation is not reachable through the service API in 0.5.0; these relationships
-  do not establish KEK-wrapped custody.
+- Key hierarchies with parent-child dependency tracking. A parent on `CreateKey`
+  creates a child wrapped under it: one level, opt-in through a `wrapping:`
+  profile on a platform-custody provider. The only mechanism in 0.5.0 is the
+  software one, which unwraps the child into service memory for each use, so
+  this is not KEK-wrapped custody. Without a profile, `CreateKey` with a parent
+  is refused; keys created before 0.5.0 that name a parent are refused as
+  wrapping parents. Native PKCS#11 wrapping is not reachable through the
+  service, for any token, SoftHSM included. How a child's use lease is closed,
+  including on cancellation, is stated in
+  [Using a child](KEY_MATERIAL_REPRESENTATION.md#using-a-child).
 - Content-addressed key identity via Logical IDs (LIDs)
 - Full key state machine: Creating → Enabled ⇄ Disabled →
   PendingDeletion → Destroyed

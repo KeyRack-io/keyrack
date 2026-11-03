@@ -297,7 +297,9 @@ fn build_test_state_with_provider(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
 }
 
@@ -948,7 +950,9 @@ fn build_two_provider_state(
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
 }
 
@@ -1783,7 +1787,9 @@ fn build_routed_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -1856,7 +1862,9 @@ fn build_delegate_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -3027,7 +3035,9 @@ fn build_no_policy_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -3220,7 +3230,9 @@ fn build_scoped_state(scope: &str) -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -3265,7 +3277,9 @@ fn build_scoped_state_no_rules(scope: &str) -> (Arc<ServiceState>, Arc<Capturing
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -3794,7 +3808,9 @@ fn build_rejecting_authn_state() -> (Arc<ServiceState>, Arc<CapturingSink>) {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     (state, audit)
 }
@@ -3830,7 +3846,9 @@ fn build_invalid_cred_authn_state() -> Arc<ServiceState> {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
 }
 
@@ -4101,7 +4119,9 @@ async fn grpc_authn_reject_no_credential() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4209,7 +4229,9 @@ async fn mtls_valid_cert_principal_reaches_pdp_audit() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4267,7 +4289,9 @@ async fn mtls_no_cert_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4344,7 +4368,9 @@ async fn mtls_untrusted_ca_tls_rejected() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4464,7 +4490,9 @@ async fn explain_routing_returns_routed_for_matching_attributes() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4545,7 +4573,9 @@ async fn explain_routing_returns_deny_and_creates_no_key() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -4769,7 +4799,9 @@ async fn scope_owner_check_emits_result_error_on_storage_failure() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     // Insert a key record directly in storage, bound to the failing
@@ -5001,7 +5033,9 @@ async fn trusted_mtls_peer_denied_on_tenant_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -5092,7 +5126,9 @@ async fn trusted_mtls_peer_passes_platform_scoped_connection() {
         metrics_handle,
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
 
     let svc = keyrack_service::grpc::KeyServiceImpl::new(Arc::clone(&state));
@@ -5277,21 +5313,15 @@ async fn revoke_exportability_post_export_refused() {
 #[tokio::test]
 async fn make_key_exportable_leaf_only_rejects_parent() {
     let (state, _pdp, _audit) = build_test_state();
-    let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
 
     // Create a parent key
     let parent_id = create_aes_key(&svc).await;
 
-    // Create a child key under that parent
-    let _child_resp = svc
-        .create_key(Request::new(proto::CreateKeyRequest {
-            key_spec: proto::KeySpec::Aes256.into(),
-            description: "child".into(),
-            parent_key_id: Some(parent_id.clone()),
-            ..Default::default()
-        }))
-        .await
-        .expect("create child key");
+    // Give that parent a child. Seeded rather than created: this test is about
+    // MakeKeyExportable refusing a key that has dependents, not about which
+    // providers can wrap.
+    create_child_key(&state, &parent_id).await;
 
     // Attempt to make parent exportable — should fail (has dependents)
     let resp = svc
@@ -5619,10 +5649,13 @@ async fn rest_born_exportable_with_parent_rejected() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
 
+    // Refused as a contradictory request: a key with a parent is wrapped under
+    // it and is never handed out, so asking for both cannot be satisfied. It
+    // used to be refused one gate later, as leaf-only policy.
     assert_eq!(
         resp.status(),
-        axum::http::StatusCode::CONFLICT,
-        "REST born-exportable with parent must be rejected (leaf-only)"
+        axum::http::StatusCode::BAD_REQUEST,
+        "REST born-exportable with parent must be rejected"
     );
 }
 
@@ -6304,7 +6337,9 @@ async fn grpc_list_keys_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -6341,7 +6376,9 @@ async fn grpc_list_aliases_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -6378,7 +6415,9 @@ async fn grpc_generate_random_requires_auth() {
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     });
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state);
 
@@ -6485,7 +6524,9 @@ fn build_state_for_principal(
         metrics_handle: recorder.handle(),
         max_plaintext_bytes: 4096,
         nats_publisher: None,
+        lease_cleanup: keyrack_service::lease::LeaseCleanup::default(),
         legacy_compromised_key_decrypt: false,
+        wrapping: keyrack_service::hierarchy::WrappingProfiles::none(),
     })
 }
 
@@ -7857,30 +7898,62 @@ async fn rest_re_encrypt_refused_when_key_state_forbids_the_direction() {
 // `domain::disable_key`, so this test fails if either one drifts again.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Create a key whose `parent_key_id` is `parent`, and return its key id.
-async fn create_child_key(svc: &keyrack_service::grpc::KeyServiceImpl, parent: &str) -> String {
-    svc.create_key(Request::new(proto::CreateKeyRequest {
-        key_spec: proto::KeySpec::Aes256.into(),
-        description: "cascade descendant".into(),
-        parent_key_id: Some(parent.to_owned()),
-        ..Default::default()
-    }))
-    .await
-    .expect("create child key")
-    .into_inner()
-    .metadata
-    .expect("metadata")
-    .key_id
+/// Make a key a child of `parent` in storage, and return its key id.
+///
+/// Creation is not driven through `CreateKey` here. From 0.5.0 a parent binding
+/// means the child's material is wrapped under that parent, which requires a
+/// provider that implements wrapping and a profile the deployment configured,
+/// and a wrapped key cannot itself wrap a further generation. These tests are
+/// about walking a hierarchy that already exists — cascade disable and
+/// descendant rotation — so they state the hierarchy instead of negotiating a
+/// provider profile to obtain one.
+async fn create_child_key(state: &Arc<ServiceState>, parent: &str) -> String {
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let child_id = create_aes_key(&svc).await;
+    let child: keyrack_core::lid::Lid = child_id.parse().expect("parse child lid");
+    let parent_lid: keyrack_core::lid::Lid = parent.parse().expect("parse parent lid");
+
+    let mut record = state.storage.get_key(&child).await.expect("child");
+    let parent_version = state
+        .storage
+        .get_key(&parent_lid)
+        .await
+        .expect("parent")
+        .current_key_version;
+    record.parent_lid = Some(parent_lid);
+    record.description = "cascade descendant".into();
+    // Shaped as 0.5 shapes a child — wrapped, not independently resident — so
+    // these tests do not rest on the pre-0.5.0 record shape that is now
+    // refused on use. The descriptor is deliberately not openable: a lifecycle
+    // walk never touches the material.
+    record.key_versions[0].material = keyrack_core::key::KeyMaterial::ParentWrapped(
+        keyrack_core::key::ParentWrappedMaterial::new(
+            keyrack_core::key::ProviderRef::new("default"),
+            keyrack_core::wrapping::WrappingIdentifier::new("cascade-test-domain").unwrap(),
+            keyrack_core::wrapping::VersionedKeyId::new(parent_lid, parent_version).unwrap(),
+            keyrack_core::wrapping::WrappingContextVersion::V1,
+            keyrack_core::wrapping::WrappedKeyFormat::RawSecret,
+            keyrack_core::wrapping::WrappingIdentifier::new("cascade-test-mechanism").unwrap(),
+            keyrack_core::wrapping::WrappingIdentifier::new("seeded-not-openable").unwrap(),
+        )
+        .unwrap(),
+    );
+    record.occ_version += 1;
+    state
+        .storage
+        .update_key(&record)
+        .await
+        .expect("bind parent");
+    child_id
 }
 
 /// Seed `root -> child -> grandchild`. Two generations, so the test covers the
 /// recursive walk and not merely the direct-children case.
-async fn seed_three_generations(
-    svc: &keyrack_service::grpc::KeyServiceImpl,
-) -> (String, String, String) {
-    let root = create_aes_key(svc).await;
-    let child = create_child_key(svc, &root).await;
-    let grandchild = create_child_key(svc, &child).await;
+async fn seed_three_generations(state: &Arc<ServiceState>) -> (String, String, String) {
+    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+    let root = create_aes_key(&svc).await;
+    let child = create_child_key(state, &root).await;
+    let grandchild = create_child_key(state, &child).await;
     (root, child, grandchild)
 }
 
@@ -7893,8 +7966,8 @@ async fn cross_surface_disable_cascade_parity() {
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
 
     // Two independent three-generation trees, one disabled over each surface.
-    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
-    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&state).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&state).await;
 
     // ── gRPC path ──
     svc.disable_key(Request::new(proto::DisableKeyRequest {
@@ -7985,8 +8058,8 @@ async fn cross_surface_disable_cascade_handles_non_enabled_descendants_alike() {
 
     // Two identical trees, each with the middle generation put into a state
     // that cannot transition to Disabled.
-    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
-    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&state).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&state).await;
     for child in [&grpc_child, &rest_child] {
         svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
             key_id: child.clone(),
@@ -8070,8 +8143,8 @@ async fn cross_surface_rotate_descendant_jobs_parity() {
     let (state, _pdp, _audit) = build_test_state();
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
 
-    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&svc).await;
-    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&svc).await;
+    let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&state).await;
+    let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&state).await;
 
     // ── gRPC path ──
     svc.rotate_key(Request::new(proto::RotateKeyRequest {

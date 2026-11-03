@@ -102,5 +102,13 @@ Remaining migration work includes:
 - Orchestrating and verifying bulk data re-encryption before retiring old keys.
 - Cross-provider wrapped-key transport; data `ReEncrypt` does not provide it.
 
-Core's logical parent-child relationships do not establish a wrapping chain.
-Wrapped-child creation is not reachable through the service API in this release.
+Parent-child relationships recorded before 0.5.0 do not establish a wrapping
+chain. From 0.5.0, `CreateKey` with a
+parent creates a wrapped child only under a `wrapping:` profile on a
+platform-custody provider, one level deep, and is refused without one; the only
+mechanism in this release is software, which unwraps the child into service
+memory, so it is not custody. Keys created before 0.5.0 that name a parent carry
+the earlier, logical meaning and are refused as wrapping parents. Native PKCS#11
+wrapping is not reachable through the service, for any token, SoftHSM included.
+See [Using a child](../KEY_MATERIAL_REPRESENTATION.md#using-a-child) for how a
+wrapped child's use lease is closed.

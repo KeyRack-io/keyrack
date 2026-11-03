@@ -48,7 +48,14 @@ pub struct ServiceState {
     pub max_plaintext_bytes: usize,
     /// Explicit dangerous legacy opt-in, copied from the startup configuration.
     pub legacy_compromised_key_decrypt: bool,
+    /// Providers that may hold child keys wrapped under a parent, and the exact
+    /// profile each one was activated with. Empty means child creation is
+    /// refused: a hierarchy is configured, never inferred from a request.
+    pub wrapping: crate::hierarchy::WrappingProfiles,
     pub nats_publisher: Option<Arc<NatsStateChangedPublisher>>,
+    /// Owner of wrapped-lease opens and closes that must outlive a cancelled
+    /// request. Drained by [`crate::shutdown::drain`].
+    pub lease_cleanup: crate::lease::LeaseCleanup,
 }
 
 impl ServiceState {

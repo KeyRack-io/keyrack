@@ -52,7 +52,12 @@ use zeroize::Zeroize;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use hmac::{Hmac, Mac};
+use p256::ecdsa::signature::{
+    hazmat::{PrehashSigner as _, PrehashVerifier as _},
+    Signer as _, Verifier as _,
+};
 use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
+use p256::elliptic_curve::Generate;
 use p384::ecdsa::{SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -370,10 +375,16 @@ impl SoftwareProvider {
             envelope_blake3: *blake3::hash(envelope).as_bytes(),
             creation,
         };
-        // Lock order is wrapping state, then keys; every wrapping path keeps it.
+        // Lock order is wrapping state, then keys. Both maps are updated under
+        // both locks so a close of a predicted next identity cannot record
+        // closure while the material is still being inserted.
         let object = {
             let mut state = self
                 .wrapping
+                .write()
+                .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
+            let mut keys = self
+                .keys
                 .write()
                 .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?;
             state.issued = state
@@ -382,12 +393,9 @@ impl SoftwareProvider {
                 .ok_or_else(|| KeyRackError::Provider("object identities exhausted".into()))?;
             let object = format!("kr-sw-a2-{}-{}", self.incarnation, state.issued);
             state.open.insert(object.clone(), binding);
+            keys.insert(object.clone(), child);
             object
         };
-        self.keys
-            .write()
-            .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
-            .insert(object.clone(), child);
         WrappedKeyLease::new(
             KeyHandle {
                 key_id: object.clone(),
@@ -487,11 +495,13 @@ impl CryptoProvider for SoftwareProvider {
                 KeyMaterial::Ed25519(signing_key)
             }
             KeySpec::EcdsaP256Sha256 => {
-                let signing_key = P256SigningKey::random(&mut OsRng);
+                let signing_key = P256SigningKey::try_generate_from_rng(&mut getrandom_ec::SysRng)
+                    .map_err(|e| KeyRackError::Provider(format!("P-256 keygen failed: {e}")))?;
                 KeyMaterial::EcdsaP256(signing_key)
             }
             KeySpec::EcdsaP384 => {
-                let signing_key = P384SigningKey::random(&mut OsRng);
+                let signing_key = P384SigningKey::try_generate_from_rng(&mut getrandom_ec::SysRng)
+                    .map_err(|e| KeyRackError::Provider(format!("P-384 keygen failed: {e}")))?;
                 KeyMaterial::EcdsaP384(signing_key)
             }
             KeySpec::RsaPkcs1v15Sha256 { key_size } | KeySpec::RsaPssSha256 { key_size } => {

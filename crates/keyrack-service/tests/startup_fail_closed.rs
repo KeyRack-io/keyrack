@@ -166,6 +166,38 @@ fn omitting_the_pdp_block_is_a_hard_startup_error() {
 }
 
 #[test]
+fn customer_wrapping_refuses_before_storage_or_provider_startup() {
+    let dir = TempDir::new("customer-wrapping");
+    let database = dir.path("must-not-open.sqlite");
+    let config = dir.write(
+        "keyrack.json",
+        &serde_json::json!({
+            "grpc_addr": "127.0.0.1:0",
+            "rest_addr": "127.0.0.1:0",
+            "pdp": {"type": "always_allow"},
+            "audit": {"type": "stdout"},
+            "authn": {"type": "insecure"},
+            "storage": {"type": "sqlite", "path": database},
+            "providers": [{"name": "external", "custody": "customer",
+                "type": "vault_transit", "vault_addr": "https://127.0.0.1:1",
+                "vault_token": "test-token", "ca_cert": "/missing/customer-ca.pem"}],
+            "wrapping": [{"provider": "external", "mechanism": "test:wrap:v1",
+                "security_domain": "test-domain"}]
+        })
+        .to_string(),
+    );
+    let output = expect_startup_failure(&config);
+    assert!(
+        output.contains("'external' must have platform custody"),
+        "{output}"
+    );
+    assert!(
+        !database.exists(),
+        "config refusal must precede storage startup"
+    );
+}
+
+#[test]
 fn signing_without_a_persistent_key_is_a_hard_startup_error() {
     let dir = TempDir::new("ephemeral-key");
     let config = dir.write(

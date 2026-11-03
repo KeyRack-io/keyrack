@@ -8,8 +8,6 @@ unmaintained = "all"
 unused-ignored-advisory = "deny"
 # Baseline exceptions require review; new advisory IDs and yanks still fail.
 ignore = [
-    # Temporary until the p256/p384 0.14 migration, before 0.5.0.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via p256/p384 0.13. Reachable only in software-backend P-256/P-384 ECDSA. No 0.5.x fix; removed by the p256/p384 0.14 migration PR before 0.5.0." },
     # rsa@0.9.10: Marvin Attack: potential key recovery through timing sidechannels
     # No safe upgrade is available!
     # No fixed release is available. Software-backend RSA private-key operations are not
@@ -49,6 +47,20 @@ multiple-versions = "deny"
 
 # Only the older locked versions are exempt; new duplicate versions still fail.
 skip = [
+    # keyrack-core, rsa@0.9 and x509-cert@0.2 require der@0.7; EC 0.14 uses der@0.8.
+    { name = "der", version = "=0.7.10" },
+    # curve25519-dalek@4.1 requires 0.2; p384@0.14 requires 0.3.
+    { name = "fiat-crypto", version = "=0.2.9" },
+    # der@0.7 and rsa@0.9 require 0.7; EC der@0.8 requires 1.0.
+    { name = "pem-rfc7468", version = "=0.7.0" },
+    # rsa@0.9 and ed25519@2.2 require 0.10; elliptic-curve@0.14 requires 0.11.
+    { name = "pkcs8", version = "=0.10.2" },
+    # rand@0.9 requires 0.9; EC 0.14 and getrandom-ec require 0.10.
+    { name = "rand_core", version = "=0.9.5" },
+    # rsa@0.9 and ed25519@2.2 require 2.2; ecdsa@0.17 requires 3.0.
+    { name = "signature", version = "=2.2.0" },
+    # rsa@0.9 and x509-cert@0.2 require 0.7; EC 0.14 requires 0.8.
+    { name = "spki", version = "=0.7.3" },
     # tokio-websockets@0.10.1 via async-nats@0.47 requires this compatibility
     # package; it re-exports webpki-roots@1.0.11, with no independent root store.
     { name = "webpki-roots", version = "=0.26.11" },
@@ -66,7 +78,7 @@ skip = [
     { name = "cpufeatures", version = "=0.2.17" },
     # crypto-common@0.1.6 is required by aead@0.5.2, cipher@0.4.4, digest@0.10.7, universal-hash@0.5.1.
     { name = "crypto-common", version = "=0.1.6" },
-    # digest@0.10.7 is required by curve25519-dalek@4.1.3, ecdsa@0.16.9, elliptic-curve@0.13.8, hmac@0.12.1, md-5@0.10.6, rsa@0.9.10, sha1@0.10.6, sha2@0.10.9, sha3@0.10.9, signature@2.2.0.
+    # digest@0.10.7 is required by curve25519-dalek@4.1.3, hmac@0.12.1, md-5@0.10.6, rsa@0.9.10, sha1@0.10.6, sha2@0.10.9, sha3@0.10.9, signature@2.2.0.
     { name = "digest", version = "=0.10.7" },
     # getrandom@0.2.17 is required by keyrack-wasm@0.5.0, nkeys@0.4.5, rand_core@0.6.4, ring@0.17.14.
     { name = "getrandom", version = "=0.2.17" },
@@ -96,11 +108,11 @@ skip = [
     { name = "rand", version = "=0.8.6" },
     # rand_chacha@0.3.1 is required by rand@0.8.6.
     { name = "rand_chacha", version = "=0.3.1" },
-    # rand_core@0.6.4 is required by crypto-bigint@0.5.5, crypto-common@0.1.6, ed25519-dalek@2.2.0, elliptic-curve@0.13.8, ff@0.13.1, group@0.13.0, rand@0.8.6, rand_chacha@0.3.1, rsa@0.9.10, signatory@0.27.1, signature@2.2.0.
+    # rand_core@0.6.4 is required by crypto-common@0.1.6, ed25519-dalek@2.2.0, rand@0.8.6, rand_chacha@0.3.1, rsa@0.9.10, signatory@0.27.1, signature@2.2.0.
     { name = "rand_core", version = "=0.6.4" },
     # redox_syscall@0.5.18 is required by parking_lot_core@0.9.12.
     { name = "redox_syscall", version = "=0.5.18" },
-    # sha2@0.10.9 is required by ed25519-dalek@2.2.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-surface-contract@0.1.0, keyrack-vault@0.5.0, p256@0.13.2, p384@0.13.1, rsa@0.9.10, sqlx-core@0.8.6, sqlx-macros-core@0.8.6, sqlx-postgres@0.8.6.
+    # sha2@0.10.9 is required by ed25519-dalek@2.2.0, keyrack-core@0.5.0, keyrack-crypto-worker@0.1.0, keyrack-surface-contract@0.1.0, keyrack-vault@0.5.0, rsa@0.9.10, sqlx-core@0.8.6, sqlx-macros-core@0.8.6, sqlx-postgres@0.8.6.
     { name = "sha2", version = "=0.10.9" },
     # socket2@0.5.10 is required by tonic@0.12.3, tonic@0.13.1.
     { name = "socket2", version = "=0.5.10" },

@@ -498,7 +498,8 @@ pub trait CryptoProvider: Send + Sync {
     /// profile gets a failure, not a key.
     ///
     /// Callers must close every returned lease, including on the error paths
-    /// of whatever they do in between.
+    /// of whatever they do in between and when they are cancelled: a lease
+    /// this returns after its caller has gone is still owed a close.
     ///
     /// There is deliberately no creation binding here. Opening an existing
     /// child is ordinary use, and closing such a lease certifies nothing about
