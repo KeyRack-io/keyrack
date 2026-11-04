@@ -1,9 +1,11 @@
 # Wrapped-key migration
 
-**Evidence baseline:** `558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec`.
-Use the [contract at that exact source revision](https://github.com/KeyRack-io/keyrack/blob/558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec/docs/WRAPPED_KEY_MIGRATION.md)
-and the [pinned CI and conformance evidence](#pinned-revision-and-ci-results)
-for this handoff. A later branch head does not inherit these results.
+**Reviewed implementation:** `4c0822e69036e3b032de60f278b835b43243c244`, including
+main `bf2316dcf082b84eae524ec733722e108ecdafbe`. The [pinned CI and conformance evidence](#pinned-revision-and-ci-results)
+below applies to this integrated implementation. `558bd6a` is historical and is
+no longer the review baseline. This documentation update records the evidence;
+it changes no implementation or tests. The [final review receipt](https://github.com/KeyRack-io/keyrack/pull/66#issuecomment-6618787921)
+names the final PR head, including this evidence-only update, and its CI runs.
 
 `RewrapKey` moves every retained version of one logical wrapped key. Omitting a
 new parent rewraps under the existing parent's current version; naming a new
@@ -249,34 +251,39 @@ its old parent survives, and does not erase database logs or backups.
 
 ### Pinned revision and CI results
 
-Results produced on 2026-11-02 are pinned to source commit
-[`558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec`](https://github.com/KeyRack-io/keyrack/commit/558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec).
-The three runs below report that exact `head_sha` and `success`; verified again
-on 2026-11-04. Their checkout logs identify GitHub's PR merge commit
-`ed4dccb0c92ff952bd2cc84da85e05ca311f27fb`, merging the source into
-`8f45f83f212fb21ec3db9b0fe086499248636ea9`. Both source and tested merge have
-Git tree `2ebfb752f7a53cb4e63c1fbc63ee200b164705db`: the tested contents are identical.
+The reviewed implementation and results are pinned to
+[`4c0822e69036e3b032de60f278b835b43243c244`](https://github.com/KeyRack-io/keyrack/commit/4c0822e69036e3b032de60f278b835b43243c244),
+which merges main `bf2316dcf082b84eae524ec733722e108ecdafbe`. The three runs below report that exact `head_sha`
+and `success`; verified on 2026-11-04. Their checkout logs identify GitHub's PR
+merge commit `1a47b3565f94fd5e1cffa7fe4bcf1d5149d7a534`. Both source and tested merge have Git tree
+`fcf8dc9f41ba034b77e53bcab12d94aacee1b68a`: the tested contents are identical.
 
 | CI run for this source SHA | Evidence |
 | --- | --- |
-| [CI — 41475420166](https://github.com/KeyRack-io/keyrack/actions/runs/41475420166) | Test, Clippy and Format passed. Test includes 14 service migration tests, 10 API authorization/intent/receipt tests and 51 SQLite library tests. |
-| [REST/gRPC surface parity — 41475419914](https://github.com/KeyRack-io/keyrack/actions/runs/41475419914) | Explicit API surface and generated claim passed. |
-| [Wrapped-key migration — 41475419960](https://github.com/KeyRack-io/keyrack/actions/runs/41475419960) | 10 live PostgreSQL migration tests and 16 deliberate fence reversions passed; restored baseline passed. |
+| [CI — 41744528352](https://github.com/KeyRack-io/keyrack/actions/runs/41744528352) | Test, Check, Clippy and Format passed, including migration, lifecycle metadata and shared deletion-query coverage. |
+| [REST/gRPC surface parity — 41744528395](https://github.com/KeyRack-io/keyrack/actions/runs/41744528395) | Explicit API surface and generated claim passed after regeneration for the merged tree. |
+| [Wrapped-key migration — 41744529291](https://github.com/KeyRack-io/keyrack/actions/runs/41744529291) | Live PostgreSQL migration conformance and 19 deliberate fence reversions passed; restored baseline passed. Three controls individually remove the child, source-parent and target-parent migration dependencies. |
 
-The migration run's [migration-fence-controls artifact](https://github.com/KeyRack-io/keyrack/actions/runs/41475419960/artifacts/13157377884)
+The migration run's [migration-fence-controls artifact](https://github.com/KeyRack-io/keyrack/actions/runs/41744529291/artifacts/13282294383)
 contains the complete logs and `results.json`. Its downloaded archive SHA-256 is
-`1f8954814f7c817093dc18aa747eea7969f9e986a57fbd840dc5e3d316a3c5d0`.
-The [archived conformance receipt](evidence/wrapped-key-migration-558bd6a.json)
-preserves that result, all 16 control names, source-file hashes, source/checkout
+`e07019446046569997328679ac9c38f4d892d90756f60a233da36f3dce56ee20`.
+The [archived conformance receipt](evidence/wrapped-key-migration-4c0822e.json)
+preserves the result, all 19 control names, source-file hashes, source/checkout
 SHAs, tree identity and run links independently of CI artifact retention. Every
-receipt source-file hash was checked against the pinned commit. The 35-test
-full PostgreSQL conformance result reported on #66 was a separate local run;
-the linked migration CI job ran the 10-test migration subset.
+receipt source-file hash was checked against the pinned commit. Local validation
+of this implementation also passed 1,129 workspace tests (33 existing skips),
+55 SQLite tests, the full 39-test PostgreSQL conformance suite plus its library
+test, and the deletion-scheduling/logical-count reverted controls. The linked
+migration CI job runs the migration subset of PostgreSQL conformance.
+
+The [558bd6a receipt](evidence/wrapped-key-migration-558bd6a.json) remains historical
+evidence only. It does not cover the main integration, typed reservation-intent
+conflict, fail-closed default fence, or shared migration dependency query above.
 
 **0.5.0 release re-pin is pending:** `v0.5.0` did not exist on 2026-11-04.
 When cut, pin the contract to that tag, record its peeled commit SHA, and attach
-successful CI/conformance runs for that release commit. Preserve this record
-as historical evidence; do not relabel these pre-release runs as tag results.
+successful CI/conformance runs for that release commit. Preserve these records
+as historical evidence; do not relabel pre-release runs as tag results.
 The required handoff is in [Releasing KeyRack](RELEASING.md#050-migration-evidence-handoff).
 
 ### Acceptance coverage
@@ -292,12 +299,13 @@ not native PKCS#11 qualification.
 
 | Acceptance point | Executable tests |
 | --- | --- |
-| Every intent field, optional OCC and version set | `every_caller_intent_field_is_bound_on_both_surfaces`, `initial_occ_and_covered_version_assertions_refuse_without_reservation`, `migration_intent_binds_every_condition` |
+| Every intent field, optional OCC and version set | `every_caller_intent_field_is_bound_on_both_surfaces`, `initial_occ_and_covered_version_assertions_refuse_without_reservation`, `migration_intent_binds_every_condition`, `competing_replica_intents_return_conflict_from_reservation_on_both_surfaces` |
 | Continuity of every version at every phase | `retained_versions_decrypt_continuously_in_reserve_stage_commit_and_after_erasure`, `reader_paused_before_open_survives_commit_and_parent_destruction_on_both_paths`, `migration_concurrent_reader_snapshots` |
 | Unchanged identity/material and old ciphertext | `every_version_survives_rewrap_and_reparent_and_old_parent_is_destroyable`; software wrapping tests |
 | Rotation, creation and ordinary updates | `cancellation_retains_the_fence_and_retry_finishes_the_migration`, `migration_all_writer_fences`, `migration_creation_and_occ_preempt`, `metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_migration`, `migration_ordinary_updates_and_aliases`, `lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation` |
 | Lost replies, retries and restarts | `terminal_receipt_binds_envelopes_and_survives_lost_reply_and_later_changes`, `recovery_resumes_each_phase_and_committed_replay_is_idempotent`, `migration_reopens_at_every_durable_phase`, `migration_reconnects_at_each_phase_and_rolls_back_failed_commit`, `simultaneous_same_operation_retries_share_the_committed_result`, `independently_prepared_same_operation_keeps_the_first_reserved_intent` |
 | Partial/unknown provider outcomes | `partial_repeatable_provider_failure_preserves_every_reader_until_recovery`, `unknown_nonrepeatable_provider_outcome_retains_reservation_without_redispatch`, `migration_ownership_epoch_and_unknown_outcome` |
+| Unsupported storage fence fails closed | `unsupported_migration_fencing_fails_closed` |
 | Stale worker rejected after takeover | `migration_ownership_epoch_and_unknown_outcome`; ownership stage/commit reversion controls |
 | Terminal result, original parent block and erasure | `migration_terminal_result_and_reader_snapshots`, `migration_atomic_publication_and_retirement`, `migration_commit_rollback_restores_old_envelopes_and_fence`, `migration_blocks_due_unreferenced_target_destruction`, `migration_destruction_dependency_query_tracks_migration` |
 | Restore with destroyed source parent | `restoring_pre_migration_database_after_parent_destruction_fails_explicitly` |
