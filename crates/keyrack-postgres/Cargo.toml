@@ -23,6 +23,7 @@ uuid = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 keyrack-test-support = { workspace = true }
 
 [lints]

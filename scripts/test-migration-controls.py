@@ -26,7 +26,7 @@ CONTROLS = [
     ("pending_creation", SQLITE + "migration.rs", "fn migration_reserve(", "if pending { return Err(migration_busy()); }", "let _ = pending;", "tests::migration_creation_and_occ_preempt"),
     ("overlapping_migration", SQLITE + "migration.rs", "fn migration_reserve(", "guard(conn, &record.lid)?;", "", "tests::migration_all_writer_fences"),
     ("reservation_occ", SQLITE + "migration.rs", "fn snapshots(", "request.validate_snapshots(&child, &old, &new)", "{ let _ = (&child, &old, &new); Ok(()) }", "tests::migration_creation_and_occ_preempt"),
-    ("commit_occ", SQLITE + "migration.rs", "fn migration_commit(", "snapshots(conn,&value.request)?;", "", "migration::tests::migration_commit_rechecks_every_occ"),
+    ("commit_occ", SQLITE + "migration.rs", "fn migration_commit(", "snapshots(conn,&value.request,true)?;", "", "migration::tests::migration_commit_rechecks_every_occ"),
     ("target_fence", SQLITE + "migration.rs", "fn snapshots(", "destruction::guard(conn, &record.lid)?;", "let _ = (destruction::guard, record);", "migration::tests::migration_reservation_checks_destruction_fence_independently"),
     ("parent_immutable", SQLITE + "migration.rs", "fn guard_update(", "if previous.parent_lid != next.parent_lid {", "if false && previous.parent_lid != next.parent_lid {", "tests::migration_deny_paths"),
     ("stage_owner", SQLITE + "migration.rs", "fn migration_stage(", "value.require_owner(ownership)?;", "", "tests::migration_ownership_epoch_and_unknown_outcome"),
@@ -36,6 +36,14 @@ CONTROLS = [
     ("unknown_outcome", "crates/keyrack-core/src/migration/wrapped.rs", "pub fn begin_dispatch(", "if self.dispatch.is_some_and(|dispatch| !dispatch.retry_safe) {", "if false && self.dispatch.is_some_and(|dispatch| !dispatch.retry_safe) {", "tests::migration_ownership_epoch_and_unknown_outcome"),
     ("creation_envelope_erasure", SQLITE + "migration.rs", "fn migration_commit(", "DELETE FROM creation_journal WHERE child_lid=?1 AND phase='committed'", "DELETE FROM creation_journal WHERE child_lid=?1 AND phase='committed' AND 0", "tests::migration_atomic_publication_and_retirement"),
     ("migration_envelope_erasure", SQLITE + "migration.rs", "fn migration_commit(", "DELETE FROM migration_envelopes WHERE operation_id IN", "DELETE FROM migration_envelopes WHERE 0 AND operation_id IN", "tests::migration_atomic_publication_and_retirement"),
+    ('disabled_source_support', 'crates/keyrack-core/src/migration/wrapped.rs', 'pub fn validate(&self)', 'if !matches!(old.state, KeyState::Enabled | KeyState::Disabled) {', 'if old.state != KeyState::Enabled {', 'tests::migration_disabled_source_maintenance_binds_state'),
+    ('source_state_eligibility', 'crates/keyrack-core/src/migration/wrapped.rs', 'pub fn validate(&self)', 'if !matches!(old.state, KeyState::Enabled | KeyState::Disabled) {', 'if false {', 'tests::migration_disabled_source_maintenance_binds_state'),
+    ('destination_enabled', 'crates/keyrack-core/src/migration/wrapped.rs', 'pub fn validate(&self)', 'if new.state != KeyState::Enabled {', 'if false {', 'tests::migration_disabled_source_maintenance_binds_state'),
+    ('source_state_at_claim', 'crates/keyrack-sqlite/src/migration.rs', 'fn migration_claim(', 'snapshots(conn, &value.request, true)?;', '', 'migration::tests::migration_source_state_drift_blocks_recovery'),
+    ('source_state_at_dispatch', 'crates/keyrack-sqlite/src/migration.rs', 'fn migration_dispatch(', 'snapshots(conn, &value.request, true)?;', '', 'migration::tests::migration_source_state_drift_blocks_recovery'),
+    ('source_state_at_stage', 'crates/keyrack-sqlite/src/migration.rs', 'fn migration_stage(', 'snapshots(conn,&value.request,true)?;', '', 'migration::tests::migration_source_state_drift_blocks_recovery'),
+    ('source_state_at_commit', 'crates/keyrack-sqlite/src/migration.rs', 'fn migration_commit(', 'snapshots(conn,&value.request,true)?;', '', 'migration::tests::migration_source_state_drift_blocks_recovery'),
+    ('old_receipt_digest', 'crates/keyrack-core/src/migration/wrapped.rs', 'terminal result binding mismatch', '|| entry.old_envelope_digest\n                        != blake3::Hash::from_bytes(self.old_envelope_digests[index])\n                            .to_hex()\n                            .as_str()', '', 'tests::migration_terminal_result_and_reader_snapshots'),
 ]
 
 

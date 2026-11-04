@@ -442,10 +442,175 @@ mod migration_postgres {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn migration_legacy_upgrade_binds_receipts_once_at_every_phase() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        for phase in 0..3 {
+            let store = PostgresStorage::connect(&url).await.unwrap();
+            let (request, _) = seeded(&store).await;
+            let original = store
+                .wrapped_key_snapshot(&request.child.lid, 1)
+                .await
+                .unwrap()
+                .envelope;
+            store.reserve_migration(&request).await.unwrap();
+            let owner = test_owner(&store, request.operation).await;
+            if phase > 0 {
+                store
+                    .stage_migration(request.operation, owner, &envelopes())
+                    .await
+                    .unwrap();
+            }
+            if phase > 1 {
+                store
+                    .commit_migration(request.operation, owner)
+                    .await
+                    .unwrap();
+            }
+            let mut legacy = serde_json::to_value(
+                store
+                    .get_migration(request.operation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            legacy.as_object_mut().unwrap().remove("schema_version");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("old_envelope_digests");
+            let mut tx = pool.begin().await.unwrap();
+            // Match the storage's global writer advisory fence during the simulated upgrade.
+            sqlx::query("SELECT pg_advisory_xact_lock(1263682386)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE kr_migration_journal SET journal_json=$1 WHERE operation_id=$2")
+                .bind(legacy)
+                .bind(request.operation.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM kr_migration_schema")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(store);
+            let store = PostgresStorage::connect(&url).await.unwrap();
+            let upgraded = store
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(upgraded.schema_version, 2);
+            assert_eq!(
+                upgraded.old_envelope_digests[0],
+                *blake3::hash(&original).as_bytes()
+            );
+            assert_eq!(
+                store
+                    .wrapped_key_snapshot(&request.child.lid, 1)
+                    .await
+                    .unwrap()
+                    .envelope,
+                if phase == 2 {
+                    envelopes()[0].clone()
+                } else {
+                    original
+                }
+            );
+            if phase == 0 {
+                store
+                    .stage_migration(request.operation, owner, &envelopes())
+                    .await
+                    .unwrap();
+            }
+            store
+                .commit_migration(request.operation, owner)
+                .await
+                .unwrap();
+            let valid = serde_json::to_value(
+                store
+                    .get_migration(request.operation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            for missing in [false, true] {
+                let mut edited = valid.clone();
+                if missing {
+                    edited
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("old_envelope_digests");
+                } else {
+                    edited["result"]["versions"][0]["old_envelope_digest"] =
+                        serde_json::Value::String("0".repeat(64));
+                }
+                sqlx::query(
+                    "UPDATE kr_migration_journal SET journal_json=$1 WHERE operation_id=$2",
+                )
+                .bind(edited)
+                .bind(request.operation.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+                let reopened = PostgresStorage::connect(&url).await.unwrap();
+                assert!(reopened.get_migration(request.operation).await.is_err());
+            }
+            // Restore this test's row so another phase's one-time upgrade sees valid data.
+            sqlx::query("UPDATE kr_migration_journal SET journal_json=$1 WHERE operation_id=$2")
+                .bind(valid)
+                .bind(request.operation.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn migration_source_state_drift_blocks_recovery() {
+        let store = make_store().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        keyrack_test_support::migration_conformance::source_state_drift_blocks_recovery(
+            &store,
+            |record| {
+                let pool = &pool;
+                async move {
+                    sqlx::query("UPDATE kr_keys SET record_json=$1,occ_version=$2 WHERE lid=$3")
+                        .bind(serde_json::to_value(&record).unwrap())
+                        .bind(i64::try_from(record.occ_version).unwrap())
+                        .bind(record.lid.to_string())
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+            },
+        )
+        .await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn migration_reconnects_at_each_phase_and_rolls_back_failed_commit() {
         let url = std::env::var("DATABASE_URL").unwrap();
         let first = PostgresStorage::connect(&url).await.unwrap();
-        let (request, creations) = seeded(&first).await;
+        let (mut request, creations) = seeded(&first).await;
+        request.old_parent.state = keyrack_core::key::KeyState::Disabled;
+        request.old_parent.occ_version += 1;
+        first.update_key(&request.old_parent).await.unwrap();
         first.reserve_migration(&request).await.unwrap();
         drop(first);
         let second = PostgresStorage::connect(&url).await.unwrap();

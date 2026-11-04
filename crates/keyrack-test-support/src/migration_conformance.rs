@@ -82,6 +82,219 @@ pub fn envelopes() -> Vec<Vec<u8>> {
     ]
 }
 
+/// Maintenance authority is bound to the exact source state, never a temporary
+/// enable. This is shared by SQLite and PostgreSQL conformance.
+pub async fn disabled_source_maintenance_binds_state(store: &dyn StorageBackend) {
+    let (mut request, _) = seeded(store).await;
+    request.old_parent.state = KeyState::Disabled;
+    request.old_parent.occ_version += 1;
+    store.update_key(&request.old_parent).await.unwrap();
+    request.validate().unwrap();
+    for role in 0..2 {
+        let mut denied = request.clone();
+        if role == 0 {
+            denied.child.state = KeyState::Disabled;
+        } else {
+            denied.new_parent.state = KeyState::Disabled;
+        }
+        assert!(
+            denied.validate().is_err(),
+            "only the source may be disabled"
+        );
+    }
+    for state in [
+        KeyState::PendingDeletion,
+        KeyState::Compromised,
+        KeyState::Destroyed,
+    ] {
+        let mut denied = request.clone();
+        denied.old_parent.state = state;
+        assert!(
+            denied.validate().is_err(),
+            "unsafe source state must be refused"
+        );
+    }
+    for compromised in [false, true] {
+        let mut denied = request.clone();
+        if compromised {
+            denied.old_parent.was_compromised = true;
+        } else {
+            denied.old_parent.scheduled_deletion_at = Some(chrono::Utc::now());
+        }
+        assert!(
+            denied.validate().is_err(),
+            "source history and schedule remain authoritative"
+        );
+    }
+    assert!(
+        MigrationRequest::new(
+            Uuid::new_v4(),
+            None,
+            request.child.clone(),
+            request.old_parent.clone(),
+            request.old_parent.clone()
+        )
+        .is_err(),
+        "a disabled source cannot also be the destination"
+    );
+    let reserved = store.reserve_migration(&request).await.unwrap();
+    assert_eq!(reserved.request.old_parent.state, KeyState::Disabled);
+    assert_eq!(reserved.old_envelope_digests.len(), 2);
+    let decoded: keyrack_core::migration::MigrationJournal =
+        serde_json::from_str(&serde_json::to_string(&reserved).unwrap()).unwrap();
+    assert!(decoded.request.same_intent(&request).unwrap());
+    let mut changed = request.clone();
+    changed.old_parent.state = KeyState::Enabled;
+    assert!(!decoded.request.same_intent(&changed).unwrap());
+    assert!(
+        matches!(
+            store.reserve_migration(&changed).await,
+            Err(KeyRackError::MigrationIntentConflict { .. })
+        ),
+        "source state is immutable intent"
+    );
+    let owner = test_owner(store, request.operation).await;
+    for phase in 0..2 {
+        if phase == 1 {
+            store
+                .stage_migration(request.operation, owner, &envelopes())
+                .await
+                .unwrap();
+        }
+        let mut enabled = request.old_parent.clone();
+        enabled.state = KeyState::Enabled;
+        enabled.occ_version += 1;
+        retryable(store.update_key(&enabled).await);
+        assert_eq!(
+            store.get_key(&request.old_parent.lid).await.unwrap().state,
+            KeyState::Disabled
+        );
+    }
+    store
+        .commit_migration(request.operation, owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_key(&request.old_parent.lid).await.unwrap().state,
+        KeyState::Disabled
+    );
+    assert_eq!(
+        store.get_key(&request.child.lid).await.unwrap().parent_lid,
+        Some(request.new_parent.lid)
+    );
+    assert_eq!(
+        store
+            .get_migration(request.operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .request
+            .old_parent
+            .state,
+        KeyState::Disabled
+    );
+}
+
+/// Simulate an out-of-band lifecycle change after a crash. Normal writers are
+/// fenced; recovery must still refuse stale maintenance authority independently.
+pub async fn source_state_drift_blocks_recovery<F, Fut>(store: &dyn StorageBackend, overwrite: F)
+where
+    F: Fn(KeyRecord) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for phase in 0..4 {
+        for state in [
+            KeyState::Enabled,
+            KeyState::PendingDeletion,
+            KeyState::Compromised,
+            KeyState::Destroyed,
+            KeyState::Disabled,
+        ] {
+            let (mut request, creations) = seeded(store).await;
+            request.old_parent.state = KeyState::Disabled;
+            request.old_parent.occ_version += 1;
+            store.update_key(&request.old_parent).await.unwrap();
+            store.reserve_migration(&request).await.unwrap();
+            let owner = if phase > 0 {
+                Some(
+                    store
+                        .claim_migration(request.operation, Uuid::new_v4(), 0)
+                        .await
+                        .unwrap()
+                        .ownership()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if phase > 1 {
+                store
+                    .begin_migration_dispatch(request.operation, owner.unwrap(), true)
+                    .await
+                    .unwrap();
+            }
+            if phase > 2 {
+                store
+                    .stage_migration(request.operation, owner.unwrap(), &envelopes())
+                    .await
+                    .unwrap();
+            }
+            let mut changed = request.old_parent.clone();
+            changed.state = state;
+            // Same-state recovery also fails after a Disabled -> Enabled ->
+            // Disabled cycle: the immutable source revision cannot advance.
+            if state == KeyState::Disabled {
+                changed.occ_version += 2;
+            }
+            // Other cases retain OCC to isolate the lifecycle binding.
+            overwrite(changed).await;
+            let error = match phase {
+                0 => store
+                    .claim_migration(request.operation, Uuid::new_v4(), 0)
+                    .await
+                    .unwrap_err(),
+                1 => store
+                    .begin_migration_dispatch(request.operation, owner.unwrap(), true)
+                    .await
+                    .unwrap_err(),
+                2 => store
+                    .stage_migration(request.operation, owner.unwrap(), &envelopes())
+                    .await
+                    .unwrap_err(),
+                _ => store
+                    .commit_migration(request.operation, owner.unwrap())
+                    .await
+                    .unwrap_err(),
+            };
+            assert!(
+                matches!(error, KeyRackError::MigrationRejected { .. }),
+                "source-state drift must reject recovery phase {phase}: {error}"
+            );
+            let journal = store
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(journal.request.old_parent.state, KeyState::Disabled);
+            assert_eq!(
+                journal.phase,
+                if phase == 3 {
+                    MigrationPhase::Staged
+                } else {
+                    MigrationPhase::Reserved
+                }
+            );
+            retryable(store.check_migration_fence(&request.old_parent.lid).await);
+            for creation in creations {
+                assert!(store
+                    .read_creation_envelope(creation.operation)
+                    .await
+                    .is_ok());
+            }
+        }
+    }
+}
+
 pub async fn atomic_publication_and_retirement(store: &dyn StorageBackend) {
     let (request, creations) = seeded(store).await;
     let operation = request.operation;
@@ -722,7 +935,7 @@ pub async fn terminal_result_and_reader_snapshots(store: &dyn StorageBackend) {
             5 => result.versions[0].new_parent_version += 1,
             6 => result.versions[0].old_reference.push('x'),
             7 => result.versions[0].new_envelope_digest = "0".repeat(64),
-            _ => result.versions[0].old_envelope_digest = "invalid".into(),
+            _ => result.versions[0].old_envelope_digest = "0".repeat(64),
         }
         assert!(
             journal.validate().is_err(),
@@ -991,6 +1204,10 @@ pub async fn destruction_dependency_query_tracks_migration(store: &dyn StorageBa
 #[macro_export]
 macro_rules! migration_conformance_tests {
     ($store:expr) => {
+        #[tokio::test]
+        async fn migration_disabled_source_maintenance_binds_state() {
+            $crate::migration_conformance::disabled_source_maintenance_binds_state(&$store).await;
+        }
         #[tokio::test]
         async fn migration_destruction_dependency_query_tracks_migration() {
             $crate::migration_conformance::destruction_dependency_query_tracks_migration(&$store)

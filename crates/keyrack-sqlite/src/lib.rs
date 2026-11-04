@@ -94,7 +94,8 @@ impl SqliteStorage {
         // no approval row and therefore retain the fail-closed default.
         storage.creation_tx(|conn| {
             conn.execute_batch(destruction::SCHEMA)
-                .map_err(|e| map_sql(&e))
+                .map_err(|e| map_sql(&e))?;
+            migration::upgrade_schema(conn)
         })?;
         Ok(storage)
     }
@@ -117,7 +118,8 @@ impl SqliteStorage {
         // no approval row and therefore retain the fail-closed default.
         storage.creation_tx(|conn| {
             conn.execute_batch(destruction::SCHEMA)
-                .map_err(|e| map_sql(&e))
+                .map_err(|e| map_sql(&e))?;
+            migration::upgrade_schema(conn)
         })?;
         Ok(storage)
     }

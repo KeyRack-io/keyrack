@@ -626,7 +626,14 @@ pub async fn execute_rewrap_with_options(
         // This permit stays with the task, never the request future.
         let _slot = slot;
         let start = Instant::now();
-        let result = rewrap_authorized(&state, &ctx, &new_parent_id, &operation_id, options).await;
+        let result = Box::pin(rewrap_authorized(
+            &state,
+            &ctx,
+            &new_parent_id,
+            &operation_id,
+            options,
+        ))
+        .await;
         let (outcome, label) = match &result {
             Ok(_) => (AuditResult::Success, "success"),
             Err(crate::domain::DomainError::PermissionDenied(_)) => (AuditResult::Denied, "denied"),

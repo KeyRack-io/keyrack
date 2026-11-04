@@ -127,6 +127,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             | KeyRackError::InvalidStateTransition { .. }
             | KeyRackError::KeyDestructionFenced(_)
             | KeyRackError::MigrationIntentConflict { .. }
+            | KeyRackError::MigrationRejected { .. }
             | KeyRackError::WrappingParentDestroyed => Self::Core(e),
             _ => Self::Internal(e.to_string()),
         }
@@ -154,6 +155,7 @@ impl DomainError {
                     | KeyRackError::DeletionDependencyRefused { .. }
                     | KeyRackError::WrappingParentDestroyed
                     | KeyRackError::MigrationIntentConflict { .. }
+                    | KeyRackError::MigrationRejected { .. }
                     | KeyRackError::OperationNotPermitted { .. }
                     | KeyRackError::ImmutableTag { .. }
                     | KeyRackError::DepthLimitExceeded { .. }
@@ -196,6 +198,9 @@ impl DomainError {
                 }
                 KeyRackError::MigrationIntentConflict { .. } => {
                     (StatusCode::CONFLICT, "MigrationIntentConflict")
+                }
+                KeyRackError::MigrationRejected { .. } => {
+                    (StatusCode::CONFLICT, "MigrationRejected")
                 }
                 KeyRackError::InvalidStateTransition { .. } => {
                     (StatusCode::CONFLICT, "InvalidStateTransition")

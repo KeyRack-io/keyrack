@@ -507,7 +507,7 @@ mod tests {
         store.create_key(&record).await.unwrap();
         let error = store.check_migration_fence(&record.lid).await.unwrap_err();
         assert!(
-            matches!(error, KeyRackError::Storage(ref message) if message.contains("migration fence unsupported"))
+            matches!(error, KeyRackError::MigrationRejected { ref reason } if reason.contains("migration fence unsupported"))
         );
     }
 

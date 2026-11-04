@@ -6,6 +6,7 @@
 //! authorized snapshots under its writer fence before any provider dispatch.
 
 use crate::{domain::DomainError, state::ServiceState};
+use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{KeyMaterial, KeyRecord, KeyVersionRecord};
 use keyrack_core::lid::Lid;
 use keyrack_core::migration::{MigrationConditions, MigrationPhase, MigrationRequest};
@@ -191,7 +192,7 @@ pub async fn rewrap_key(
         request.proposed.updated_at = journal.request.proposed.updated_at;
     }
     let result = run_migration(state, &request).await;
-    if result.is_err() {
+    if let Err(error) = &result {
         // A stale worker may READ an already committed result but must never
         // stage or commit using the new owner's authority.
         if let Ok(Some(journal)) = state.storage.get_migration(request.operation).await {
@@ -199,20 +200,64 @@ pub async fn rewrap_key(
                 if journal.phase == MigrationPhase::Committed {
                     return Ok(journal.request.proposed);
                 }
-                return Err(DomainError::ProviderUnavailable(
-                    if journal
+                if journal.phase == MigrationPhase::Reserved
+                    && journal
                         .dispatch
                         .is_some_and(|dispatch| !dispatch.retry_safe)
-                    {
-                        "unknown migration provider outcome requires reconciliation; reservation retained".into()
-                    } else {
-                        "migration remains pending; retry the same operation ID".into()
-                    },
+                {
+                    // A rejected local precondition does not prove what a
+                    // previously dispatched nonrepeatable effect did. Keep the
+                    // reconciliation obligation ahead of error classification.
+                    return Err(DomainError::ProviderUnavailable(
+                        "unknown migration provider outcome requires reconciliation; reservation retained".into(),
+                    ));
+                }
+                if deterministic_rejection(error) {
+                    // This is not cancellation: a nonterminal journal and all
+                    // its dependency fences remain until explicit recovery.
+                    return Err(DomainError::from(KeyRackError::MigrationRejected {
+                        reason: format!(
+                            "operation {} requires repair or reconciliation; reservation retained: {error}",
+                            request.operation
+                        ),
+                    }));
+                }
+                return Err(DomainError::ProviderUnavailable(
+                    "migration remains pending; retry the same operation ID".into(),
                 ));
             }
         }
     }
     result
+}
+
+/// Classify explicit semantic failures only. Storage/opaque provider failures
+/// and OCC conflicts do not establish a deterministic rejection.
+fn deterministic_rejection(error: &DomainError) -> bool {
+    match error {
+        DomainError::NotFound(_)
+        | DomainError::InvalidArgument(_)
+        | DomainError::FailedPrecondition(_)
+        | DomainError::PermissionDenied(_) => true,
+        DomainError::Core(error) => matches!(
+            error,
+            KeyRackError::MigrationRejected { .. }
+                | KeyRackError::MigrationIntentConflict { .. }
+                | KeyRackError::KeyNotFound(_)
+                | KeyRackError::InvalidStateTransition { .. }
+                | KeyRackError::OperationNotPermitted { .. }
+                | KeyRackError::KeyDestructionFenced(_)
+                | KeyRackError::WrappingParentDestroyed
+                | KeyRackError::EncryptionContextMismatch
+                | KeyRackError::AuthorizationDenied { .. }
+                | KeyRackError::DeletionDependencyRefused { .. }
+                | KeyRackError::InvalidIdentity(_)
+                | KeyRackError::ImmutableTag { .. }
+                | KeyRackError::DepthLimitExceeded { .. }
+                | KeyRackError::CycleDetected { .. }
+        ),
+        DomainError::ProviderUnavailable(_) | DomainError::Internal(_) => false,
+    }
 }
 
 async fn run_migration(
@@ -383,4 +428,25 @@ async fn run_migration(
         .commit_migration(request.operation, ownership)
         .await
         .map_err(DomainError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postreserve_failure_classification_does_not_guess_from_opaque_messages() {
+        for error in [
+            KeyRackError::Storage("database temporarily unavailable".into()),
+            KeyRackError::Provider("unknown backend outcome".into()),
+            KeyRackError::ProviderUnavailable("custody unavailable".into()),
+        ] {
+            assert!(!deterministic_rejection(&DomainError::from(error)));
+        }
+        assert!(deterministic_rejection(&DomainError::from(
+            KeyRackError::MigrationRejected {
+                reason: "source snapshot changed".into()
+            },
+        )));
+    }
 }

@@ -2,6 +2,17 @@
 
 All notable changes to KeyRack will be documented in this file.
 
+## [Post-0.5.0 — unreleased]
+
+- Allow `RewrapKey` to drain every version from a Disabled source parent to a
+  different Enabled parent while the child remains Enabled. The source is never
+  re-enabled; caller state gates remain in force. Source lifecycle/deletion/
+  compromise state is bound into the immutable journal and recovery checks.
+- Report deterministic migration failures as typed `MigrationRejected`
+  (`FAILED_PRECONDITION` / HTTP 409), retaining reservations and unknown-outcome
+  reconciliation requirements. Bind terminal old-envelope digests to independently
+  retained reservation hashes, with a one-time legacy-journal upgrade.
+
 ## [Unreleased]
 
 Release preparation sets the eighteen workspace crates previously at 0.4.0 to

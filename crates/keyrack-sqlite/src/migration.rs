@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS migration_envelopes (
  operation_id TEXT NOT NULL, version TEXT NOT NULL, envelope BLOB NOT NULL CHECK(length(envelope) BETWEEN 1 AND 65536),
  PRIMARY KEY(operation_id,version)
 );
+CREATE TABLE IF NOT EXISTS migration_schema (version INTEGER PRIMARY KEY CHECK(version=2));
 CREATE TABLE IF NOT EXISTS retired_creation_journal (operation_id TEXT PRIMARY KEY, journal_json TEXT NOT NULL);
 ";
 
@@ -120,7 +121,7 @@ fn save(conn: &Connection, value: &MigrationJournal) -> Result<()> {
     Ok(())
 }
 
-fn snapshots(conn: &Connection, request: &MigrationRequest) -> Result<()> {
+fn snapshots(conn: &Connection, request: &MigrationRequest, admitted: bool) -> Result<()> {
     let child = creation::key(conn, &request.child.lid)?
         .ok_or(KeyRackError::KeyNotFound(request.child.lid))?;
     let old = creation::key(conn, &request.old_parent.lid)?
@@ -130,7 +131,12 @@ fn snapshots(conn: &Connection, request: &MigrationRequest) -> Result<()> {
     for record in [&child, &old, &new] {
         destruction::guard(conn, &record.lid)?;
     }
-    request.validate_snapshots(&child, &old, &new)
+    match request.validate_snapshots(&child, &old, &new) {
+        Err(KeyRackError::ProviderUnavailable(_)) if admitted => Err(invalid(
+            "reserved key snapshot changed; immutable migration intent cannot advance",
+        )),
+        result => result,
+    }
 }
 
 fn envelope_ref(conn: &Connection, reference: &str) -> Result<Vec<u8>> {
@@ -167,6 +173,80 @@ fn envelope_ref(conn: &Connection, reference: &str) -> Result<Vec<u8>> {
     Err(invalid("unknown wrapped envelope reference"))
 }
 
+/// Upgrade once under the storage writer transaction, never during journal reads.
+pub(super) fn upgrade_schema(conn: &Connection) -> Result<()> {
+    let initialized: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM migration_schema WHERE version=2)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| map_sql(&e))?;
+    if initialized {
+        return Ok(());
+    }
+    let rows: Vec<(String, String, String, String, String, bool)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT operation_id,journal_json,child_lid,old_parent_lid,new_parent_lid,committed FROM migration_journal ORDER BY committed DESC",
+            )
+            .map_err(|e| map_sql(&e))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .map_err(|e| map_sql(&e))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(|e| map_sql(&e))?
+    };
+    for (operation, json, child, old, new, committed) in rows {
+        let mut value: MigrationJournal =
+            serde_json::from_str(&json).map_err(|_| invalid("invalid legacy journal"))?;
+        if operation != value.request.operation.to_string()
+            || child != value.request.child.lid.to_string()
+            || old != value.request.old_parent.lid.to_string()
+            || new != value.request.new_parent.lid.to_string()
+            || committed != (value.phase == MigrationPhase::Committed)
+        {
+            return Err(invalid("legacy journal index mismatch"));
+        }
+        if value.schema_version == 1 {
+            let old = if value.phase == MigrationPhase::Committed {
+                Vec::new()
+            } else {
+                source_envelopes(conn, &value.request)?
+            };
+            value.upgrade_legacy(&old)?;
+            save(conn, &value)?;
+        }
+        required(conn, value.request.operation)?;
+    }
+    conn.execute("INSERT INTO migration_schema(version) VALUES(2)", [])
+        .map_err(|e| map_sql(&e))?;
+    Ok(())
+}
+
+fn source_envelopes(conn: &Connection, request: &MigrationRequest) -> Result<Vec<Vec<u8>>> {
+    request
+        .child
+        .key_versions
+        .iter()
+        .map(|version| {
+            let KeyMaterial::ParentWrapped(material) = &version.material else {
+                return Err(invalid("resident child version"));
+            };
+            envelope_ref(conn, material.wrapped_material_ref().as_str())
+        })
+        .collect()
+}
+
 impl SqliteStorage {
     pub(super) fn migration_reserve(&self, request: &MigrationRequest) -> Result<MigrationJournal> {
         request.validate()?;
@@ -175,14 +255,14 @@ impl SqliteStorage {
                 if !existing.request.same_intent(request)? { return Err(KeyRackError::MigrationIntentConflict { operation: request.operation }); }
                 return Ok(existing);
             }
-            snapshots(conn, request)?;
+            snapshots(conn, request, false)?;
             for record in [&request.child,&request.old_parent,&request.new_parent] {
                 guard(conn, &record.lid)?;
                 let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM creation_journal WHERE phase!='committed' AND (child_lid=?1 OR parent_lid=?1))",
                     [record.lid.to_string()], |row| row.get(0)).map_err(|e| map_sql(&e))?;
                 if pending { return Err(migration_busy()); }
             }
-            let value = MigrationJournal::reserved(request.clone());
+            let value = MigrationJournal::reserved(request.clone(), &source_envelopes(conn, request)?)?;
             conn.execute("INSERT INTO migration_journal(operation_id,child_lid,old_parent_lid,new_parent_lid,committed,journal_json) VALUES(?1,?2,?3,?4,0,?5)",
                 params![request.operation.to_string(),request.child.lid.to_string(),request.old_parent.lid.to_string(),request.new_parent.lid.to_string(),
                 serde_json::to_string(&value).map_err(|_| invalid("journal encoding"))?]).map_err(|e| map_sql(&e))?;
@@ -202,6 +282,7 @@ impl SqliteStorage {
     ) -> Result<MigrationJournal> {
         self.creation_tx(|conn| {
             let mut value = required(conn, operation)?;
+            snapshots(conn, &value.request, true)?;
             value.claim(owner, expected_epoch)?;
             save(conn, &value)?;
             Ok(value)
@@ -216,6 +297,7 @@ impl SqliteStorage {
     ) -> Result<MigrationJournal> {
         self.creation_tx(|conn| {
             let mut value = required(conn, operation)?;
+            snapshots(conn, &value.request, true)?;
             value.begin_dispatch(ownership, retry_safe)?;
             save(conn, &value)?;
             Ok(value)
@@ -267,7 +349,7 @@ impl SqliteStorage {
             value.validate_envelopes(envelopes)?;
             if value.phase != MigrationPhase::Reserved { return Ok(value); }
             if value.dispatch.as_ref().map(|d| d.epoch) != Some(ownership.epoch) { return Err(invalid("provider dispatch belongs to another ownership epoch")); }
-            snapshots(conn,&value.request)?;
+            snapshots(conn,&value.request,true)?;
             for (version,envelope) in value.request.proposed.key_versions.iter().zip(envelopes) {
                 conn.execute("INSERT INTO migration_envelopes(operation_id,version,envelope) VALUES(?1,?2,?3)",
                     params![operation.to_string(),version.version_number.to_string(),envelope]).map_err(|e| map_sql(&e))?;
@@ -289,7 +371,7 @@ impl SqliteStorage {
             value.require_owner(ownership)?;
             if value.phase == MigrationPhase::Committed { return Ok(value.request.proposed); }
             if value.phase != MigrationPhase::Staged { return Err(invalid("envelopes not staged")); }
-            snapshots(conn,&value.request)?;
+            snapshots(conn,&value.request,true)?;
             let count: i64 = conn.query_row("SELECT count(*) FROM migration_envelopes WHERE operation_id=?1",[operation.to_string()],|r|r.get(0)).map_err(|e|map_sql(&e))?;
             if usize::try_from(count).ok()!=Some(value.request.child.key_versions.len()) { return Err(invalid("incomplete staged envelopes")); }
             for version in &value.request.proposed.key_versions {
@@ -343,11 +425,167 @@ mod tests {
     use keyrack_test_support::migration_conformance::{envelopes, seeded, test_owner};
 
     #[tokio::test]
+    async fn migration_legacy_upgrade_binds_receipts_once_at_every_phase() {
+        for phase in 0..3 {
+            let path = std::env::temp_dir().join(format!(
+                "keyrack-migration-upgrade-{}.sqlite",
+                Uuid::new_v4()
+            ));
+            let store = SqliteStorage::open(&path).unwrap();
+            let (request, _) = seeded(&store).await;
+            let original = store
+                .wrapped_key_snapshot(&request.child.lid, 1)
+                .await
+                .unwrap()
+                .envelope;
+            store.reserve_migration(&request).await.unwrap();
+            let owner = test_owner(&store, request.operation).await;
+            if phase > 0 {
+                store
+                    .stage_migration(request.operation, owner, &envelopes())
+                    .await
+                    .unwrap();
+            }
+            if phase > 1 {
+                store
+                    .commit_migration(request.operation, owner)
+                    .await
+                    .unwrap();
+            }
+            let mut legacy = serde_json::to_value(
+                store
+                    .get_migration(request.operation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            legacy.as_object_mut().unwrap().remove("schema_version");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("old_envelope_digests");
+            store
+                .creation_tx(|conn| {
+                    conn.execute(
+                        "UPDATE migration_journal SET journal_json=?1 WHERE operation_id=?2",
+                        params![legacy.to_string(), request.operation.to_string()],
+                    )
+                    .map_err(|e| map_sql(&e))?;
+                    conn.execute("DELETE FROM migration_schema", [])
+                        .map_err(|e| map_sql(&e))?;
+                    Ok(())
+                })
+                .unwrap();
+            drop(store);
+            let store = SqliteStorage::open(&path).unwrap();
+            let upgraded = store
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(upgraded.schema_version, 2);
+            assert_eq!(
+                upgraded.old_envelope_digests[0],
+                *blake3::hash(&original).as_bytes()
+            );
+            assert_eq!(
+                store
+                    .wrapped_key_snapshot(&request.child.lid, 1)
+                    .await
+                    .unwrap()
+                    .envelope,
+                if phase == 2 {
+                    envelopes()[0].clone()
+                } else {
+                    original
+                }
+            );
+            if phase == 0 {
+                store
+                    .stage_migration(request.operation, owner, &envelopes())
+                    .await
+                    .unwrap();
+            }
+            store
+                .commit_migration(request.operation, owner)
+                .await
+                .unwrap();
+            let valid = serde_json::to_value(
+                store
+                    .get_migration(request.operation)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            for missing in [false, true] {
+                let mut edited = valid.clone();
+                if missing {
+                    edited
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("old_envelope_digests");
+                } else {
+                    edited["result"]["versions"][0]["old_envelope_digest"] =
+                        serde_json::Value::String("0".repeat(64));
+                }
+                store
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE migration_journal SET journal_json=?1 WHERE operation_id=?2",
+                            params![edited.to_string(), request.operation.to_string()],
+                        )
+                        .map_err(|e| map_sql(&e))?;
+                        Ok(())
+                    })
+                    .unwrap();
+                // Reopening must not freeze a later edit as if it were legacy data.
+                let reopened = SqliteStorage::open(&path).unwrap();
+                assert!(reopened.get_migration(request.operation).await.is_err());
+            }
+            drop(store);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_source_state_drift_blocks_recovery() {
+        let store = SqliteStorage::in_memory().unwrap();
+        keyrack_test_support::migration_conformance::source_state_drift_blocks_recovery(
+            &store,
+            |record| {
+                let store = &store;
+                async move {
+                    store
+                        .with_conn(|conn| {
+                            conn.execute(
+                                "UPDATE keys SET record_json=?1,occ_version=?2 WHERE lid=?3",
+                                params![
+                                    serde_json::to_string(&record).unwrap(),
+                                    i64::try_from(record.occ_version).unwrap(),
+                                    record.lid.to_string()
+                                ],
+                            )
+                            .map_err(|e| map_sql(&e))?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn migration_reopens_at_every_durable_phase() {
         let path =
             std::env::temp_dir().join(format!("keyrack-migration-{}.sqlite", Uuid::new_v4()));
         let store = SqliteStorage::open(&path).unwrap();
-        let (request, creations) = seeded(&store).await;
+        let (mut request, creations) = seeded(&store).await;
+        request.old_parent.state = keyrack_core::key::KeyState::Disabled;
+        request.old_parent.occ_version += 1;
+        store.update_key(&request.old_parent).await.unwrap();
         store.reserve_migration(&request).await.unwrap();
         drop(store);
         let store = SqliteStorage::open(&path).unwrap();
@@ -496,12 +734,9 @@ mod tests {
             let store = SqliteStorage::in_memory().unwrap();
             let (request, _) = seeded(&store).await;
             store.reserve_migration(&request).await.unwrap();
+            let owner = test_owner(&store, request.operation).await;
             store
-                .stage_migration(
-                    request.operation,
-                    test_owner(&store, request.operation).await,
-                    &envelopes(),
-                )
+                .stage_migration(request.operation, owner, &envelopes())
                 .await
                 .unwrap();
             let mut tampered = match subject {
@@ -526,10 +761,7 @@ mod tests {
                 .unwrap();
             assert!(
                 store
-                    .commit_migration(
-                        request.operation,
-                        test_owner(&store, request.operation).await
-                    )
+                    .commit_migration(request.operation, owner)
                     .await
                     .is_err(),
                 "commit must recheck each snapshot OCC"

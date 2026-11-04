@@ -1228,40 +1228,75 @@ impl CryptoProvider for SoftwareProvider {
         new_parent: &KeyHandle,
     ) -> Result<Vec<u8>> {
         if old_context.provider_ref != new_context.provider_ref {
-            return Err(KeyRackError::Provider(
-                "cross-provider wrapped-key migration is not supported".into(),
-            ));
+            return Err(KeyRackError::MigrationRejected {
+                reason: "cross-provider wrapped-key migration is not supported".into(),
+            });
         }
         if old_context.security_domain != new_context.security_domain {
-            return Err(KeyRackError::Provider(
-                "cross-security-domain wrapped-key migration is not supported".into(),
-            ));
+            return Err(KeyRackError::MigrationRejected {
+                reason: "cross-security-domain wrapped-key migration is not supported".into(),
+            });
         }
-        let old_aad = self.admit(old_context, old_parent, WrappingOperation::Rewrap)?;
-        let new_aad = self.admit(new_context, new_parent, WrappingOperation::Rewrap)?;
+        let old_aad = self
+            .admit(old_context, old_parent, WrappingOperation::Rewrap)
+            .map_err(|error| KeyRackError::MigrationRejected {
+                reason: error.to_string(),
+            })?;
+        let new_aad = self
+            .admit(new_context, new_parent, WrappingOperation::Rewrap)
+            .map_err(|error| KeyRackError::MigrationRejected {
+                reason: error.to_string(),
+            })?;
         let mut permitted = old_context.clone();
         permitted.parent = new_context.parent;
         permitted.parent_spec.clone_from(&new_context.parent_spec);
         if &permitted != new_context {
-            return Err(KeyRackError::Provider(
-                "rewrap must preserve every child and wrapping-profile binding".into(),
-            ));
+            return Err(KeyRackError::MigrationRejected {
+                reason: "rewrap must preserve every child and wrapping-profile binding".into(),
+            });
         }
         if envelope.len() != SOFTWARE_ENVELOPE_BYTES {
-            return Err(KeyRackError::Provider(
-                "wrapped material is not a software AES-256-GCM envelope".into(),
-            ));
+            return Err(KeyRackError::MigrationRejected {
+                reason: "wrapped material is not a software AES-256-GCM envelope".into(),
+            });
         }
         // No object/lease is inserted and there is no suspension point. The
         // local plaintext is zeroized on success, error or unwind, and only
         // ciphertext is returned to the service. Software is still not custody.
-        let child = Zeroizing::new(self.open_under_parent(old_parent, envelope, &old_aad)?);
+        let child = Zeroizing::new({
+            let keys = self
+                .keys
+                .read()
+                .map_err(|error| KeyRackError::Provider(format!("lock poisoned: {error}")))?;
+            match keys.get(&old_parent.key_id) {
+                Some(KeyMaterial::Aes256(key)) => gcm_decrypt::<Aes256Gcm>(key, envelope, &old_aad)
+                    .map_err(|error| KeyRackError::MigrationRejected {
+                        reason: error.to_string(),
+                    })?,
+                Some(_) => {
+                    return Err(KeyRackError::MigrationRejected {
+                        reason: "source parent material is not an AES-256 wrapping key".into(),
+                    })
+                }
+                None => return Err(KeyRackError::WrappingParentDestroyed),
+            }
+        });
         if child.len() != 32 {
-            return Err(KeyRackError::Provider(
-                "unwrapped child is not an AES-256 key".into(),
-            ));
+            return Err(KeyRackError::MigrationRejected {
+                reason: "unwrapped child is not an AES-256 key".into(),
+            });
         }
-        self.seal_under_parent(new_parent, &child, &new_aad)
+        let keys = self
+            .keys
+            .read()
+            .map_err(|error| KeyRackError::Provider(format!("lock poisoned: {error}")))?;
+        match keys.get(&new_parent.key_id) {
+            Some(KeyMaterial::Aes256(key)) => gcm_encrypt::<Aes256Gcm>(key, &child, &new_aad),
+            Some(_) => Err(KeyRackError::MigrationRejected {
+                reason: "destination parent material is not an AES-256 wrapping key".into(),
+            }),
+            None => Err(KeyRackError::WrappingParentDestroyed),
+        }
     }
 
     async fn close_wrapped_key(&self, lease: &WrappedKeyLease) -> Result<WrappedKeyClosure> {

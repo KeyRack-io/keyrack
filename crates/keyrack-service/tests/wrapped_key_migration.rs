@@ -59,6 +59,7 @@ struct ObservedProvider {
     release: Semaphore,
     retry_safe: AtomicBool,
     fail_at_call: AtomicUsize,
+    corrupt_rewrap_envelope: AtomicUsize,
     opens: AtomicUsize,
     open_paused: AtomicBool,
     open_entered: Semaphore,
@@ -75,6 +76,7 @@ impl ObservedProvider {
             release: Semaphore::new(0),
             retry_safe: AtomicBool::new(true),
             fail_at_call: AtomicUsize::new(0),
+            corrupt_rewrap_envelope: AtomicUsize::new(0),
             opens: AtomicUsize::new(0),
             open_paused: AtomicBool::new(false),
             open_entered: Semaphore::new(0),
@@ -183,9 +185,19 @@ impl CryptoProvider for ObservedProvider {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
         }
+        let mut input = envelope.to_vec();
+        match self.corrupt_rewrap_envelope.load(Ordering::SeqCst) {
+            1 => {
+                input.pop();
+            }
+            2 => {
+                input[12] ^= 1;
+            }
+            _ => {}
+        }
         let envelope = self
             .inner
-            .rewrap_wrapped_key(old, old_parent, envelope, new, new_parent)
+            .rewrap_wrapped_key(old, old_parent, &input, new, new_parent)
             .await?;
         if self.fail_at_call.load(Ordering::SeqCst) == call {
             return Err(KeyRackError::ProviderUnavailable(
@@ -1421,4 +1433,208 @@ async fn metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_m
             new.lid
         );
     }
+}
+
+#[tokio::test]
+async fn deterministic_postreserve_rejection_is_typed_on_both_surfaces_and_keeps_fences() {
+    use axum::body::Body;
+    use keyrack_service::proto::{self, key_service_server::KeyService};
+    use tower::ServiceExt;
+
+    for corruption in [1, 2] {
+        for rest in [false, true] {
+            let (state, provider, child, old, new) = fixture().await;
+            let ciphertexts = ciphertexts(&state, &child).await;
+            provider
+                .corrupt_rewrap_envelope
+                .store(corruption, Ordering::SeqCst);
+            let operation = Uuid::new_v4();
+            for _ in 0..2 {
+                if rest {
+                    let body = serde_json::json!({
+                        "operation_id": operation.to_string(),
+                        "new_parent_key_id": new.lid.to_string(),
+                    });
+                    let request = axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/keys/{}/rewrap", child.lid))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap();
+                    let response = keyrack_service::rest::router(state.clone())
+                        .oneshot(request)
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+                    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body["error"], "MigrationRejected");
+                    assert!(body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("reservation retained"));
+                } else {
+                    let error = keyrack_service::grpc::KeyServiceImpl::new(state.clone())
+                        .rewrap_key(tonic::Request::new(proto::RewrapKeyRequest {
+                            key_id: child.lid.to_string(),
+                            new_parent_key_id: new.lid.to_string(),
+                            operation_id: operation.to_string(),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                    assert!(error.message().contains("migration rejected"));
+                }
+                let journal = state
+                    .storage
+                    .get_migration(operation)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(journal.phase, MigrationPhase::Reserved);
+                assert_decrypts(&state, &child, &ciphertexts).await;
+                for record in [&child, &old, &new] {
+                    assert!(matches!(
+                        state.storage.check_migration_fence(&record.lid).await,
+                        Err(KeyRackError::ProviderUnavailable(_))
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn deterministic_provider_rejection_does_not_clear_unknown_nonrepeatable_dispatch() {
+    let (state, provider, child, _old, new) = fixture().await;
+    provider.retry_safe.store(false, Ordering::SeqCst);
+    provider.corrupt_rewrap_envelope.store(2, Ordering::SeqCst);
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let error = rewrap_key(&state, request.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, DomainError::ProviderUnavailable(ref message)
+            if message.contains("requires reconciliation"))
+        );
+    }
+    assert_eq!(
+        provider.rewraps.load(Ordering::SeqCst),
+        1,
+        "an uncertain native dispatch cannot be repeated because a local error is deterministic"
+    );
+}
+
+#[test]
+fn typed_migration_rejection_has_consistent_error_adapters() {
+    let error = || KeyRackError::MigrationRejected {
+        reason: "fixed snapshot changed".into(),
+    };
+    assert_eq!(
+        keyrack_service::convert::error_to_status(error()).code(),
+        tonic::Code::FailedPrecondition
+    );
+    let domain = DomainError::from(error());
+    assert!(matches!(
+        domain,
+        DomainError::Core(KeyRackError::MigrationRejected { .. })
+    ));
+    assert_eq!(
+        domain.to_grpc_status().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let (status, body) = domain.to_rest_error();
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(body.0["error"], "MigrationRejected");
+}
+
+#[tokio::test]
+async fn deterministic_staged_native_recovery_failure_is_not_an_unknown_provider_outcome() {
+    let path = std::env::temp_dir().join(format!(
+        "keyrack-staged-rejection-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let provider = Arc::new(ObservedProvider::new());
+    let state = service_state(
+        Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap()),
+        provider.clone(),
+    );
+    let old = domain::create_key(&state, input(None)).await.unwrap();
+    let new = domain::create_key(&state, input(None)).await.unwrap();
+    let child = domain::create_key(&state, input(Some(&old))).await.unwrap();
+    let request = prepare_migration(&state, child.lid, Some(new.lid), Uuid::new_v4())
+        .await
+        .unwrap();
+    let reserved = state.storage.reserve_migration(&request).await.unwrap();
+    let owned = state
+        .storage
+        .claim_migration(request.operation, Uuid::new_v4(), reserved.epoch)
+        .await
+        .unwrap();
+    let ownership = owned.ownership().unwrap();
+    state
+        .storage
+        .begin_migration_dispatch(request.operation, ownership, false)
+        .await
+        .unwrap();
+    let replacement = envelopes(&state, &request).await;
+    state
+        .storage
+        .stage_migration(request.operation, ownership, &replacement)
+        .await
+        .unwrap();
+    let calls = provider.rewraps.load(Ordering::SeqCst);
+
+    // Model external restoration/repair bypassing the ordinary update fence.
+    // Full staging established the native outcome before source state drifted.
+    let mut changed = old.clone();
+    changed.state = KeyState::Disabled;
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE keys SET record_json=?1 WHERE lid=?2",
+            rusqlite::params![
+                serde_json::to_string(&changed).unwrap(),
+                old.lid.to_string()
+            ],
+        )
+        .unwrap();
+    drop(state);
+    let restarted = service_state(
+        Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap()),
+        provider.clone(),
+    );
+    let error = rewrap_key(&restarted, request.clone()).await.unwrap_err();
+    assert!(matches!(
+        error,
+        DomainError::Core(KeyRackError::MigrationRejected { .. })
+    ));
+    assert_eq!(
+        error.to_grpc_status().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(error.to_rest_error().0, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        provider.rewraps.load(Ordering::SeqCst),
+        calls,
+        "staged recovery must not redispatch"
+    );
+    let journal = restarted
+        .storage
+        .get_migration(request.operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.phase, MigrationPhase::Staged);
+    assert!(!journal.dispatch.unwrap().retry_safe);
+    assert!(matches!(
+        restarted.storage.check_migration_fence(&old.lid).await,
+        Err(KeyRackError::ProviderUnavailable(_))
+    ));
+    drop(restarted);
+    std::fs::remove_file(path).unwrap();
 }

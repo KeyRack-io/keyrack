@@ -74,6 +74,11 @@ pub enum KeyRackError {
     #[error("migration operation {operation} already names different intent")]
     MigrationIntentConflict { operation: uuid::Uuid },
 
+    /// Fixed migration intent or material was rejected. Retrying unchanged input
+    /// cannot resolve this condition; any existing reservation remains fenced.
+    #[error("migration rejected: {reason}")]
+    MigrationRejected { reason: String },
+
     #[error("resolution depth limit exceeded (max {max_depth})")]
     DepthLimitExceeded { max_depth: u32 },
 

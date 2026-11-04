@@ -248,6 +248,7 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
         KeyRackError::DeletionDependencyRefused { .. } | KeyRackError::WrappingParentDestroyed => {
             (StatusCode::CONFLICT, "FailedPrecondition")
         }
+        KeyRackError::MigrationRejected { .. } => (StatusCode::CONFLICT, "MigrationRejected"),
         KeyRackError::KeyDestructionFenced(_) => (StatusCode::CONFLICT, "KeyDestructionFenced"),
         KeyRackError::InvalidStateTransition { .. } => {
             (StatusCode::CONFLICT, "InvalidStateTransition")

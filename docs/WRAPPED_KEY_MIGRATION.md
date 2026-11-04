@@ -1,11 +1,10 @@
 # Wrapped-key migration
 
-**Reviewed implementation:** `4c0822e69036e3b032de60f278b835b43243c244`, including
-main `bf2316dcf082b84eae524ec733722e108ecdafbe`. The [pinned CI and conformance evidence](#pinned-revision-and-ci-results)
-below applies to this integrated implementation. `558bd6a` is historical and is
-no longer the review baseline. This documentation update records the evidence;
-it changes no implementation or tests. The [final review receipt](https://github.com/KeyRack-io/keyrack/pull/66#issuecomment-6618787921)
-names the final PR head, including this evidence-only update, and its CI runs.
+**Post-0.5.0 draft:** disabled-source maintenance and receipt/error hardening.
+Do not merge this change before the `v0.5.0` tag. The original implementation
+merged in #66 as `2c93cfaaceb26b22802989fd9bcab37d9ef1c04d`; the historical
+[0.5.0 evidence](#pinned-revision-and-ci-results) below does not certify this
+follow-up. Its draft PR records the exact new head and corresponding CI runs.
 
 `RewrapKey` moves every retained version of one logical wrapped key. Omitting a
 new parent rewraps under the existing parent's current version; naming a new
@@ -45,13 +44,16 @@ The three optional revisions are **key OCC revisions**, not cryptographic key
 version numbers. Supplied values must match the corresponding stored snapshots.
 The journal binds the child, both parent identities, their observed revisions,
 the target parent version, every retained child version, and all caller
-assertions. Presence is significant: omitting a revision and explicitly supplying
+assertions. The complete source snapshot includes its lifecycle state, deletion
+schedule and compromise history; a retry never refreshes these admitted facts. Presence is significant: omitting a revision and explicitly supplying
 its observed value are different intents, as are implicit and explicit parent
 selection or version coverage. Reusing an ID with identical intent resumes the
 operation or returns its original result. A changed intent returns gRPC
 `FAILED_PRECONDITION` / HTTP 409. Invalid syntax or duplicate version entries
-returns `INVALID_ARGUMENT` / HTTP 400. A concurrent OCC/fence conflict is
-retryable; retry the original operation ID, never invent another ID to bypass it.
+returns `INVALID_ARGUMENT` / HTTP 400. A concurrent OCC/fence conflict before reservation is retryable; retry the
+original operation ID, never invent another ID to bypass it. Once reserved,
+snapshot/OCC drift is a deterministic rejection because admitted intent cannot
+advance, including a source that changes state and later returns to Disabled.
 
 `kms:RewrapKey` permission is required independently on the child, old parent and
 new parent, including two parent grants when both roles name the same LID.
@@ -85,9 +87,12 @@ Each `versions[]` entry contains:
 | `old_envelope_digest`, `new_envelope_digest` | Lowercase 64-character hexadecimal BLAKE3 digests of the exact encrypted envelope bytes. |
 | `old_reference`, `new_reference` | Original retired reference and resulting live reference, such as `creation:<uuid>` and `migration:<uuid>:<version>`. |
 
-The old hashes are computed from durable source envelopes inside the commit
-transaction, before erasure. New hashes are checked against the staged bytes and
-exact version set. The result, child switch and erasure commit atomically. A
+Old envelope hashes are captured under the writer fence at reservation and
+retained independently of the terminal result. Commit checks the source bytes
+against these hashes before erasure; reload checks every terminal old digest
+against the retained binding. Editing a terminal digest to another valid hex
+value is rejected. New hashes are checked against the staged bytes and exact
+version set. The result, child switch and erasure commit atomically. A
 Reserved or Staged journal has no terminal result. Only a committed terminal
 result releases this migration's old-parent dependency; other children or
 journals can still block that parent. The result is immutable and a retry returns
@@ -102,7 +107,17 @@ binding receipt, not a signature or a proof of token custody.
 | Native PKCS#11 profile through Worker | Pending Worker's integration and profile qualification; not enabled by this PR. Child unwrap and rewrap must remain inside the token. |
 | Cross-provider or cross-security-domain | Explicitly refused; no transport or software fallback. |
 | Wrapped child as destination parent, or a cycle | Refused; only a resident wrapping parent is eligible. |
-| Scheduled, destroyed, compromised or otherwise ineligible parent | Refused. This slice conservatively requires both parents and the child to be enabled, uncompromised and non-exportable. |
+| Disabled source, different Enabled destination, Enabled child | Supported for maintenance; no temporary re-enable. |
+| Disabled child or destination, including a Disabled parent named as both source and destination | Refused. |
+| Scheduled, destroyed, compromised or otherwise ineligible source or destination | Refused, including compromise history after another lifecycle transition. All participants remain non-exportable. |
+
+A Disabled source is admitted only as the source of the internal rewrap
+primitive, after the same three PDP checks. Its state and revision do not change.
+The operation grants no caller permission on that parent: ordinary encrypt,
+sign, data-key generation and export retain their existing state checks. KeyRack's
+existing Decrypt-on-Disabled recovery policy remains unchanged. Disabling a
+parent can cascade to its children; this operation still requires the child to
+be Enabled explicitly before reservation.
 
 Software wrapping is not hardware custody. Its resident keys live in process
 memory; persistent journal recovery assumes the provider's resident parent
@@ -136,7 +151,9 @@ A token capability declaration alone never authorizes blind repetition.
    fence, fix the complete version set and pin the target version. Readers keep
    using the current envelopes. All three identities remain reserved.
 2. **Claim ownership:** compare the current journal epoch and atomically advance
-   it for an owner UUID. Every dispatch, stage and commit must supply that owner
+   it for an owner UUID. Recovery rechecks the admitted snapshots, including
+   source state, before ownership/dispatch, staging and commit. Every dispatch,
+   stage and commit must supply that owner
    and epoch. Takeover advances the epoch; an old worker cannot stage or commit,
    even if it later receives a successful provider reply.
 3. **Record dispatch before effects:** a durable marker records the dispatch
@@ -164,6 +181,39 @@ accept stale output, or provide an administrative flag that declares it safe.
 Worker/native integration must supply qualified outcome/cleanup reconciliation
 before that profile is enabled. A nonrepeatable batch that successfully reaches
 Staged is recoverable without repeating its effects.
+
+A source-state change after reservation does not authorize a refreshed intent.
+Ordinary lifecycle writes are fenced. If restored or externally modified storage
+nevertheless changes the source, recovery refuses further dispatch/publication
+and retains the reservation. A Disabled-to-Enabled transition is also a change;
+it does not silently widen the original authorization snapshot.
+
+Deterministic migration validation failures use typed `MigrationRejected`
+(gRPC `FAILED_PRECONDITION`, REST HTTP 409), including after reservation. They
+are not advertised as retryable availability failures. The reservation remains
+held: a rejection does not prove provider cleanup or authorize cancellation.
+Transient availability failures remain `UNAVAILABLE` / HTTP 503. An unknown
+nonrepeatable provider outcome while Reserved retains the reconciliation requirement and takes
+precedence over an unrelated deterministic error; no native effect is repeated
+blindly. Once Staged, the provider outcome is known and a deterministic
+publication refusal returns 409 without redispatch. A committed result is still
+returned on a lost-reply retry.
+
+### Upgrading journals written by 0.5.0
+
+Stop all 0.5.0 writers before upgrading. Journal v2 is not readable by the old
+binary; mixed-version writers and in-place downgrade are unsupported. Keep a
+coordinated database/provider backup for rollback. A one-time transaction
+upgrades legacy journals before ordinary migration use.
+For Reserved and Staged journals it derives source digests from still-live,
+verified envelopes. For already Committed journals those bytes were erased:
+the upgrade freezes the old digest values from the existing terminal receipt.
+This trusts the pre-upgrade database; it cannot authenticate a change made before
+the upgrade. A durable format marker prevents subsequent loads from rebuilding
+missing bindings or accepting edited terminal hashes. The upgrade preserves
+existing child references and envelopes, so previously migrated children remain
+readable. These bindings detect inconsistent edits, not an attacker rewriting
+all database integrity metadata together.
 
 **There is no operation-cancel API after reservation.** Cancelling an HTTP/gRPC
 request cancels the caller's wait, not the migration. Admitted tasks retain
@@ -255,6 +305,9 @@ its old parent survives, and does not erase database logs or backups.
 
 ### Pinned revision and CI results
 
+These are historical 0.5.0 implementation results, not results for the
+post-0.5.0 maintenance change described above.
+
 The reviewed implementation and results are pinned to
 [`4c0822e69036e3b032de60f278b835b43243c244`](https://github.com/KeyRack-io/keyrack/commit/4c0822e69036e3b032de60f278b835b43243c244),
 which merges main `bf2316dcf082b84eae524ec733722e108ecdafbe`. The three runs below report that exact `head_sha`
@@ -303,6 +356,10 @@ not native PKCS#11 qualification.
 
 | Acceptance point | Executable tests |
 | --- | --- |
+| Deterministic rejection and unknown-outcome distinction | `deterministic_postreserve_rejection_is_typed_on_both_surfaces_and_keeps_fences`, `deterministic_provider_rejection_does_not_clear_unknown_nonrepeatable_dispatch`, `deterministic_staged_native_recovery_failure_is_not_an_unknown_provider_outcome`, `rewrap_missing_or_wrong_type_parent_material_is_a_deterministic_rejection` |
+| Disabled-source maintenance on both APIs | `both_surfaces_drain_disabled_source_without_enabling_it_and_preserve_every_version`, `both_surfaces_refuse_unsafe_source_states_and_disabled_child_or_destination` |
+| Source-state binding and recovery on both backends | `migration_disabled_source_maintenance_binds_state`, `migration_source_state_drift_blocks_recovery`; claim/dispatch/stage/commit reverted controls |
+| Legacy journal continuity and immutable old digests | `migration_legacy_upgrade_binds_receipts_once_at_every_phase`, `migration_terminal_result_and_reader_snapshots`; old-receipt digest reverted control |
 | Every intent field, optional OCC and version set | `every_caller_intent_field_is_bound_on_both_surfaces`, `initial_occ_and_covered_version_assertions_refuse_without_reservation`, `migration_intent_binds_every_condition`, `competing_replica_intents_return_conflict_from_reservation_on_both_surfaces` |
 | Continuity of every version at every phase | `retained_versions_decrypt_continuously_in_reserve_stage_commit_and_after_erasure`, `reader_paused_before_open_survives_commit_and_parent_destruction_on_both_paths`, `migration_concurrent_reader_snapshots` |
 | Unchanged identity/material and old ciphertext | `every_version_survives_rewrap_and_reparent_and_old_parent_is_destroyable`; software wrapping tests |

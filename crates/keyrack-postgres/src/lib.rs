@@ -142,6 +142,7 @@ async fn initialize_schema(pool: &PgPool) -> Result<()> {
         .execute(destruction::SCHEMA)
         .await
         .map_err(|e| KeyRackError::Storage(format!("deletion schema: {e}")))?;
+    migration::upgrade_schema(&mut transaction).await?;
     transaction
         .commit()
         .await
