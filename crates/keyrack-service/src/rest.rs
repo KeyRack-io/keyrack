@@ -245,9 +245,10 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
-        KeyRackError::DeletionDependencyRefused { .. } | KeyRackError::WrappingParentDestroyed => {
+        KeyRackError::DeletionDependencyRefused { .. } => {
             (StatusCode::CONFLICT, "FailedPrecondition")
         }
+        KeyRackError::WrappingParentDestroyed => (StatusCode::CONFLICT, "WrappingParentDestroyed"),
         KeyRackError::KeyDestructionFenced(_) => (StatusCode::CONFLICT, "KeyDestructionFenced"),
         KeyRackError::InvalidStateTransition { .. } => {
             (StatusCode::CONFLICT, "InvalidStateTransition")
@@ -2328,4 +2329,23 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, RestError> {
                 "invalid base64 encoding",
             )
         })
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    #[test]
+    fn core_and_domain_preserve_wrapping_parent_destroyed_kind() {
+        use keyrack_core::error::KeyRackError;
+        let direct = super::map_core_err(KeyRackError::WrappingParentDestroyed);
+        let domain =
+            crate::domain::DomainError::Core(KeyRackError::WrappingParentDestroyed).to_rest_error();
+        assert_eq!(direct.0, axum::http::StatusCode::CONFLICT);
+        assert_eq!(direct.1 .0["error"], "WrappingParentDestroyed");
+        assert!(direct.1 .0["message"]
+            .as_str()
+            .unwrap()
+            .contains("wrapping parent destroyed"));
+        assert_eq!(direct.0, domain.0);
+        assert_eq!(direct.1 .0, domain.1 .0);
+    }
 }

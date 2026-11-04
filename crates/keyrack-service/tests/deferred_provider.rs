@@ -86,6 +86,11 @@ async fn deferred_construction_retries_permission_refusal_and_delegates_after_re
         "cryptographic refusal must not become unavailable"
     );
     provider.destroy_key(&handle).await.unwrap();
+    assert_eq!(
+        provider.destroy_key_with_outcome(&handle).await.unwrap(),
+        keyrack_core::provider::DestroyKeyOutcome::AlreadyAbsent,
+        "deferred provider must preserve confirmed-absence evidence",
+    );
 }
 
 #[tokio::test]
