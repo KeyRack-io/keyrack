@@ -90,14 +90,34 @@ async fn load_creation(
     operation: Uuid,
 ) -> Result<Option<StoredCreation>> {
     let query = format!("{JOURNAL_SELECT} WHERE operation_id = $1");
-    sqlx::query(&query)
+    let row = sqlx::query(&query)
         .bind(operation.to_string())
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await
-        .map_err(database_error)?
-        .as_ref()
-        .map(decode_journal)
-        .transpose()
+        .map_err(database_error)?;
+    if let Some(row) = row {
+        return decode_journal(&row).map(Some);
+    }
+    let json: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT journal_json FROM kr_retired_creation_journal WHERE operation_id=$1",
+    )
+    .bind(operation.to_string())
+    .fetch_optional(connection)
+    .await
+    .map_err(database_error)?;
+    json.map(|json| {
+        let journal: CreationJournal =
+            serde_json::from_value(json).map_err(|_| invalid("invalid retired journal"))?;
+        journal.validate()?;
+        if journal.request.operation != operation || journal.phase != CreationPhase::Committed {
+            return Err(invalid("invalid retired journal identity"));
+        }
+        Ok(StoredCreation {
+            journal,
+            envelope: None,
+        })
+    })
+    .transpose()
 }
 
 async fn require_creation(
@@ -204,6 +224,17 @@ pub(super) async fn replace_key(
     Ok(())
 }
 
+pub(super) async fn committed_envelope(
+    connection: &mut PgConnection,
+    operation: Uuid,
+) -> Result<Vec<u8>> {
+    let stored = require_creation(connection, operation).await?;
+    if stored.journal.phase != CreationPhase::Committed {
+        return Err(invalid("creation envelope is not committed"));
+    }
+    stored.envelope.ok_or(invalid("missing committed envelope"))
+}
+
 impl PostgresStorage {
     pub(super) async fn creation_reserve(
         &self,
@@ -211,6 +242,7 @@ impl PostgresStorage {
     ) -> Result<CreationJournal> {
         request.validate()?;
         let mut transaction = write_transaction(&self.pool).await?;
+        crate::migration::guard_record(&mut transaction, &request.record).await?;
         crate::destruction::guard_write(&mut transaction, &request.record).await?;
         if let Some(stored) = load_creation(&mut transaction, request.operation).await? {
             if !same_json(&stored.journal.request, request)? {
@@ -388,6 +420,7 @@ impl PostgresStorage {
         )
         .await?
         .ok_or(invalid("parent key not found"))?;
+        crate::migration::guard_record(&mut transaction, &stored.journal.request.record).await?;
         let record = stored
             .journal
             .publication(owner, revision, current.as_ref(), &parent)?;
@@ -410,11 +443,7 @@ impl PostgresStorage {
 
     pub(super) async fn creation_read_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
         let mut connection = self.pool.acquire().await.map_err(database_error)?;
-        let stored = require_creation(&mut connection, operation).await?;
-        if stored.journal.phase != CreationPhase::Committed {
-            return Err(invalid("creation envelope is not committed"));
-        }
-        stored.envelope.ok_or(invalid("missing committed envelope"))
+        committed_envelope(&mut connection, operation).await
     }
 
     pub(super) async fn creation_recoverable(
@@ -452,6 +481,7 @@ impl PostgresStorage {
 
     pub(super) async fn create_key_guarded(&self, record: &KeyRecord) -> Result<()> {
         let mut transaction = write_transaction(&self.pool).await?;
+        crate::migration::guard_record(&mut transaction, record).await?;
         crate::destruction::guard_write(&mut transaction, record).await?;
         let reserved: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM kr_creation_journal WHERE child_lid = $1)",
@@ -493,11 +523,13 @@ impl PostgresStorage {
             });
         }
         let previous = decode_key(&row, &record.lid)?;
+        crate::migration::guard_update(&mut transaction, &previous, record).await?;
         if previous.has_compromise_history() && !record.has_compromise_history() {
             return Err(KeyRackError::Other(
                 "cannot clear a key's compromise history".into(),
             ));
         }
+        crate::migration::guard_record(&mut transaction, record).await?;
         crate::destruction::guard_write(&mut transaction, record).await?;
         if record.state == keyrack_core::key::KeyState::Destroyed {
             return Err(keyrack_core::destruction::invalid(

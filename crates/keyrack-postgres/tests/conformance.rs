@@ -408,3 +408,127 @@ mod creation_postgres {
         pool.close().await;
     }
 }
+
+keyrack_test_support::migration_conformance_tests!(make_store().await);
+
+mod migration_postgres {
+    use super::*;
+    use keyrack_core::creation::same_json;
+    use keyrack_core::migration::MigrationPhase;
+    use keyrack_core::storage::StorageBackend;
+    use keyrack_test_support::migration_conformance::{envelopes, seeded, test_owner};
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn migration_reconnects_at_each_phase_and_rolls_back_failed_commit() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let first = PostgresStorage::connect(&url).await.unwrap();
+        let (request, creations) = seeded(&first).await;
+        first.reserve_migration(&request).await.unwrap();
+        drop(first);
+        let second = PostgresStorage::connect(&url).await.unwrap();
+        assert_eq!(
+            second
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            MigrationPhase::Reserved
+        );
+        second
+            .stage_migration(
+                request.operation,
+                test_owner(&second, request.operation).await,
+                &envelopes(),
+            )
+            .await
+            .unwrap();
+        drop(second);
+        let third = PostgresStorage::connect(&url).await.unwrap();
+        assert_eq!(
+            third
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            MigrationPhase::Staged
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let trigger = format!("kr_migration_fail_{}", Uuid::new_v4().simple());
+        let function = format!("{trigger}_fn");
+        sqlx::query(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected migration commit failure'; END; $$")).execute(&pool).await.unwrap();
+        sqlx::query(&format!("CREATE TRIGGER {trigger} BEFORE UPDATE ON kr_migration_journal FOR EACH ROW WHEN (NEW.operation_id='{}' AND NEW.committed) EXECUTE FUNCTION {function}()",request.operation)).execute(&pool).await.unwrap();
+        let result = third
+            .commit_migration(
+                request.operation,
+                test_owner(&third, request.operation).await,
+            )
+            .await;
+        sqlx::query(&format!("DROP TRIGGER {trigger} ON kr_migration_journal"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP FUNCTION {function}()"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected migration commit failure"));
+        assert!(same_json(
+            &third.get_key(&request.child.lid).await.unwrap(),
+            &request.child
+        )
+        .unwrap());
+        assert_eq!(
+            third
+                .get_migration(request.operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            MigrationPhase::Staged
+        );
+        for creation in &creations {
+            assert!(third
+                .read_creation_envelope(creation.operation)
+                .await
+                .is_ok());
+        }
+        third
+            .commit_migration(
+                request.operation,
+                test_owner(&third, request.operation).await,
+            )
+            .await
+            .unwrap();
+        drop(third);
+        let fourth = PostgresStorage::connect(&url).await.unwrap();
+        assert!(same_json(
+            &fourth
+                .commit_migration(
+                    request.operation,
+                    test_owner(&fourth, request.operation).await
+                )
+                .await
+                .unwrap(),
+            &request.proposed
+        )
+        .unwrap());
+        for creation in creations {
+            assert!(fourth
+                .read_creation_envelope(creation.operation)
+                .await
+                .is_err());
+        }
+        pool.close().await;
+    }
+}

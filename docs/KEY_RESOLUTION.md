@@ -70,7 +70,52 @@ with `parent_lid = None` is a root key. A key with
 `parent_lid = Some(lid_abc...)` is a child of that parent.
 
 The hierarchy is set at creation time via `CreateKey(parent_key_id: ...)`.
-Once set, `parent_lid` is immutable — it is stored, not recomputed.
+The stored `parent_lid` changes only through `RewrapKey` with a
+`new_parent_key_id`. Generic metadata updates and direct rule-change migration
+cannot rewrite it. The operation rewraps **every version** and atomically
+switches all envelopes and `parent_lid`; it does not change the child's LID,
+version numbers, identity tags, provider binding, or existing ciphertext.
+
+A hierarchy rule change does not automatically migrate existing material.
+Hierarchy queries and policies that inspect stored ancestry observe the new
+parent after commit. Attribute-based `RuleRegistry` resolution continues to
+use the configured rules: reparenting does not edit those rules or change
+future attribute-derived routing decisions. Operators must explicitly align
+rules with their intended hierarchy; resolving a different chain is not
+permission to overwrite the stored relationship. Existing child IDs and
+ciphertext continue to resolve the stored key and its versions.
+
+`RewrapKey(key_id, operation_id, new_parent_key_id)` and
+`POST /v1/keys/{key_id}/rewrap` share the same operation. Omitting the new parent
+rewraps under the existing parent's current version, pinned at reservation.
+The REST body contains `operation_id` and optional `new_parent_key_id`; both
+surfaces also accept `old_parent_key_id`, `expected_child_revision`,
+`expected_old_parent_revision`, `expected_new_parent_revision`, and
+`covered_versions`. Revisions are optional OCC assertions, never replacements
+for the reservation's snapshot checks. Omitted or empty `covered_versions`
+means all versions; a supplied set must contain every retained version exactly
+once. Order is canonicalized. Assertions, including whether they were supplied,
+bind the operation ID: adding, removing or changing one on a retry conflicts.
+Both surfaces return `metadata`, `operation_id` and a committed `result`
+receipt containing the child, old/new parent versions, and old/new envelope
+digests and references for every version. This receipt remains unchanged on
+replay even if ordinary metadata later changes. See the complete schema in
+[Wrapped-key migration](WRAPPED_KEY_MIGRATION.md).
+Repeat the same non-nil UUID
+with the same intent to recover an interrupted request; changing its intent
+is refused. Permission `kms:RewrapKey` is required separately on the child,
+the old parent and the new parent, even when the parents have the same LID.
+
+The audit stream records `attempt`, then an outcome (`success`, `denied` or
+`error`) using the operation ID. Audit readers must recognize the added
+`attempt` result. Once admitted, execution and outcome recording survive a
+client disconnect. The process admits at most 64 migration tasks, including
+those whose clients disconnected; at capacity it returns retryable gRPC
+`UNAVAILABLE` / HTTP 503 before reservation or provider execution. A process
+crash can leave only the attempt; retrying the
+operation ID resumes the journal. An audit-sink error fails the call; if it
+occurs after commit, the migration remains committed and the same ID recovers
+its result.
 
 > **From 0.5.0 a parent means wrapping.** The diagrams and scenarios below show
 > each key with its own independent provider material, which is what a parent

@@ -820,10 +820,9 @@ async fn a_parent_created_before_0_5_0_is_refused_by_name() {
 
     // A pre-0.5.0 child: a parent binding alongside independently resident
     // material, which is what the earlier lineage-only meaning produced.
-    let mut legacy = parent_key(&state).await;
+    let mut legacy = keyrack_test_support::fixtures::unique_test_key_record(KeyState::Enabled);
     legacy.parent_lid = Some(grandparent.lid);
-    legacy.occ_version += 1;
-    state.storage.update_key(&legacy).await.unwrap();
+    state.storage.create_key(&legacy).await.unwrap();
     let stored = state.storage.get_key(&legacy.lid).await.unwrap();
     assert!(
         stored.has_legacy_parent_semantics(),

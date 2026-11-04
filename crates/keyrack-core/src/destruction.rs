@@ -16,9 +16,10 @@ pub fn invalid(message: &str) -> KeyRackError {
 }
 
 /// Dependency counts without disclosing dependent key identities.
-/// Every stored version and every journal phase counts, including historical
-/// material and completed creation journals. Logical-only children are reported
-/// separately and do not block destruction.
+/// Every stored version and every creation-journal phase counts, including
+/// historical material and completed creations. Nonterminal migrations count
+/// until their atomic commit releases the reservation. Logical-only children
+/// are reported separately and do not block destruction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DestructionDependencies {
     /// Direct persisted child records with nonempty, entirely provider-resident
@@ -27,6 +28,8 @@ pub struct DestructionDependencies {
     pub own_parent_wrapped_versions: u64,
     pub dependent_parent_wrapped_versions: u64,
     pub creation_journal_rows: u64,
+    /// Nonterminal migrations naming this key as child, source, or target.
+    pub migration_journal_rows: u64,
 }
 
 impl DestructionDependencies {
@@ -34,14 +37,16 @@ impl DestructionDependencies {
         self.own_parent_wrapped_versions == 0
             && self.dependent_parent_wrapped_versions == 0
             && self.creation_journal_rows == 0
+            && self.migration_journal_rows == 0
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "own_parent_wrapped_versions={}, dependent_parent_wrapped_versions={}, creation_journal_rows={}",
+            "own_parent_wrapped_versions={}, dependent_parent_wrapped_versions={}, creation_journal_rows={}, migration_journal_rows={}",
             self.own_parent_wrapped_versions,
             self.dependent_parent_wrapped_versions,
             self.creation_journal_rows,
+            self.migration_journal_rows,
         )
     }
 

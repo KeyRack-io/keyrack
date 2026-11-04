@@ -312,6 +312,11 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
 
 #[allow(clippy::result_large_err)]
 fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::Status> {
+    if ctx.action == AuditAction::RewrapKey {
+        return Err(tonic::Status::internal(
+            "RewrapKey requires the migration executor",
+        ));
+    }
     let request = AuthzRequest {
         pdp_api_version: PDP_API_VERSION.into(),
         request_id: ctx.request_id.clone(),
@@ -415,6 +420,267 @@ async fn authorize_request(
     }
 }
 
+/// Authorize and audit the one logical-key migration primitive for both APIs.
+///
+/// Once admitted, the task owns its outcome independently of a disconnected
+/// caller. A process crash can still leave an attempt without an outcome;
+/// repeating the operation ID reconciles the durable migration journal.
+/// At most 64 tasks per process may remain active, including after disconnect.
+pub async fn execute_rewrap(
+    state: &Arc<ServiceState>,
+    principal: Principal,
+    request_id: String,
+    child_id: String,
+    new_parent_id: String,
+    operation_id: String,
+) -> Result<keyrack_core::key::KeyRecord, crate::domain::DomainError> {
+    execute_rewrap_with_options(
+        state,
+        principal,
+        request_id,
+        child_id,
+        new_parent_id,
+        operation_id,
+        RewrapOptions::default(),
+    )
+    .await
+    .map(|outcome| outcome.record)
+}
+
+/// Caller assertions form part of immutable operation intent, including absence.
+#[derive(Debug, Default, Clone)]
+pub struct RewrapOptions {
+    pub old_parent_key_id: String,
+    pub expected_child_revision: Option<u64>,
+    pub expected_old_parent_revision: Option<u64>,
+    pub expected_new_parent_revision: Option<u64>,
+    pub covered_versions: Vec<u64>,
+}
+
+pub struct RewrapOutcome {
+    pub record: keyrack_core::key::KeyRecord,
+    pub result: keyrack_core::migration::MigrationResult,
+}
+
+pub async fn execute_rewrap_with_options(
+    state: &Arc<ServiceState>,
+    principal: Principal,
+    request_id: String,
+    child_id: String,
+    new_parent_id: String,
+    operation_id: String,
+    options: RewrapOptions,
+) -> Result<RewrapOutcome, crate::domain::DomainError> {
+    let mut ctx = OpContext::key(AuditAction::RewrapKey, principal, &child_id);
+    ctx.request_id = request_id;
+    emit_rewrap_audit(state, &ctx, &operation_id, AuditResult::Attempt).await?;
+    let Ok(slot) = MIGRATION_TASKS.try_acquire() else {
+        emit_rewrap_audit(state, &ctx, &operation_id, AuditResult::Error).await?;
+        return Err(crate::domain::DomainError::ProviderUnavailable(
+            "migration task limit reached; retry the same operation ID".into(),
+        ));
+    };
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        // This permit stays with the task, never the request future.
+        let _slot = slot;
+        let start = Instant::now();
+        let result = rewrap_authorized(&state, &ctx, &new_parent_id, &operation_id, options).await;
+        let (outcome, label) = match &result {
+            Ok(_) => (AuditResult::Success, "success"),
+            Err(crate::domain::DomainError::PermissionDenied(_)) => (AuditResult::Denied, "denied"),
+            Err(_) => (AuditResult::Error, "error"),
+        };
+        emit_rewrap_audit(&state, &ctx, &operation_id, outcome).await?;
+        crate::metrics::record_op(&ctx.action.to_string(), label, start.elapsed());
+        result
+    })
+    .await
+    .map_err(|error| {
+        crate::domain::DomainError::Internal(format!("migration task failed: {error}"))
+    })?
+}
+
+static MIGRATION_TASKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+
+async fn rewrap_authorized(
+    state: &Arc<ServiceState>,
+    ctx: &OpContext,
+    new_parent_id: &str,
+    operation_id: &str,
+    options: RewrapOptions,
+) -> Result<RewrapOutcome, crate::domain::DomainError> {
+    use crate::domain::DomainError;
+    use keyrack_core::lid::Lid;
+    use keyrack_core::pdp::AttributeValue;
+
+    let child: Lid = ctx
+        .resource_id
+        .parse()
+        .map_err(|_| DomainError::InvalidArgument("invalid key_id".into()))?;
+    let new_parent = if new_parent_id.is_empty() {
+        None
+    } else {
+        Some(
+            new_parent_id
+                .parse::<Lid>()
+                .map_err(|_| DomainError::InvalidArgument("invalid new_parent_key_id".into()))?,
+        )
+    };
+    let operation = uuid::Uuid::parse_str(operation_id)
+        .map_err(|_| DomainError::InvalidArgument("operation_id must be a non-nil UUID".into()))?;
+    if operation.is_nil() {
+        return Err(DomainError::InvalidArgument(
+            "operation_id must be a non-nil UUID".into(),
+        ));
+    }
+    let expected_old_parent = if options.old_parent_key_id.is_empty() {
+        None
+    } else {
+        Some(
+            options
+                .old_parent_key_id
+                .parse::<Lid>()
+                .map_err(|_| DomainError::InvalidArgument("invalid old_parent_key_id".into()))?,
+        )
+    };
+    let conditions = keyrack_core::migration::MigrationConditions {
+        expected_child_occ: options.expected_child_revision,
+        expected_old_parent_occ: options.expected_old_parent_revision,
+        expected_new_parent_occ: options.expected_new_parent_revision,
+        expected_old_parent,
+        covered_versions: if options.covered_versions.is_empty() {
+            None
+        } else {
+            Some(options.covered_versions)
+        },
+    };
+    let migration = crate::migration::prepare_migration_with_conditions(
+        state, child, new_parent, operation, conditions,
+    )
+    .await?;
+    let scope = ctx
+        .principal
+        .attributes
+        .get("scope")
+        .and_then(|value| match value {
+            AttributeValue::String(value) => Some(value.as_str()),
+            _ => None,
+        });
+    // Do not collapse duplicate LIDs: old and new parent are separate grants,
+    // even when rewrapping under a newer version of the same logical parent.
+    for (role, snapshot) in [
+        ("child", &migration.child),
+        ("old_parent", &migration.old_parent),
+        ("new_parent", &migration.new_parent),
+    ] {
+        let current = state
+            .storage
+            .get_key_for_use(&snapshot.lid)
+            .await
+            .map_err(DomainError::from)?;
+        crate::domain::enforce_scope_for_key_op(
+            state,
+            &current,
+            None,
+            scope,
+            &ctx.principal.id,
+            &AuditAction::RewrapKey,
+        )
+        .await?;
+        let mut attributes = BTreeMap::new();
+        if let Some(owner) = &current.owner_principal_id {
+            attributes.insert(
+                "owner_principal_id".into(),
+                AttributeValue::String(owner.clone()),
+            );
+        }
+        for (name, value) in current.user_tags.iter() {
+            attributes.insert(format!("tag:{name}"), AttributeValue::String(value.into()));
+        }
+        let mut context = RequestContext::default();
+        for (name, value) in [
+            ("operation_request_id", ctx.request_id.as_str()),
+            ("operation_id", operation_id),
+            ("migration_role", role),
+        ] {
+            context
+                .entries
+                .insert(name.into(), AttributeValue::String(value.into()));
+        }
+        let request = AuthzRequest {
+            pdp_api_version: PDP_API_VERSION.into(),
+            request_id: new_request_id(),
+            action: AuditAction::RewrapKey,
+            principal: ctx.principal.clone(),
+            resource: Resource {
+                id: current.lid.to_string(),
+                resource_type: "Key".into(),
+                attributes,
+            },
+            context,
+        };
+        authorize_request(state, &request).await.map_err(|error| {
+            if error.code() == tonic::Code::PermissionDenied {
+                DomainError::PermissionDenied(format!("{role}: {}", error.message()))
+            } else {
+                DomainError::Internal(format!("{role}: {}", error.message()))
+            }
+        })?;
+    }
+    let record = crate::migration::rewrap_key(state, migration).await?;
+    let journal = state
+        .storage
+        .get_migration(operation)
+        .await
+        .map_err(DomainError::from)?
+        .ok_or_else(|| DomainError::Internal("committed migration receipt missing".into()))?;
+    if journal.phase != keyrack_core::migration::MigrationPhase::Committed {
+        return Err(DomainError::Internal(
+            "migration has no committed terminal result".into(),
+        ));
+    }
+    let result = journal
+        .result
+        .ok_or_else(|| DomainError::Internal("committed migration receipt missing".into()))?;
+    Ok(RewrapOutcome { record, result })
+}
+
+async fn emit_rewrap_audit(
+    state: &Arc<ServiceState>,
+    ctx: &OpContext,
+    operation_id: &str,
+    result: AuditResult,
+) -> Result<(), crate::domain::DomainError> {
+    let mut event = AuditEvent::new(
+        keyrack_core::audit::EventType::KeyStateChanged,
+        AuditAction::RewrapKey,
+        AuditPrincipal {
+            id: ctx.principal.id.clone(),
+            principal_type: ctx.principal.principal_type.clone(),
+        },
+        AuditResource {
+            id: ctx.resource_id.clone(),
+            resource_type: "Key".into(),
+        },
+        result,
+    )
+    .with_request_id(ctx.request_id.clone());
+    event.add_metadata("operation_id", operation_id);
+    event.add_metadata(
+        "migration_phase",
+        if result == AuditResult::Attempt {
+            "attempt"
+        } else {
+            "outcome"
+        },
+    );
+    state.audit.emit(&event).await.map_err(|error| {
+        crate::metrics::record_audit_error();
+        crate::domain::DomainError::Internal(format!("migration audit failed: {error}"))
+    })
+}
+
 /// REST-side execute: same PDP + audit guarantees but uses Axum's
 /// error type instead of `tonic::Status`.
 pub async fn execute_rest<F, Fut, T>(
@@ -492,7 +758,8 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
     match action {
         AuditAction::CreateKey | AuditAction::ImportKeyMaterial => EventType::KeyCreated,
         AuditAction::RotateKey => EventType::KeyRotated,
-        AuditAction::EnableKey
+        AuditAction::RewrapKey
+        | AuditAction::EnableKey
         | AuditAction::DisableKey
         | AuditAction::ScheduleKeyDeletion
         | AuditAction::CancelKeyDeletion
@@ -582,7 +849,7 @@ pub async fn authorize_with_resource_attrs(
     // two-key executor; neither a generic nor bound context can bypass it here.
     if matches!(
         ctx.action,
-        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo
+        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo | AuditAction::RewrapKey
     ) || ctx.re_encrypt_destination.is_some()
     {
         return Err(tonic::Status::internal(
@@ -791,5 +1058,79 @@ mod authn_transport_tests {
         ]);
 
         ensure_rest_authn_transport_supported(&chain).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod migration_bound_tests {
+    use super::*;
+    use keyrack_core::key::{ProviderClass, ProviderRef};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<AuditResult>>);
+    #[async_trait::async_trait]
+    impl keyrack_core::audit::AuditSink for Capture {
+        async fn emit(&self, event: &AuditEvent) -> keyrack_core::error::Result<()> {
+            self.0.lock().unwrap().push(event.result);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_migration_executor_refuses_before_work_and_audits_it() {
+        let held = MIGRATION_TASKS.try_acquire_many(64).unwrap();
+        let audit = Arc::new(Capture::default());
+        let registry = keyrack_core::registry::StaticProviderRegistry::single(
+            Arc::new(keyrack_core::provider::inmem::InMemoryProvider::new()),
+            ProviderClass::Software,
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let state = Arc::new(ServiceState {
+            storage: Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap()),
+            providers: Arc::new(registry),
+            provider_router: crate::routing::ProviderRouter::new(
+                vec![],
+                ProviderRef::new("default"),
+            )
+            .unwrap(),
+            pdp: Arc::new(keyrack_core::pdp::AlwaysAllow),
+            audit: audit.clone(),
+            authn: Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![])),
+            metrics_handle: recorder.handle(),
+            max_plaintext_bytes: 4096,
+            legacy_compromised_key_decrypt: false,
+            nats_publisher: None,
+            lease_cleanup: crate::lease::LeaseCleanup::default(),
+            wrapping: crate::hierarchy::WrappingProfiles::none(),
+        });
+        let call = || {
+            execute_rewrap(
+                &state,
+                Principal::system(),
+                new_request_id(),
+                "invalid-child".into(),
+                String::new(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+        };
+        assert!(matches!(
+            call().await,
+            Err(crate::domain::DomainError::ProviderUnavailable(_))
+        ));
+        drop(held);
+        assert!(matches!(
+            call().await,
+            Err(crate::domain::DomainError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            *audit.0.lock().unwrap(),
+            [
+                AuditResult::Attempt,
+                AuditResult::Error,
+                AuditResult::Attempt,
+                AuditResult::Error
+            ]
+        );
     }
 }

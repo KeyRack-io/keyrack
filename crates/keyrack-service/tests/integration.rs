@@ -7924,12 +7924,12 @@ async fn rest_re_encrypt_refused_when_key_state_forbids_the_direction() {
 /// descendant rotation — so they state the hierarchy instead of negotiating a
 /// provider profile to obtain one.
 async fn create_child_key(state: &Arc<ServiceState>, parent: &str) -> String {
-    let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
-    let child_id = create_aes_key(&svc).await;
-    let child: keyrack_core::lid::Lid = child_id.parse().expect("parse child lid");
+    let mut record = keyrack_test_support::fixtures::unique_test_key_record(
+        keyrack_core::key::KeyState::Enabled,
+    );
+    let child_id = record.lid.to_string();
     let parent_lid: keyrack_core::lid::Lid = parent.parse().expect("parse parent lid");
 
-    let mut record = state.storage.get_key(&child).await.expect("child");
     let parent_version = state
         .storage
         .get_key(&parent_lid)
@@ -7954,12 +7954,11 @@ async fn create_child_key(state: &Arc<ServiceState>, parent: &str) -> String {
         )
         .unwrap(),
     );
-    record.occ_version += 1;
     state
         .storage
-        .update_key(&record)
+        .create_key(&record)
         .await
-        .expect("bind parent");
+        .expect("seed existing hierarchy");
     child_id
 }
 

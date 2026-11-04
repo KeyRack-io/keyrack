@@ -173,6 +173,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                 own_parent_wrapped_versions: 0,
                 dependent_parent_wrapped_versions: u64::from(phase == 3),
                 creation_journal_rows: 1,
+                migration_journal_rows: 0,
             },
             "creation phase {phase} must retain its journal dependency",
         );
@@ -187,6 +188,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                     own_parent_wrapped_versions: 1,
                     dependent_parent_wrapped_versions: 0,
                     creation_journal_rows: 1,
+                    migration_journal_rows: 0,
                 },
             );
         }
@@ -219,6 +221,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
         store.destruction_dependencies(&child.lid).await.unwrap(),
         DestructionDependencies {
             creation_journal_rows: 1,
+            migration_journal_rows: 0,
             ..DestructionDependencies::default()
         },
         "a journal pins the child even before publishing its wrapped version",
@@ -275,6 +278,7 @@ pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageB
         own_parent_wrapped_versions: 2,
         dependent_parent_wrapped_versions: 3,
         creation_journal_rows: 1,
+        migration_journal_rows: 0,
     };
     let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
     assert_eq!(counts, expected);
@@ -282,7 +286,7 @@ pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageB
     let summary = counts.summary();
     assert_eq!(
         summary,
-        "own_parent_wrapped_versions=2, dependent_parent_wrapped_versions=3, creation_journal_rows=1"
+        "own_parent_wrapped_versions=2, dependent_parent_wrapped_versions=3, creation_journal_rows=1, migration_journal_rows=0"
     );
     for other in [&request.record.lid, &logical_child.lid, &unrelated.lid] {
         assert!(!summary.contains(&other.to_string()));

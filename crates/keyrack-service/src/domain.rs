@@ -117,6 +117,8 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             }
             KeyRackError::InvalidStateTransition { .. }
             | KeyRackError::KeyDestructionFenced(_)
+            | KeyRackError::WrappingParentDestroyed
+            | KeyRackError::MigrationIntentConflict { .. }
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
             | KeyRackError::InvalidIdentity(_)
@@ -149,6 +151,8 @@ impl DomainError {
                     }
                     KeyRackError::InvalidStateTransition { .. }
                     | KeyRackError::KeyDestructionFenced(_)
+                    | KeyRackError::WrappingParentDestroyed
+                    | KeyRackError::MigrationIntentConflict { .. }
                     | KeyRackError::OperationNotPermitted { .. }
                     | KeyRackError::ImmutableTag { .. }
                     | KeyRackError::DepthLimitExceeded { .. }
@@ -184,6 +188,12 @@ impl DomainError {
                     }
                     KeyRackError::KeyDestructionFenced(_) => {
                         (StatusCode::CONFLICT, "KeyDestructionFenced")
+                    }
+                    KeyRackError::MigrationIntentConflict { .. } => {
+                        (StatusCode::CONFLICT, "MigrationIntentConflict")
+                    }
+                    KeyRackError::WrappingParentDestroyed => {
+                        (StatusCode::CONFLICT, "WrappingParentDestroyed")
                     }
                     KeyRackError::InvalidStateTransition { .. } => {
                         (StatusCode::CONFLICT, "InvalidStateTransition")
@@ -883,6 +893,11 @@ pub async fn list_keys(
 
 pub async fn enable_key(state: &Arc<ServiceState>, key_id: &str) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
+    state
+        .storage
+        .check_migration_fence(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut record = state
         .storage
         .get_key_for_use(&lid)
@@ -944,6 +959,7 @@ pub async fn disable_key(
     use keyrack_core::error::KeyRackError;
 
     let lid = *lid;
+    state.storage.check_migration_fence(&lid).await?;
     let mut record = state.storage.get_key_for_use(&lid).await?;
     let old_state = record.state.to_string();
     record
@@ -1051,6 +1067,11 @@ pub async fn cancel_key_deletion(
     key_id: &str,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
+    state
+        .storage
+        .check_migration_fence(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut record = state
         .storage
         .get_key_for_use(&lid)
@@ -1155,29 +1176,56 @@ enum PreparedUse {
 
 async fn open_usable(
     state: &ServiceState,
-    prepared: PreparedUse,
+    mut prepared: PreparedUse,
     provider: &Arc<dyn CryptoProvider>,
 ) -> Result<OpenedUse, DomainError> {
-    match prepared {
-        PreparedUse::Resident(handle) => Ok(OpenedUse {
-            handle,
-            lease: None,
-        }),
-        PreparedUse::Wrapped {
-            context,
-            parent,
-            envelope,
-            used,
-        } => {
-            let lease = state
-                .lease_cleanup
-                .open(Arc::clone(provider), *context, parent, envelope, used)
-                .await
-                .map_err(DomainError::from)?;
-            Ok(OpenedUse {
-                handle: lease.handle().clone(),
-                lease: Some(lease),
-            })
+    loop {
+        match prepared {
+            PreparedUse::Resident(handle) => {
+                return Ok(OpenedUse {
+                    handle,
+                    lease: None,
+                })
+            }
+            PreparedUse::Wrapped {
+                context,
+                parent,
+                envelope,
+                used,
+            } => {
+                let child = context.child;
+                let previous_parent = context.parent;
+                let opened = state
+                    .lease_cleanup
+                    .open(Arc::clone(provider), *context, parent, envelope, used)
+                    .await;
+                match opened {
+                    Ok(lease) => {
+                        return Ok(OpenedUse {
+                            handle: lease.handle().clone(),
+                            lease: Some(lease),
+                        })
+                    }
+                    Err(keyrack_core::error::KeyRackError::WrappingParentDestroyed) => {
+                        // A committed migration may retire and destroy the old
+                        // parent between the atomic read and the provider open.
+                        // Refresh only the binding, before any caller crypto is
+                        // run. No ciphertext decrypt/encrypt is ever retried.
+                        let refreshed =
+                            prepare_wrapped(state, &child.lid, child.version.get()).await?;
+                        if matches!(&refreshed, PreparedUse::Wrapped { context, .. }
+                            if context.parent != previous_parent)
+                        {
+                            prepared = refreshed;
+                        } else {
+                            return Err(DomainError::from(
+                                keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(DomainError::from(error)),
+                }
+            }
         }
     }
 }
@@ -1194,62 +1242,77 @@ async fn prepare_usable(
                 .map_err(DomainError::from)?
                 .clone(),
         )),
-        KeyMaterial::ParentWrapped(material) => {
-            let operation = material
-                .wrapped_material_ref()
-                .as_str()
-                .strip_prefix("creation:")
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
-            let envelope = state
-                .storage
-                .read_creation_envelope(operation)
-                .await
-                .map_err(|_| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
-            let parent = state
-                .storage
-                .get_key(&material.parent().lid)
-                .await
-                .map_err(DomainError::from)?;
-            let parent_version = parent
-                .get_version(material.parent().version.get())
-                .ok_or_else(|| {
-                    DomainError::FailedPrecondition(format!(
-                        "parent-wrapped material names parent version {} which is absent",
-                        material.parent().version
-                    ))
-                })?;
-            let parent_handle = parent_version
-                .resident_handle()
-                .map_err(DomainError::from)?
-                .clone();
-            let context = WrappingContext {
-                version: material.wrapping_context_version(),
-                child: VersionedKeyId::new(record.lid, version.version_number).map_err(|e| {
-                    DomainError::Internal(format!("invalid wrapped child version: {e}"))
-                })?,
-                parent: material.parent(),
-                parent_spec: parent.key_spec.clone(),
-                child_spec: record.key_spec.clone(),
-                key_format: material.key_format().clone(),
-                purpose: WrappingKeyPurpose::EncryptDecrypt,
-                provider_ref: material.provider_ref().clone(),
-                security_domain: material.security_domain().clone(),
-                mechanism: material.mechanism().clone(),
-                public_material_sha256: None,
-            };
-            Ok(PreparedUse::Wrapped {
-                context: Box::new(context),
-                parent: parent_handle,
-                envelope,
-                used: crate::lease::LeaseUse {
-                    key_id: record.lid.to_string(),
-                    version: version.version_number,
-                    provider: material.provider_ref().as_str().to_owned(),
-                },
-            })
+        KeyMaterial::ParentWrapped(_) => {
+            prepare_wrapped(state, &record.lid, version.version_number).await
         }
     }
+}
+
+/// One transaction reads the current descriptor, its envelope and its exact
+/// parent. A caller retaining pre-migration metadata therefore cannot observe
+/// the gap between publishing a new descriptor and erasing the old envelope.
+async fn prepare_wrapped(
+    state: &ServiceState,
+    lid: &Lid,
+    version_number: u64,
+) -> Result<PreparedUse, DomainError> {
+    let snapshot = state
+        .storage
+        .wrapped_key_snapshot(lid, version_number)
+        .await
+        .map_err(|error| match error {
+            keyrack_core::error::KeyRackError::WrappingParentDestroyed => DomainError::from(error),
+            _ => DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()),
+        })?;
+    let record = snapshot.record;
+    let parent = snapshot.parent;
+    if parent.state == KeyState::Destroyed {
+        return Err(DomainError::from(
+            keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+        ));
+    }
+    let version = record
+        .get_version(version_number)
+        .ok_or_else(|| DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))?;
+    let KeyMaterial::ParentWrapped(material) = &version.material else {
+        return Err(DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()));
+    };
+    let parent_version = parent
+        .get_version(material.parent().version.get())
+        .ok_or_else(|| {
+            DomainError::FailedPrecondition(format!(
+                "parent-wrapped material names parent version {} which is absent",
+                material.parent().version
+            ))
+        })?;
+    let parent_handle = parent_version
+        .resident_handle()
+        .map_err(DomainError::from)?
+        .clone();
+    let context = WrappingContext {
+        version: material.wrapping_context_version(),
+        child: VersionedKeyId::new(record.lid, version.version_number)
+            .map_err(|e| DomainError::Internal(format!("invalid wrapped child version: {e}")))?,
+        parent: material.parent(),
+        parent_spec: parent.key_spec.clone(),
+        child_spec: record.key_spec.clone(),
+        key_format: material.key_format().clone(),
+        purpose: WrappingKeyPurpose::EncryptDecrypt,
+        provider_ref: material.provider_ref().clone(),
+        security_domain: material.security_domain().clone(),
+        mechanism: material.mechanism().clone(),
+        public_material_sha256: None,
+    };
+    Ok(PreparedUse::Wrapped {
+        context: Box::new(context),
+        parent: parent_handle,
+        envelope: snapshot.envelope,
+        used: crate::lease::LeaseUse {
+            key_id: record.lid.to_string(),
+            version: version.version_number,
+            provider: material.provider_ref().as_str().to_owned(),
+        },
+    })
 }
 
 async fn close_usable(opened: OpenedUse) -> Result<(), DomainError> {
@@ -1414,6 +1477,11 @@ pub async fn rotate_key(
     key_id: &str,
 ) -> Result<RotateKeyResult, DomainError> {
     let lid = *lid;
+    state
+        .storage
+        .check_migration_fence(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let mut record = state
         .storage
         .get_key_for_use(&lid)

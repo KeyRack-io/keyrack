@@ -36,6 +36,8 @@ service KeyService {
   rpc CancelKeyDeletion(CancelKeyDeletionRequest) returns (CancelKeyDeletionResponse);
   rpc ReportKeyCompromise(ReportKeyCompromiseRequest) returns (ReportKeyCompromiseResponse);
   rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
+  // Atomically rewrap every version, optionally under a different resident parent.
+  rpc RewrapKey(RewrapKeyRequest) returns (RewrapKeyResponse);
 
   // ── Key versions ──────────────────────────────────────────────────
 
@@ -505,6 +507,50 @@ message RotateKeyRequest {
 message RotateKeyResponse {
   KeyMetadata metadata = 1;
   uint32 new_version = 2;
+}
+
+// The operation ID is a caller-generated UUID. Reuse it with the same intent
+// to recover a lost response or interrupted migration. An empty new parent
+// means the existing parent's current version at reservation.
+message RewrapKeyRequest {
+  string key_id = 1;
+  string new_parent_key_id = 2;
+  string operation_id = 3;
+  // Optional assertion of the source logical parent. Empty means omitted.
+  string old_parent_key_id = 4;
+  optional uint64 expected_child_revision = 5;
+  optional uint64 expected_old_parent_revision = 6;
+  optional uint64 expected_new_parent_revision = 7;
+  // Empty means all stored versions; a supplied set must cover all versions.
+  repeated uint64 covered_versions = 8;
+}
+
+message RewrapKeyResponse {
+  KeyMetadata metadata = 1;
+  string operation_id = 2;
+  // Immutable terminal receipt. Present only after atomic commit and erasure.
+  WrappedKeyMigrationResult result = 3;
+}
+
+message WrappedKeyMigrationResult {
+  string operation_id = 1;
+  string child = 2;
+  string old_parent = 3;
+  repeated uint64 old_parent_versions = 4;
+  string new_parent = 5;
+  uint64 new_parent_version = 6;
+  string digest_algorithm = 7;
+  repeated WrappedKeyMigrationVersionResult versions = 8;
+}
+
+message WrappedKeyMigrationVersionResult {
+  uint64 version = 1;
+  uint64 old_parent_version = 2;
+  uint64 new_parent_version = 3;
+  string old_envelope_digest = 4;
+  string new_envelope_digest = 5;
+  string old_reference = 6;
+  string new_reference = 7;
 }
 
 // ═══════════════════════════════════════════════════════════════════

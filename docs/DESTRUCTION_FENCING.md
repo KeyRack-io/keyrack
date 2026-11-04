@@ -8,12 +8,15 @@ revocation.
 
 `ScheduleKeyDeletion` refuses before changing the lifecycle when the key has any
 `ParentWrapped` version, another key has a `ParentWrapped` version naming it as
-parent, or any creation-journal row names it as parent or child. This applies to
+parent, any creation-journal row names it as parent or child, or a nonterminal
+migration names it as child, old parent or new parent. This applies to
 the domain/library, gRPC and REST paths. gRPC returns `FAILED_PRECONDITION`; REST
 returns HTTP 409 with `FailedPrecondition`. The diagnostic contains counts named
 `own_parent_wrapped_versions`, `dependent_parent_wrapped_versions` and
-`creation_journal_rows`, never the LIDs of other keys. Counts cover all versions
-and all journal phases; a row matching both journal roles counts once. Logical
+`creation_journal_rows` and `migration_journal_rows`, never the LIDs of other keys.
+Counts cover all versions, every creation-journal phase and nonterminal migration
+journals; a row matching multiple roles counts once. Committed migration receipts
+do not block the retired parent. Logical
 `parent_lid` relationships alone do not block scheduling. Successful gRPC and REST
 schedule responses include `logical_only_children`: the number of direct
 persisted child records whose versions all contain resident material, observed
@@ -38,6 +41,12 @@ histories, so this check adds database work to scheduling.
    including pending child rotations, and scans existing material references for
    legacy or directly stored ParentWrapped records. Logical `parent_lid` alone is
    not a wrapping dependency.
+   It also refuses every nonterminal migration naming the key as child, old
+   parent or new parent. Migration reservations and destruction claims share
+   the writer lock, so either winning reservation excludes the other. Committed
+   migration metadata is an idempotency receipt, not an active old-parent
+   dependency: commit removes old envelopes and active creation references
+   atomically. Current descriptors retain the new-parent dependency.
 3. The transaction inserts a permanent claim journal and advances key OCC. Only
    successful commit of a **new** claim returns an execution ticket. Existing
    claims return no ticket. Generic updates, cancellation, reactivation and new

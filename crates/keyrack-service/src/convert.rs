@@ -291,6 +291,8 @@ pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status 
         KeyRackError::OptimisticConcurrencyConflict { .. } => tonic::Status::aborted(msg),
         KeyRackError::InvalidStateTransition { .. }
         | KeyRackError::KeyDestructionFenced(_)
+        | KeyRackError::WrappingParentDestroyed
+        | KeyRackError::MigrationIntentConflict { .. }
         | KeyRackError::OperationNotPermitted { .. }
         | KeyRackError::ImmutableTag { .. }
         | KeyRackError::DepthLimitExceeded { .. }

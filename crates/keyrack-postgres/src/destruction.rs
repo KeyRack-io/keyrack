@@ -46,7 +46,12 @@ async fn dependencies(connection: &mut PgConnection, lid: &Lid) -> Result<Destru
     .fetch_one(&mut *connection)
     .await
     .map_err(database_error)?;
+    let migrations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kr_migration_journal WHERE committed=false AND (child_lid=$1 OR old_parent_lid=$1 OR new_parent_lid=$1)",
+    ).bind(lid.to_string()).fetch_one(&mut *connection).await.map_err(database_error)?;
     let mut counts = DestructionDependencies {
+        migration_journal_rows: u64::try_from(migrations)
+            .map_err(|_| invalid("dependency count out of range"))?,
         creation_journal_rows: u64::try_from(journals)
             .map_err(|_| invalid("dependency count out of range"))?,
         ..DestructionDependencies::default()
@@ -103,6 +108,12 @@ impl PostgresStorage {
             .await?
             .ok_or(KeyRackError::KeyNotFound(*lid))?;
         let counts = dependencies(&mut tx, lid).await?;
+        if counts.migration_journal_rows != 0 {
+            return Err(KeyRackError::ProviderUnavailable(format!(
+                "key participates in an in-flight migration; retry the operation: {}",
+                counts.summary()
+            )));
+        }
         if !counts.is_empty() {
             return Err(invalid(&counts.summary()));
         }

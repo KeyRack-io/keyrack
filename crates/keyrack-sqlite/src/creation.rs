@@ -56,10 +56,27 @@ pub(super) fn key(conn: &Connection, lid: &Lid) -> Result<Option<KeyRecord>> {
 }
 
 fn journal(conn: &Connection, operation: Uuid) -> Result<Option<CreationJournal>> {
-    stored_journal(conn, operation)?
-        .as_ref()
-        .map(decode)
-        .transpose()
+    if let Some(row) = stored_journal(conn, operation)? {
+        return decode(&row).map(Some);
+    }
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT journal_json FROM retired_creation_journal WHERE operation_id=?1",
+            [operation.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| map_sql(&e))?;
+    json.map(|json| {
+        let value: CreationJournal =
+            serde_json::from_str(&json).map_err(|_| invalid("invalid retired journal"))?;
+        value.validate()?;
+        if value.request.operation != operation || value.phase != CreationPhase::Committed {
+            return Err(invalid("invalid retired journal identity"));
+        }
+        Ok(value)
+    })
+    .transpose()
 }
 
 fn stored_journal(conn: &Connection, operation: Uuid) -> Result<Option<StoredJournal>> {
@@ -196,6 +213,16 @@ pub(super) fn guard_update(
     Ok(())
 }
 
+pub(super) fn committed_envelope(conn: &Connection, operation: Uuid) -> Result<Vec<u8>> {
+    let value = required_journal(conn, operation)?;
+    if value.phase != CreationPhase::Committed {
+        return Err(invalid("staged material is unavailable"));
+    }
+    let bytes = envelope(conn, operation)?;
+    validate_envelope(&value, &bytes)?;
+    Ok(bytes)
+}
+
 impl SqliteStorage {
     pub(super) fn creation_tx<T>(
         &self,
@@ -213,6 +240,7 @@ impl SqliteStorage {
     pub(super) fn reserve_a2(&self, request: &CreationRequest) -> Result<CreationJournal> {
         request.validate()?;
         self.creation_tx(|conn| {
+            crate::migration::guard_record(conn, &request.record)?;
             crate::destruction::guard_write(conn, &request.record)?;
             if let Some(existing) = journal(conn, request.operation)? {
                 if existing.request.fingerprint()? != request.fingerprint()? { return Err(invalid("operation intent conflict")); }
@@ -326,6 +354,7 @@ impl SqliteStorage {
             let current = key(conn, &request.record.lid)?;
             let parent_lid = request.material()?.parent().lid;
             let parent = key(conn, &parent_lid)?.ok_or(KeyRackError::KeyNotFound(parent_lid))?;
+            crate::migration::guard_record(conn, &value.request.record)?;
             let record = value.publication(owner, revision, current.as_ref(), &parent)?;
             let json = serde_json::to_string(&record)
                 .map_err(|_| invalid("record serialization failed"))?;
@@ -351,15 +380,7 @@ impl SqliteStorage {
     }
 
     pub(super) fn read_a2_envelope(&self, operation: Uuid) -> Result<Vec<u8>> {
-        self.with_conn(|conn| {
-            let value = required_journal(conn, operation)?;
-            if value.phase != CreationPhase::Committed {
-                return Err(invalid("staged material is unavailable"));
-            }
-            let bytes = envelope(conn, operation)?;
-            validate_envelope(&value, &bytes)?;
-            Ok(bytes)
-        })
+        self.with_conn(|conn| committed_envelope(conn, operation))
     }
 
     pub(super) fn recover_a2(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {

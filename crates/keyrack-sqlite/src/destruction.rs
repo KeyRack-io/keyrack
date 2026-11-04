@@ -60,7 +60,13 @@ fn dependencies(conn: &Connection, lid: &Lid) -> Result<DestructionDependencies>
             |row| row.get(0),
         )
         .map_err(|e| map_sql(&e))?;
+    let migrations: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM migration_journal WHERE committed=0 AND (child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1)",
+        [lid.to_string()], |row| row.get(0),
+    ).map_err(|e| map_sql(&e))?;
     let mut counts = DestructionDependencies {
+        migration_journal_rows: u64::try_from(migrations)
+            .map_err(|_| invalid("dependency count out of range"))?,
         creation_journal_rows: u64::try_from(journals)
             .map_err(|_| invalid("dependency count out of range"))?,
         ..DestructionDependencies::default()
@@ -113,6 +119,7 @@ impl SqliteStorage {
             if exists { return Ok(None); }
             let record = creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
             let counts = dependencies(conn, lid)?;
+            if counts.migration_journal_rows != 0 { return Err(KeyRackError::ProviderUnavailable(format!("key participates in an in-flight migration; retry the operation: {}", counts.summary()))); }
             if !counts.is_empty() { return Err(invalid(&counts.summary())); }
             let record = prepare_claim(record, expected, now)?;
             let json = serde_json::to_string(&record).map_err(|_| invalid("claim serialization"))?;

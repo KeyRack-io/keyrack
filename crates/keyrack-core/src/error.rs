@@ -34,6 +34,10 @@ pub enum KeyRackError {
     #[error("key {0} is destruction-fenced; lifecycle reconciliation is required")]
     KeyDestructionFenced(Lid),
 
+    /// The exact parent material named by a wrapped version no longer exists.
+    #[error("wrapping parent destroyed")]
+    WrappingParentDestroyed,
+
     #[error("invalid state transition from {from:?} to {to:?} for key {lid}")]
     InvalidStateTransition {
         lid: Lid,
@@ -62,6 +66,10 @@ pub enum KeyRackError {
         expected: u64,
         actual: u64,
     },
+
+    /// An operation ID is already reserved for different migration intent.
+    #[error("migration operation {operation} already names different intent")]
+    MigrationIntentConflict { operation: uuid::Uuid },
 
     #[error("resolution depth limit exceeded (max {max_depth})")]
     DepthLimitExceeded { max_depth: u32 },

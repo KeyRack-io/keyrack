@@ -34,6 +34,7 @@
 
 mod creation;
 mod destruction;
+mod migration;
 
 use async_trait::async_trait;
 use keyrack_core::creation::{
@@ -133,6 +134,10 @@ async fn initialize_schema(pool: &PgPool) -> Result<()> {
         .execute(CREATE_TABLES)
         .await
         .map_err(|e| KeyRackError::Storage(format!("schema: {e}")))?;
+    (&mut *transaction)
+        .execute(migration::SCHEMA)
+        .await
+        .map_err(|e| KeyRackError::Storage(format!("migration schema: {e}")))?;
     transaction
         .commit()
         .await
@@ -150,6 +155,73 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
+    async fn reserve_migration(
+        &self,
+        request: &keyrack_core::migration::MigrationRequest,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_reserve(request).await
+    }
+    async fn get_migration(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
+        self.migration_get(operation).await
+    }
+    async fn claim_migration(
+        &self,
+        operation: uuid::Uuid,
+        owner: uuid::Uuid,
+        expected_epoch: u64,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_claim(operation, owner, expected_epoch).await
+    }
+    async fn begin_migration_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        retry_safe: bool,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_dispatch(operation, ownership, retry_safe)
+            .await
+    }
+    async fn wrapped_key_snapshot(
+        &self,
+        lid: &Lid,
+        version: u64,
+    ) -> Result<keyrack_core::migration::WrappedKeySnapshot> {
+        self.migration_snapshot(lid, version).await
+    }
+    async fn stage_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        envelopes: &[Vec<u8>],
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.migration_stage(operation, ownership, envelopes).await
+    }
+    async fn commit_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
+        self.migration_commit(operation, ownership).await
+    }
+    async fn read_migration_envelope(
+        &self,
+        operation: uuid::Uuid,
+        version: u64,
+    ) -> Result<Vec<u8>> {
+        self.migration_read(operation, version).await
+    }
+    async fn check_migration_fence(&self, lid: &Lid) -> Result<()> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(creation::database_error)?;
+        migration::guard(&mut connection, lid).await
+    }
+
     async fn destruction_dependencies(
         &self,
         lid: &Lid,

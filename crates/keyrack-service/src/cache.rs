@@ -82,6 +82,81 @@ impl CachingStorage {
 
 #[async_trait::async_trait]
 impl StorageBackend for CachingStorage {
+    async fn reserve_migration(
+        &self,
+        request: &keyrack_core::migration::MigrationRequest,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner.reserve_migration(request).await
+    }
+    async fn get_migration(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<Option<keyrack_core::migration::MigrationJournal>> {
+        self.inner.get_migration(operation).await
+    }
+    async fn claim_migration(
+        &self,
+        operation: uuid::Uuid,
+        owner: uuid::Uuid,
+        expected_epoch: u64,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner
+            .claim_migration(operation, owner, expected_epoch)
+            .await
+    }
+    async fn begin_migration_dispatch(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        retry_safe: bool,
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner
+            .begin_migration_dispatch(operation, ownership, retry_safe)
+            .await
+    }
+    async fn wrapped_key_snapshot(
+        &self,
+        lid: &Lid,
+        version: u64,
+    ) -> Result<keyrack_core::migration::WrappedKeySnapshot> {
+        self.inner.wrapped_key_snapshot(lid, version).await
+    }
+    async fn stage_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+        envelopes: &[Vec<u8>],
+    ) -> Result<keyrack_core::migration::MigrationJournal> {
+        self.inner
+            .stage_migration(operation, ownership, envelopes)
+            .await
+    }
+    async fn commit_migration(
+        &self,
+        operation: uuid::Uuid,
+        ownership: keyrack_core::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
+        let journal = self.inner.get_migration(operation).await?;
+        if let Some(value) = &journal {
+            self.invalidate(&value.request.child.lid).await;
+        }
+        let result = self.inner.commit_migration(operation, ownership).await;
+        if let Some(value) = &journal {
+            self.invalidate(&value.request.child.lid).await;
+        }
+        result
+    }
+    async fn read_migration_envelope(
+        &self,
+        operation: uuid::Uuid,
+        version: u64,
+    ) -> Result<Vec<u8>> {
+        self.inner.read_migration_envelope(operation, version).await
+    }
+    async fn check_migration_fence(&self, lid: &Lid) -> Result<()> {
+        self.inner.check_migration_fence(lid).await
+    }
+
     async fn destruction_dependencies(
         &self,
         lid: &Lid,
@@ -183,12 +258,16 @@ impl StorageBackend for CachingStorage {
         owner: keyrack_core::creation::CreationOwner,
         revision: u64,
     ) -> Result<KeyRecord> {
-        let record = self
+        let journal = self.inner.get_creation(operation).await?;
+        let lid = journal.request.record.lid;
+        self.invalidate(&lid).await;
+        let result = self
             .inner
             .publish_creation(operation, owner, revision)
-            .await?;
-        self.key_cache.insert(record.lid, record.clone()).await;
-        Ok(record)
+            .await;
+        // A committed retry can return a pre-migration snapshot. Never cache it.
+        self.invalidate(&lid).await;
+        result
     }
 
     async fn read_creation_envelope(&self, operation: uuid::Uuid) -> Result<Vec<u8>> {
@@ -360,5 +439,44 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+    #[tokio::test]
+    async fn creation_replay_never_caches_pre_migration_metadata() {
+        let inner = Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap());
+        let cache = CachingStorage::new(inner, 100, Duration::from_secs(3600));
+        let (request, creations) =
+            keyrack_test_support::migration_conformance::seeded(&cache).await;
+        cache.reserve_migration(&request).await.unwrap();
+        cache
+            .stage_migration(
+                request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&cache, request.operation)
+                    .await,
+                &keyrack_test_support::migration_conformance::envelopes(),
+            )
+            .await
+            .unwrap();
+        cache
+            .commit_migration(
+                request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&cache, request.operation)
+                    .await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_key(&request.child.lid).await.unwrap().parent_lid,
+            Some(request.new_parent.lid)
+        );
+        let creation = &creations[0];
+        let historical = cache
+            .publish_creation(creation.operation, creation.owner, 3)
+            .await
+            .unwrap();
+        assert_eq!(historical.parent_lid, Some(request.old_parent.lid));
+        assert_eq!(
+            cache.get_key(&request.child.lid).await.unwrap().parent_lid,
+            Some(request.new_parent.lid)
+        );
     }
 }

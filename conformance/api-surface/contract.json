@@ -262,6 +262,18 @@
       "stub_body_sha256": null
     },
     {
+      "rpc": "RewrapKey",
+      "grpc_handler": "rewrap_key",
+      "rest": {
+        "method": "POST",
+        "path": "/v1/keys/:key_id/rewrap",
+        "handler": "rewrap_key",
+        "feature": null
+      },
+      "gap": null,
+      "stub_body_sha256": null
+    },
+    {
       "rpc": "ListKeyVersions",
       "grpc_handler": "list_key_versions",
       "rest": null,

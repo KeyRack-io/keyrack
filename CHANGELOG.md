@@ -31,13 +31,32 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Added
 
+- **Rewrap and reparent every version of a wrapped key.** `RewrapKey` and REST
+  `POST /v1/keys/{key_id}/rewrap` share one synchronous primitive and a required
+  operation UUID. Omit `new_parent_key_id` to use the current parent's current
+  version; name a different resident parent to reparent. Both require the same
+  provider and security domain. `kms:RewrapKey` is authorized separately on the
+  child and both parents, with attempt and outcome audit events. Reservation
+  pins the target version and fences conflicting writes; staged envelopes and
+  all-version commit recover through the same operation ID. Commit changes
+  `parent_lid` and retires old envelopes atomically, releasing the old wrapping
+  dependency. Generic parent mutation is refused. SQLite and PostgreSQL share
+  conformance tests, with live PostgreSQL and reverted-fence controls in CI.
+  Caller OCC assertions and version coverage bind immutable intent. Ownership
+  epochs reject stale publishers, and unknown nonrepeatable provider outcomes
+  retain their reservations. Readers keep access through commit and erasure.
+  The committed result records exact parent versions, references and encrypted
+  envelope digests and is returned unchanged on retry.
+  Only the software provider currently implements the new provider primitive;
+  it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
+
 - Key and version metadata expose `lifecycle_state` and
   `has_compromise_history` over gRPC and REST. The existing gRPC version `state`
   is deprecated and retains its compatibility meaning: compromise history
   reports `Compromised` even after the live lifecycle advances to destruction.
   Operation eligibility is unchanged; see [SPEC §7.2](docs/SPEC.md#72-valid-transitions).
 - Deletion scheduling refuses keys with wrapped versions, wrapped dependents or
-  creation-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
+  creation- or nonterminal migration-journal references, with gRPC `FAILED_PRECONDITION` / HTTP 409 and
   blocking-kind counts. Logical-only children remain allowed. Scheduling and the
   authoritative destruction claim share the SQLite/PostgreSQL dependency query.
 

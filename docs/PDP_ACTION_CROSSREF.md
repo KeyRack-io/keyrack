@@ -73,7 +73,30 @@ Internal domain functions still require their caller's authorization/audit envel
 | `ScheduleKeyDeletion` | `kms:ScheduleKeyDeletion` | Yes |
 | `CancelKeyDeletion` | `kms:CancelKeyDeletion` | Yes |
 | `RotateKey` | `kms:RotateKey` | Yes |
+| `RewrapKey` (child and both parents) | `kms:RewrapKey` | New in 0.5.0 |
 | `ReportKeyCompromise` | `kms:ReportKeyCompromise` | **No** |
+
+### RewrapKey authorizes three roles
+
+`RewrapKey` and `POST /v1/keys/{key_id}/rewrap` require `kms:RewrapKey`
+on the child, the old parent and the new parent before reserving or resuming a
+migration. All three checks run even when both parent roles have the same LID.
+Every PDP question has an independent request ID and enforces response
+correlation, version and obligations. The context includes `migration_role`
+(`child`, `old_parent`, `new_parent`), `operation_id` and
+`operation_request_id`. Resource attributes include current `owner_principal_id`
+when present and user tags under `tag:<name>`; current records are reread even
+when the operation ID already committed. Storage OCC binds authorization's
+snapshots to the pending migration. A retry still authorizes the original old
+parent recorded in the journal.
+
+The action grants neither standalone decrypt/export nor key rotation.
+[The Cedar example](examples/rewrap.cedar) grants exact resources; the bundled
+engine's attribute/context limitation described above still applies.
+Attempts and outcomes share `kms:RewrapKey`, the child resource, request ID and
+operation ID. Audit `result: attempt` does not mean authorized or committed;
+normal outcomes are `success`, `denied` or `error`. A client disconnect does
+not cancel the admitted task; a process crash may leave an unresolved attempt.
 
 ## Key versioning
 

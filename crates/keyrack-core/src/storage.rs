@@ -72,9 +72,101 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Migration methods are atomic writer-fenced transactions. Unsupported backends fail closed.
+    async fn reserve_migration(
+        &self,
+        _request: &crate::migration::MigrationRequest,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn get_migration(
+        &self,
+        _operation: uuid::Uuid,
+    ) -> Result<Option<crate::migration::MigrationJournal>> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Take ownership by compare-and-swap; increments the durable epoch.
+    async fn claim_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _owner: uuid::Uuid,
+        _expected_epoch: u64,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Persist a possibly unknown provider effect before dispatch, fenced by ownership.
+    /// An unfinished nonrepeatable effect refuses another dispatch and retains the
+    /// reservation for provider-specific reconciliation.
+    async fn begin_migration_dispatch(
+        &self,
+        _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
+        _retry_safe: bool,
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Read the current descriptor, parent and validated envelope atomically under
+    /// the migration writer protocol; never combine cached metadata with new bytes.
+    async fn wrapped_key_snapshot(
+        &self,
+        _lid: &Lid,
+        _version: u64,
+    ) -> Result<crate::migration::WrappedKeySnapshot> {
+        Err(crate::migration::migration_invalid(
+            "atomic wrapped-key snapshot unsupported",
+        ))
+    }
+    /// Publish all staged bytes under the current ownership epoch. The dispatch
+    /// marker must belong to this epoch; stale owners fail even on terminal retries.
+    async fn stage_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
+        _envelopes: &[Vec<u8>],
+    ) -> Result<crate::migration::MigrationJournal> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Atomically switch every version, persist the immutable terminal receipt,
+    /// and erase old envelopes. Ownership is checked before any idempotent return.
+    async fn commit_migration(
+        &self,
+        _operation: uuid::Uuid,
+        _ownership: crate::migration::MigrationOwnership,
+    ) -> Result<KeyRecord> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    async fn read_migration_envelope(
+        &self,
+        _operation: uuid::Uuid,
+        _version: u64,
+    ) -> Result<Vec<u8>> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration unsupported",
+        ))
+    }
+    /// Refuse before provider-side mutation if any logical identity is reserved.
+    async fn check_migration_fence(&self, _lid: &Lid) -> Result<()> {
+        Err(crate::migration::migration_invalid(
+            "transactional migration fence unsupported",
+        ))
+    }
+
     /// Read all destruction blockers in one consistent storage snapshot. Count
-    /// material versions and all parent/child creation journal rows, not logical
-    /// parent links. This is advisory: claim MUST recheck under its writer fence.
+    /// material versions, all parent/child creation journal rows, and nonterminal
+    /// migrations naming the key as child/source/target, not logical parent links.
+    /// This is advisory: claim MUST recheck under its writer fence.
     /// Unsupported implementations fail closed, never return empty counts.
     async fn destruction_dependencies(
         &self,
@@ -85,8 +177,8 @@ pub trait StorageBackend: Send + Sync {
 
     /// Commit a one-shot resident destruction fence before any provider effect.
     /// Re-read state, due time, OCC and full material history in the transaction;
-    /// reject all parent/child creation references. All writers must honor the
-    /// fence. None means already claimed, NEVER permission to dispatch again.
+    /// reject creation references and nonterminal migration participants. All
+    /// writers must honor the fence. None means already claimed, NEVER permission to dispatch again.
     /// A commit/response failure is ambiguous and must not be retried as work.
     async fn claim_destruction(
         &self,
@@ -342,6 +434,17 @@ mod tests {
                 rotation_jobs: Mutex::new(HashMap::new()),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_migration_fencing_fails_closed() {
+        let store = MemoryStorage::new();
+        let record = make_test_record(KeyState::Enabled);
+        store.create_key(&record).await.unwrap();
+        let error = store.check_migration_fence(&record.lid).await.unwrap_err();
+        assert!(
+            matches!(error, KeyRackError::Storage(ref message) if message.contains("migration fence unsupported"))
+        );
     }
 
     #[tokio::test]
