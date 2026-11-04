@@ -545,6 +545,12 @@ impl HookedStorage {
 
 #[async_trait]
 impl StorageBackend for HookedStorage {
+    async fn destroyed_wrapping_parents(
+        &self,
+        lid: &Lid,
+    ) -> Result<Vec<keyrack_core::destruction::DestroyedWrappingParent>> {
+        self.inner.destroyed_wrapping_parents(lid).await
+    }
     async fn get_key_for_use(&self, lid: &Lid) -> Result<KeyRecord> {
         self.inner.get_key_for_use(lid).await
     }

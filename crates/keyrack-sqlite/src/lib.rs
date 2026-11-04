@@ -241,8 +241,6 @@ impl StorageBackend for SqliteStorage {
         self.with_conn(|conn| migration::guard(conn, lid))
     }
 
-
-
     async fn claim_destruction(
         &self,
         lid: &Lid,

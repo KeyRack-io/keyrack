@@ -1,7 +1,7 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! One-shot storage fencing for key-material destruction, not authorization,
+//! Durable storage fencing for key-material destruction, not authorization,
 //! provider evidence, subtree erasure, or distributed revocation. A durable
 //! claim is never released by timeout, cancellation, crash, or provider error.
 
@@ -37,6 +37,7 @@ pub struct DeletionIntent {
 pub struct ScheduledDeletion {
     pub record: KeyRecord,
     pub logical_only_children: u64,
+    pub approved_dependents: Vec<DestructionDependent>,
 }
 
 /// Durable, version-specific metadata; the dependent's material and state are
@@ -56,7 +57,7 @@ pub struct DestructionDependencies {
     /// Informational; direct persisted children with nonempty all-resident histories.
     pub logical_only_children: u64,
     pub own_parent_wrapped_versions: u64,
-    pub dependent_parent_wrapped_versions: u64,
+    pub dependent_wrapping_edges: u64,
     pub creation_journal_rows: u64,
     pub in_flight_creation_journal_rows: u64,
     pub migration_journal_rows: u64,
@@ -72,8 +73,8 @@ impl DestructionDependencies {
 
     pub fn summary(&self) -> String {
         format!(
-            "own_parent_wrapped_versions={}, dependent_parent_wrapped_versions={}, creation_journal_rows={}, in_flight_creation_journal_rows={}, migration_journal_rows={}",
-            self.own_parent_wrapped_versions, self.dependent_parent_wrapped_versions,
+            "own_parent_wrapped_versions={}, dependent_wrapping_edges={}, creation_journal_rows={}, in_flight_creation_journal_rows={}, migration_journal_rows={}",
+            self.own_parent_wrapped_versions, self.dependent_wrapping_edges,
             self.creation_journal_rows, self.in_flight_creation_journal_rows, self.migration_journal_rows,
         )
     }
@@ -100,7 +101,7 @@ impl DestructionDependencies {
                 if record.lid == *lid {
                     self.own_parent_wrapped_versions += 1;
                 } else if material.parent().lid == *lid {
-                    self.dependent_parent_wrapped_versions += 1;
+                    self.dependent_wrapping_edges += 1;
                     self.dependents.push(DestructionDependent {
                         lid: record.lid,
                         version: version.version_number,
@@ -155,13 +156,14 @@ impl DestructionDependencies {
     }
 }
 
-/// Execution ticket issued only after committing a fresh destruction claim.
-/// Deliberately neither Clone nor Deserialize. Reading/retrying a journal must
-/// never mint another ticket. Dropping it leaves the durable fence in place.
+/// Execution authority for a committed destruction operation. A recovered ticket
+/// retains the exact operation and immutable material snapshot from its journal.
+/// Provider deletion is retried idempotently; the durable fence never expires.
 #[derive(Debug)]
 pub struct DestructionClaim {
     operation: Uuid,
     record: KeyRecord,
+    recovered: bool,
 }
 
 impl DestructionClaim {
@@ -172,7 +174,22 @@ impl DestructionClaim {
             return Err(invalid("invalid committed claim"));
         }
         validate_destruction_history(&record)?;
-        Ok(Self { operation, record })
+        Ok(Self {
+            operation,
+            record,
+            recovered: false,
+        })
+    }
+
+    /// Reissue only after validating the durable journal against the fenced row.
+    pub fn recovered(operation: Uuid, record: KeyRecord) -> Result<Self> {
+        let mut claim = Self::committed(operation, record)?;
+        claim.recovered = true;
+        Ok(claim)
+    }
+
+    pub fn is_recovered(&self) -> bool {
+        self.recovered
     }
 
     pub fn operation(&self) -> Uuid {
@@ -258,4 +275,15 @@ pub fn completed_record(claim: &DestructionClaim, current: &KeyRecord) -> Result
     record.state = KeyState::Destroyed;
     record.updated_at = Utc::now();
     Ok(record)
+}
+
+/// Validate a repeat completion without changing the original completion time.
+/// Only the same operation's exact terminal snapshot may be accepted.
+pub fn validate_completed_record(claim: &DestructionClaim, current: &KeyRecord) -> Result<()> {
+    let mut expected = completed_record(claim, claim.record())?;
+    expected.updated_at = current.updated_at;
+    if !crate::creation::same_json(&expected, current)? {
+        return Err(invalid("completed snapshot changed"));
+    }
+    Ok(())
 }

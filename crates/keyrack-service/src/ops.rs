@@ -85,6 +85,9 @@ pub struct OpContext {
     requested_version: Option<u32>,
     // Only bound from a decoded schedule request, never untrusted metadata.
     allow_dependent_data_loss: bool,
+    approved_deletion_edges: std::sync::Arc<
+        std::sync::Mutex<Option<Vec<keyrack_core::destruction::DestructionDependent>>>,
+    >,
 }
 
 impl OpContext {
@@ -99,6 +102,7 @@ impl OpContext {
             re_encrypt_destination: None,
             requested_version: None,
             allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -108,6 +112,18 @@ impl OpContext {
         let mut ctx = Self::key(AuditAction::ScheduleKeyDeletion, principal, key_id);
         ctx.allow_dependent_data_loss = allow;
         ctx
+    }
+
+    /// Capture only the exact snapshot returned by committed storage admission.
+    pub fn deletion_snapshot_recorder(
+        &self,
+    ) -> impl FnOnce(Vec<keyrack_core::destruction::DestructionDependent>) + Send + 'static {
+        let captured = self.approved_deletion_edges.clone();
+        move |edges| {
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(edges);
+        }
     }
 
     /// Bind `GetKeyVersion` authorization to the exact decoded version.
@@ -162,6 +178,7 @@ impl OpContext {
             re_encrypt_destination: None,
             requested_version: None,
             allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -181,6 +198,7 @@ impl OpContext {
             re_encrypt_destination: None,
             requested_version: None,
             allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -195,6 +213,7 @@ impl OpContext {
             re_encrypt_destination: None,
             requested_version: None,
             allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 }
@@ -341,6 +360,14 @@ async fn emit_audit(
 
     if ctx.action == AuditAction::ScheduleKeyDeletion {
         event.add_metadata("allow_dependent_data_loss", ctx.allow_dependent_data_loss);
+        if let Some(edges) = ctx
+            .approved_deletion_edges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            event.add_metadata("approved_dependents", serde_json::json!(edges));
+        }
     }
 
     if let Some(code) = authorization_status {
@@ -976,7 +1003,9 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         AuditAction::CascadeDisable => EventType::CascadeDisable,
         AuditAction::KeyDestroyed
         | AuditAction::ProviderDestroyKey
-        | AuditAction::KeyDestructionRefused => EventType::KeyDeleted,
+        | AuditAction::KeyDestructionRefused
+        | AuditAction::KeyDestructionRetried
+        | AuditAction::KeyDestructionDeferred => EventType::KeyDeleted,
         AuditAction::AccessSecret | AuditAction::GetKeyMaterial => EventType::SecretAccess,
         AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
         AuditAction::MakeKeyExportable | AuditAction::RevokeKeyExportability => {

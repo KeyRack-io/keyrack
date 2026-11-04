@@ -59,6 +59,7 @@ struct ObservedProvider {
     release: Semaphore,
     retry_safe: AtomicBool,
     fail_at_call: AtomicUsize,
+    opens: AtomicUsize,
     open_paused: AtomicBool,
     open_entered: Semaphore,
     open_release: Semaphore,
@@ -74,6 +75,7 @@ impl ObservedProvider {
             release: Semaphore::new(0),
             retry_safe: AtomicBool::new(true),
             fail_at_call: AtomicUsize::new(0),
+            opens: AtomicUsize::new(0),
             open_paused: AtomicBool::new(false),
             open_entered: Semaphore::new(0),
             open_release: Semaphore::new(0),
@@ -158,6 +160,7 @@ impl CryptoProvider for ObservedProvider {
         parent: &KeyHandle,
         envelope: &[u8],
     ) -> Result<WrappedKeyLease> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
         if self.open_paused.swap(false, Ordering::SeqCst) {
             self.open_entered.add_permits(1);
             self.open_release.acquire().await.unwrap().forget();
@@ -1109,6 +1112,91 @@ async fn reader_paused_before_open_survives_commit_and_parent_destruction_on_bot
 }
 
 #[tokio::test]
+async fn successive_parent_retirements_refresh_the_open_binding_only_once() {
+    let (state, provider, child, old, next) = fixture().await;
+    let final_parent = domain::create_key(&state, input(None)).await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let before = provider.opens.load(Ordering::SeqCst);
+    provider.open_paused.store(true, Ordering::SeqCst);
+    let reader = tokio::spawn({
+        let state = state.clone();
+        let calls = calls.clone();
+        let child = child.clone();
+        async move {
+            let crypto = state
+                .providers
+                .resolve(&ProviderRef::new("default"))
+                .unwrap()
+                .provider;
+            domain::with_usable_handle(
+                &state,
+                &child,
+                child.primary_version().unwrap(),
+                &crypto,
+                |_handle| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        }
+    });
+    for (destination, retired) in [(&next, &old), (&final_parent, &next)] {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.open_entered.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        let request = prepare_migration(&state, child.lid, Some(destination.lid), Uuid::new_v4())
+            .await
+            .unwrap();
+        rewrap_key(&state, request).await.unwrap();
+        destroy_resident_parent(&state, retired).await;
+        // The first failure refreshes to `next`; pause that second open so a
+        // second real migration can retire its binding before it reaches crypto.
+        provider
+            .open_paused
+            .store(destination.lid == next.lid, Ordering::SeqCst);
+        provider.open_release.add_permits(1);
+    }
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("a second retired binding must stop refresh");
+    assert!(
+        matches!(
+            error,
+            DomainError::Core(KeyRackError::WrappingParentDestroyed)
+        ),
+        "second open must preserve the typed parent-loss error: {error:?}"
+    );
+    assert_eq!(
+        provider.opens.load(Ordering::SeqCst) - before,
+        2,
+        "one initial open and at most one refreshed open"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "caller crypto must not run after the second parent-loss failure"
+    );
+    assert_eq!(
+        state
+            .storage
+            .get_key_for_use(&child.lid)
+            .await
+            .unwrap()
+            .parent_lid,
+        Some(final_parent.lid),
+        "the second refresh would have had a valid new binding"
+    );
+}
+
+#[tokio::test]
 async fn restoring_pre_migration_database_after_parent_destruction_fails_explicitly() {
     let path = std::env::temp_dir().join(format!("keyrack-restore-{}.sqlite", Uuid::new_v4()));
     let backup = path.with_extension("backup.sqlite");
@@ -1158,7 +1246,10 @@ async fn restoring_pre_migration_database_after_parent_destruction_fails_explici
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, DomainError::FailedPrecondition(message) if message == "wrapping parent destroyed"),
+            matches!(
+                &error,
+                DomainError::Core(KeyRackError::WrappingParentDestroyed)
+            ),
             "unexpected restore result: {error:?}"
         );
     }
@@ -1282,7 +1373,7 @@ async fn metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_m
                 .unwrap_err();
             assert!(
                 matches!(&scheduling_error, DomainError::FailedPrecondition(message)
-                    if message.contains("migration_journal_rows=1")),
+                    if message.contains("migration_journal_rows=1") && message.contains("in_flight_journal")),
                 "scheduling must report the shared migration dependency for {key_id}, staged={staged}: {scheduling_error}"
             );
             assert!(keyrack_core::creation::same_json(

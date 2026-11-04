@@ -71,8 +71,9 @@ new authorization and snapshot; cancellation never leaves reusable approval.
    full version history, envelope bindings and the approval against current
    dependencies. Empty, duplicate or malformed histories fail closed.
 2. A successful claim inserts a permanent destruction journal and advances OCC.
-   Only commitment of a **new** claim returns an execution ticket. Existing
-   claims return no ticket. Generic updates, cancellation, reactivation, new
+   The claim transaction also persists loss markers before any provider effect.
+   Later scans recover the same operation ID and exact snapshot from an incomplete
+   journal; completed journals return no ticket. Generic updates, cancellation, reactivation, new
    wrapping references and conflicting migration reservations use the same
    writer fence. After a claim, cancellation returns gRPC FailedPrecondition or
    HTTP 409; a stale OCC can instead produce a concurrency-conflict error.
@@ -87,9 +88,11 @@ new authorization and snapshot; cancellation never leaves reusable approval.
    or publish Destroyed instead of this completion path.
 5. With a valid override, the parent is destroyed without deleting or migrating
    dependents. Their records, lifecycle states and envelopes remain, while
-   the storage loss-marker table records the affected versions. All API responses
+   the claim transaction records the affected versions in the loss-marker table. All API responses
    carrying key metadata, including lists and mutation responses, read these
-   markers freshly into `wrapping_parent_destroyed_versions`. A marker-query
+   markers freshly into `wrapping_parent_destroyed_versions`, matching the current
+   material's parent LID and version. Historical markers do not block a different
+   current wrapping edge. A marker-query
    failure fails the response rather than reporting an empty list. Later opens
    of affected wrapped versions return `wrapping parent destroyed` with gRPC
    `FAILED_PRECONDITION` / HTTP 409, before envelope or provider dispatch.
@@ -106,14 +109,19 @@ writes. Cache wrappers delegate them to storage and invalidate local metadata.
   still use its own fenced envelope-erasure lifecycle; the loss marker is not
   a recovery or reactivation mechanism.
 - A lost response, task cancellation, process crash, provider error, partial
-  success or completion error **does not release the fence**. Later scans do not
-  retry destruction. An error is not evidence that material survived unchanged.
-  There is no automatic takeover, timeout release or recovery/abort API in this
-  lifecycle. Do not clear journal rows manually to get retries: that discards the
-  one-shot guarantee without resolving potentially completed external effects.
+  success or completion error **does not release the fence**. Later scans resume
+  the same journal operation and immutable provider handles. Confirmed absence
+  counts as a successful provider delete; access and transport failures retain
+  PendingDeletion. Completion is idempotent for the same operation and snapshot.
+  Loss markers remain visible even if the provider effect succeeded and SQL
+  completion rolled back. `kms:KeyDestructionRetried` and
+  `kms:KeyDestructionDeferred` report the operation ID and retry/failure reason;
+  `keyrack_deletion_retries_total` counts resumed attempts. Audit is best-effort.
+  Never clear the journal manually or reuse a provider handle for new material.
+  There is no timeout fence release or abort API.
 - Storage completion trusts the service's provider-success decision; the ticket
   is a storage execution capability, not PDP authority, signed evidence or a
-  malicious-coordinator proof. `DestructionClaim::committed` is for trusted
+  malicious-coordinator proof. `DestructionClaim::committed` and `DestructionClaim::recovered` are for trusted
   storage implementors. Non-Clone/move discipline is not in-process authenticity.
 - Provider instances are pinned within an attempt, not independently qualified
   hardware identities. Reconfiguration before resolution and out-of-band backend
@@ -152,6 +160,7 @@ cargo test -p keyrack-postgres --features live-tests
 # New or empty directory outside disposable build storage; retain the evidence:
 python3 scripts/test-deletion-scheduling-controls.py --output /path/to/deletion-controls
 python3 scripts/test-deletion-approval-controls.py --output /path/to/approval-controls
+python3 scripts/test-destruction-recovery-controls.py --output /path/to/recovery-controls
 ```
 
 The scheduling control runner copies the source into a disposable directory,
@@ -164,7 +173,14 @@ live-provider tests remain separate invocations.
 
 The approval control runner separately removes snapshot comparison, journal
 refusal, the extra PDP authorization, the claim recheck, envelope erasure and
-the refusal counter, strict boolean decoding and parent-loss markers. Each run must fail its named test with the specific unsafe
+the refusal counter, strict boolean decoding, claim-time loss markers, recovered
+claims, parent-binding matching, legacy defaults and audit evidence. Each run
+must fail its named test with the specific unsafe
 outcome; compilation failures do not qualify. It restores the source and reruns
 the baseline, retaining per-mutation hashes, logs and diagnostics. Surface
 controls run gRPC and REST separately so a failure on one cannot mask the other.
+
+The provider recovery control runner removes the Vault and KMIP absence checks
+in a disposable copy and checks both failure to recover a missing key and
+incorrect acceptance of other failures. Those fixtures exercise HTTP/TTLV
+responses, not a claim of live hardware qualification.

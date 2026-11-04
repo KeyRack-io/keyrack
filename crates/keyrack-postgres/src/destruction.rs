@@ -151,7 +151,7 @@ async fn dependencies(connection: &mut PgConnection, lid: &Lid) -> Result<Destru
     }
     counts.dependents.sort();
     counts.dependents.dedup();
-    counts.dependent_parent_wrapped_versions =
+    counts.dependent_wrapping_edges =
         u64::try_from(counts.dependents.len()).map_err(|_| invalid("dependency count overflow"))?;
     Ok(counts)
 }
@@ -270,6 +270,44 @@ async fn validate_owned_envelopes(connection: &mut PgConnection, record: &KeyRec
     Ok(())
 }
 
+/// Persist the approved loss decision before any provider effect. The fence
+/// prevents later writers from adding edges to the claimed parent.
+async fn mark_parent_loss(connection: &mut PgConnection, lid: &Lid) -> Result<()> {
+    // Only actual live material descriptors get a parent-loss marker. Retain
+    // their state, key versions and envelopes exactly as they were.
+    let rows = sqlx::query("SELECT lid,record_json,occ_version FROM kr_keys WHERE lid!=$1")
+        .bind(lid.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for row in rows {
+        let json: serde_json::Value = row.try_get("record_json").map_err(database_error)?;
+        let child: KeyRecord =
+            serde_json::from_value(json).map_err(|_| invalid("invalid dependent metadata"))?;
+        let indexed_lid: String = row.try_get("lid").map_err(database_error)?;
+        let occ: i64 = row.try_get("occ_version").map_err(database_error)?;
+        if child.lid.to_string() != indexed_lid
+            || u64::try_from(occ).ok() != Some(child.occ_version)
+        {
+            return Err(invalid("dependent row binding mismatch"));
+        }
+        if child.state == KeyState::Destroyed {
+            continue;
+        }
+        for version in &child.key_versions {
+            if let KeyMaterial::ParentWrapped(material) = &version.material {
+                if material.parent().lid == *lid {
+                    sqlx::query("INSERT INTO kr_destroyed_wrapping_parents(child_lid,child_version,parent_lid,parent_version) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+                            .bind(child.lid.to_string()).bind(version.version_number.to_string())
+                            .bind(lid.to_string()).bind(material.parent().version.get().to_string())
+                            .execute(&mut *connection).await.map_err(database_error)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl PostgresStorage {
     pub(super) async fn destruction_schedule(
         &self,
@@ -303,18 +341,20 @@ impl PostgresStorage {
         replace_key(&mut tx, &record, expected).await?;
         sqlx::query("INSERT INTO kr_deletion_schedules(lid,scheduled_at,allow_dependent_data_loss,approved_dependents) VALUES($1,$2,$3,$4) ON CONFLICT(lid) DO UPDATE SET scheduled_at=EXCLUDED.scheduled_at,allow_dependent_data_loss=EXCLUDED.allow_dependent_data_loss,approved_dependents=EXCLUDED.approved_dependents")
             .bind(lid.to_string()).bind(at).bind(approved.allow_dependent_data_loss)
-            .bind(serde_json::to_value(approved.approved_dependents).map_err(|_|invalid("snapshot serialization"))?)
+            .bind(serde_json::to_value(&approved.approved_dependents).map_err(|_|invalid("snapshot serialization"))?)
             .execute(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         Ok(ScheduledDeletion {
             record,
             logical_only_children: dependencies.logical_only_children,
+            approved_dependents: approved.approved_dependents,
         })
     }
 
     pub(super) async fn destruction_cancel(&self, lid: &Lid, expected: u64) -> Result<KeyRecord> {
         let mut tx = write_transaction(&self.pool).await?;
         guard(&mut tx, lid).await?;
+        crate::migration::guard(&mut tx, lid).await?;
         let mut record = load_key(&mut tx, lid)
             .await?
             .ok_or(KeyRackError::KeyNotFound(*lid))?;
@@ -399,19 +439,37 @@ impl PostgresStorage {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<DestructionClaim>> {
         let mut tx = write_transaction(&self.pool).await?;
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kr_destruction_journal WHERE lid=$1)")
-                .bind(lid.to_string())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(database_error)?;
-        if exists {
-            tx.commit().await.map_err(database_error)?;
-            return Ok(None);
-        }
         let record = load_key(&mut tx, lid)
             .await?
             .ok_or(KeyRackError::KeyNotFound(*lid))?;
+        let retained = sqlx::query(
+            "SELECT operation_id,record_json,completed FROM kr_destruction_journal WHERE lid=$1",
+        )
+        .bind(lid.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = retained {
+            let completed: bool = row.try_get("completed").map_err(database_error)?;
+            if completed || record.occ_version != expected {
+                tx.commit().await.map_err(database_error)?;
+                return Ok(None);
+            }
+            let operation: String = row.try_get("operation_id").map_err(database_error)?;
+            let operation = uuid::Uuid::parse_str(&operation)
+                .map_err(|_| invalid("invalid retained operation"))?;
+            let json: serde_json::Value = row.try_get("record_json").map_err(database_error)?;
+            let snapshot: KeyRecord = serde_json::from_value(json)
+                .map_err(|_| invalid("invalid retained claim snapshot"))?;
+            if snapshot.lid != *lid || !keyrack_core::creation::same_json(&snapshot, &record)? {
+                return Err(invalid("retained claim snapshot changed"));
+            }
+            // Also covers retained claims created before loss markers existed.
+            mark_parent_loss(&mut tx, lid).await?;
+            let claim = DestructionClaim::recovered(operation, snapshot)?;
+            tx.commit().await.map_err(database_error)?;
+            return Ok(Some(claim));
+        }
         let counts = dependencies(&mut tx, lid).await?;
         counts.validate_intent(&intent(&mut tx, &record).await?.unwrap_or_default())?;
         validate_owned_envelopes(&mut tx, &record).await?;
@@ -422,8 +480,9 @@ impl PostgresStorage {
             .bind(lid.to_string()).bind(operation.to_string()).bind(json)
             .execute(&mut *tx).await.map_err(database_error)?;
         replace_key(&mut tx, &record, expected).await?;
+        mark_parent_loss(&mut tx, lid).await?;
         tx.commit().await.map_err(database_error)?;
-        // Only a successfully committed new claim may issue an execution ticket.
+        // Issue a fresh ticket only after its fence and loss markers commit.
         Ok(Some(DestructionClaim::committed(operation, record)?))
     }
 
@@ -443,48 +502,20 @@ impl PostgresStorage {
         let json: serde_json::Value = row.try_get("record_json").map_err(database_error)?;
         let snapshot: KeyRecord =
             serde_json::from_value(json).map_err(|_| invalid("invalid claim snapshot"))?;
-        if completed
-            || operation != claim.operation().to_string()
+        if operation != claim.operation().to_string()
             || !keyrack_core::creation::same_json(&snapshot, claim.record())?
         {
-            return Err(invalid("claim mismatch or already completed"));
+            return Err(invalid("claim mismatch"));
         }
         let current = load_key(&mut tx, &lid)
             .await?
             .ok_or(KeyRackError::KeyNotFound(lid))?;
-        let record = completed_record(&claim, &current)?;
-        // Only actual live material descriptors get a parent-loss marker. Retain
-        // their state, key versions and envelopes exactly as they were.
-        let rows = sqlx::query("SELECT lid,record_json,occ_version FROM kr_keys WHERE lid!=$1")
-            .bind(lid.to_string())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(database_error)?;
-        for row in rows {
-            let json: serde_json::Value = row.try_get("record_json").map_err(database_error)?;
-            let child: KeyRecord =
-                serde_json::from_value(json).map_err(|_| invalid("invalid dependent metadata"))?;
-            let indexed_lid: String = row.try_get("lid").map_err(database_error)?;
-            let occ: i64 = row.try_get("occ_version").map_err(database_error)?;
-            if child.lid.to_string() != indexed_lid
-                || u64::try_from(occ).ok() != Some(child.occ_version)
-            {
-                return Err(invalid("dependent row binding mismatch"));
-            }
-            if child.state == KeyState::Destroyed {
-                continue;
-            }
-            for version in &child.key_versions {
-                if let KeyMaterial::ParentWrapped(material) = &version.material {
-                    if material.parent().lid == lid {
-                        sqlx::query("INSERT INTO kr_destroyed_wrapping_parents(child_lid,child_version,parent_lid,parent_version) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-                            .bind(child.lid.to_string()).bind(version.version_number.to_string())
-                            .bind(lid.to_string()).bind(material.parent().version.get().to_string())
-                            .execute(&mut *tx).await.map_err(database_error)?;
-                    }
-                }
-            }
+        if completed {
+            keyrack_core::destruction::validate_completed_record(&claim, &current)?;
+            tx.commit().await.map_err(database_error)?;
+            return Ok(current);
         }
+        let record = completed_record(&claim, &current)?;
         // Erase only envelopes owned by this logical key, never its dependents.
         sqlx::query("INSERT INTO kr_retired_creation_journal(operation_id,journal_json) SELECT operation_id,journal_json FROM kr_creation_journal WHERE child_lid=$1 AND phase='committed' ON CONFLICT(operation_id) DO NOTHING")
             .bind(lid.to_string()).execute(&mut *tx).await.map_err(database_error)?;

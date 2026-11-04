@@ -41,16 +41,10 @@ async fn key_metadata(
     record: &keyrack_core::key::KeyRecord,
 ) -> Result<proto::KeyMetadata, Status> {
     let mut metadata = convert::key_record_to_metadata(record);
-    metadata.wrapping_parent_destroyed_versions = state
-        .storage
-        .destroyed_wrapping_parents(&record.lid)
-        .await
-        .map_err(convert::error_to_status)?
-        .into_iter()
-        .map(|lost| lost.version)
-        .collect();
-    metadata.wrapping_parent_destroyed_versions.sort_unstable();
-    metadata.wrapping_parent_destroyed_versions.dedup();
+    metadata.wrapping_parent_destroyed_versions =
+        crate::domain::destroyed_wrapping_versions(state, &record.lid)
+            .await
+            .map_err(convert::error_to_status)?;
     Ok(metadata)
 }
 
@@ -1539,6 +1533,7 @@ impl KeyService for KeyServiceImpl {
         let mut op_ctx =
             OpContext::deletion_schedule(principal, &key_id, req.allow_dependent_data_loss);
         op_ctx.request_id = request_id;
+        let record_snapshot = op_ctx.deletion_snapshot_recorder();
         ops::execute(&self.state, op_ctx, |state| async move {
             let scheduled = crate::domain::schedule_key_deletion_with_intent(
                 &state,
@@ -1548,6 +1543,7 @@ impl KeyService for KeyServiceImpl {
             )
             .await
             .map_err(|error| error.to_grpc_status())?;
+            record_snapshot(scheduled.approved_dependents.clone());
             Ok(Response::new(proto::ScheduleKeyDeletionResponse {
                 metadata: Some(key_metadata(&state, &scheduled.record).await?),
                 deletion_date: scheduled

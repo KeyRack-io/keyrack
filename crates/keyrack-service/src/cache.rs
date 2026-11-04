@@ -197,8 +197,6 @@ impl StorageBackend for CachingStorage {
         self.inner.check_migration_fence(lid).await
     }
 
-
-
     async fn claim_destruction(
         &self,
         lid: &Lid,

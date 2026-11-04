@@ -20,9 +20,9 @@
 
 //! Background workers for periodic maintenance tasks.
 //!
-//! Scanners keep lifecycle state in storage. Destruction uses a durable one-shot
-//! claim before provider effects; interrupted/ambiguous claims remain fenced for
-//! reconciliation, never automatic redispatch on restart.
+//! Scanners keep lifecycle state in storage. Destruction uses one durable
+//! claim before provider effects; interrupted claims retain their fence and are
+//! resumed from the durable snapshot using idempotent provider deletion.
 
 use crate::state::ServiceState;
 use keyrack_core::audit::{
@@ -130,14 +130,45 @@ pub async fn run_deletion_scan_at(
                 continue;
             }
         };
-        // The fresh, transactionally fenced snapshot, NEVER the scan row.
+        if claim.is_recovered() {
+            emit_destruction_progress(
+                state,
+                &claim,
+                AuditAction::KeyDestructionRetried,
+                "durable_claim_resumed",
+            )
+            .await;
+            metrics::counter!("keyrack_deletion_retries_total").increment(1);
+        }
+        // The transactionally fenced snapshot, NEVER the scan row.
         if !destroy_backend_material(state, claim.record()).await {
+            emit_destruction_progress(
+                state,
+                &claim,
+                AuditAction::KeyDestructionDeferred,
+                "provider_outcome_unconfirmed",
+            )
+            .await;
             failed += 1;
             continue;
         }
 
+        let operation_id = claim.operation();
         if let Err(e) = state.storage.complete_destruction(claim).await {
-            tracing::warn!(lid = %record.lid, error = %e, "destruction completion ambiguous; fence retained");
+            tracing::warn!(lid = %record.lid, %operation_id, error = %e, "destruction completion ambiguous; fence retained");
+            let mut event = AuditEvent::new(
+                EventType::KeyDeleted,
+                AuditAction::KeyDestructionDeferred,
+                system_principal(),
+                AuditResource {
+                    id: record.lid.to_string(),
+                    resource_type: "Key".into(),
+                },
+                AuditResult::Error,
+            );
+            event.add_metadata("operation_id", operation_id.to_string());
+            event.add_metadata("reason", "completion_unconfirmed");
+            let _ = state.audit.emit(&event).await;
             failed += 1;
             continue;
         }
@@ -163,10 +194,31 @@ pub async fn run_deletion_scan_at(
         tracing::error!(
             failed,
             "deletion worker could not destroy backend material; keys left in \
-             pending_deletion; claimed operations require reconciliation"
+             pending_deletion; retained claims will be retried"
         );
     }
     Ok(())
+}
+
+async fn emit_destruction_progress(
+    state: &ServiceState,
+    claim: &keyrack_core::destruction::DestructionClaim,
+    action: AuditAction,
+    reason: &str,
+) {
+    let mut event = AuditEvent::new(
+        EventType::KeyDeleted,
+        action,
+        system_principal(),
+        AuditResource {
+            id: claim.record().lid.to_string(),
+            resource_type: "Key".into(),
+        },
+        AuditResult::Error,
+    );
+    event.add_metadata("operation_id", claim.operation().to_string());
+    event.add_metadata("reason", reason);
+    let _ = state.audit.emit(&event).await;
 }
 
 /// Destroy the provider-side material of every version of `record`.
@@ -175,8 +227,8 @@ pub async fn run_deletion_scan_at(
 /// first provider-resolution or delete failure, having audited that failure —
 /// the caller must then leave the record in `PendingDeletion`.
 ///
-/// No automatic retry follows failure: some versions/effects may already be
-/// destroyed even when a provider reports an error. The durable fence remains.
+/// A retained claim may retry the same immutable handles after restart. Providers
+/// must treat confirmed absence as success; unknown outcomes keep the fence.
 async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> bool {
     // Envelope bytes are erased only by fenced storage completion. Never ask a
     // provider to destroy the wrapped child's parent handle or transient lease.

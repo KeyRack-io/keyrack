@@ -42,6 +42,15 @@ fn state_at(
         ProviderRef::new("default"),
         WrappingIdentifier::new("deletion-test").unwrap(),
     ));
+    state_at_with_provider(path, pdp, audit, provider)
+}
+
+fn state_at_with_provider(
+    path: &std::path::Path,
+    pdp: Arc<dyn PolicyDecisionPoint>,
+    audit: Arc<CapturingSink>,
+    provider: Arc<dyn keyrack_core::provider::CryptoProvider>,
+) -> Arc<ServiceState> {
     let mut state = build_test_state_with_provider(provider, pdp, audit);
     let state_mut = Arc::get_mut(&mut state).unwrap();
     state_mut.storage = Arc::new(keyrack_sqlite::SqliteStorage::open(path).unwrap());
@@ -213,6 +222,50 @@ async fn dependency_override_event_surface_matrix() {
                             .unwrap()
                             .unwrap();
                         assert_eq!(intent.allow_dependent_data_loss, allow);
+                        // The audit records the server's committed edge snapshot,
+                        // including version, parent version and envelope identity.
+                        let expected_edges = if kind == "wrapped" && allow {
+                            let child = dependent.as_ref().unwrap();
+                            let version = child.primary_version().unwrap();
+                            let KeyMaterial::ParentWrapped(material) = &version.material else {
+                                panic!("wrapped fixture must have wrapped material");
+                            };
+                            vec![keyrack_core::destruction::DestructionDependent {
+                                lid: child.lid,
+                                version: version.version_number,
+                                parent_version: material.parent().version.get(),
+                                envelope_ref: material.wrapped_material_ref().as_str().to_owned(),
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        assert_eq!(intent.approved_dependents, expected_edges);
+                        let events = audit.events();
+                        let scheduled_events: Vec<_> = events
+                            .iter()
+                            .filter(|entry| {
+                                entry.action
+                                    == keyrack_core::audit::AuditAction::ScheduleKeyDeletion
+                                    && entry.result == keyrack_core::audit::AuditResult::Success
+                                    && entry.resource.id == key
+                            })
+                            .collect();
+                        assert_eq!(
+                            scheduled_events.len(),
+                            1,
+                            "{surface}: one successful schedule audit"
+                        );
+                        assert_eq!(
+                            scheduled_events[0].metadata.get("approved_dependents"),
+                            Some(&serde_json::json!(intent.approved_dependents)),
+                            "{surface}: audit must contain the exact persisted approved edge list"
+                        );
+                        assert_eq!(
+                            scheduled_events[0]
+                                .metadata
+                                .get("allow_dependent_data_loss"),
+                            Some(&serde_json::json!(allow))
+                        );
                         if event == "cancel" {
                             assert_eq!(
                                 request(state.clone(), surface, &key, "cancel", false)
@@ -605,6 +658,11 @@ async fn migration_journals_refuse_all_roles_and_overrides_on_both_surfaces() {
                         .storage
                         .stage_migration(
                             migration.operation,
+                            keyrack_test_support::migration_conformance::test_owner(
+                                state.storage.as_ref(),
+                                migration.operation,
+                            )
+                            .await,
                             &keyrack_test_support::migration_conformance::envelopes(),
                         )
                         .await
@@ -662,4 +720,478 @@ async fn rest_rejects_non_boolean_data_loss_intent() {
     }
     drop(state);
     std::fs::remove_file(file).unwrap();
+}
+
+async fn ciphertext_for(state: Arc<ServiceState>, child: &KeyRecord) -> Vec<u8> {
+    keyrack_service::grpc::KeyServiceImpl::new(state)
+        .encrypt(Request::new(proto::EncryptRequest {
+            key_id: child.lid.to_string(),
+            plaintext: b"survives unrelated deletion".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .ciphertext_blob
+}
+
+async fn assert_parent_loss(
+    state: Arc<ServiceState>,
+    surface: &str,
+    child: &KeyRecord,
+    ciphertext: &[u8],
+    lost: bool,
+) {
+    let key = child.lid.to_string();
+    let expected_versions = if lost { vec![1] } else { vec![] };
+    if surface == "grpc" {
+        let service = keyrack_service::grpc::KeyServiceImpl::new(state);
+        let result = service
+            .decrypt(Request::new(proto::DecryptRequest {
+                key_id: key.clone(),
+                ciphertext_blob: ciphertext.to_vec(),
+                ..Default::default()
+            }))
+            .await;
+        if lost {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("wrapping parent destroyed"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().into_inner().plaintext,
+                b"survives unrelated deletion"
+            );
+        }
+        let metadata = service
+            .describe_key(Request::new(proto::DescribeKeyRequest { key_id: key }))
+            .await
+            .unwrap()
+            .into_inner()
+            .metadata
+            .unwrap();
+        assert_eq!(
+            metadata.wrapping_parent_destroyed_versions, expected_versions,
+            "loss metadata must match the current wrapping parent"
+        );
+    } else {
+        let (status, body) = rest_json(
+            state.clone(),
+            "POST",
+            &format!("/v1/keys/{key}/actions-decrypt"),
+            serde_json::json!({"ciphertext_blob":base64::engine::general_purpose::STANDARD.encode(ciphertext)}),
+        ).await;
+        assert_eq!(status, if lost { 409 } else { 200 }, "{body}");
+        if lost {
+            assert!(
+                body.to_string().contains("wrapping parent destroyed"),
+                "{body}"
+            );
+            assert!(
+                body.to_string().contains("WrappingParentDestroyed"),
+                "{body}"
+            );
+        } else {
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(body["plaintext"].as_str().unwrap())
+                    .unwrap(),
+                b"survives unrelated deletion"
+            );
+        }
+        let (status, body) = rest_json(
+            state,
+            "GET",
+            &format!("/v1/keys/{key}/describe"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let actual: Vec<u64> = body["wrapping_parent_destroyed_versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            actual, expected_versions,
+            "loss metadata must match the current wrapping parent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn destruction_completion_failure_recovers_after_restart_on_both_surfaces() {
+    for surface in surfaces() {
+        let file = path();
+        let provider = Arc::new(SoftwareProvider::scoped(
+            ProviderRef::new("default"),
+            WrappingIdentifier::new("deletion-test").unwrap(),
+        ));
+        let audit = Arc::new(CapturingSink::new());
+        let state = state_at_with_provider(
+            &file,
+            Arc::new(AlwaysAllow),
+            audit.clone(),
+            provider.clone(),
+        );
+        let parent = domain::create_key(&state, input(None)).await.unwrap();
+        let child = domain::create_key(&state, input(Some(&parent)))
+            .await
+            .unwrap();
+        let unrelated = domain::create_key(&state, input(None)).await.unwrap();
+        let ciphertext = ciphertext_for(state.clone(), &child).await;
+        let unrelated_ciphertext = ciphertext_for(state.clone(), &unrelated).await;
+        assert_eq!(
+            request(
+                state.clone(),
+                surface,
+                &parent.lid.to_string(),
+                "schedule",
+                true
+            )
+            .await
+            .0,
+            200
+        );
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection.execute_batch(
+            "CREATE TRIGGER fail_destruction_completion BEFORE UPDATE OF completed ON destruction_journal
+             WHEN NEW.completed=1 BEGIN SELECT RAISE(ABORT,'injected completion failure'); END;",
+        ).unwrap();
+        let due = chrono::Utc::now() + chrono::Duration::days(8);
+        keyrack_service::workers::run_deletion_scan_at(&state, due)
+            .await
+            .unwrap();
+        let pending = state.storage.get_key(&parent.lid).await.unwrap();
+        assert_eq!(pending.state, KeyState::PendingDeletion);
+        let absent = provider
+            .encrypt(
+                parent.primary_version().unwrap().resident_handle().unwrap(),
+                b"absent",
+                b"",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            absent.to_string().contains("key not found"),
+            "provider material must be gone before injected completion failure: {absent}"
+        );
+        let operation: String = connection
+            .query_row(
+                "SELECT operation_id FROM destruction_journal WHERE lid=?1 AND completed=0",
+                [parent.lid.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            audit.events().iter().any(|event| event.action
+                == keyrack_core::audit::AuditAction::KeyDestructionDeferred
+                && event.metadata["operation_id"] == operation),
+            "failed completion must be audited"
+        );
+        // The process and SQLite storage restart; the separately owned provider
+        // persists, including its already-deleted key and the unrelated live key.
+        drop(state);
+        let restarted =
+            state_at_with_provider(&file, Arc::new(AlwaysAllow), audit.clone(), provider);
+        assert_parent_loss(restarted.clone(), surface, &child, &ciphertext, true).await;
+        assert_parent_loss(
+            restarted.clone(),
+            surface,
+            &unrelated,
+            &unrelated_ciphertext,
+            false,
+        )
+        .await;
+        connection
+            .execute_batch("DROP TRIGGER fail_destruction_completion;")
+            .unwrap();
+        keyrack_service::workers::run_deletion_scan_at(&restarted, due)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.storage.get_key(&parent.lid).await.unwrap().state,
+            KeyState::Destroyed,
+            "retained destruction claim must eventually complete"
+        );
+        assert!(
+            audit.events().iter().any(|event| event.action
+                == keyrack_core::audit::AuditAction::KeyDestructionRetried
+                && event.metadata["operation_id"] == operation),
+            "durable retry must be audited"
+        );
+        assert_parent_loss(restarted.clone(), surface, &child, &ciphertext, true).await;
+        assert_parent_loss(
+            restarted.clone(),
+            surface,
+            &unrelated,
+            &unrelated_ciphertext,
+            false,
+        )
+        .await;
+        drop(connection);
+        drop(restarted);
+        std::fs::remove_file(file).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rotation_and_rewrap_reject_persisted_stale_approval_on_both_surfaces() {
+    for surface in surfaces() {
+        for change in ["rotation", "rewrap"] {
+            let file = path();
+            let audit = Arc::new(CapturingSink::new());
+            let state = state_at(&file, Arc::new(AlwaysAllow), audit.clone());
+            let parent = domain::create_key(&state, input(None)).await.unwrap();
+            let child = domain::create_key(&state, input(Some(&parent)))
+                .await
+                .unwrap();
+            let key = parent.lid.to_string();
+            assert_eq!(
+                request(state.clone(), surface, &key, "schedule", true)
+                    .await
+                    .0,
+                200
+            );
+            let connection = rusqlite::Connection::open(&file).unwrap();
+            let approved: String = connection
+                .query_row(
+                    "SELECT intent_json FROM deletion_schedules WHERE lid=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            // Public admission already rejects new work against a pending parent.
+            if change == "rotation" {
+                assert!(
+                    domain::rotate_key(&state, &child.lid, &child.lid.to_string())
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(keyrack_service::migration::prepare_migration(
+                    &state,
+                    child.lid,
+                    None,
+                    uuid::Uuid::new_v4()
+                )
+                .await
+                .is_err());
+            }
+            assert_eq!(
+                request(state.clone(), surface, &key, "cancel", false)
+                    .await
+                    .0,
+                200
+            );
+            let mut enabled = state.storage.get_key(&parent.lid).await.unwrap();
+            enabled.transition_to(KeyState::Enabled).unwrap();
+            state.storage.update_key(&enabled).await.unwrap();
+            let changed = if change == "rotation" {
+                domain::rotate_key(&state, &child.lid, &child.lid.to_string())
+                    .await
+                    .unwrap()
+                    .record
+            } else {
+                let request = keyrack_service::migration::prepare_migration(
+                    &state,
+                    child.lid,
+                    None,
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+                keyrack_service::migration::rewrap_key(&state, request)
+                    .await
+                    .unwrap()
+            };
+            if change == "rotation" {
+                assert_eq!(changed.key_versions.len(), 2);
+            } else {
+                assert_eq!(changed.key_versions.len(), 1);
+                assert_ne!(
+                    changed.key_versions[0].material,
+                    child.key_versions[0].material
+                );
+            }
+            assert_eq!(
+                request(state.clone(), surface, &key, "schedule", true)
+                    .await
+                    .0,
+                200
+            );
+            // Restore only the prior approved edge list. All material, envelopes,
+            // retirement, and the fresh schedule are produced by real operations.
+            // This models stale persisted approval at the claim boundary, beyond
+            // the ordinary pending-parent admission guard.
+            connection
+                .execute(
+                    "UPDATE deletion_schedules SET intent_json=?1 WHERE lid=?2",
+                    rusqlite::params![approved, key],
+                )
+                .unwrap();
+            let scheduled = state.storage.get_key(&parent.lid).await.unwrap();
+            let error = state
+                .storage
+                .claim_destruction(
+                    &parent.lid,
+                    scheduled.occ_version,
+                    chrono::Utc::now() + chrono::Duration::days(8),
+                )
+                .await
+                .expect_err("changed wrapping edge must refuse stale approval");
+            assert!(
+                matches!(error, keyrack_core::error::KeyRackError::DeletionDependencyRefused { ref reason, .. } if reason == "dependent_outside_approved_snapshot"),
+                "{surface}/{change}: {error}"
+            );
+            keyrack_service::workers::run_deletion_scan_at(
+                &state,
+                chrono::Utc::now() + chrono::Duration::days(8),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state.storage.get_key(&parent.lid).await.unwrap().state,
+                KeyState::PendingDeletion
+            );
+            assert!(audit.events().iter().any(|event| event.action
+                == keyrack_core::audit::AuditAction::KeyDestructionRefused
+                && event.metadata["reason"] == "dependent_outside_approved_snapshot"));
+            assert!(!audit
+                .events()
+                .iter()
+                .any(|event| event.action == keyrack_core::audit::AuditAction::ProviderDestroyKey));
+            drop(connection);
+            drop(state);
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn retained_loss_markers_match_current_parent_identity_and_version() {
+    for surface in surfaces() {
+        for same_parent in [true, false] {
+            let file = path();
+            let state = state_at(&file, Arc::new(AlwaysAllow), Arc::new(CapturingSink::new()));
+            let parent = domain::create_key(&state, input(None)).await.unwrap();
+            let child = domain::create_key(&state, input(Some(&parent)))
+                .await
+                .unwrap();
+            let ciphertext = ciphertext_for(state.clone(), &child).await;
+            let target = if same_parent {
+                domain::rotate_key(&state, &parent.lid, &parent.lid.to_string())
+                    .await
+                    .unwrap();
+                parent.lid
+            } else {
+                domain::create_key(&state, input(None)).await.unwrap().lid
+            };
+            let migration = keyrack_service::migration::prepare_migration(
+                &state,
+                child.lid,
+                Some(target),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+            let changed = keyrack_service::migration::rewrap_key(&state, migration)
+                .await
+                .unwrap();
+            let connection = rusqlite::Connection::open(&file).unwrap();
+            // Historical evidence refers to the retired material, not the
+            // current parent pair. Markers are deliberately never deleted.
+            connection.execute(
+                "INSERT INTO destroyed_wrapping_parents(child_lid,child_version,parent_lid,parent_version) VALUES(?1,'1',?2,'1')",
+                rusqlite::params![child.lid.to_string(), parent.lid.to_string()],
+            ).unwrap();
+            assert_parent_loss(state.clone(), surface, &changed, &ciphertext, false).await;
+            drop(connection);
+            drop(state);
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn existing_database_pending_deletion_has_no_implicit_loss_approval() {
+    for surface in surfaces() {
+        for wrapped in [false, true] {
+            let file = path();
+            let provider = Arc::new(SoftwareProvider::scoped(
+                ProviderRef::new("default"),
+                WrappingIdentifier::new("deletion-test").unwrap(),
+            ));
+            let audit = Arc::new(CapturingSink::new());
+            let state = state_at_with_provider(
+                &file,
+                Arc::new(AlwaysAllow),
+                audit.clone(),
+                provider.clone(),
+            );
+            let parent = domain::create_key(&state, input(None)).await.unwrap();
+            if wrapped {
+                domain::create_key(&state, input(Some(&parent)))
+                    .await
+                    .unwrap();
+            }
+            let mut pending = parent.clone();
+            pending.transition_to(KeyState::PendingDeletion).unwrap();
+            pending.scheduled_deletion_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+            state.storage.update_key(&pending).await.unwrap();
+            drop(state);
+            let connection = rusqlite::Connection::open(&file).unwrap();
+            // Reproduce the old schema: a PendingDeletion key existed before
+            // either approval snapshots or wrapping-loss marker tables existed.
+            connection
+                .execute_batch(
+                    "DROP TABLE deletion_schedules; DROP TABLE destroyed_wrapping_parents;",
+                )
+                .unwrap();
+            drop(connection);
+            let upgraded =
+                state_at_with_provider(&file, Arc::new(AlwaysAllow), audit.clone(), provider);
+            assert!(upgraded
+                .storage
+                .deletion_intent(&parent.lid)
+                .await
+                .unwrap()
+                .is_none());
+            keyrack_service::workers::run_deletion_scan_at(&upgraded, chrono::Utc::now())
+                .await
+                .unwrap();
+            assert_eq!(
+                upgraded.storage.get_key(&parent.lid).await.unwrap().state,
+                if wrapped {
+                    KeyState::PendingDeletion
+                } else {
+                    KeyState::Destroyed
+                },
+                "legacy pending row must not gain data-loss approval"
+            );
+            if wrapped {
+                assert!(audit.events().iter().any(|event| event.action
+                    == keyrack_core::audit::AuditAction::KeyDestructionRefused
+                    && event.metadata["reason"] == "dependent_data_loss_not_approved"));
+                let (status, body) = request(
+                    upgraded.clone(),
+                    surface,
+                    &parent.lid.to_string(),
+                    "cancel",
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "legacy pending schedule remains cancellable: {body}"
+                );
+            }
+            drop(upgraded);
+            std::fs::remove_file(file).unwrap();
+        }
+    }
 }

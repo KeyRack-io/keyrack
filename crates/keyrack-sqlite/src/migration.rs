@@ -231,6 +231,16 @@ impl SqliteStorage {
             let KeyMaterial::ParentWrapped(material) = &entry.material else {
                 return Err(invalid("version is not wrapped"));
             };
+            let loss_decided: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM destruction_journal WHERE lid=?1) OR EXISTS(SELECT 1 FROM destroyed_wrapping_parents WHERE parent_lid=?1 AND parent_version=?2 AND child_lid=?3 AND child_version=?4)",
+                    rusqlite::params![material.parent().lid.to_string(), material.parent().version.get().to_string(), lid.to_string(), version.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_sql(&e))?;
+            if loss_decided {
+                return Err(KeyRackError::WrappingParentDestroyed);
+            }
             let envelope = envelope_ref(conn, material.wrapped_material_ref().as_str())?;
             let parent = creation::key(conn, &material.parent().lid)?
                 .ok_or(KeyRackError::WrappingParentDestroyed)?;

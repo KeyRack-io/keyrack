@@ -200,10 +200,14 @@ pub enum AuditAction {
     KeyDestroyed,
     #[serde(rename = "kms:KeyDestructionRefused")]
     KeyDestructionRefused,
+    #[serde(rename = "kms:KeyDestructionRetried")]
+    KeyDestructionRetried,
+    #[serde(rename = "kms:KeyDestructionDeferred")]
+    KeyDestructionDeferred,
     /// Outcome of the provider-side material delete performed by the deletion
     /// worker. Audited separately from `KeyDestroyed` (the record transition)
     /// so an operator can tell "`KeyRack` says destroyed" from "the backend
-    /// object is actually gone". An `Error` result means the material survives.
+    /// object is actually gone". An `Error` result leaves the provider outcome unconfirmed.
     #[serde(rename = "kms:ProviderDestroyKey")]
     ProviderDestroyKey,
 

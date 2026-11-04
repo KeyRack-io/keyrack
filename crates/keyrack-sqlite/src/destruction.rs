@@ -174,7 +174,7 @@ fn dependencies(conn: &Connection, lid: &Lid) -> Result<DestructionDependencies>
     }
     counts.dependents.sort();
     counts.dependents.dedup();
-    counts.dependent_parent_wrapped_versions =
+    counts.dependent_wrapping_edges =
         u64::try_from(counts.dependents.len()).map_err(|_| invalid("dependency count overflow"))?;
     Ok(counts)
 }
@@ -317,12 +317,13 @@ impl SqliteStorage {
             record.scheduled_deletion_at=Some(at);
             save_key(conn,&record,expected)?;
             conn.execute("INSERT INTO deletion_schedules(lid,scheduled_at,intent_json) VALUES(?1,?2,?3) ON CONFLICT(lid) DO UPDATE SET scheduled_at=excluded.scheduled_at,intent_json=excluded.intent_json",params![lid.to_string(),at.to_rfc3339(),serde_json::to_string(&approval).map_err(|_|invalid("intent serialization"))?]).map_err(|e|map_sql(&e))?;
-            Ok(ScheduledDeletion { record, logical_only_children: observed.logical_only_children })
+            Ok(ScheduledDeletion { record, logical_only_children: observed.logical_only_children, approved_dependents: approval.approved_dependents })
         })
     }
     pub(super) fn destruction_cancel(&self, lid: &Lid, expected: u64) -> Result<KeyRecord> {
         self.creation_tx(|conn| {
             guard(conn, lid)?;
+            crate::migration::guard(conn, lid)?;
             let mut record = checked_record(conn, lid, expected)?;
             if record.state != KeyState::PendingDeletion {
                 return Err(invalid("key is not pending deletion"));
@@ -350,22 +351,51 @@ impl SqliteStorage {
         expected: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<DestructionClaim>> {
-        let operation = uuid::Uuid::new_v4();
-        let record=self.creation_tx(|conn| {
-            let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM destruction_journal WHERE lid=?1)",[lid.to_string()],|row|row.get(0)).map_err(|e|map_sql(&e))?;
-            if exists {return Ok(None);}
-            let record=creation::key(conn,lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
-            let counts=dependencies(conn,lid)?;
-            counts.validate_intent(&intent(conn,&record)?.unwrap_or_default())?;
-            validate_owned_envelopes(conn,&record)?;
-            let record=prepare_claim(record,expected,now)?;
-            let json=serde_json::to_string(&record).map_err(|_|invalid("claim serialization"))?;
-            conn.execute("INSERT INTO destruction_journal(lid,operation_id,record_json,completed) VALUES(?1,?2,?3,0)",params![lid.to_string(),operation.to_string(),json]).map_err(|e|map_sql(&e))?;
-            save_key(conn,&record,expected)?;
-            Ok(Some(record))
+        let claimed = self.creation_tx(|conn| {
+            let journal: Option<(String, String, bool)> = conn.query_row(
+                "SELECT operation_id,record_json,completed FROM destruction_journal WHERE lid=?1",
+                [lid.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            ).optional().map_err(|e| map_sql(&e))?;
+            if let Some((operation, json, completed)) = journal {
+                if completed { return Ok(None); }
+                let snapshot: KeyRecord = serde_json::from_str(&json)
+                    .map_err(|_| invalid("invalid claim snapshot"))?;
+                let operation = operation.parse::<uuid::Uuid>()
+                    .map_err(|_| invalid("invalid claim operation"))?;
+                if operation.is_nil() || snapshot.lid != *lid || snapshot.state != KeyState::PendingDeletion {
+                    return Err(invalid("claim binding mismatch"));
+                }
+                let current = creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
+                if !keyrack_core::creation::same_json(&snapshot, &current)? {
+                    return Err(invalid("claimed snapshot changed"));
+                }
+                if expected != snapshot.occ_version { return Ok(None); }
+                keyrack_core::destruction::validate_destruction_history(&snapshot)?;
+                // Also backfill claims written before loss markers were part of admission.
+                record_loss_markers(conn, lid)?;
+                return Ok(Some((operation, snapshot, true)));
+            }
+            let record = creation::key(conn, lid)?.ok_or(KeyRackError::KeyNotFound(*lid))?;
+            let counts = dependencies(conn, lid)?;
+            counts.validate_intent(&intent(conn, &record)?.unwrap_or_default())?;
+            validate_owned_envelopes(conn, &record)?;
+            let record = prepare_claim(record, expected, now)?;
+            let operation = uuid::Uuid::new_v4();
+            let json = serde_json::to_string(&record).map_err(|_| invalid("claim serialization"))?;
+            conn.execute("INSERT INTO destruction_journal(lid,operation_id,record_json,completed) VALUES(?1,?2,?3,0)",
+                params![lid.to_string(), operation.to_string(), json]).map_err(|e| map_sql(&e))?;
+            record_loss_markers(conn, lid)?;
+            save_key(conn, &record, expected)?;
+            Ok(Some((operation, record, false)))
         })?;
-        record
-            .map(|record| DestructionClaim::committed(operation, record))
+        claimed
+            .map(|(operation, record, recovered)| {
+                if recovered {
+                    DestructionClaim::recovered(operation, record)
+                } else {
+                    DestructionClaim::committed(operation, record)
+                }
+            })
             .transpose()
     }
     pub(super) fn destruction_complete(&self, claim: DestructionClaim) -> Result<KeyRecord> {
@@ -374,24 +404,13 @@ impl SqliteStorage {
             let stored:Option<(String,String,bool)>=conn.query_row("SELECT operation_id,record_json,completed FROM destruction_journal WHERE lid=?1",[lid.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|e|map_sql(&e))?;
             let(operation,json,completed)=stored.ok_or(invalid("claim missing"))?;
             let snapshot:KeyRecord=serde_json::from_str(&json).map_err(|_|invalid("invalid claim snapshot"))?;
-            if completed || operation!=claim.operation().to_string() || !keyrack_core::creation::same_json(&snapshot,claim.record())? {return Err(invalid("claim mismatch or already completed"));}
+            if operation!=claim.operation().to_string() || !keyrack_core::creation::same_json(&snapshot,claim.record())? {return Err(invalid("claim mismatch"));}
             let current=creation::key(conn,&lid)?.ok_or(KeyRackError::KeyNotFound(lid))?;
-            let record=completed_record(&claim,&current)?;
-            // Mark only current wrapped versions, without touching dependent
-            // metadata, lifecycle state or envelope bytes.
-            let observed=dependencies(conn,&lid)?;
-            for edge in observed.dependents {
-                if let Some(child)=creation::key(conn,&edge.lid)? {
-                    if child.state==KeyState::Destroyed {continue;}
-                    if let Some(version)=child.get_version(edge.version) {
-                        if let KeyMaterial::ParentWrapped(material)=&version.material {
-                            if material.parent().lid==lid && material.parent().version.get()==edge.parent_version && material.wrapped_material_ref().as_str()==edge.envelope_ref {
-                                conn.execute("INSERT OR IGNORE INTO destroyed_wrapping_parents(child_lid,child_version,parent_lid,parent_version) VALUES(?1,?2,?3,?4)",params![edge.lid.to_string(),edge.version.to_string(),lid.to_string(),edge.parent_version.to_string()]).map_err(|e|map_sql(&e))?;
-                            }
-                        }
-                    }
-                }
+            if completed {
+                keyrack_core::destruction::validate_completed_record(&claim, &current)?;
+                return Ok(current);
             }
+            let record=completed_record(&claim,&current)?;
             conn.execute("INSERT INTO retired_creation_journal(operation_id,journal_json) SELECT operation_id,journal_json FROM creation_journal WHERE child_lid=?1 AND phase='committed' ON CONFLICT(operation_id) DO NOTHING",[lid.to_string()]).map_err(|e|map_sql(&e))?;
             conn.execute("DELETE FROM creation_journal WHERE child_lid=?1 AND phase='committed'",[lid.to_string()]).map_err(|e|map_sql(&e))?;
             conn.execute("DELETE FROM migration_envelopes WHERE operation_id IN (SELECT operation_id FROM migration_journal WHERE child_lid=?1 AND committed=1)",[lid.to_string()]).map_err(|e|map_sql(&e))?;
@@ -403,6 +422,30 @@ impl SqliteStorage {
         drop(claim);
         result
     }
+}
+
+// Persist loss before provider effects; inspect current descriptors rather than
+// marking retired envelopes or a child version rewrapped to another parent.
+fn record_loss_markers(conn: &Connection, lid: &Lid) -> Result<()> {
+    let observed = dependencies(conn, lid)?;
+    for edge in observed.dependents {
+        if let Some(child) = creation::key(conn, &edge.lid)? {
+            if child.state == KeyState::Destroyed {
+                continue;
+            }
+            if let Some(version) = child.get_version(edge.version) {
+                if let KeyMaterial::ParentWrapped(material) = &version.material {
+                    if material.parent().lid == *lid
+                        && material.parent().version.get() == edge.parent_version
+                        && material.wrapped_material_ref().as_str() == edge.envelope_ref
+                    {
+                        conn.execute("INSERT OR IGNORE INTO destroyed_wrapping_parents(child_lid,child_version,parent_lid,parent_version) VALUES(?1,?2,?3,?4)",params![edge.lid.to_string(),edge.version.to_string(),lid.to_string(),edge.parent_version.to_string()]).map_err(|e|map_sql(&e))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn guard_update(conn: &Connection, record: &KeyRecord) -> Result<()> {
@@ -432,7 +475,7 @@ mod tests {
     use keyrack_test_support::fixtures::unique_test_key_record;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn independent_connections_and_restart_do_not_reissue_claims() {
+    async fn independent_connections_and_restart_resume_the_same_claim() {
         let path = std::env::temp_dir().join(format!(
             "keyrack-destruction-{}.sqlite",
             uuid::Uuid::new_v4()
@@ -453,15 +496,19 @@ mod tests {
             (attempt.join().unwrap().unwrap(), other.unwrap())
         });
         assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
+        let operation = a.as_ref().or(b.as_ref()).unwrap().operation();
         drop((a, b));
         drop(first);
         drop(second);
         let reopened = SqliteStorage::open(&path).unwrap();
-        assert!(reopened
+        let recovered = reopened
             .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
             .await
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert!(recovered.is_recovered());
+        assert_eq!(recovered.operation(), operation);
+        assert_eq!(recovered.record().occ_version, record.occ_version + 1);
         let mut cancelled = reopened.get_key(&record.lid).await.unwrap();
         cancelled.transition_to(KeyState::Disabled).unwrap();
         assert!(reopened.update_key(&cancelled).await.is_err());
@@ -510,14 +557,25 @@ mod tests {
             store.get_key(&record.lid).await.unwrap().state,
             KeyState::PendingDeletion
         );
-        assert!(store
+        let recovered = store
             .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
             .await
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert!(recovered.is_recovered());
         let mut cancelled = store.get_key(&record.lid).await.unwrap();
         cancelled.transition_to(KeyState::Disabled).unwrap();
         assert!(store.update_key(&cancelled).await.is_err());
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_completion;")
+                    .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        assert_eq!(
+            store.complete_destruction(recovered).await.unwrap().state,
+            KeyState::Destroyed
+        );
     }
     async fn published(
         store: &SqliteStorage,
@@ -599,6 +657,138 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .allow_dependent_data_loss
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_pending_row_without_schedule_has_no_loss_approval() {
+        for wrapped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy.sqlite");
+            let old = SqliteStorage::open(&path).unwrap();
+            let mut parent = if wrapped {
+                published(&old).await.0
+            } else {
+                let key = unique_test_key_record(KeyState::Enabled);
+                old.create_key(&key).await.unwrap();
+                key
+            };
+            parent = due(parent);
+            old.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE keys SET record_json=?1 WHERE lid=?2",
+                    params![
+                        serde_json::to_string(&parent).unwrap(),
+                        parent.lid.to_string()
+                    ],
+                )
+                .map_err(|error| map_sql(&error))?;
+                conn.execute_batch(
+                    "DROP TABLE deletion_schedules; DROP TABLE destroyed_wrapping_parents;",
+                )
+                .map_err(|error| map_sql(&error))
+            })
+            .unwrap();
+            drop(old);
+            let upgraded = SqliteStorage::open(&path).unwrap();
+            assert!(upgraded
+                .deletion_intent(&parent.lid)
+                .await
+                .unwrap()
+                .is_none());
+            let result = upgraded
+                .claim_destruction(&parent.lid, parent.occ_version, chrono::Utc::now())
+                .await;
+            if wrapped {
+                assert!(
+                    matches!(result, Err(KeyRackError::DeletionDependencyRefused { ref reason, .. }) if reason == "dependent_data_loss_not_approved")
+                );
+                assert_eq!(
+                    upgraded.get_key(&parent.lid).await.unwrap().state,
+                    KeyState::PendingDeletion
+                );
+            } else {
+                assert!(result.unwrap().is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claimed_loss_survives_completion_failure_and_storage_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.sqlite");
+        let store = SqliteStorage::open(&path).unwrap();
+        let (parent, request) = published(&store).await;
+        let pending = store
+            .schedule_destruction(&parent.lid, parent.occ_version, chrono::Utc::now(), true)
+            .await
+            .unwrap()
+            .record;
+        // Marker insertion and the initial claim must roll back together.
+        store.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_initial_claim BEFORE UPDATE ON keys BEGIN SELECT RAISE(ABORT,'injected claim failure'); END;").map_err(|e| map_sql(&e))).unwrap();
+        assert!(store
+            .claim_destruction(&parent.lid, pending.occ_version, chrono::Utc::now())
+            .await
+            .is_err());
+        assert!(store
+            .destroyed_wrapping_parents(&request.record.lid)
+            .await
+            .unwrap()
+            .is_empty());
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_initial_claim;")
+                    .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        let claim = store
+            .claim_destruction(&parent.lid, pending.occ_version, chrono::Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = claim.operation();
+        store.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE ON destruction_journal BEGIN SELECT RAISE(ABORT,'injected completion failure'); END;").map_err(|e| map_sql(&e))).unwrap();
+        assert!(store.complete_destruction(claim).await.is_err());
+        drop(store);
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let markers = reopened
+            .destroyed_wrapping_parents(&request.record.lid)
+            .await
+            .unwrap();
+        assert_eq!(
+            markers,
+            vec![DestroyedWrappingParent {
+                version: 1,
+                parent_lid: parent.lid,
+                parent_version: 1
+            }]
+        );
+        assert!(matches!(
+            reopened.wrapped_key_snapshot(&request.record.lid, 1).await,
+            Err(KeyRackError::WrappingParentDestroyed)
+        ));
+        let current = reopened.get_key(&parent.lid).await.unwrap();
+        assert_eq!(current.state, KeyState::PendingDeletion);
+        let recovered = reopened
+            .claim_destruction(&parent.lid, current.occ_version, chrono::Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recovered.is_recovered());
+        assert_eq!(recovered.operation(), operation);
+        reopened
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_completion;")
+                    .map_err(|e| map_sql(&e))
+            })
+            .unwrap();
+        assert_eq!(
+            reopened
+                .complete_destruction(recovered)
+                .await
+                .unwrap()
+                .state,
+            KeyState::Destroyed
         );
     }
 
@@ -686,6 +876,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // The durable decision is visible before provider deletion or completion.
+        assert_eq!(
+            store.destroyed_wrapping_parents(&before.lid).await.unwrap(),
+            vec![DestroyedWrappingParent {
+                version: 1,
+                parent_lid: parent.lid,
+                parent_version: 1
+            }]
+        );
+        assert!(matches!(
+            store.wrapped_key_snapshot(&before.lid, 1).await,
+            Err(KeyRackError::WrappingParentDestroyed)
+        ));
         assert_eq!(
             store.complete_destruction(claim).await.unwrap().state,
             KeyState::Destroyed
@@ -865,11 +1068,20 @@ mod tests {
         store
             .stage_migration(
                 request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&store, request.operation)
+                    .await,
                 &keyrack_test_support::migration_conformance::envelopes(),
             )
             .await
             .unwrap();
-        let child = store.commit_migration(request.operation).await.unwrap();
+        let child = store
+            .commit_migration(
+                request.operation,
+                keyrack_test_support::migration_conformance::test_owner(&store, request.operation)
+                    .await,
+            )
+            .await
+            .unwrap();
         let pending = store
             .schedule_destruction(&child.lid, child.occ_version, chrono::Utc::now(), false)
             .await
@@ -914,11 +1126,26 @@ mod tests {
             let staged = store
                 .stage_migration(
                     request.operation,
+                    keyrack_test_support::migration_conformance::test_owner(
+                        &store,
+                        request.operation,
+                    )
+                    .await,
                     &keyrack_test_support::migration_conformance::envelopes(),
                 )
                 .await
                 .unwrap();
-            let mut child = store.commit_migration(request.operation).await.unwrap();
+            let mut child = store
+                .commit_migration(
+                    request.operation,
+                    keyrack_test_support::migration_conformance::test_owner(
+                        &store,
+                        request.operation,
+                    )
+                    .await,
+                )
+                .await
+                .unwrap();
             if corrupt_after_schedule {
                 child = store
                     .schedule_destruction(&child.lid, child.occ_version, chrono::Utc::now(), false)
@@ -1045,6 +1272,11 @@ mod tests {
                 store
                     .stage_migration(
                         request.operation,
+                        keyrack_test_support::migration_conformance::test_owner(
+                            &store,
+                            request.operation,
+                        )
+                        .await,
                         &keyrack_test_support::migration_conformance::envelopes(),
                     )
                     .await

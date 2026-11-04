@@ -257,8 +257,6 @@ impl StorageBackend for PostgresStorage {
         migration::guard(&mut connection, lid).await
     }
 
-
-
     async fn claim_destruction(
         &self,
         lid: &Lid,

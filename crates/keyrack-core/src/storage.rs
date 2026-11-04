@@ -204,18 +204,12 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
-    /// Read all destruction blockers in one consistent storage snapshot. Count
-    /// material versions, all parent/child creation journal rows, and nonterminal
-    /// migrations naming the key as child/source/target, not logical parent links.
-    /// This is advisory: claim MUST recheck under its writer fence.
-    /// Unsupported implementations fail closed, never return empty counts.
-
-
-    /// Commit a one-shot resident destruction fence before any provider effect.
-    /// Re-read state, due time, OCC and full material history in the transaction;
-    /// reject creation references and nonterminal migration participants. All
-    /// writers must honor the fence. None means already claimed, NEVER permission to dispatch again.
-    /// A commit/response failure is ambiguous and must not be retried as work.
+    /// Commit the destruction fence and dependent loss markers before effects.
+    /// Re-read state, due time, OCC and full material history in the transaction.
+    /// Existing incomplete journals resume the same operation and frozen material
+    /// snapshot at the current OCC; stale scans and completed operations return
+    /// None. All writers honor the permanent fence. Provider deletes must be
+    /// idempotent, including an already-absent key.
     async fn claim_destruction(
         &self,
         _lid: &Lid,
@@ -228,7 +222,8 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Atomically publish Destroyed for the exact claim after ALL provider
-    /// destroys succeeded. Consume the ticket; errors retain the durable fence.
+    /// destroys succeeded. Repeated completion of the same operation is
+    /// idempotent; errors retain the durable fence for a later worker pass.
     /// This is a trusted service/storage boundary, not external authorization.
     async fn complete_destruction(
         &self,

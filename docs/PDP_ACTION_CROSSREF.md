@@ -212,6 +212,8 @@ precedes the worker claim.
 | Rotation job expiry worker | `kms:RotationJobExpired` | **No** |
 | Scheduled key destruction worker | `kms:KeyDestroyed` | **No** |
 | Destruction claim refusal | `kms:KeyDestructionRefused` | New in 0.5.0 |
+| Retained destruction operation resumed | `kms:KeyDestructionRetried` | New in 0.5.0 |
+| Provider or completion outcome unconfirmed | `kms:KeyDestructionDeferred` | New in 0.5.0 |
 
 ## Action registry maintenance
 

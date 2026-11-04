@@ -16,7 +16,7 @@ enum Blocker {
 impl Blocker {
     fn count(self) -> &'static str {
         match self {
-            Self::DependentWrappedVersion => "dependent_parent_wrapped_versions=1",
+            Self::DependentWrappedVersion => "dependent_wrapping_edges=1",
             Self::ParentJournal | Self::ChildJournal => "creation_journal_rows=1",
         }
     }

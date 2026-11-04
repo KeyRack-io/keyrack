@@ -69,11 +69,14 @@ async fn destruction_claim_survives_reconnect_and_completion_rollback() {
         .unwrap();
     drop(store);
     let reopened = make_store().await;
-    assert!(reopened
+    let recovered = reopened
         .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert!(recovered.is_recovered());
+    assert_eq!(recovered.operation(), claim.operation());
+    drop(recovered);
     let name = format!("destruction_failure_{}", uuid::Uuid::new_v4().simple());
     let function = format!("{name}_fn");
     sqlx::query(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected destruction completion failure'; END; $$"))
@@ -98,8 +101,26 @@ async fn destruction_claim_survives_reconnect_and_completion_rollback() {
     assert_eq!(still_fenced.occ_version, record.occ_version + 1);
     still_fenced.transition_to(KeyState::Disabled).unwrap();
     assert!(reopened.update_key(&still_fenced).await.is_err());
-    assert!(reopened
+    let recovered = reopened
         .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered.is_recovered());
+    let concurrent_recovery = reopened
+        .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = reopened.complete_destruction(recovered).await.unwrap();
+    let repeated = reopened
+        .complete_destruction(concurrent_recovery)
+        .await
+        .unwrap();
+    assert!(keyrack_core::creation::same_json(&completed, &repeated).unwrap());
+    assert_eq!(completed.state, KeyState::Destroyed);
+    assert!(reopened
+        .claim_destruction(&record.lid, completed.occ_version, chrono::Utc::now())
         .await
         .unwrap()
         .is_none());

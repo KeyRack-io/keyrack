@@ -652,7 +652,12 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   versions in fresh `wrapping_parent_destroyed_versions` metadata on key
   responses, and makes subsequent opens fail with `wrapping parent destroyed`.
   The assurance covers KeyRack's own keys, versions, wrapped edges and journals;
-  existing permanent-claim and recovery limitations remain.
+  physical storage copies and externally retained material remain outside it.
+
+- Destruction claims persist dependent-loss status before provider deletion and
+  recover incomplete operations after restart using the same frozen handles.
+  Confirmed provider-key absence permits completion; deferred and retried
+  operations are audited. Loss markers match current wrapping parent bindings.
 
 ## [0.4.0] — 2026-08-30
 

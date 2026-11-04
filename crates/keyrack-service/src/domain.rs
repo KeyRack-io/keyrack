@@ -110,14 +110,12 @@ impl std::fmt::Display for DomainError {
 
 impl From<keyrack_core::error::KeyRackError> for DomainError {
     fn from(e: keyrack_core::error::KeyRackError) -> Self {
-        use keyrack_core::error::KeyRackError;
         match &e {
             KeyRackError::KeyNotFound(_) => Self::NotFound(e.to_string()),
             KeyRackError::Storage(msg) if msg.contains("not found") => {
                 Self::NotFound(e.to_string())
             }
             KeyRackError::DeletionDependencyRefused { .. }
-            | KeyRackError::MigrationIntentConflict { .. }
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
             | KeyRackError::InvalidIdentity(_)
@@ -128,6 +126,7 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             KeyRackError::OptimisticConcurrencyConflict { .. }
             | KeyRackError::InvalidStateTransition { .. }
             | KeyRackError::KeyDestructionFenced(_)
+            | KeyRackError::MigrationIntentConflict { .. }
             | KeyRackError::WrappingParentDestroyed => Self::Core(e),
             _ => Self::Internal(e.to_string()),
         }
@@ -144,7 +143,6 @@ impl DomainError {
             Self::ProviderUnavailable(msg) => tonic::Status::unavailable(msg),
             Self::Internal(msg) => tonic::Status::internal(msg),
             Self::Core(e) => {
-                use keyrack_core::error::KeyRackError;
                 let msg = e.to_string();
                 match e {
                     KeyRackError::KeyNotFound(_) => tonic::Status::not_found(msg),
@@ -182,44 +180,41 @@ impl DomainError {
                 (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
             }
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
-            Self::Core(e) => {
-                use keyrack_core::error::KeyRackError;
-                match e {
-                    KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
-                    KeyRackError::OptimisticConcurrencyConflict { .. } => {
-                        (StatusCode::CONFLICT, "OccConflict")
-                    }
-                    KeyRackError::DeletionDependencyRefused { .. } => {
-                        (StatusCode::CONFLICT, "FailedPrecondition")
-                    }
-                    KeyRackError::KeyDestructionFenced(_) => {
-                        (StatusCode::CONFLICT, "KeyDestructionFenced")
-                    }
-                    KeyRackError::MigrationIntentConflict { .. } => {
-                        (StatusCode::CONFLICT, "MigrationIntentConflict")
-                    }
-                    KeyRackError::WrappingParentDestroyed => {
-                        (StatusCode::CONFLICT, "WrappingParentDestroyed")
-                    }
-                    KeyRackError::InvalidStateTransition { .. } => {
-                        (StatusCode::CONFLICT, "InvalidStateTransition")
-                    }
-                    KeyRackError::OperationNotPermitted { .. } => {
-                        (StatusCode::FORBIDDEN, "OperationNotPermitted")
-                    }
-                    KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
-                    KeyRackError::EncryptionContextMismatch => {
-                        (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
-                    }
-                    KeyRackError::AuthorizationDenied { .. } => {
-                        (StatusCode::FORBIDDEN, "AuthorizationDenied")
-                    }
-                    KeyRackError::ProviderUnavailable(_) => {
-                        (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
-                    }
-                    _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            Self::Core(e) => match e {
+                KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
+                KeyRackError::OptimisticConcurrencyConflict { .. } => {
+                    (StatusCode::CONFLICT, "OccConflict")
                 }
-            }
+                KeyRackError::DeletionDependencyRefused { .. } => {
+                    (StatusCode::CONFLICT, "FailedPrecondition")
+                }
+                KeyRackError::KeyDestructionFenced(_) => {
+                    (StatusCode::CONFLICT, "KeyDestructionFenced")
+                }
+                KeyRackError::WrappingParentDestroyed => {
+                    (StatusCode::CONFLICT, "WrappingParentDestroyed")
+                }
+                KeyRackError::MigrationIntentConflict { .. } => {
+                    (StatusCode::CONFLICT, "MigrationIntentConflict")
+                }
+                KeyRackError::InvalidStateTransition { .. } => {
+                    (StatusCode::CONFLICT, "InvalidStateTransition")
+                }
+                KeyRackError::OperationNotPermitted { .. } => {
+                    (StatusCode::FORBIDDEN, "OperationNotPermitted")
+                }
+                KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
+                KeyRackError::EncryptionContextMismatch => {
+                    (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
+                }
+                KeyRackError::AuthorizationDenied { .. } => {
+                    (StatusCode::FORBIDDEN, "AuthorizationDenied")
+                }
+                KeyRackError::ProviderUnavailable(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            },
         };
         crate::ops::rest_error(code, kind, &self.to_string())
     }
@@ -962,8 +957,6 @@ pub async fn disable_key(
     lid: &Lid,
     key_id: &str,
 ) -> Result<DisableKeyResult, keyrack_core::error::KeyRackError> {
-    use keyrack_core::error::KeyRackError;
-
     let lid = *lid;
     state.storage.check_migration_fence(&lid).await?;
     let mut record = state.storage.get_key_for_use(&lid).await?;
@@ -1078,6 +1071,11 @@ pub async fn cancel_key_deletion(
     key_id: &str,
 ) -> Result<KeyRecord, DomainError> {
     let lid = parse_lid(key_id)?;
+    state
+        .storage
+        .check_migration_fence(&lid)
+        .await
+        .map_err(DomainError::from)?;
     let record = state.storage.get_key_for_use(&lid).await?;
     if record.state != KeyState::PendingDeletion {
         return Err(DomainError::FailedPrecondition(
@@ -1176,6 +1174,7 @@ async fn open_usable(
     mut prepared: PreparedUse,
     provider: &Arc<dyn CryptoProvider>,
 ) -> Result<OpenedUse, DomainError> {
+    let mut refreshed_parent = false;
     loop {
         match prepared {
             PreparedUse::Resident(handle) => {
@@ -1204,6 +1203,12 @@ async fn open_usable(
                         })
                     }
                     Err(keyrack_core::error::KeyRackError::WrappingParentDestroyed) => {
+                        if refreshed_parent {
+                            return Err(DomainError::from(
+                                keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+                            ));
+                        }
+                        refreshed_parent = true;
                         // A committed migration may retire and destroy the old
                         // parent between the atomic read and the provider open.
                         // Refresh only the binding, before any caller crypto is
@@ -1245,6 +1250,29 @@ async fn prepare_usable(
     }
 }
 
+/// Loss status is read live and applies only to the current wrapping edge.
+pub async fn destroyed_wrapping_versions(
+    state: &ServiceState,
+    lid: &Lid,
+) -> keyrack_core::error::Result<Vec<u64>> {
+    let record = state.storage.get_key_for_use(lid).await?;
+    let markers = state.storage.destroyed_wrapping_parents(lid).await?;
+    let mut versions: Vec<_> = markers
+        .into_iter()
+        .filter(|lost| {
+            record.get_version(lost.version).is_some_and(|version| {
+                matches!(&version.material,
+            KeyMaterial::ParentWrapped(material) if material.parent().lid == lost.parent_lid
+                && material.parent().version.get() == lost.parent_version)
+            })
+        })
+        .map(|lost| lost.version)
+        .collect();
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(versions)
+}
+
 /// One transaction reads the current descriptor, its envelope and its exact
 /// parent. A caller retaining pre-migration metadata therefore cannot observe
 /// the gap between publishing a new descriptor and erasing the old envelope.
@@ -1271,6 +1299,21 @@ async fn prepare_wrapped(
     let KeyMaterial::ParentWrapped(material) = &version.material else {
         return Err(DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()));
     };
+    if state
+        .storage
+        .destroyed_wrapping_parents(lid)
+        .await?
+        .iter()
+        .any(|lost| {
+            lost.version == version_number
+                && lost.parent_lid == material.parent().lid
+                && lost.parent_version == material.parent().version.get()
+        })
+    {
+        return Err(DomainError::from(
+            keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+        ));
+    }
     let parent_version = parent
         .get_version(material.parent().version.get())
         .ok_or_else(|| {

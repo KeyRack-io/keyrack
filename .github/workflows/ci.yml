@@ -161,6 +161,8 @@ jobs:
             migrated_child_erasure_removes_all_version_envelopes
             nonterminal_migration_roles_refuse_even_with_override
             schedule_reports_logical_children_from_its_admission_snapshot
+            claimed_parent_loss_survives_completion_failure_and_reconnect
+            existing_database_pending_deletion_without_schedule_has_no_implicit_approval
           )
           listing=$(cargo test --locked -p keyrack-postgres --features live-tests --test deletion_overrides -- --list)
           for test_name in "${tests[@]}"; do
@@ -182,7 +184,7 @@ jobs:
         run: |
           set -euo pipefail
           listing=$(cargo test --locked -p keyrack-service --test integration -- --list)
-          for test_name in dependency_override_event_surface_matrix override_requires_its_own_permission_on_both_surfaces refusal_is_audited_and_counted_without_destroying_material destroyed_parent_is_explicit_and_child_envelopes_can_be_erased_on_both_surfaces migration_journals_refuse_all_roles_and_overrides_on_both_surfaces rest_rejects_non_boolean_data_loss_intent; do
+          for test_name in dependency_override_event_surface_matrix override_requires_its_own_permission_on_both_surfaces refusal_is_audited_and_counted_without_destroying_material destroyed_parent_is_explicit_and_child_envelopes_can_be_erased_on_both_surfaces migration_journals_refuse_all_roles_and_overrides_on_both_surfaces rest_rejects_non_boolean_data_loss_intent destruction_completion_failure_recovers_after_restart_on_both_surfaces rotation_and_rewrap_reject_persisted_stale_approval_on_both_surfaces retained_loss_markers_match_current_parent_identity_and_version existing_database_pending_deletion_has_no_implicit_loss_approval; do
             grep -Fxq "deletion_override::${test_name}: test" <<< "$listing"
           done
           cargo test --locked -p keyrack-service --test integration deletion_
@@ -190,6 +192,8 @@ jobs:
         run: python3 scripts/test-deletion-scheduling-controls.py --output "${{ runner.temp }}/deletion-scheduling"
       - name: Revert approval and claim refusals
         run: python3 scripts/test-deletion-approval-controls.py --output "${{ runner.temp }}/deletion-approval"
+      - name: Revert provider recovery and bounded-open controls
+        run: python3 scripts/test-destruction-recovery-controls.py --output "${{ runner.temp }}/destruction-recovery"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -197,6 +201,7 @@ jobs:
           path: |
             ${{ runner.temp }}/deletion-scheduling/
             ${{ runner.temp }}/deletion-approval/
+            ${{ runner.temp }}/destruction-recovery/
           if-no-files-found: error
 
   docker:

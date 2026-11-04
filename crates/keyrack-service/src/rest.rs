@@ -143,16 +143,10 @@ struct KeyListResponse {
 // failed marker query may silently become an empty loss-status list.
 async fn key_response(state: &ServiceState, record: &KeyRecord) -> Result<KeyResponse, RestError> {
     let mut response = KeyResponse::from(record);
-    response.wrapping_parent_destroyed_versions = state
-        .storage
-        .destroyed_wrapping_parents(&record.lid)
-        .await
-        .map_err(map_core_err)?
-        .into_iter()
-        .map(|lost| lost.version)
-        .collect();
-    response.wrapping_parent_destroyed_versions.sort_unstable();
-    response.wrapping_parent_destroyed_versions.dedup();
+    response.wrapping_parent_destroyed_versions =
+        crate::domain::destroyed_wrapping_versions(state, &record.lid)
+            .await
+            .map_err(map_core_err)?;
     Ok(response)
 }
 
@@ -711,11 +705,13 @@ async fn schedule_key_deletion(
     };
     let mut op_ctx = OpContext::deletion_schedule(principal, &key_id, allow);
     op_ctx.request_id = request_id;
+    let record_snapshot = op_ctx.deletion_snapshot_recorder();
     ops::execute_rest(&state, op_ctx, |state| async move {
         let scheduled =
             crate::domain::schedule_key_deletion_with_intent(&state, &key_id, days, allow)
                 .await
                 .map_err(|error| error.to_rest_error())?;
+        record_snapshot(scheduled.approved_dependents.clone());
         let Json(mut response) = key_json(&state, &scheduled.record).await?;
         response["logical_only_children"] = serde_json::json!(scheduled.logical_only_children);
         Ok(Json(response))
