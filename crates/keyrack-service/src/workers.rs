@@ -28,7 +28,8 @@ use crate::state::ServiceState;
 use keyrack_core::audit::{
     AuditAction, AuditEvent, AuditPrincipal, AuditResource, AuditResult, EventType,
 };
-use keyrack_core::key::{KeyRecord, KeyState};
+use keyrack_core::key::KeyState;
+use keyrack_core::provider::DestroyKeyOutcome;
 use keyrack_core::rotation::RotationJobState;
 use keyrack_core::storage::KeyFilter;
 use std::sync::Arc;
@@ -141,7 +142,7 @@ pub async fn run_deletion_scan_at(
             metrics::counter!("keyrack_deletion_retries_total").increment(1);
         }
         // The transactionally fenced snapshot, NEVER the scan row.
-        if !destroy_backend_material(state, claim.record()).await {
+        if !destroy_backend_material(state, &claim).await {
             emit_destruction_progress(
                 state,
                 &claim,
@@ -206,6 +207,12 @@ async fn emit_destruction_progress(
     action: AuditAction,
     reason: &str,
 ) {
+    // A resumed attempt is not itself a failure or proof of completion.
+    let result = if action == AuditAction::KeyDestructionRetried {
+        AuditResult::Success
+    } else {
+        AuditResult::Error
+    };
     let mut event = AuditEvent::new(
         EventType::KeyDeleted,
         action,
@@ -214,7 +221,7 @@ async fn emit_destruction_progress(
             id: claim.record().lid.to_string(),
             resource_type: "Key".into(),
         },
-        AuditResult::Error,
+        result,
     );
     event.add_metadata("operation_id", claim.operation().to_string());
     event.add_metadata("reason", reason);
@@ -229,13 +236,17 @@ async fn emit_destruction_progress(
 ///
 /// A retained claim may retry the same immutable handles after restart. Providers
 /// must treat confirmed absence as success; unknown outcomes keep the fence.
-async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> bool {
+async fn destroy_backend_material(
+    state: &ServiceState,
+    claim: &keyrack_core::destruction::DestructionClaim,
+) -> bool {
+    let record = claim.record();
     // Envelope bytes are erased only by fenced storage completion. Never ask a
     // provider to destroy the wrapped child's parent handle or transient lease.
     if let Err(error) = keyrack_core::destruction::validate_destruction_history(record) {
         emit_destroy_event(
             state,
-            record,
+            claim,
             record.current_key_version,
             Err(&error.to_string()),
         )
@@ -264,8 +275,7 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
                 providers.insert(binding, entry);
             }
             Err(e) => {
-                emit_destroy_event(state, record, version.version_number, Err(&e.to_string()))
-                    .await;
+                emit_destroy_event(state, claim, version.version_number, Err(&e.to_string())).await;
                 return false;
             }
         }
@@ -289,9 +299,9 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
             return false;
         };
 
-        match entry.provider.destroy_key(handle).await {
-            Ok(()) => {
-                emit_destroy_event(state, record, version.version_number, Ok(())).await;
+        match entry.provider.destroy_key_with_outcome(handle).await {
+            Ok(outcome) => {
+                emit_destroy_event(state, claim, version.version_number, Ok(outcome)).await;
             }
             Err(e) => {
                 let reason = e.to_string();
@@ -302,7 +312,7 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
                     error = %reason,
                     "provider failed to destroy key material; key NOT destroyed"
                 );
-                emit_destroy_event(state, record, version.version_number, Err(&reason)).await;
+                emit_destroy_event(state, claim, version.version_number, Err(&reason)).await;
                 return false;
             }
         }
@@ -315,10 +325,11 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
 /// partial destruction, not proof that the backend material survives.
 async fn emit_destroy_event(
     state: &ServiceState,
-    record: &KeyRecord,
+    claim: &keyrack_core::destruction::DestructionClaim,
     version_number: u64,
-    outcome: Result<(), &str>,
+    outcome: Result<DestroyKeyOutcome, &str>,
 ) {
+    let record = claim.record();
     let mut event = AuditEvent::new(
         EventType::KeyDeleted,
         AuditAction::ProviderDestroyKey,
@@ -334,6 +345,11 @@ async fn emit_destroy_event(
         },
     );
     event.add_metadata("key_version", version_number);
+    event.add_metadata("operation_id", claim.operation().to_string());
+    event.add_metadata("recovered", claim.is_recovered());
+    if matches!(outcome, Ok(DestroyKeyOutcome::AlreadyAbsent)) {
+        event.add_metadata("reason", "provider_key_already_absent");
+    }
     if let Err(reason) = outcome {
         event.add_metadata("error", reason);
     }

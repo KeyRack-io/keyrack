@@ -50,6 +50,15 @@ use crate::sensitive::Sensitive;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Successful provider deletion, optionally distinguishing confirmed absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestroyKeyOutcome {
+    /// The delete contract completed; the provider does not assert prior absence.
+    Completed,
+    /// The backend confirmed absence under this provider's visibility rules.
+    AlreadyAbsent,
+}
+
 /// Opaque handle to key material managed by a provider.
 ///
 /// The `key_id` is provider-internal (e.g. a UUID, HSM object label,
@@ -431,6 +440,15 @@ pub trait CryptoProvider: Send + Sync {
     /// Confirmed absence must return success; access/transport errors must not.
     /// Handles must not be reused for replacement material.
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()>;
+
+    /// Delete with an optional absence distinction for auditing. The default
+    /// preserves existing providers without inferring absence from unit success.
+    /// Overrides must use the delete operation's own evidence, not a preflight
+    /// lookup that races deletion. Access and transport errors remain errors.
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
+        self.destroy_key(handle).await?;
+        Ok(DestroyKeyOutcome::Completed)
+    }
 
     /// Report the algorithms, key specs, and operations this provider
     /// supports.

@@ -33,8 +33,8 @@ use cryptoki::types::AuthPin;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use std::collections::HashMap;
@@ -1186,18 +1186,23 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
+fn destroy_objects_by_label(session: &Session, label: &str) -> Result<DestroyKeyOutcome> {
     let template = vec![Attribute::Label(label.as_bytes().to_vec())];
     let objects = session
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find for destroy", &e))?;
 
+    // This is absence in the authenticated session's label-search view, not
+    // proof that no object exists outside that view.
+    if objects.is_empty() {
+        return Ok(DestroyKeyOutcome::AlreadyAbsent);
+    }
     for obj in objects {
         session
             .destroy_object(obj)
             .map_err(|e| map_pkcs11_error("destroy_object", &e))?;
     }
-    Ok(())
+    Ok(DestroyKeyOutcome::Completed)
 }
 
 #[async_trait]
@@ -1326,6 +1331,10 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
         let label = handle.key_id.clone();
 
         self.run(move |session| destroy_objects_by_label(session, &label))
@@ -1881,10 +1890,20 @@ mod concurrent_login_tests {
         drop(anchor);
         let cold_wrong_pin_denied = Pkcs11Provider::new(&wrong_config).is_err();
         let cold_correct_pin_accepted = Pkcs11Provider::new(&config).is_ok();
-        first
-            .destroy_key(&handle)
-            .await
-            .expect("regression key cleanup");
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("regression key cleanup"),
+            DestroyKeyOutcome::Completed
+        );
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("empty authenticated label search"),
+            DestroyKeyOutcome::AlreadyAbsent
+        );
         assert!(
             ambient_wrong_pin_denied,
             "constructor bypassed credential validation"

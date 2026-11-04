@@ -53,8 +53,8 @@ use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use serde::{Deserialize, Serialize};
@@ -237,15 +237,16 @@ impl KmipProvider {
         Ok(())
     }
 
-    fn check_destroy_response(resp: &messages::KmipResponse) -> Result<()> {
+    fn check_destroy_response(resp: &messages::KmipResponse) -> Result<DestroyKeyOutcome> {
         // KMIP 1.4 §9.1.3.2.29: Item Not Found = 0x00000001.
         // Only Destroy may turn this exact failed-operation reason into success.
         if resp.result_status == ttlv::result_status::OPERATION_FAILED
             && resp.result_reason == Some(0x0000_0001)
         {
-            return Ok(());
+            return Ok(DestroyKeyOutcome::AlreadyAbsent);
         }
-        Self::check_response(resp)
+        Self::check_response(resp)?;
+        Ok(DestroyKeyOutcome::Completed)
     }
 
     fn key_spec_to_kmip(spec: &KeySpec) -> Result<(u32, i32, bool)> {
@@ -458,6 +459,10 @@ impl CryptoProvider for KmipProvider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
         // KMIP forbids destroying an Active object, and `generate_key`
         // activates every key it creates, so Destroy on its own always fails.
         // A revoke failure is not fatal: the key may already be deactivated,
@@ -481,7 +486,7 @@ impl CryptoProvider for KmipProvider {
         let request = messages::destroy_request(&handle.key_id);
 
         let resp = self.send_request(&request).await?;
-        Self::check_destroy_response(&resp)?;
+        let outcome = Self::check_destroy_response(&resp)?;
 
         tracing::info!(
             key_id = %handle.key_id,
@@ -489,7 +494,7 @@ impl CryptoProvider for KmipProvider {
             "KMIP key destroyed"
         );
 
-        Ok(())
+        Ok(outcome)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -557,11 +562,33 @@ mod tests {
                 super::KmipProvider::check_destroy_response(&response).is_ok(),
                 accepted
             );
+            if accepted {
+                assert_eq!(
+                    super::KmipProvider::check_destroy_response(&response).unwrap(),
+                    DestroyKeyOutcome::AlreadyAbsent
+                );
+            }
             assert!(
                 super::KmipProvider::check_response(&response).is_err(),
                 "absence must not make non-destroy operations succeed"
             );
         }
+    }
+
+    #[test]
+    fn successful_destroy_does_not_assert_prior_absence() {
+        let frame = crate::ttlv::structure(
+            0x0042_007b,
+            vec![crate::ttlv::structure(
+                0x0042_000f,
+                vec![crate::ttlv::enumeration(0x0042_007f, 0)],
+            )],
+        );
+        let response = crate::messages::parse_response(&frame).unwrap();
+        assert_eq!(
+            super::KmipProvider::check_destroy_response(&response).unwrap(),
+            DestroyKeyOutcome::Completed
+        );
     }
 
     use super::*;

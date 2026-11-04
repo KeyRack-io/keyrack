@@ -33,9 +33,9 @@ use crate::creation::{
 use crate::error::{KeyRackError, Result};
 use crate::key::{KeySpec, ProviderRef};
 use crate::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, GeneratedWrappedKey, KeyHandle,
-    KeySpecCapability, MacAlgorithm, ProviderCapabilities, SigningAlgorithm, WrappedKeyClosure,
-    WrappedKeyLease,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, GeneratedWrappedKey,
+    KeyHandle, KeySpecCapability, MacAlgorithm, ProviderCapabilities, SigningAlgorithm,
+    WrappedKeyClosure, WrappedKeyLease,
 };
 use crate::sensitive::Sensitive;
 use crate::wrapping::{
@@ -1074,11 +1074,20 @@ impl CryptoProvider for SoftwareProvider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
-        self.keys
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
+        let removed = self
+            .keys
             .write()
             .map_err(|e| KeyRackError::Provider(format!("lock poisoned: {e}")))?
             .remove(&handle.key_id);
-        Ok(())
+        Ok(if removed.is_some() {
+            DestroyKeyOutcome::Completed
+        } else {
+            DestroyKeyOutcome::AlreadyAbsent
+        })
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1501,6 +1510,21 @@ mod tests {
         let provider = SoftwareProvider::new();
         let r = provider.generate_random(64).await.unwrap();
         assert_eq!(r.expose().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn destruction_outcome_distinguishes_removed_and_absent_material() {
+        let provider = SoftwareProvider::new();
+        let handle = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+        assert_eq!(
+            provider.destroy_key_with_outcome(&handle).await.unwrap(),
+            DestroyKeyOutcome::Completed
+        );
+        assert_eq!(
+            provider.destroy_key_with_outcome(&handle).await.unwrap(),
+            DestroyKeyOutcome::AlreadyAbsent
+        );
+        provider.destroy_key(&handle).await.unwrap();
     }
 
     #[tokio::test]
