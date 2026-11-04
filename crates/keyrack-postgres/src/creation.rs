@@ -446,6 +446,25 @@ impl PostgresStorage {
         committed_envelope(&mut connection, operation).await
     }
 
+    pub(super) async fn creation_withdraw(&self, operation: Uuid) -> Result<()> {
+        let mut transaction = write_transaction(&self.pool).await?;
+        let Some(stored) = load_creation(&mut transaction, operation).await? else {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(());
+        };
+        stored.journal.withdrawable()?;
+        let removed = sqlx::query("DELETE FROM kr_creation_journal WHERE operation_id = $1")
+            .bind(operation.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if removed.rows_affected() != 1 {
+            return Err(invalid("creation disappeared during withdrawal"));
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
     pub(super) async fn creation_recoverable(
         &self,
         after: Option<Uuid>,

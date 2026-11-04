@@ -229,6 +229,79 @@ where
     result
 }
 
+/// [`execute`] for an operation whose effects must not stop halfway.
+///
+/// Once authorized, the operation and its audit outcome run in a task of their
+/// own: a caller that disconnects stops waiting, not the operation, and the
+/// outcome is still audited. A process crash can still leave the operation
+/// unaudited; what it committed is in storage.
+#[allow(clippy::result_large_err)]
+pub async fn execute_detached<F, Fut, T>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    op: F,
+) -> Result<T, tonic::Status>
+where
+    F: FnOnce(Arc<ServiceState>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>> + Send + 'static,
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
+
+    if let Err(denied) = authorize(state, &ctx).await {
+        emit_authorization_failure(state, &ctx, denied.code()).await;
+        record_authorization_failure(&ctx, denied.code(), start);
+        return Err(denied);
+    }
+
+    let operation = op(Arc::clone(state));
+    run_detached(state, ctx, start, operation, |status| {
+        status.message().to_owned()
+    })
+    .await
+    .unwrap_or_else(|| Err(tonic::Status::internal("operation task failed")))
+}
+
+/// Run an authorized operation and record its outcome in one task. `None` means
+/// the task itself failed, so no outcome was recorded.
+async fn run_detached<T, E, Fut>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    start: Instant,
+    operation: Fut,
+    describe: fn(&E) -> String,
+) -> Option<Result<T, E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let result = operation.await;
+        let (audit_result, result_str) = match &result {
+            Ok(_) => (AuditResult::Success, "success"),
+            Err(error) => {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    action = %ctx.action,
+                    resource = %ctx.resource_id,
+                    error = %describe(error),
+                    "op.failed"
+                );
+                (AuditResult::Error, "error")
+            }
+        };
+        emit_audit(&state, &ctx, audit_result, None, None).await;
+        crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
+        result
+    })
+    .await
+    .map_err(|error| tracing::error!(error = %error, "detached operation task failed"))
+    .ok()
+}
+
 async fn emit_audit(
     state: &Arc<ServiceState>,
     ctx: &OpContext,
@@ -719,6 +792,48 @@ where
     crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
 
     result
+}
+
+/// REST twin of [`execute_detached`].
+pub async fn execute_rest_detached<F, Fut, T>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    op: F,
+) -> Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+where
+    F: FnOnce(Arc<ServiceState>) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>,
+        > + Send
+        + 'static,
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
+
+    if let Err(denied) = authorize_rest(state, &ctx).await {
+        let code = if denied.0 == axum::http::StatusCode::FORBIDDEN {
+            tonic::Code::PermissionDenied
+        } else {
+            tonic::Code::Internal
+        };
+        emit_authorization_failure(state, &ctx, code).await;
+        record_authorization_failure(&ctx, code, start);
+        return Err(denied);
+    }
+
+    let operation = op(Arc::clone(state));
+    run_detached(state, ctx, start, operation, |(code, body)| {
+        format!("{code}: {}", body.0)
+    })
+    .await
+    .unwrap_or_else(|| {
+        Err(rest_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "operation task failed",
+        ))
+    })
 }
 
 async fn authorize_rest(

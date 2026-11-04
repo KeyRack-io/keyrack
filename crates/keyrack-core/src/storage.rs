@@ -290,6 +290,39 @@ pub trait StorageBackend: Send + Sync {
             "transactional creation unsupported",
         ))
     }
+    /// Every nonterminal creation of a new version of `child`, read from the
+    /// recovery pages. A read, not a reservation: the answer can be stale by
+    /// the time it is used, and every writer still rechecks under its lock.
+    async fn pending_creations(
+        &self,
+        child: &Lid,
+    ) -> Result<Vec<crate::creation::CreationJournal>> {
+        let mut found = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .recoverable_creations(after, crate::creation::MAX_CREATION_PAGE_SIZE)
+                .await?;
+            found.extend(
+                page.items
+                    .into_iter()
+                    .filter(|journal| journal.request.record.lid == *child),
+            );
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => return Ok(found),
+            }
+        }
+    }
+    /// Remove a nonterminal entry that [`crate::creation::CreationJournal::withdrawable`]
+    /// admits, under the writer transaction, from any owner. Withdrawing an
+    /// entry that is already gone succeeds; one that still owes cleanup, or is
+    /// committed, is refused and left as it was.
+    async fn withdraw_creation(&self, _operation: uuid::Uuid) -> Result<()> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
 
     // ── Keys ──────────────────────────────────────────────────────
 

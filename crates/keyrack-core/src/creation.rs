@@ -114,6 +114,7 @@ impl CreationRequest {
             || record.key_usage != KeyUsage::EncryptDecrypt
             || !matches!(record.key_spec, KeySpec::Aes128 | KeySpec::Aes256)
             || record.lid == material.parent().lid
+            || record.parent_lid != Some(material.parent().lid)
             || record.occ_version == 0
             || record.occ_version > i64::MAX as u64
             || self.expected_parent_occ > i64::MAX as u64
@@ -163,6 +164,13 @@ impl CreationRequest {
             || parent.key_spec != self.parent_spec
         {
             return Err(invalid("parent snapshot is no longer eligible"));
+        }
+        // A new version is wrapped under what the parent encrypts with now;
+        // older parent versions only ever open what was wrapped under them.
+        if material.parent().version.get() != parent.current_key_version {
+            return Err(invalid(
+                "new version must wrap under the parent's current version",
+            ));
         }
         let parent_version = parent
             .get_version(material.parent().version.get())
@@ -579,6 +587,30 @@ impl CreationJournal {
         }
         Ok(None)
     }
+
+    /// Whether this entry may be withdrawn without anything being owed.
+    ///
+    /// Two states qualify, and only these: a reservation whose one-shot
+    /// dispatch was never claimed, so no provider effect can exist; and a
+    /// resolved entry, whose object's closure was verified and recorded but
+    /// whose publication was refused. Any owner may withdraw either, because
+    /// neither depends on the owner being alive: a claim racing the withdrawal
+    /// is serialized by the writer transaction and finds the row gone.
+    ///
+    /// Everything else still owes something. A claimed dispatch may have
+    /// generated an object, and a staged envelope has no verified closure, so
+    /// both stay for reconciliation; a committed entry is the version itself.
+    pub fn withdrawable(&self) -> Result<()> {
+        self.validate()?;
+        match self.phase {
+            CreationPhase::Reserved if !self.dispatch_started => Ok(()),
+            CreationPhase::Resolved => Ok(()),
+            CreationPhase::Reserved | CreationPhase::Staged => {
+                Err(invalid("creation may have an unclosed provider effect"))
+            }
+            CreationPhase::Committed => Err(invalid("creation is committed")),
+        }
+    }
 }
 
 /// A fresh claim is an execution decision, not authority or provider evidence.
@@ -653,8 +685,10 @@ pub fn guard_referenced_parent(previous: &KeyRecord, next: &KeyRecord) -> Result
 }
 
 /// Nonterminal operations are deliberately retained: no timeout or owner expiry
-/// releases a reservation or implies cleanup. Recovery can inspect these pages;
-/// takeover/abort require a later qualified cleanup protocol, not blind retries.
+/// releases a reservation or implies cleanup. Recovery can inspect these pages
+/// and withdraw only what [`CreationJournal::withdrawable`] admits; takeover of
+/// anything still owed requires a later qualified cleanup protocol, not blind
+/// retries.
 #[derive(Debug, Clone)]
 pub struct CreationPage {
     pub items: Vec<CreationJournal>,

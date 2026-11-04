@@ -282,6 +282,10 @@ impl StorageBackend for CachingStorage {
         self.inner.recoverable_creations(after, limit).await
     }
 
+    async fn withdraw_creation(&self, operation: uuid::Uuid) -> Result<()> {
+        self.inner.withdraw_creation(operation).await
+    }
+
     // ── Keys ──────────────────────────────────────────────────────
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {

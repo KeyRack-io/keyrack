@@ -1,0 +1,56 @@
+name: Wrapped-child rotation
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "fix/**", "handback/**"]
+  push:
+    branches: [main]
+
+jobs:
+  rotation:
+    name: Rotation PostgreSQL parity and reverted fences
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: keyrack_test
+          POSTGRES_PASSWORD: disposable_ci_only
+          POSTGRES_DB: keyrack_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keyrack_test -d keyrack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://keyrack_test:disposable_ci_only@127.0.0.1:5432/keyrack_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo fetch --locked
+      - name: Live PostgreSQL rotation and recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
+          for test in rotation_old_versions_decrypt_and_new_version_names_parent_current rotation_crash_recovery_each_phase rotation_journal_pins_parent_current_version_and_lineage rotation_withdraw_semantics rotation_and_migration_fences; do
+            grep -Fxq "rotation_postgres::$test: test" <<< "$listing"
+          done
+          cargo test -p keyrack-postgres --features live-tests --test conformance rotation_postgres:: -- --nocapture
+      - name: SQLite and service rotation
+        run: |
+          cargo test -p keyrack-sqlite --test rotation_conformance -- --nocapture
+          cargo test -p keyrack-service --test wrapped_child_rotation -- --nocapture
+      - name: Revert each rotation fence in a disposable source copy
+        run: python3 scripts/test-rotation-controls.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rotation-fence-controls
+          path: target/proofs/rotation/
+          if-no-files-found: error

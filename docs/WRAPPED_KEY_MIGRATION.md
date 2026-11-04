@@ -187,7 +187,7 @@ migration fence.
 | --- | --- |
 | Child/old-parent/new-parent metadata changes, enable/disable, cancel deletion | Fenced; refused as retryable. The transaction repeats the check after service preflight. |
 | Schedule deletion | Refused by the shared deletion-dependency query (`FAILED_PRECONDITION` / HTTP 409), including `migration_journal_rows` for child/source/target. A migration admitted after that query is caught by the transactional update fence with a retryable refusal. |
-| Child rotation, either parent rotation, new child creation under either parent | Fenced; a competing committed change instead makes reservation fail OCC. Wrapped-child rotation remains unsupported outside migration. |
+| Child rotation, either parent rotation, new child creation under either parent | Fenced; refused as retryable. A competing committed change instead makes reservation fail OCC. |
 | Another migration involving any reserved identity | Fenced. |
 | Destruction claim for child or either parent | Refused while the journal is nonterminal. |
 | Alias create, delete or retarget | Safely permitted. Migration intent is addressed by LID, so changing an alias cannot retarget it. |
@@ -227,6 +227,10 @@ and destruction until reconciled. Committed entries retain their retirement
 rules. Safe withdrawal relinquishes the reservation's priority. Migration
 ownership epochs, pinned target version, full-version commit and terminal-result
 requirements remain in force.
+
+A rotation never publishes a version under the old parent after a migration
+commits. Rotating a parent does not rewrap its children; that is this
+operation.
 
 ## Database restore and destroyed parents
 

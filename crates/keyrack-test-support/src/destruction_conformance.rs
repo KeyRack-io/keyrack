@@ -204,6 +204,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
     let (parent, mut request) = fixture();
     let mut child = unique_test_key_record(KeyState::Enabled);
     child.lid = request.record.lid;
+    child.parent_lid = Some(parent.lid);
     store.create_key(&parent).await.unwrap();
     store.create_key(&child).await.unwrap();
     let mut next = child.clone();

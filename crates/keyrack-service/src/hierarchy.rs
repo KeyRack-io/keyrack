@@ -43,7 +43,10 @@
 use crate::domain::DomainError;
 use crate::state::ServiceState;
 use keyrack_core::creation::{creation_correlation, CreationOwner, CreationRequest};
-use keyrack_core::creation_driver::{A2CreationDriver, CreationProgress, WrappingCreationProvider};
+use keyrack_core::creation_driver::{
+    A2CreationDriver, CreationPendingReason, CreationProgress, WrappingCreationProvider,
+};
+use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{
     Exportability, KeyMaterial, KeyRecord, KeySpec, KeyState, KeyVersionRecord, ProviderRef,
 };
@@ -54,8 +57,8 @@ use keyrack_core::wrapping::{
     VersionedKeyId, WrappedKeyFormat, WrappedKeyLifecycle, WrappingContextVersion,
     WrappingIdentifier, WrappingOperation,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 /// The one wrapping profile a deployment activates on one provider.
@@ -192,13 +195,69 @@ pub async fn create_wrapped_child(
     let parent_provider = parent_provider_ref(&parent)?;
     refuse_cross_domain(provider_name, parent_provider)?;
 
-    let parent_version = parent
+    record.provider_ref = Some(provider_name.clone());
+    record.provider_class = entry.class;
+    record.key_versions = Vec::new();
+    let version = journaled_version(provider_name, entry, profile, &parent, record, None)?;
+
+    let progress = version.run(state).await.map_err(DomainError::from)?;
+
+    match progress {
+        CreationProgress::Committed(record) => Ok(*record),
+        // Not a failure and not a success: the attempt owns durable state that
+        // only reconciliation may resolve. Retrying the same call would be a
+        // second attempt, which is why this does not retry itself.
+        CreationProgress::Pending(reason) => Err(DomainError::ProviderUnavailable(format!(
+            "child creation is unresolved ({reason:?}); it requires reconciliation \
+             and must not be assumed to have failed"
+        ))),
+    }
+}
+
+/// One wrapped version ready for the creation journal, and the adapter that
+/// owns its provider object from before Generate until that object is closed.
+struct JournaledVersion {
+    request: CreationRequest,
+    driver: WrappingCreationProvider,
+}
+
+impl JournaledVersion {
+    async fn run(self, state: &ServiceState) -> keyrack_core::error::Result<CreationProgress> {
+        A2CreationDriver::new(Arc::clone(&state.storage), Arc::new(self.driver))
+            .run(self.request)
+            .await
+    }
+}
+
+/// Propose `record`'s next version, wrapped under the parent's current one.
+///
+/// `record` carries the versions it already has, none for a creation, and
+/// `expected_key_occ` is the snapshot those versions were read at, `None` for a
+/// creation. The parent's current version is named in the descriptor and its
+/// handle given to the provider, so the version wraps under exactly what the
+/// journal rechecks.
+fn journaled_version(
+    provider_name: &ProviderRef,
+    entry: &ProviderEntry,
+    profile: &WrappingProfile,
+    parent: &KeyRecord,
+    mut record: KeyRecord,
+    expected_key_occ: Option<u64>,
+) -> Result<JournaledVersion, DomainError> {
+    let parent_handle = parent
         .primary_version()
-        .ok_or_else(|| DomainError::FailedPrecondition("parent has no primary version".into()))?;
-    let parent_handle = parent_version
+        .ok_or_else(|| DomainError::FailedPrecondition("parent has no primary version".into()))?
         .resident_handle()
         .map_err(DomainError::from)?
         .clone();
+    let version_number = record
+        .key_versions
+        .iter()
+        .map(|v| v.version_number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| DomainError::FailedPrecondition("key version number exhausted".into()))?;
 
     let operation = Uuid::new_v4();
     let attempt = Uuid::new_v4();
@@ -214,16 +273,29 @@ pub async fn create_wrapped_child(
     )
     .map_err(|e| DomainError::InvalidArgument(format!("invalid wrapped material: {e}")))?;
 
-    record.occ_version = 1;
-    record.current_key_version = 1;
-    record.provider_ref = Some(provider_name.clone());
-    record.provider_class = entry.class;
-    record.key_versions = vec![KeyVersionRecord {
-        version_number: 1,
+    let created_at = match expected_key_occ {
+        None => record.created_at,
+        Some(_) => chrono::Utc::now(),
+    };
+    record.occ_version = match expected_key_occ {
+        None => 1,
+        Some(occ) => occ
+            .checked_add(1)
+            .ok_or_else(|| DomainError::FailedPrecondition("key OCC exhausted".into()))?,
+    };
+    if expected_key_occ.is_some() {
+        record.updated_at = created_at;
+    }
+    for version in &mut record.key_versions {
+        version.is_primary = false;
+    }
+    record.key_versions.push(KeyVersionRecord {
+        version_number,
         material: KeyMaterial::ParentWrapped(material),
-        created_at: record.created_at,
+        created_at,
         is_primary: true,
-    }];
+    });
+    record.current_key_version = version_number;
 
     let mut request = CreationRequest {
         operation,
@@ -231,7 +303,7 @@ pub async fn create_wrapped_child(
         owner: creation_owner(),
         correlation: creation_correlation(operation, attempt),
         record,
-        expected_key_occ: None,
+        expected_key_occ,
         expected_parent_occ: parent.occ_version,
         parent_spec: parent.key_spec.clone(),
         context_bytes: Vec::new(),
@@ -241,12 +313,12 @@ pub async fn create_wrapped_child(
         .and_then(|context| {
             context
                 .canonical_bytes()
-                .map_err(|e| keyrack_core::error::KeyRackError::Other(e.to_string()))
+                .map_err(|e| KeyRackError::Other(e.to_string()))
         })
         .map_err(DomainError::from)?;
 
     // The provider is asked for the whole profile before anything is created:
-    // a child that cannot later be opened and closed must not exist.
+    // a version that cannot later be opened and closed must not exist.
     let driver = WrappingCreationProvider::new(
         Arc::clone(&entry.provider),
         parent_handle,
@@ -257,21 +329,264 @@ pub async fn create_wrapped_child(
             "provider '{provider_name}' cannot wrap child keys: {e}"
         ))
     })?;
+    Ok(JournaledVersion { request, driver })
+}
 
-    let progress = A2CreationDriver::new(Arc::clone(&state.storage), Arc::new(driver))
-        .run(request)
+/// How many times a rotation re-reads after its snapshot went stale before it
+/// reached the provider, before refusing as retryable.
+const STALE_SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Rotate a wrapped child: its next version is generated already wrapped under
+/// the parent's current version, through the same journal as a creation.
+///
+/// Earlier versions are left exactly as they are, each under the parent
+/// version it names, so their ciphertext keeps decrypting. Nothing here
+/// rewraps them; moving a child's versions to another parent version is a
+/// migration.
+///
+/// Against a migration of this child or its parent, whichever reservation the
+/// writer lock admits first wins. A migration in flight refuses this as
+/// retryable before any provider call; a rotation in flight makes the
+/// migration wait; and a migration that committed after this read leaves this
+/// snapshot stale, so it is re-read and the version wraps under the new parent.
+///
+/// One rotation per key runs in this process at a time. A rotation dropped
+/// part-way leaves its journal entry to say what happened, so callers drive it
+/// to completion; the RPC surfaces run it detached from the request.
+pub async fn rotate_wrapped_child(
+    state: &Arc<ServiceState>,
+    child: Lid,
+) -> Result<KeyRecord, DomainError> {
+    let _in_flight = RotationInFlight::take(child)?;
+    rotate_until_settled(state, child).await
+}
+
+async fn rotate_until_settled(state: &ServiceState, lid: Lid) -> Result<KeyRecord, DomainError> {
+    let mut last_seen = None;
+    for _ in 0..STALE_SNAPSHOT_ATTEMPTS {
+        withdraw_what_is_owed_nothing(state, &lid).await?;
+        let child = state
+            .storage
+            .get_key_for_use(&lid)
+            .await
+            .map_err(DomainError::from)?;
+        let (provider_name, entry, profile, parent) = rotation_target(state, &child).await?;
+        let expected = child.occ_version;
+        let version = journaled_version(
+            &provider_name,
+            &entry,
+            &profile,
+            &parent,
+            child.clone(),
+            Some(expected),
+        )?;
+        let operation = version.request.operation;
+        match version.run(state).await {
+            Ok(CreationProgress::Committed(record)) => return Ok(*record),
+            Ok(CreationProgress::Pending(reason)) => {
+                // Only a resolved entry owes nothing; it can be withdrawn and
+                // retried when what refused its publication was a newer snapshot.
+                let resolved = state
+                    .storage
+                    .get_creation(operation)
+                    .await
+                    .is_ok_and(|journal| journal.withdrawable().is_ok());
+                if !(resolved && superseded(state, &child, &parent).await?) {
+                    return Err(unresolved_rotation(reason));
+                }
+                state
+                    .storage
+                    .withdraw_creation(operation)
+                    .await
+                    .map_err(DomainError::from)?;
+            }
+            Err(error) => {
+                // Withdrawal succeeds only for an entry that owes no provider
+                // cleanup: reserved with no dispatch recorded, or resolved. Such
+                // an entry must not block the key; any other is kept.
+                if state.storage.withdraw_creation(operation).await.is_err() {
+                    return Err(DomainError::FailedPrecondition(format!(
+                        "wrapped-key rotation {operation} may have reached the provider before \
+                         it failed ({error}); it requires reconciliation"
+                    )));
+                }
+                if matches!(error, KeyRackError::ProviderUnavailable(_)) {
+                    return Err(DomainError::from(error));
+                }
+                if another_rotation_pending(state, &lid, operation).await? {
+                    return Err(rotation_in_progress());
+                }
+                if !superseded(state, &child, &parent).await? {
+                    return Err(DomainError::from(error));
+                }
+            }
+        }
+        last_seen = Some(expected);
+    }
+    let actual = state
+        .storage
+        .get_key_for_use(&lid)
+        .await
+        .map_err(DomainError::from)?
+        .occ_version;
+    Err(DomainError::Core(
+        KeyRackError::OptimisticConcurrencyConflict {
+            lid,
+            expected: last_seen.unwrap_or(actual),
+            actual,
+        },
+    ))
+}
+
+/// The provider, profile and parent a child's next version is wrapped with.
+///
+/// The provider is the child's own, the profile is what the deployment
+/// configures for it now, and the parent is read fresh: every refusal that
+/// applies to creating a child under it applies to adding a version under it.
+async fn rotation_target(
+    state: &ServiceState,
+    child: &KeyRecord,
+) -> Result<(ProviderRef, ProviderEntry, WrappingProfile, KeyRecord), DomainError> {
+    refuse_unwrappable_child(child)?;
+    let KeyMaterial::ParentWrapped(current) = &child
+        .primary_version()
+        .ok_or_else(|| DomainError::FailedPrecondition("key has no primary version".into()))?
+        .material
+    else {
+        return Err(DomainError::FailedPrecondition(
+            "key's primary version is not parent-wrapped".into(),
+        ));
+    };
+    let provider_name = current.provider_ref().clone();
+    let profile = state.wrapping.require(&provider_name)?.clone();
+    let entry = state
+        .providers
+        .resolve(&provider_name)
+        .map_err(DomainError::from)?;
+    let parent_lid = child.parent_lid.ok_or_else(|| {
+        DomainError::FailedPrecondition("parent-wrapped key names no parent".into())
+    })?;
+    let parent = state
+        .storage
+        .get_key_for_use(&parent_lid)
         .await
         .map_err(DomainError::from)?;
+    refuse_unwrappable_parent(&parent)?;
+    refuse_cross_domain(&provider_name, parent_provider_ref(&parent)?)?;
+    Ok((provider_name, entry, profile, parent))
+}
 
-    match progress {
-        CreationProgress::Committed(record) => Ok(*record),
-        // Not a failure and not a success: the attempt owns durable state that
-        // only reconciliation may resolve. Retrying the same call would be a
-        // second attempt, which is why this does not retry itself.
-        CreationProgress::Pending(reason) => Err(DomainError::ProviderUnavailable(format!(
-            "child creation is unresolved ({reason:?}); it requires reconciliation \
-             and must not be assumed to have failed"
-        ))),
+/// Withdraw what an earlier rotation of `lid` left that owes nothing, and
+/// refuse while anything it left still owes cleanup.
+///
+/// No rotation of this key is running in this process, so an entry this
+/// process owns was left by one that ended unresolved. An entry another
+/// instance owns may be a rotation still running there or one that stopped
+/// there; nothing here can tell which, so that refusal is retryable.
+async fn withdraw_what_is_owed_nothing(state: &ServiceState, lid: &Lid) -> Result<(), DomainError> {
+    for journal in state
+        .storage
+        .pending_creations(lid)
+        .await
+        .map_err(DomainError::from)?
+    {
+        let operation = journal.request.operation;
+        let phase = journal.phase.as_str();
+        if journal.withdrawable().is_err() {
+            if journal.request.owner != creation_owner() {
+                return Err(DomainError::ProviderUnavailable(format!(
+                    "another instance's rotation of this key ({operation}) is in phase {phase} \
+                     with provider cleanup unconfirmed; retry after it finishes, and reconcile \
+                     it if that instance stopped"
+                )));
+            }
+            return Err(DomainError::FailedPrecondition(format!(
+                "an earlier rotation of this key ({operation}) stopped in phase {phase} with \
+                 provider cleanup unconfirmed; it requires reconciliation before the key can \
+                 rotate again"
+            )));
+        }
+        state
+            .storage
+            .withdraw_creation(operation)
+            .await
+            .map_err(DomainError::from)?;
+    }
+    Ok(())
+}
+
+/// Whether the child or parent changed since `child` and `parent` were read.
+async fn superseded(
+    state: &ServiceState,
+    child: &KeyRecord,
+    parent: &KeyRecord,
+) -> Result<bool, DomainError> {
+    let now_child = state
+        .storage
+        .get_key_for_use(&child.lid)
+        .await
+        .map_err(DomainError::from)?;
+    let now_parent = state
+        .storage
+        .get_key_for_use(&parent.lid)
+        .await
+        .map_err(DomainError::from)?;
+    Ok(now_child.occ_version != child.occ_version || now_parent.occ_version != parent.occ_version)
+}
+
+async fn another_rotation_pending(
+    state: &ServiceState,
+    lid: &Lid,
+    ours: Uuid,
+) -> Result<bool, DomainError> {
+    Ok(state
+        .storage
+        .pending_creations(lid)
+        .await
+        .map_err(DomainError::from)?
+        .iter()
+        .any(|journal| journal.request.operation != ours))
+}
+
+fn rotation_in_progress() -> DomainError {
+    DomainError::ProviderUnavailable(
+        "another rotation of this key is in progress; retry after it finishes".into(),
+    )
+}
+
+fn unresolved_rotation(reason: CreationPendingReason) -> DomainError {
+    DomainError::ProviderUnavailable(format!(
+        "wrapped-key rotation is unresolved ({reason:?}); it requires reconciliation \
+         and must not be assumed to have failed"
+    ))
+}
+
+/// The keys this process is rotating, so two rotations of one key here never
+/// race each other into the journal.
+fn rotations_in_flight() -> &'static Mutex<HashSet<Lid>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<Lid>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct RotationInFlight(Lid);
+
+impl RotationInFlight {
+    fn take(lid: Lid) -> Result<Self, DomainError> {
+        let mut held = rotations_in_flight()
+            .lock()
+            .map_err(|_| DomainError::Internal("rotation registry lock poisoned".into()))?;
+        if !held.insert(lid) {
+            return Err(rotation_in_progress());
+        }
+        Ok(Self(lid))
+    }
+}
+
+impl Drop for RotationInFlight {
+    fn drop(&mut self) {
+        if let Ok(mut held) = rotations_in_flight().lock() {
+            held.remove(&self.0);
+        }
     }
 }
 

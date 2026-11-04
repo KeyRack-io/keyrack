@@ -279,6 +279,9 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<keyrack_core::creation::CreationPage> {
         self.recover_a2(after, limit)
     }
+    async fn withdraw_creation(&self, operation: uuid::Uuid) -> Result<()> {
+        self.withdraw_a2(operation)
+    }
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {
         let lid_str = record.lid.to_string();

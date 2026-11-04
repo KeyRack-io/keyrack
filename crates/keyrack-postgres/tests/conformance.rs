@@ -532,3 +532,69 @@ mod migration_postgres {
         pool.close().await;
     }
 }
+
+mod rotation_postgres {
+    use super::*;
+    use keyrack_core::storage::StorageBackend;
+    use std::sync::Arc;
+
+    async fn arc_store() -> Arc<dyn StorageBackend> {
+        Arc::new(make_store().await)
+    }
+
+    #[tokio::test]
+    async fn rotation_old_versions_decrypt_and_new_version_names_parent_current() {
+        keyrack_test_support::rotation_conformance::old_versions_decrypt_and_new_version_names_parent_current(
+            arc_store().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_crash_recovery_each_phase() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let reconnect_url = url.clone();
+        keyrack_test_support::rotation_conformance::crash_recovery_each_phase(
+            move || {
+                let url = url.clone();
+                async move {
+                    Arc::new(PostgresStorage::connect(&url).await.unwrap())
+                        as Arc<dyn StorageBackend>
+                }
+            },
+            move |store| {
+                let url = reconnect_url.clone();
+                async move {
+                    drop(store);
+                    Arc::new(PostgresStorage::connect(&url).await.unwrap())
+                        as Arc<dyn StorageBackend>
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_journal_pins_parent_current_version_and_lineage() {
+        keyrack_test_support::rotation_conformance::journal_pins_parent_current_version_and_lineage(
+            arc_store().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_withdraw_semantics() {
+        keyrack_test_support::rotation_conformance::withdraw_semantics(&make_store().await).await;
+    }
+
+    #[tokio::test]
+    async fn rotation_and_migration_fences() {
+        Box::pin(
+            keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
+                arc_store().await,
+                arc_store().await,
+            ),
+        )
+        .await;
+    }
+}

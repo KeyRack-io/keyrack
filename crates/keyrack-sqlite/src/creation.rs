@@ -383,6 +383,25 @@ impl SqliteStorage {
         self.with_conn(|conn| committed_envelope(conn, operation))
     }
 
+    pub(super) fn withdraw_a2(&self, operation: Uuid) -> Result<()> {
+        self.creation_tx(|conn| {
+            let Some(value) = journal(conn, operation)? else {
+                return Ok(());
+            };
+            value.withdrawable()?;
+            let removed = conn
+                .execute(
+                    "DELETE FROM creation_journal WHERE operation_id=?1",
+                    [operation.to_string()],
+                )
+                .map_err(|e| map_sql(&e))?;
+            if removed != 1 {
+                return Err(invalid("creation disappeared during withdrawal"));
+            }
+            Ok(())
+        })
+    }
+
     pub(super) fn recover_a2(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {
         validate_page_size(limit)?;
         self.with_conn(|conn| {

@@ -1471,6 +1471,10 @@ pub async fn re_encrypt_with_usable_handles(
 /// `RotateKey` handlers. The rotated history is preflighted before provider effects;
 /// the result counts persisted jobs separately from failed enqueue attempts.
 /// See [`disable_key`] for why `lid` and `key_id` are both parameters.
+///
+/// The new version commits before descendant jobs are queued, so a caller that
+/// stops part-way can leave a rotation without its jobs. The handlers run it
+/// through [`crate::ops::execute_detached`] so a dropped request cannot.
 pub async fn rotate_key(
     state: &Arc<ServiceState>,
     lid: &Lid,
@@ -1482,7 +1486,7 @@ pub async fn rotate_key(
         .check_migration_fence(&lid)
         .await
         .map_err(DomainError::from)?;
-    let mut record = state
+    let record = state
         .storage
         .get_key_for_use(&lid)
         .await
@@ -1493,7 +1497,7 @@ pub async fn rotate_key(
         ));
     }
 
-    require_resident_versions(&record)?;
+    let wrapped = wrapped_history(&record)?;
     let new_version = record
         .current_key_version
         .checked_add(1)
@@ -1503,13 +1507,6 @@ pub async fn rotate_key(
             "next key version already exists".into(),
         ));
     }
-
-    // Resolve the provider for the current primary version BEFORE pushing
-    // the new version, so resolution uses the existing binding.
-    let entry = state
-        .providers
-        .resolve_for_primary(&record)
-        .map_err(DomainError::from)?;
 
     // Finish fallible traversal before creating material or committing rotation.
     // This is logical ancestry, not a cryptographic dependency index or saga.
@@ -1530,40 +1527,12 @@ pub async fn rotate_key(
         }
     }
 
-    let new_handle = entry
-        .provider
-        .generate_key(&record.key_spec)
-        .await
-        .map_err(DomainError::from)?;
-
-    // Persist the binding actually used for generation, including a version
-    // override or the registry default. A record-level default can differ.
-    let new_version_provider_ref = Some(
-        record
-            .effective_provider_ref(record.current_key_version)
-            .unwrap_or_else(|| state.providers.default_ref())
-            .clone(),
-    );
-    for v in &mut record.key_versions {
-        v.is_primary = false;
-    }
-    record
-        .key_versions
-        .push(KeyVersionRecord::provider_resident(
-            new_version,
-            new_handle,
-            new_version_provider_ref,
-            chrono::Utc::now(),
-            true,
-        ));
-    record.current_key_version = new_version;
-    record.occ_version += 1;
-    record.updated_at = chrono::Utc::now();
-    state
-        .storage
-        .update_key(&record)
-        .await
-        .map_err(DomainError::from)?;
+    let record = if wrapped {
+        crate::hierarchy::rotate_wrapped_child(state, lid).await?
+    } else {
+        rotate_resident(state, record, new_version).await?
+    };
+    let new_version = record.current_key_version;
 
     // Rotation has committed; enqueue the preflighted logical descendants.
     // Durable atomic enqueue/recovery remains separate lifecycle work.
@@ -1620,6 +1589,73 @@ pub async fn rotate_key(
         jobs_created,
         jobs_failed,
     })
+}
+
+/// Whether `record`'s versions are all parent-wrapped (`true`) or all resident
+/// (`false`). A history mixing the two has no rotation: neither path can carry
+/// the other kind's versions forward.
+fn wrapped_history(record: &KeyRecord) -> Result<bool, DomainError> {
+    let wrapped = record
+        .key_versions
+        .iter()
+        .filter(|v| matches!(v.material, KeyMaterial::ParentWrapped(_)))
+        .count();
+    if wrapped == 0 {
+        return Ok(false);
+    }
+    if wrapped == record.key_versions.len() && record.parent_lid.is_some() {
+        return Ok(true);
+    }
+    Err(DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))
+}
+
+/// Generate a resident version on the primary version's provider and commit it.
+async fn rotate_resident(
+    state: &Arc<ServiceState>,
+    mut record: KeyRecord,
+    new_version: u64,
+) -> Result<KeyRecord, DomainError> {
+    // Resolve the provider for the current primary version BEFORE pushing
+    // the new version, so resolution uses the existing binding.
+    let entry = state
+        .providers
+        .resolve_for_primary(&record)
+        .map_err(DomainError::from)?;
+    let new_handle = entry
+        .provider
+        .generate_key(&record.key_spec)
+        .await
+        .map_err(DomainError::from)?;
+
+    // Persist the binding actually used for generation, including a version
+    // override or the registry default. A record-level default can differ.
+    let new_version_provider_ref = Some(
+        record
+            .effective_provider_ref(record.current_key_version)
+            .unwrap_or_else(|| state.providers.default_ref())
+            .clone(),
+    );
+    for v in &mut record.key_versions {
+        v.is_primary = false;
+    }
+    record
+        .key_versions
+        .push(KeyVersionRecord::provider_resident(
+            new_version,
+            new_handle,
+            new_version_provider_ref,
+            chrono::Utc::now(),
+            true,
+        ));
+    record.current_key_version = new_version;
+    record.occ_version += 1;
+    record.updated_at = chrono::Utc::now();
+    state
+        .storage
+        .update_key(&record)
+        .await
+        .map_err(DomainError::from)?;
+    Ok(record)
 }
 
 // ── State gating (shared by gRPC + REST) ────────────────────────────

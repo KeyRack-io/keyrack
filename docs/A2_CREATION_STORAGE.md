@@ -98,8 +98,10 @@ for any such reconciliation; mixed-version creation is unsupported.
 Existing
 material-only `ParentWrapped` descriptors are not retroactively qualified or given
 committed creation records. Storage backends/wrappers without transaction support
-fail closed through default methods; in particular the service caching wrapper is
-not wired to these methods yet. No REST/gRPC creation/rotation path invokes them.
+fail closed through default methods. Creating a wrapped child and rotating one
+both go through these methods. A rotation withdraws an earlier entry for the
+same child only when that entry is Reserved with no dispatch marker, or
+Resolved; every other unresolved row stays for reconciliation.
 
 Remaining activation work includes a qualified provider adapter and creation
 verifier implementing the [unregistered lifecycle driver](A2_CREATION_LIFECYCLE.md),

@@ -774,7 +774,7 @@ async fn rotate_key(
     let principal = ops::extract_principal_rest(&state, &headers).await?;
     let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
     op_ctx.request_id = request_id;
-    ops::execute_rest(&state, op_ctx, |state| async move {
+    ops::execute_rest_detached(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let outcome = crate::domain::rotate_key(&state, &lid, &key_id)
             .await
