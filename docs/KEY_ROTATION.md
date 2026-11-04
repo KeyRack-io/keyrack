@@ -99,6 +99,16 @@ disconnects or times out stops waiting, not the rotation: the new version,
 the descendant jobs, the NATS event and the audit outcome are all still
 recorded. A process crash can still stop a rotation part-way.
 
+Only one rotation of a key runs per process at a time. A second request for
+the same key, such as a retry after a disconnect, is refused as retryable
+(`UNAVAILABLE`, HTTP 503) until the first finishes. Rotations of different keys
+run in parallel.
+
+If the write in step 5 loses its OCC check, nothing was written. The provider
+key generated in step 3 is then destroyed, best-effort, and an audit event
+records the cleanup and its result. If the write fails without a definite
+outcome, the new key is kept and logged, because the write may have committed.
+
 ### Rotating a Wrapped Child
 
 A child whose versions are wrapped under its parent rotates through the same
@@ -118,8 +128,7 @@ Rotating a parent does **not** rewrap its children. It creates their rotation
 jobs; rotating a child adds a version under the parent's new version, and
 `RewrapKey` moves a child's existing versions.
 
-One rotation of a key runs per process at a time; a concurrent request is
-refused as retryable (`UNAVAILABLE`, HTTP 503). A rotation still stale after
+The per-process rotation limit above applies here too. A rotation still stale after
 its last re-read is refused as a conflict (`ABORTED`, HTTP 409). An earlier
 attempt that never reached the provider, or whose provider object is confirmed
 closed, is withdrawn by the next rotation.

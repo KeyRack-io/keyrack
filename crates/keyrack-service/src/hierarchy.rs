@@ -332,8 +332,8 @@ fn journaled_version(
     Ok(JournaledVersion { request, driver })
 }
 
-/// How many times a rotation re-reads after its snapshot went stale before it
-/// reached the provider, before refusing as retryable.
+/// How many attempts a rotation makes while its snapshot keeps going stale.
+/// After the last, it is refused as an OCC conflict (`ABORTED` / HTTP 409).
 const STALE_SNAPSHOT_ATTEMPTS: usize = 3;
 
 /// Rotate a wrapped child: its next version is generated already wrapped under
@@ -346,18 +346,19 @@ const STALE_SNAPSHOT_ATTEMPTS: usize = 3;
 ///
 /// Against a migration of this child or its parent, whichever reservation the
 /// writer lock admits first wins. A migration in flight refuses this as
-/// retryable before any provider call; a rotation in flight makes the
-/// migration wait; and a migration that committed after this read leaves this
-/// snapshot stale, so it is re-read and the version wraps under the new parent.
+/// retryable before any provider call; a rotation in flight refuses the
+/// migration as retryable; and a migration that committed after this read
+/// leaves this snapshot stale, so it is re-read and the version wraps under
+/// the new parent.
 ///
-/// One rotation per key runs in this process at a time. A rotation dropped
+/// The caller holds this key's in-process rotation slot. A rotation dropped
 /// part-way leaves its journal entry to say what happened, so callers drive it
 /// to completion; the RPC surfaces run it detached from the request.
-pub async fn rotate_wrapped_child(
+pub(crate) async fn rotate_wrapped_child(
     state: &Arc<ServiceState>,
     child: Lid,
+    _slot: &RotationInFlight,
 ) -> Result<KeyRecord, DomainError> {
-    let _in_flight = RotationInFlight::take(child)?;
     rotate_until_settled(state, child).await
 }
 
@@ -568,10 +569,12 @@ fn rotations_in_flight() -> &'static Mutex<HashSet<Lid>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-struct RotationInFlight(Lid);
+/// This process's one rotation slot for a key, released on drop. Every
+/// rotation holds it from before provider generation until it has published.
+pub(crate) struct RotationInFlight(Lid);
 
 impl RotationInFlight {
-    fn take(lid: Lid) -> Result<Self, DomainError> {
+    pub(crate) fn take(lid: Lid) -> Result<Self, DomainError> {
         let mut held = rotations_in_flight()
             .lock()
             .map_err(|_| DomainError::Internal("rotation registry lock poisoned".into()))?;

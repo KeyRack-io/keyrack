@@ -63,8 +63,8 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   queues their rotation jobs, and `RewrapKey` moves existing versions. A
   rotation racing a migration ends with every version under the new parent, or
   is refused as retryable. A stale read is retried a bounded number of times,
-  then refused as a conflict (`ABORTED`, HTTP 409). Concurrent rotations of one
-  key are serialised in a process and refused as retryable across processes.
+  then refused as a conflict (`ABORTED`, HTTP 409). A second rotation of a key
+  while one runs is refused as retryable, in the same process or another.
   Once authorized, any `RotateKey` runs detached from its request: a dropped
   request still records the rotation's descendant jobs, NATS event and audit
   outcome. An interrupted attempt that never reached the
@@ -236,6 +236,18 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   legacy tolerance left anywhere.
 
 ### Fixed
+
+- **Rotating a provider-resident key.** A request repeated while the same key's
+  rotation was still generating started another provider generation. Now only
+  one rotation of a key runs per process, and a second is refused as retryable
+  (`UNAVAILABLE`, HTTP 503). A rotation whose write lost its concurrency check
+  used to leave its new provider key behind. Now it destroys that key,
+  best-effort, and audits the cleanup. If the write's outcome is unknown, the
+  key is kept and logged, because the write may have committed.
+
+- **A panicking operation went unaudited.** Every request executor now records
+  the panic as an `Error` audit outcome and in metrics, then answers `INTERNAL`
+  (HTTP 500).
 
 - `GetKeyVersion` authorization is bound to the requested version through the
   integer `key_version` attribute from the decoded request. Version 0 returns
