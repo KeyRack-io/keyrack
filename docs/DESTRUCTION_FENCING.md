@@ -117,6 +117,13 @@ writes. Cache wrappers delegate them to storage and invalidate local metadata.
   completion rolled back. `kms:KeyDestructionRetried` and
   `kms:KeyDestructionDeferred` report the operation ID and retry/failure reason;
   `keyrack_deletion_retries_total` counts resumed attempts. Audit is best-effort.
+  A resumed attempt is a successful retry event, not a completed destruction.
+  `kms:ProviderDestroyKey` distinguishes confirmed absence with
+  `reason: provider_key_already_absent`, result `Success`, operation ID, version,
+  and recovered-claim flag. Providers that cannot distinguish absence omit this
+  reason. PKCS#11 confirmation is an empty label search in the authenticated
+  session's view: an existing object invisible to that session would also allow
+  completion. Login, search, and deletion errors still refuse it.
   Never clear the journal manually or reuse a provider handle for new material.
   There is no timeout fence release or abort API.
 - Storage completion trusts the service's provider-success decision; the ticket

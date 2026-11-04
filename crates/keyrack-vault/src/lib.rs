@@ -29,8 +29,8 @@ use base64::Engine;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use reqwest::Client;
@@ -659,6 +659,10 @@ impl CryptoProvider for VaultTransitProvider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
         // Step 1: enable deletion on the key.
         let config = KeyConfigRequest {
             deletion_allowed: true,
@@ -673,10 +677,11 @@ impl CryptoProvider for VaultTransitProvider {
             if !self.confirm_key_absent(handle).await.unwrap_or(false) {
                 return Err(error);
             }
+            return Ok(DestroyKeyOutcome::AlreadyAbsent);
         }
 
         tracing::info!(key_id = %handle.key_id, "vault transit key destroyed");
-        Ok(())
+        Ok(DestroyKeyOutcome::Completed)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -940,13 +945,14 @@ mod tests {
                 token: "test-token".into(),
                 mount: "transit".into(),
             };
-            provider
-                .destroy_key(&KeyHandle {
+            let outcome = provider
+                .destroy_key_with_outcome(&KeyHandle {
                     key_id: "key".into(),
                     key_spec: KeySpec::Aes256,
                 })
                 .await
                 .unwrap();
+            assert_eq!(outcome, DestroyKeyOutcome::AlreadyAbsent);
             server.await.unwrap();
         }
         for (status, body, mount_status) in [

@@ -671,6 +671,11 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   Confirmed provider-key absence permits completion; deferred and retried
   operations are audited. Loss markers match current wrapping parent bindings.
 
+- Preserve `WrappingParentDestroyed` in the direct REST error mapper. Destruction
+  audit records distinguish provider-confirmed absence from ordinary success;
+  resumed attempts are no longer themselves classified as errors. Document
+  PKCS#11's session-visible label-search limit for absence confirmation.
+
 ## [0.4.0] — 2026-08-30
 
 Exportable-key custody: an explicit, audited path for raw key material to leave
