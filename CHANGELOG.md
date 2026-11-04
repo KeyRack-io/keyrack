@@ -13,7 +13,7 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 - Qualified hardware custody for wrapped children. The experimental, explicitly
   configured SoftHSM profile exercises native PKCS#11 wrapping in a software
   token loaded into KeyRack's process; no hardware token is qualified.
-- Export, rotation and destruction of wrapped material remain refused.
+- Export and destruction of wrapped material remain refused.
   Rotating a resident root does not automatically migrate its existing children;
   an explicit same-provider rewrap is required.
 - The crypto worker remains a provisional harness that the service does not use.

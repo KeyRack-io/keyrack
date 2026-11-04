@@ -460,9 +460,12 @@ repeating native effects.
 
 Commit erases the service's old envelopes. It cannot retire copies already
 retained elsewhere: an old envelope can still open under its old parent version
-while that version remains available. Export, rotation and destruction of
-wrapped material stay refused; resident-root rotation is supported. This profile
-does not introduce dependent-data-loss deletion intent.
+while that version remains available. Export and destruction of wrapped material
+stay refused. Wrapped-child rotation creates a new version under the parent's
+current version; older child versions keep their existing parent bindings.
+Resident-root rotation creates a new root version without rewrapping existing
+child versions; use `RewrapKey` to migrate those versions. This profile does not
+introduce dependent-data-loss deletion intent.
 
 #### When a token goes away and comes back
 
