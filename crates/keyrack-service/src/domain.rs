@@ -1456,6 +1456,10 @@ pub async fn re_encrypt_with_usable_handles(
 /// `RotateKey` handlers. The rotated history is preflighted before provider effects;
 /// the result counts persisted jobs separately from failed enqueue attempts.
 /// See [`disable_key`] for why `lid` and `key_id` are both parameters.
+///
+/// The new version commits before descendant jobs are queued, so a caller that
+/// stops part-way can leave a rotation without its jobs. The handlers run it
+/// through [`crate::ops::execute_detached`] so a dropped request cannot.
 pub async fn rotate_key(
     state: &Arc<ServiceState>,
     lid: &Lid,

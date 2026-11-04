@@ -755,4 +755,30 @@ pub async fn rotation_and_migration_fences(
     }
     assert_decrypts(&state, &migrated, 1, &ct_v1).await;
     assert_decrypts(&state, &migrated, rotated.current_key_version, &ct_v2).await;
+
+    // The storage fence alone, without the service's earlier check: a reserved
+    // migration refuses a rotation's reservation of the child.
+    let (state, parent, child) = parent_and_child(interaction_store.clone()).await;
+    let new_parent = domain::create_key(&state, create_input(None))
+        .await
+        .unwrap();
+    interaction_store
+        .reserve_migration(
+            &keyrack_core::migration::MigrationRequest::new(
+                Uuid::new_v4(),
+                Some(new_parent.lid),
+                child.clone(),
+                parent.clone(),
+                new_parent,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    retryable(
+        interaction_store
+            .reserve_creation(&rotation_request(&child, &parent, stale_owner()))
+            .await,
+    );
+    assert_no_pending_creations(interaction_store.as_ref(), &child).await;
 }

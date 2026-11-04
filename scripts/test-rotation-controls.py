@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CORE = "crates/keyrack-core/src/creation.rs"
 SQLITE = "crates/keyrack-sqlite/src/"
 POSTGRES = "crates/keyrack-postgres/src/creation.rs"
+POSTGRES_MIGRATION = "crates/keyrack-postgres/src/migration.rs"
 SERVICE = "crates/keyrack-service/src/"
 
 SQLITE_ROTATION = ("keyrack-sqlite", (), "rotation_conformance", None)
@@ -44,6 +45,9 @@ CONTROLS = [
     ("migration_blocks_rotation_reservation", SQLITE + "creation.rs", "fn reserve_a2(",
      "crate::migration::guard_record(conn, &request.record)?;", "",
      SERVICE_ROTATION, "migration_reserved_after_rotation_check_refuses_before_provider"),
+    ("sqlite_migration_blocks_rotation_reservation", SQLITE + "creation.rs", "fn reserve_a2(",
+     "crate::migration::guard_record(conn, &request.record)?;", "",
+     SQLITE_ROTATION, "rotation_and_migration_fences"),
     ("rotation_blocks_migration_reservation", SQLITE + "migration.rs", "fn migration_reserve(",
      "if pending { return Err(migration_busy()); }", "let _ = pending;",
      SERVICE_ROTATION, "rotation_reserved_first_refuses_rewrap_until_rotation_commits"),
@@ -60,6 +64,12 @@ CONTROLS = [
      "VersionedKeyId::new(parent.lid, parent.current_key_version.min(1))",
      SERVICE_ROTATION,
      "parent_rotation_queues_job_without_rewrapping_child_then_child_rotation_uses_new_parent_version"),
+    ("grpc_rotation_detached", SERVICE + "grpc.rs", "async fn rotate_key(",
+     "ops::execute_detached(", "ops::execute(",
+     SERVICE_ROTATION, "dropped_rotation_request_leaves_key_consistent"),
+    ("rest_rotation_detached", SERVICE + "rest.rs", "async fn rotate_key(",
+     "ops::execute_rest_detached(", "ops::execute_rest(",
+     SERVICE_ROTATION, "dropped_rotation_request_leaves_key_consistent"),
     ("one_rotation_per_key_in_process", SERVICE + "hierarchy.rs", "fn take(lid: Lid)",
      "if !held.insert(lid) {", "if !held.insert(lid) && held.is_empty() {",
      SERVICE_ROTATION, "dropped_rotation_request_leaves_key_consistent"),
@@ -73,6 +83,12 @@ POSTGRES_CONTROLS = [
     ("postgres_withdraw_phase", POSTGRES, "async fn creation_withdraw(",
      "stored.journal.withdrawable()?;", "let _ = stored.journal.withdrawable();",
      POSTGRES_ROTATION, "rotation_postgres::rotation_withdraw_semantics"),
+    ("postgres_migration_blocks_rotation_reservation", POSTGRES, "async fn creation_reserve(",
+     "crate::migration::guard_record(&mut transaction, &request.record).await?;", "",
+     POSTGRES_ROTATION, "rotation_postgres::rotation_and_migration_fences"),
+    ("postgres_rotation_blocks_migration_reservation", POSTGRES_MIGRATION, "async fn migration_reserve(",
+     "if pending {", "if pending && false {",
+     POSTGRES_ROTATION, "rotation_postgres::rotation_and_migration_fences"),
 ]
 
 

@@ -94,6 +94,11 @@ The REST endpoint `POST /v1/keys/:key_id/actions-rotate` and the gRPC
 `RotateKey` RPC share one implementation, including descendant jobs and the
 NATS event.
 
+Steps 2–8 run detached from the request once step 1 admits it. A caller that
+disconnects or times out stops waiting, not the rotation: the new version,
+the descendant jobs, the NATS event and the audit outcome are all still
+recorded. A process crash can still stop a rotation part-way.
+
 ### Rotating a Wrapped Child
 
 A child whose versions are wrapped under its parent rotates through the same
@@ -114,9 +119,10 @@ jobs; rotating a child adds a version under the parent's new version, and
 `RewrapKey` moves a child's existing versions.
 
 One rotation of a key runs per process at a time; a concurrent request is
-refused as retryable (`UNAVAILABLE`, HTTP 503). A rotation keeps running if
-its caller disconnects. An earlier attempt that never reached the provider, or
-whose provider object is confirmed closed, is withdrawn by the next rotation.
+refused as retryable (`UNAVAILABLE`, HTTP 503). A rotation still stale after
+its last re-read is refused as a conflict (`ABORTED`, HTTP 409). An earlier
+attempt that never reached the provider, or whose provider object is confirmed
+closed, is withdrawn by the next rotation.
 An attempt that may still hold a provider object refuses further rotation of
 the key until it is reconciled. If another instance owns that attempt, the
 refusal is retryable, because that attempt may still be running.

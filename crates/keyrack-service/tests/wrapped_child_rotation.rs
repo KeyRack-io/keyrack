@@ -56,6 +56,29 @@ impl AuditSink for SilentAudit {
     }
 }
 
+#[derive(Default)]
+struct CaptureAudit(Mutex<Vec<keyrack_core::audit::AuditEvent>>);
+
+#[async_trait]
+impl AuditSink for CaptureAudit {
+    async fn emit(&self, event: &keyrack_core::audit::AuditEvent) -> Result<()> {
+        self.0.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+impl CaptureAudit {
+    fn rotate_outcomes(&self, key_id: &str) -> Vec<keyrack_core::audit::AuditResult> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == AuditAction::RotateKey && event.resource.id == key_id)
+            .map(|event| event.result)
+            .collect()
+    }
+}
+
 struct DenyRotatePdp;
 
 #[async_trait]
@@ -205,6 +228,15 @@ fn service_state(
     provider: Arc<ObservedProvider>,
     pdp: Arc<dyn PolicyDecisionPoint>,
 ) -> Arc<ServiceState> {
+    service_state_audited(storage, provider, pdp, Arc::new(SilentAudit))
+}
+
+fn service_state_audited(
+    storage: Arc<dyn StorageBackend>,
+    provider: Arc<ObservedProvider>,
+    pdp: Arc<dyn PolicyDecisionPoint>,
+    audit: Arc<dyn AuditSink>,
+) -> Arc<ServiceState> {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     Arc::new(ServiceState {
         storage,
@@ -223,7 +255,7 @@ fn service_state(
         ),
         provider_router: ProviderRouter::new(vec![], ProviderRef::new("default")).unwrap(),
         pdp,
-        audit: Arc::new(SilentAudit),
+        audit,
         authn: Arc::new(keyrack_core::authn::AuthenticatorChain::new(vec![
             Box::new(keyrack_core::authn::InsecureAuthenticator),
         ])),
@@ -427,6 +459,16 @@ async fn rotate_grpc(state: &Arc<ServiceState>, key_id: &str) -> (tonic::Code, u
 }
 
 async fn rotate_rest(state: &Arc<ServiceState>, key_id: &str) -> (u16, u64) {
+    let (code, body) = rotate_rest_body(state, key_id).await;
+    let version = if code == 200 {
+        body["current_key_version"].as_u64().unwrap()
+    } else {
+        0
+    };
+    (code, version)
+}
+
+async fn rotate_rest_body(state: &Arc<ServiceState>, key_id: &str) -> (u16, serde_json::Value) {
     let request = axum::http::Request::builder()
         .method("POST")
         .uri(format!("/v1/keys/{key_id}/actions-rotate"))
@@ -441,14 +483,7 @@ async fn rotate_rest(state: &Arc<ServiceState>, key_id: &str) -> (u16, u64) {
     let bytes = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .unwrap();
-    let version = if code == 200 {
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["current_key_version"]
-            .as_u64()
-            .unwrap()
-    } else {
-        0
-    };
-    (code, version)
+    (code, serde_json::from_slice(&bytes).unwrap())
 }
 
 struct InterleaveHook {
@@ -456,6 +491,8 @@ struct InterleaveHook {
     armed: AtomicBool,
     once: AtomicBool,
     reserve_only: AtomicBool,
+    stale_every_reservation: AtomicBool,
+    stale_reservations: AtomicUsize,
     migration: Mutex<Option<(Arc<ServiceState>, MigrationRequest)>>,
 }
 
@@ -473,6 +510,8 @@ impl HookedStorage {
                 armed: AtomicBool::new(false),
                 once: AtomicBool::new(false),
                 reserve_only: AtomicBool::new(false),
+                stale_every_reservation: AtomicBool::new(false),
+                stale_reservations: AtomicUsize::new(0),
                 migration: Mutex::new(None),
             }),
         }
@@ -493,6 +532,14 @@ impl HookedStorage {
 
     fn arm_interleave(&self) {
         self.hook.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Change the watched child's parent after each of its reservations, so
+    /// every attempt's snapshot is stale by the time it publishes.
+    fn stale_every_reservation(&self) {
+        self.hook
+            .stale_every_reservation
+            .store(true, Ordering::SeqCst);
     }
 }
 
@@ -525,7 +572,25 @@ impl StorageBackend for HookedStorage {
                 }
             }
         }
-        self.inner.reserve_creation(request).await
+        let journal = self.inner.reserve_creation(request).await?;
+        if self.hook.stale_every_reservation.load(Ordering::SeqCst)
+            && watched == Some(request.record.lid)
+        {
+            let mut parent = self
+                .inner
+                .get_key(
+                    &request
+                        .record
+                        .parent_lid
+                        .expect("wrapped child names a parent"),
+                )
+                .await?;
+            parent.occ_version += 1;
+            parent.updated_at = chrono::Utc::now();
+            self.inner.update_key(&parent).await?;
+            self.hook.stale_reservations.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(journal)
     }
     async fn get_creation(
         &self,
@@ -1088,6 +1153,7 @@ async fn migration_commit_before_rotation_reservation_wraps_under_new_parent() {
 #[tokio::test]
 async fn parent_rotation_during_generate_retries_with_new_parent_version() {
     let (state, provider, child, parent) = fixture().await;
+    let v1_ciphertext = ciphertexts(&state, &child).await;
     provider.paused.store(true, Ordering::SeqCst);
     let rotation = tokio::spawn({
         let state = state.clone();
@@ -1107,6 +1173,47 @@ async fn parent_rotation_during_generate_retries_with_new_parent_version() {
         material(primary).parent().version.get(),
         parent.current_key_version
     );
+
+    let rotated = state.storage.get_key(&child.lid).await.unwrap();
+    let all = [
+        v1_ciphertext,
+        ciphertexts(&state, &rotated).await[1..].to_vec(),
+    ]
+    .concat();
+    assert_decrypts(&state, &rotated, &all).await;
+}
+
+#[tokio::test]
+async fn repeatedly_stale_rotation_is_refused_as_conflict_on_both_surfaces() {
+    for rest in [false, true] {
+        let provider = Arc::new(ObservedProvider::new());
+        let hooked = Arc::new(HookedStorage::new(Arc::new(
+            keyrack_sqlite::SqliteStorage::in_memory().unwrap(),
+        )));
+        let state = service_state(hooked.clone(), provider.clone(), Arc::new(AlwaysAllow));
+        let parent = domain::create_key(&state, input(None)).await.unwrap();
+        let child = domain::create_key(&state, input(Some(&parent)))
+            .await
+            .unwrap();
+        hooked.watch_child(child.lid);
+        hooked.stale_every_reservation();
+        let generated = provider.generates.load(Ordering::SeqCst);
+        let id = child.lid.to_string();
+
+        if rest {
+            let (code, body) = rotate_rest_body(&state, &id).await;
+            assert_eq!(code, 409, "{body}");
+            assert_eq!(body["error"], "OccConflict", "{body}");
+        } else {
+            assert_eq!(rotate_grpc(&state, &id).await, (tonic::Code::Aborted, 0));
+        }
+        assert_eq!(hooked.hook.stale_reservations.load(Ordering::SeqCst), 3);
+        // Each stale reservation is caught before dispatch.
+        assert_eq!(provider.generates.load(Ordering::SeqCst), generated);
+        let stored = state.storage.get_key(&child.lid).await.unwrap();
+        assert_same_key_snapshot(&stored, &child);
+        assert_no_pending_creation(&state, &child.lid).await;
+    }
 }
 
 #[tokio::test]
@@ -1151,68 +1258,125 @@ async fn concurrent_child_rotations_do_not_lose_versions() {
 
 #[tokio::test]
 async fn dropped_rotation_request_leaves_key_consistent() {
-    let (state, provider, child, _) = fixture().await;
-    let ciphertexts = ciphertexts(&state, &child).await;
-    let generated = provider.generates.load(Ordering::SeqCst);
-    provider.paused.store(true, Ordering::SeqCst);
-    let task = tokio::spawn({
-        let state = state.clone();
+    for rest in [false, true] {
+        let provider = Arc::new(ObservedProvider::new());
+        let audit = Arc::new(CaptureAudit::default());
+        let state = service_state_audited(
+            Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap()),
+            provider.clone(),
+            Arc::new(AlwaysAllow),
+            audit.clone(),
+        );
+        let parent = domain::create_key(&state, input(None)).await.unwrap();
+        let child = domain::create_key(&state, input(Some(&parent)))
+            .await
+            .unwrap();
+        let grandchild = seed_descendant(&state, &child).await;
         let id = child.lid.to_string();
-        let lid = child.lid;
-        async move { domain::rotate_key(&state, &lid, &id).await }
-    });
-    provider.wait_entered().await;
-    task.abort();
-    assert!(task.await.is_err_and(|join| join.is_cancelled()));
-    match domain::rotate_key(&state, &child.lid, &child.lid.to_string()).await {
-        Err(DomainError::ProviderUnavailable(message)) => {
-            assert!(message.contains("another rotation of this key is in progress"));
-        }
-        Err(other) => panic!("unexpected rotation error: {other}"),
-        Ok(_) => panic!("a second rotation ran beside the detached one"),
-    }
-    provider.release_blocked(1);
+        let ciphertexts = ciphertexts(&state, &child).await;
+        let generated = provider.generates.load(Ordering::SeqCst);
 
-    let detached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let record = state.storage.get_key_for_use(&child.lid).await.unwrap();
-            if record.current_key_version == 2 {
-                return record;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the detached rotation finishes after its caller is dropped");
-    assert!(state
-        .storage
-        .pending_creations(&child.lid)
-        .await
-        .unwrap()
-        .is_empty());
-    let all = [
-        ciphertexts.clone(),
-        self::ciphertexts(&state, &detached).await[1..].to_vec(),
-    ]
-    .concat();
-    assert_decrypts(&state, &detached, &all).await;
-
-    // The detached task publishes before it releases this key's in-process slot.
-    let rotated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match domain::rotate_key(&state, &child.lid, &child.lid.to_string()).await {
-                Ok(outcome) => return outcome.record,
-                Err(DomainError::ProviderUnavailable(message))
-                    if message.contains("another rotation of this key is in progress") =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        provider.paused.store(true, Ordering::SeqCst);
+        let request = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                if rest {
+                    rotate_rest(&state, &id).await;
+                } else {
+                    rotate_grpc(&state, &id).await;
                 }
-                Err(other) => panic!("unexpected rotation error: {other}"),
             }
+        });
+        provider.wait_entered().await;
+        request.abort();
+        assert!(request.await.is_err_and(|join| join.is_cancelled()));
+
+        // A second rotation running beside the detached one would block in the
+        // paused provider instead of being refused.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if rest {
+                rotate_rest(&state, &id).await == (503, 0)
+            } else {
+                rotate_grpc(&state, &id).await == (tonic::Code::Unavailable, 0)
+            }
+        })
+        .await;
+        assert!(
+            second.is_ok_and(|refused| refused),
+            "a second rotation must be refused as retryable while the first runs"
+        );
+        provider.release_blocked(1);
+
+        // The outcome is audited last, after the version and its descendant jobs.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !audit
+                .rotate_outcomes(&id)
+                .contains(&keyrack_core::audit::AuditResult::Success)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped request's rotation is audited");
+        assert_eq!(
+            audit.rotate_outcomes(&id),
+            [
+                keyrack_core::audit::AuditResult::Error,
+                keyrack_core::audit::AuditResult::Success
+            ],
+            "the refused second request and the dropped one's outcome"
+        );
+
+        let detached = state.storage.get_key_for_use(&child.lid).await.unwrap();
+        assert_eq!(detached.current_key_version, 2);
+        assert_no_pending_creation(&state, &child.lid).await;
+        let jobs: Vec<RotationJob> = state
+            .storage
+            .list_rotation_jobs(Some(RotationJobState::Pending))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.parent_lid == child.lid)
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].dependent_lid, grandchild);
+        assert_eq!(jobs[0].new_version, 2);
+        let all = [
+            ciphertexts.clone(),
+            self::ciphertexts(&state, &detached).await[1..].to_vec(),
+        ]
+        .concat();
+        assert_decrypts(&state, &detached, &all).await;
+
+        // The slot is released before the outcome is audited.
+        if rest {
+            assert_eq!(rotate_rest(&state, &id).await, (200, 3));
+        } else {
+            assert_eq!(rotate_grpc(&state, &id).await, (tonic::Code::Ok, 3));
         }
-    })
-    .await
-    .unwrap();
-    assert_eq!(rotated.current_key_version, 3);
-    assert_eq!(provider.generates.load(Ordering::SeqCst), generated + 2);
+        assert_eq!(provider.generates.load(Ordering::SeqCst), generated + 2);
+    }
+}
+
+/// Seed a logical descendant of `parent`. Only the descendant walk reads it, so
+/// its descriptor is shaped as a wrapped child but deliberately not openable.
+async fn seed_descendant(state: &Arc<ServiceState>, parent: &KeyRecord) -> Lid {
+    let mut record = keyrack_test_support::fixtures::unique_test_key_record(KeyState::Enabled);
+    record.parent_lid = Some(parent.lid);
+    record.key_versions[0].material = KeyMaterial::ParentWrapped(
+        ParentWrappedMaterial::new(
+            ProviderRef::new("default"),
+            name(DOMAIN),
+            keyrack_core::wrapping::VersionedKeyId::new(parent.lid, parent.current_key_version)
+                .unwrap(),
+            keyrack_core::wrapping::WrappingContextVersion::V1,
+            keyrack_core::wrapping::WrappedKeyFormat::RawSecret,
+            name(SOFTWARE_WRAPPING_MECHANISM),
+            name("seeded-not-openable"),
+        )
+        .unwrap(),
+    );
+    state.storage.create_key(&record).await.unwrap();
+    record.lid
 }

@@ -57,9 +57,12 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   name and keep decrypting. Rotating a parent does not rewrap its children; it
   queues their rotation jobs, and `RewrapKey` moves existing versions. A
   rotation racing a migration ends with every version under the new parent, or
-  is refused as retryable. A stale read is retried a bounded number of times.
-  Concurrent rotations of one key are serialised in a process and refused as
-  retryable across processes. An interrupted attempt that never reached the
+  is refused as retryable. A stale read is retried a bounded number of times,
+  then refused as a conflict (`ABORTED`, HTTP 409). Concurrent rotations of one
+  key are serialised in a process and refused as retryable across processes.
+  Once authorized, any `RotateKey` runs detached from its request: a dropped
+  request still records the rotation's descendant jobs, NATS event and audit
+  outcome. An interrupted attempt that never reached the
   provider is withdrawn by the next rotation. One that may hold a provider
   object refuses rotation until it is reconciled. The creation journal now
   refuses a version that names anything other than the parent's current

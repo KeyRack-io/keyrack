@@ -350,24 +350,15 @@ const STALE_SNAPSHOT_ATTEMPTS: usize = 3;
 /// migration wait; and a migration that committed after this read leaves this
 /// snapshot stale, so it is re-read and the version wraps under the new parent.
 ///
-/// The rotation runs detached from the caller, so a dropped request does not
-/// stop it halfway; one rotation per key runs in this process at a time.
+/// One rotation per key runs in this process at a time. A rotation dropped
+/// part-way leaves its journal entry to say what happened, so callers drive it
+/// to completion; the RPC surfaces run it detached from the request.
 pub async fn rotate_wrapped_child(
     state: &Arc<ServiceState>,
     child: Lid,
 ) -> Result<KeyRecord, DomainError> {
-    let in_flight = RotationInFlight::take(child)?;
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        let _in_flight = in_flight;
-        rotate_until_settled(&state, child).await
-    })
-    .await
-    .map_err(|_| {
-        DomainError::Internal(
-            "wrapped-key rotation was interrupted; its journal entry holds what happened".into(),
-        )
-    })?
+    let _in_flight = RotationInFlight::take(child)?;
+    rotate_until_settled(state, child).await
 }
 
 async fn rotate_until_settled(state: &ServiceState, lid: Lid) -> Result<KeyRecord, DomainError> {
@@ -410,8 +401,9 @@ async fn rotate_until_settled(state: &ServiceState, lid: Lid) -> Result<KeyRecor
                     .map_err(DomainError::from)?;
             }
             Err(error) => {
-                // Refused before dispatch, so nothing reached the provider. A
-                // reservation it left owes nothing and must not block the key.
+                // Withdrawal succeeds only for an entry that owes no provider
+                // cleanup: reserved with no dispatch recorded, or resolved. Such
+                // an entry must not block the key; any other is kept.
                 if state.storage.withdraw_creation(operation).await.is_err() {
                     return Err(DomainError::FailedPrecondition(format!(
                         "wrapped-key rotation {operation} may have reached the provider before \
