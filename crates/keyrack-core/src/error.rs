@@ -67,6 +67,10 @@ pub enum KeyRackError {
         actual: u64,
     },
 
+    /// An operation ID is already reserved for different migration intent.
+    #[error("migration operation {operation} already names different intent")]
+    MigrationIntentConflict { operation: uuid::Uuid },
+
     #[error("resolution depth limit exceeded (max {max_depth})")]
     DepthLimitExceeded { max_depth: u32 },
 

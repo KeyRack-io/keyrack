@@ -158,13 +158,27 @@ pub trait StorageBackend: Send + Sync {
     }
     /// Refuse before provider-side mutation if any logical identity is reserved.
     async fn check_migration_fence(&self, _lid: &Lid) -> Result<()> {
-        Ok(())
+        Err(crate::migration::migration_invalid(
+            "transactional migration fence unsupported",
+        ))
+    }
+
+    /// Read all destruction blockers in one consistent storage snapshot. Count
+    /// material versions, all parent/child creation journal rows, and nonterminal
+    /// migrations naming the key as child/source/target, not logical parent links.
+    /// This is advisory: claim MUST recheck under its writer fence.
+    /// Unsupported implementations fail closed, never return empty counts.
+    async fn destruction_dependencies(
+        &self,
+        _lid: &Lid,
+    ) -> Result<crate::destruction::DestructionDependencies> {
+        Err(crate::destruction::invalid("dependency query unsupported"))
     }
 
     /// Commit a one-shot resident destruction fence before any provider effect.
     /// Re-read state, due time, OCC and full material history in the transaction;
-    /// reject all parent/child creation references. All writers must honor the
-    /// fence. None means already claimed, NEVER permission to dispatch again.
+    /// reject creation references and nonterminal migration participants. All
+    /// writers must honor the fence. None means already claimed, NEVER permission to dispatch again.
     /// A commit/response failure is ambiguous and must not be retried as work.
     async fn claim_destruction(
         &self,
@@ -456,11 +470,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_migration_fencing_fails_closed() {
+        let store = MemoryStorage::new();
+        let record = make_test_record(KeyState::Enabled);
+        store.create_key(&record).await.unwrap();
+        let error = store.check_migration_fence(&record.lid).await.unwrap_err();
+        assert!(
+            matches!(error, KeyRackError::Storage(ref message) if message.contains("migration fence unsupported"))
+        );
+    }
+
+    #[tokio::test]
     async fn unsupported_destruction_fencing_fails_closed() {
         let store = MemoryStorage::new();
         let mut record = make_test_record(KeyState::PendingDeletion);
         record.scheduled_deletion_at = Some(chrono::Utc::now());
         store.create_key(&record).await.unwrap();
+        assert!(store.destruction_dependencies(&record.lid).await.is_err());
         assert!(store
             .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
             .await

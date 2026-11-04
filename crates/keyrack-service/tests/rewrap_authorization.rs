@@ -699,7 +699,7 @@ async fn terminal_receipt_binds_envelopes_and_survives_lost_reply_and_later_chan
 }
 
 #[tokio::test]
-async fn lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_validation() {
+async fn lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation() {
     for rest in [false, true] {
         let (state, _, _) = state(None, false);
         let old_parent = create(&state, None).await;
@@ -716,6 +716,16 @@ async fn lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_va
         .unwrap();
         state.storage.reserve_migration(&migration).await.unwrap();
         for record in [&child, &old_parent, &new_parent] {
+            let domain_error = domain::schedule_key_deletion(&state, &record.lid.to_string(), 7)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                domain_error,
+                domain::DomainError::FailedPrecondition(_)
+            ));
+            assert!(domain_error
+                .to_string()
+                .contains("migration_journal_rows=1"));
             for action in ["enable", "disable", "schedule-deletion", "cancel-deletion"] {
                 if rest {
                     let request = axum::http::Request::builder()
@@ -728,7 +738,20 @@ async fn lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_va
                         .oneshot(request)
                         .await
                         .unwrap();
-                    assert_eq!(response.status(), 503, "{action} on {}", record.lid);
+                    let expected = if action == "schedule-deletion" {
+                        409
+                    } else {
+                        503
+                    };
+                    assert_eq!(response.status(), expected, "{action} on {}", record.lid);
+                    if action == "schedule-deletion" {
+                        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                            .await
+                            .unwrap();
+                        assert!(String::from_utf8(bytes.to_vec())
+                            .unwrap()
+                            .contains("migration_journal_rows=1"));
+                    }
                 } else {
                     let service = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
                     let key_id = record.lid.to_string();
@@ -758,14 +781,88 @@ async fn lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_va
                             .map(|_| ()),
                         _ => unreachable!(),
                     };
-                    assert_eq!(
-                        response.unwrap_err().code(),
-                        tonic::Code::Unavailable,
-                        "{action} on {}",
-                        record.lid
-                    );
+                    let error = response.unwrap_err();
+                    let expected = if action == "schedule-deletion" {
+                        assert!(error.message().contains("migration_journal_rows=1"));
+                        tonic::Code::FailedPrecondition
+                    } else {
+                        tonic::Code::Unavailable
+                    };
+                    assert_eq!(error.code(), expected, "{action} on {}", record.lid);
                 }
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn competing_replica_intents_return_conflict_from_reservation_on_both_surfaces() {
+    use keyrack_core::error::KeyRackError;
+    use keyrack_core::migration::MigrationConditions;
+    use keyrack_core::storage::StorageBackend;
+    use keyrack_service::domain::DomainError;
+
+    let path =
+        std::env::temp_dir().join(format!("migration-intent-{}.sqlite", uuid::Uuid::new_v4()));
+    let first = Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap());
+    let second = Arc::new(keyrack_sqlite::SqliteStorage::open(&path).unwrap());
+    let (request, _) = keyrack_test_support::migration_conformance::seeded(first.as_ref()).await;
+    let operation = request.operation;
+    // Both replicas prepared valid requests before either reserved the ID. The
+    // only difference is presence of a caller OCC assertion, which binds intent.
+    let competing = request
+        .clone()
+        .with_conditions(MigrationConditions {
+            expected_child_occ: Some(request.child.occ_version),
+            ..MigrationConditions::default()
+        })
+        .unwrap();
+    assert!(first.get_migration(operation).await.unwrap().is_none());
+    assert!(second.get_migration(operation).await.unwrap().is_none());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let reserve = |store: Arc<keyrack_sqlite::SqliteStorage>, intent| {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.reserve_migration(&intent).await
+        })
+    };
+    let (one, two) = tokio::join!(
+        reserve(first.clone(), request),
+        reserve(second.clone(), competing)
+    );
+    let (winner, error) = match (one.unwrap(), two.unwrap()) {
+        (Ok(winner), Err(error)) | (Err(error), Ok(winner)) => (winner, error),
+        outcomes => panic!("exactly one reservation must win: {outcomes:?}"),
+    };
+    assert!(
+        matches!(error, KeyRackError::MigrationIntentConflict { operation: id } if id == operation)
+    );
+    let domain = DomainError::from(error);
+    assert_eq!(
+        domain.to_grpc_status().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(domain.to_rest_error().0, axum::http::StatusCode::CONFLICT);
+    // Direct core-error adapters must agree with the shared operation executor.
+    assert_eq!(
+        keyrack_service::convert::error_to_status(KeyRackError::MigrationIntentConflict {
+            operation
+        })
+        .code(),
+        tonic::Code::FailedPrecondition,
+    );
+    let core = DomainError::Core(KeyRackError::MigrationIntentConflict { operation });
+    assert_eq!(
+        core.to_grpc_status().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(core.to_rest_error().0, axum::http::StatusCode::CONFLICT);
+    let saved = first.get_migration(operation).await.unwrap().unwrap();
+    assert!(saved.request.same_intent(&winner.request).unwrap());
+    assert!(saved.result.is_none());
+    assert_eq!(saved.epoch, 0, "a losing intent must not take ownership");
+    drop(first);
+    drop(second);
+    std::fs::remove_file(path).unwrap();
 }

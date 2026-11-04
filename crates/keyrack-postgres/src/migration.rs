@@ -187,7 +187,9 @@ impl PostgresStorage {
         let mut tx = write_transaction(&self.pool).await?;
         if let Some(existing) = load(&mut tx, request.operation).await? {
             if !existing.request.same_intent(request)? {
-                return Err(invalid("operation intent conflict"));
+                return Err(KeyRackError::MigrationIntentConflict {
+                    operation: request.operation,
+                });
             }
             return Ok(existing);
         }

@@ -424,10 +424,13 @@ pub async fn intent_binds_every_condition(store: &dyn StorageBackend) {
             7 => changed.old_parent.lid = keyrack_core::lid::Lid::from_bytes([8; 32]),
             _ => changed.new_parent.lid = keyrack_core::lid::Lid::from_bytes([9; 32]),
         }
-        assert!(
-            store.reserve_migration(&changed).await.is_err(),
-            "intent field {field} must conflict"
-        );
+        let error = store.reserve_migration(&changed).await.unwrap_err();
+        if field < 5 {
+            assert!(
+                matches!(error, KeyRackError::MigrationIntentConflict { operation } if operation == request.operation),
+                "valid changed intent field {field} must return the typed conflict"
+            );
+        }
         assert!(same_json(
             &store
                 .get_migration(request.operation)
@@ -877,9 +880,118 @@ pub async fn concurrent_reader_snapshots(store: &dyn StorageBackend) {
     }
 }
 
+/// The advisory scheduling query and the transactional destruction claim must
+/// see the same migration dependency, including a target with no envelope yet.
+pub async fn destruction_dependency_query_tracks_migration(store: &dyn StorageBackend) {
+    let (request, _) = seeded(store).await;
+    assert!(store
+        .destruction_dependencies(&request.new_parent.lid)
+        .await
+        .unwrap()
+        .is_empty());
+    store.reserve_migration(&request).await.unwrap();
+    let owner = test_owner(store, request.operation).await;
+    for phase in 0..2 {
+        if phase == 1 {
+            store
+                .stage_migration(request.operation, owner, &envelopes())
+                .await
+                .unwrap();
+        }
+        for record in [&request.child, &request.old_parent, &request.new_parent] {
+            let counts = store.destruction_dependencies(&record.lid).await.unwrap();
+            assert_eq!(
+                counts.migration_journal_rows, 1,
+                "migration dependency must cover every participating identity at phase {phase}"
+            );
+            assert!(!counts.is_empty());
+            assert!(counts.summary().contains("migration_journal_rows=1"));
+            if record.lid == request.new_parent.lid {
+                assert_eq!(counts.creation_journal_rows, 0);
+                assert_eq!(counts.own_parent_wrapped_versions, 0);
+                assert_eq!(counts.dependent_parent_wrapped_versions, 0);
+            }
+            let mut scheduled = record.clone();
+            scheduled.state = KeyState::PendingDeletion;
+            scheduled.scheduled_deletion_at = Some(chrono::Utc::now());
+            scheduled.occ_version += 1;
+            retryable(store.update_key(&scheduled).await);
+            retryable(
+                store
+                    .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+                    .await,
+            );
+        }
+    }
+    store
+        .commit_migration(request.operation, owner)
+        .await
+        .unwrap();
+    for record in [&request.child, &request.old_parent, &request.new_parent] {
+        assert_eq!(
+            store
+                .destruction_dependencies(&record.lid)
+                .await
+                .unwrap()
+                .migration_journal_rows,
+            0
+        );
+    }
+    assert!(store
+        .get_migration(request.operation)
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .is_some());
+    assert!(store
+        .destruction_dependencies(&request.old_parent.lid)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!store
+        .destruction_dependencies(&request.new_parent.lid)
+        .await
+        .unwrap()
+        .is_empty());
+    let mut scheduled = crate::destruction_conformance::due(request.old_parent.clone());
+    scheduled.occ_version += 1;
+    store.update_key(&scheduled).await.unwrap();
+    assert!(store
+        .claim_destruction(&scheduled.lid, scheduled.occ_version, chrono::Utc::now())
+        .await
+        .unwrap()
+        .is_some());
+
+    // Rewrap names one identity in both parent columns; count a journal once.
+    let (request, _) = seeded(store).await;
+    let rewrap = MigrationRequest::new(
+        Uuid::new_v4(),
+        None,
+        request.child,
+        request.old_parent.clone(),
+        request.old_parent,
+    )
+    .unwrap();
+    store.reserve_migration(&rewrap).await.unwrap();
+    assert_eq!(
+        store
+            .destruction_dependencies(&rewrap.old_parent.lid)
+            .await
+            .unwrap()
+            .migration_journal_rows,
+        1
+    );
+}
+
 #[macro_export]
 macro_rules! migration_conformance_tests {
     ($store:expr) => {
+        #[tokio::test]
+        async fn migration_destruction_dependency_query_tracks_migration() {
+            $crate::migration_conformance::destruction_dependency_query_tracks_migration(&$store)
+                .await;
+        }
         #[tokio::test]
         async fn migration_concurrent_reader_snapshots() {
             $crate::migration_conformance::concurrent_reader_snapshots(&$store).await;

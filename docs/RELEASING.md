@@ -46,7 +46,7 @@ Before handing off `v0.5.0`, complete the release re-pin in
   and record identical trees rather than assuming equivalence.
 - Preserve a new conformance receipt with those revision/run identifiers and the
   fence-control artifact digest. Update the active handoff pin while retaining
-  the `558bd6a` record as historical evidence. Do not move the tag or relabel old
+  the `4c0822e` and `558bd6a` records as historical evidence. Do not move the tag or relabel old
   CI results to complete the pin.
 
 ## Demo coverage model

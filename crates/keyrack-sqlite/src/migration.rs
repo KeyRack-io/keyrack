@@ -172,7 +172,7 @@ impl SqliteStorage {
         request.validate()?;
         self.creation_tx(|conn| {
             if let Some(existing) = load(conn, request.operation)? {
-                if !existing.request.same_intent(request)? { return Err(invalid("operation intent conflict")); }
+                if !existing.request.same_intent(request)? { return Err(KeyRackError::MigrationIntentConflict { operation: request.operation }); }
                 return Ok(existing);
             }
             snapshots(conn, request)?;

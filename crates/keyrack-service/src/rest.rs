@@ -45,6 +45,10 @@ struct KeyVersionResponse {
     version_number: u64,
     created_at: chrono::DateTime<chrono::Utc>,
     is_primary: bool,
+    /// Current lifecycle state of the owning logical key.
+    lifecycle_state: keyrack_core::key::KeyState,
+    /// Logical-key compromise history, shared by every version.
+    has_compromise_history: bool,
 }
 
 /// Tenant-safe key response DTO.
@@ -55,6 +59,9 @@ struct KeyVersionResponse {
 struct KeyResponse {
     lid: String,
     state: keyrack_core::key::KeyState,
+    /// Explicit live lifecycle; `state` is retained with the same meaning.
+    lifecycle_state: keyrack_core::key::KeyState,
+    has_compromise_history: bool,
     key_spec: keyrack_core::key::KeySpec,
     key_usage: keyrack_core::key::KeyUsage,
     origin: keyrack_core::key::KeyOrigin,
@@ -88,6 +95,8 @@ impl From<&KeyRecord> for KeyResponse {
         Self {
             lid: r.lid.to_string(),
             state: r.state,
+            lifecycle_state: r.state,
+            has_compromise_history: r.has_compromise_history(),
             key_spec: r.key_spec.clone(),
             key_usage: r.key_usage,
             origin: r.origin,
@@ -112,6 +121,8 @@ impl From<&KeyRecord> for KeyResponse {
                     version_number: v.version_number,
                     created_at: v.created_at,
                     is_primary: v.is_primary,
+                    lifecycle_state: r.state,
+                    has_compromise_history: r.has_compromise_history(),
                 })
                 .collect(),
         }
@@ -642,11 +653,6 @@ async fn schedule_key_deletion(
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
-        state
-            .storage
-            .check_migration_fence(&lid)
-            .await
-            .map_err(map_core_err)?;
         let mut record = state
             .storage
             .get_key_for_use(&lid)
@@ -656,6 +662,9 @@ async fn schedule_key_deletion(
             .get("grace_period_days")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(7);
+        let dependencies = crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
+            .await
+            .map_err(|error| error.to_rest_error())?;
         record
             .transition_to(keyrack_core::key::KeyState::PendingDeletion)
             .map_err(|(f, t)| transition_err(f, t))?;
@@ -669,7 +678,9 @@ async fn schedule_key_deletion(
             .update_key(&record)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&record))
+        let Json(mut response) = key_json(&record);
+        response["logical_only_children"] = serde_json::json!(dependencies.logical_only_children);
+        Ok(Json(response))
     })
     .await
 }

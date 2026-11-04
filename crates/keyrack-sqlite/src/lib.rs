@@ -194,6 +194,13 @@ impl StorageBackend for SqliteStorage {
         self.with_conn(|conn| migration::guard(conn, lid))
     }
 
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        self.destruction_dependency_counts(lid)
+    }
+
     async fn claim_destruction(
         &self,
         lid: &Lid,

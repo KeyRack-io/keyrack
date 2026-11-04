@@ -6,6 +6,33 @@ revocation.
 
 ## Execution contract
 
+`ScheduleKeyDeletion` refuses before changing the lifecycle when the key has any
+`ParentWrapped` version, another key has a `ParentWrapped` version naming it as
+parent, any creation-journal row names it as parent or child, or a nonterminal
+migration names it as child, old parent or new parent. This applies to
+the domain/library, gRPC and REST paths. gRPC returns `FAILED_PRECONDITION`; REST
+returns HTTP 409 with `FailedPrecondition`. The diagnostic contains counts named
+`own_parent_wrapped_versions`, `dependent_parent_wrapped_versions` and
+`creation_journal_rows` and `migration_journal_rows`, never the LIDs of other keys.
+Counts cover all versions, every creation-journal phase and nonterminal migration
+journals; a row matching multiple roles counts once. Committed migration receipts
+do not block the retired parent. Logical
+`parent_lid` relationships alone do not block scheduling. Successful gRPC and REST
+schedule responses include `logical_only_children`: the number of direct
+persisted child records whose versions all contain resident material, observed
+by the same admission query. Each child counts once, regardless of lifecycle
+state or version count; grandchildren and actual wrapped dependencies are not
+included. The count is informational, not a reservation or approval of data loss.
+
+
+Scheduling and claiming share `StorageBackend::destruction_dependencies` and
+the backend's transaction query. Scheduling is an early observation, not a
+reservation: a dependency introduced after scheduling still causes the claim to
+refuse. The authoritative recheck remains under the same writer fence as claim
+insertion. Unsupported storage implementations fail closed; cache wrappers must
+query the underlying store. Dependency scans currently visit persisted key
+histories, so this check adds database work to scheduling.
+
 1. The reaper's scan result is only a candidate. `claim_destruction` re-reads the
    record under the storage writer lock and checks its OCC, due PendingDeletion
    state and entire resident version history. Empty/duplicate/malformed histories
@@ -81,13 +108,35 @@ wrapping references and terminal resurrection denial. Backend-specific tests add
 independent connections/pools, restart/reconnect and injected transaction rollback.
 Service tests pause a provider call while REST/gRPC cancellation and another reaper
 compete, and exercise cancellation-first and partial-provider-failure outcomes.
+The `integration::deletion_dependencies` tests cover each scheduling refusal on
+gRPC and REST, the domain path, unchanged records after refusal, and logical-only
+children. Reverted controls remove the shared scheduling check and require each
+of the eight surface refusal tests to fail on its own assertion.
+
+Dependent-data-loss override intent is outside this release. There is no flag to
+bypass these checks or erase journal rows to make a key eligible.
 
 ```sh
 cargo test -p keyrack-sqlite
 cargo test -p keyrack-service
 # Against a disposable database; never a deployment database:
 cargo test -p keyrack-postgres --features live-tests
+# New or empty directory outside disposable build storage; retain it as evidence:
+python3 scripts/test-deletion-scheduling-controls.py --output /path/to/deletion-controls
 ```
+
+The control runner copies the current source into a disposable directory, verifies
+all ten baseline tests, then removes only the shared scheduling refusal in that
+copy. It requires eight surface refusals and the domain refusal to fail for
+unexpected successful scheduling, while the logical-only positive still passes.
+The checkout is never edited. Source hashes, commands, logs and the result remain
+in `--output`; a nonempty output directory is refused. `CARGO_TARGET_DIR` is
+honored, and `--timeout` bounds each Cargo invocation (default 1,800 seconds).
 
 These are implementation tests, not a new Tamarin proof or a production hierarchy
 qualification. Existing ignored live-provider tests remain separate invocations.
+
+The same runner separately replaces the shared logical-only count and each
+transport's reported count with zero. The count assertion must fail for its
+specific domain, gRPC or REST response while all refusal tests keep passing.
+A final restored run must pass, with hashes and diagnostics retained in the receipt.
