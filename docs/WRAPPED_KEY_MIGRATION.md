@@ -1,5 +1,10 @@
 # Wrapped-key migration
 
+**Evidence baseline:** `558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec`.
+Use the [contract at that exact source revision](https://github.com/KeyRack-io/keyrack/blob/558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec/docs/WRAPPED_KEY_MIGRATION.md)
+and the [pinned CI and conformance evidence](#pinned-revision-and-ci-results)
+for this handoff. A later branch head does not inherit these results.
+
 `RewrapKey` moves every retained version of one logical wrapped key. Omitting a
 new parent rewraps under the existing parent's current version; naming a new
 parent reparents the key. The target version is pinned at reservation. Child
@@ -185,19 +190,40 @@ migration fence.
 | Alias create, delete or retarget | Safely permitted. Migration intent is addressed by LID, so changing an alias cannot retarget it. |
 | Decrypt a retained version | Permitted under ordinary key/PDP policy, through the consistent snapshot path. |
 
-Child rotation (`RotateKey` on a wrapped child) adds a version through the
-creation journal, wrapped under the parent's current version. Against a
-migration of the child or either parent, whichever reservation the writer
-lock admits first wins:
+## Rotation integration protocol
 
-- A migration reserved or staged first refuses the rotation as retryable
-  before any provider call.
-- A rotation reserved first refuses the migration as retryable. After the
-  rotation publishes, a retried migration moves every version, including it.
-- A migration that commits after the rotation read the child leaves the
-  rotation's snapshot stale. The rotation re-reads and wraps under the new
-  parent's current version; after a bounded number of re-reads it is refused
-  as an OCC conflict.
+The protocol agreed for [wrapped-child rotation, #68](https://github.com/KeyRack-io/keyrack/pull/68)
+is **first reservation admitted under the shared storage writer fence wins**.
+The rotation implementation reviewed for this agreement is
+`f6e8797d67a88e39cf47cad0152d47fad35a4c87`; it is separate from the pinned #66
+evidence below. Wrapped-child rotation is not enabled by the #66 baseline alone.
+
+1. If migration is Reserved or Staged first, rotation is refused retryably
+   (`UNAVAILABLE` / HTTP 503) before provider dispatch. Creation reservation and
+   publication retain their migration guards on both storage backends.
+2. If rotation's creation journal is reserved first, migration is refused
+   retryably by its pending-creation check. After rotation publishes, a freshly
+   prepared migration covers every version, including the new one. This is a
+   refusal, not a queued wait. A refusal before migration reservation leaves no
+   migration journal, so unchanged caller parameters may retry with the same
+   operation ID and fresh snapshots.
+3. If migration commits between rotation's read and reservation, OCC rejects
+   the stale rotation before dispatch. Rotation re-reads the child and its new
+   parent and wraps under that parent's current version; exhaustion of its
+   bounded retries returns `ABORTED` / HTTP 409.
+
+Caller-supplied expected revisions and `covered_versions` are never silently
+advanced. If rotation makes an assertion stale, the caller must deliberately
+refresh it. Once a migration journal exists, its snapshots and optional
+assertions are immutable; a changed intent under its operation ID conflicts.
+
+`withdraw_creation` may release only a Reserved entry with no dispatch marker,
+or a Resolved entry with verified provider closure, under the writer fence.
+Dispatch claimed/unknown and unclosed staged effects continue to block migration
+and destruction until reconciled. Committed entries retain their retirement
+rules. Safe withdrawal relinquishes the reservation's priority. Migration
+ownership epochs, pinned target version, full-version commit and terminal-result
+requirements remain in force.
 
 A rotation never publishes a version under the old parent after a migration
 commits. Rotating a parent does not rewrap its children; that is this
@@ -223,6 +249,40 @@ service-owned old bytes cannot revoke a separately retained old envelope while
 its old parent survives, and does not erase database logs or backups.
 
 ## Acceptance evidence
+
+### Pinned revision and CI results
+
+Results produced on 2026-11-02 are pinned to source commit
+[`558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec`](https://github.com/KeyRack-io/keyrack/commit/558bd6a6561e1f9e77cf506ad7f3fdc02ed764ec).
+The three runs below report that exact `head_sha` and `success`; verified again
+on 2026-11-04. Their checkout logs identify GitHub's PR merge commit
+`ed4dccb0c92ff952bd2cc84da85e05ca311f27fb`, merging the source into
+`8f45f83f212fb21ec3db9b0fe086499248636ea9`. Both source and tested merge have
+Git tree `2ebfb752f7a53cb4e63c1fbc63ee200b164705db`: the tested contents are identical.
+
+| CI run for this source SHA | Evidence |
+| --- | --- |
+| [CI — 41475420166](https://github.com/KeyRack-io/keyrack/actions/runs/41475420166) | Test, Clippy and Format passed. Test includes 14 service migration tests, 10 API authorization/intent/receipt tests and 51 SQLite library tests. |
+| [REST/gRPC surface parity — 41475419914](https://github.com/KeyRack-io/keyrack/actions/runs/41475419914) | Explicit API surface and generated claim passed. |
+| [Wrapped-key migration — 41475419960](https://github.com/KeyRack-io/keyrack/actions/runs/41475419960) | 10 live PostgreSQL migration tests and 16 deliberate fence reversions passed; restored baseline passed. |
+
+The migration run's [migration-fence-controls artifact](https://github.com/KeyRack-io/keyrack/actions/runs/41475419960/artifacts/13157377884)
+contains the complete logs and `results.json`. Its downloaded archive SHA-256 is
+`1f8954814f7c817093dc18aa747eea7969f9e986a57fbd840dc5e3d316a3c5d0`.
+The [archived conformance receipt](evidence/wrapped-key-migration-558bd6a.json)
+preserves that result, all 16 control names, source-file hashes, source/checkout
+SHAs, tree identity and run links independently of CI artifact retention. Every
+receipt source-file hash was checked against the pinned commit. The 35-test
+full PostgreSQL conformance result reported on #66 was a separate local run;
+the linked migration CI job ran the 10-test migration subset.
+
+**0.5.0 release re-pin is pending:** `v0.5.0` did not exist on 2026-11-04.
+When cut, pin the contract to that tag, record its peeled commit SHA, and attach
+successful CI/conformance runs for that release commit. Preserve this record
+as historical evidence; do not relabel these pre-release runs as tag results.
+The required handoff is in [Releasing KeyRack](RELEASING.md#050-migration-evidence-handoff).
+
+### Acceptance coverage
 
 The CI **Test** job (`.github/workflows/ci.yml`) runs the service and core tests.
 The **Explicit API surface and generated claim** job checks REST/gRPC parity.

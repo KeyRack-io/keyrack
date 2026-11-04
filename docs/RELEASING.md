@@ -31,6 +31,24 @@ PRs and on the release tag.
    the multi-arch image to `ghcr.io/keyrack-io/keyrack-service:X.Y.Z` (+ `:X.Y`).
    A failed E2E **blocks** the publish.
 
+## 0.5.0 migration evidence handoff
+
+Before handing off `v0.5.0`, complete the release re-pin in
+[Wrapped-key migration](WRAPPED_KEY_MIGRATION.md#pinned-revision-and-ci-results):
+
+- Resolve the cut tag to its peeled commit SHA and verify that it includes the
+  migration and agreed rotation/migration protocol.
+- Link the contract at `v0.5.0` and record the full release commit SHA. Record
+  successful full CI, REST/gRPC surface parity and migration PostgreSQL/fence
+  conformance run URLs for that SHA. If a required workflow has not run for the
+  release commit, obtain that evidence before describing the release as covered.
+  Record actual CI checkout SHAs too; if they differ from the tag commit, verify
+  and record identical trees rather than assuming equivalence.
+- Preserve a new conformance receipt with those revision/run identifiers and the
+  fence-control artifact digest. Update the active handoff pin while retaining
+  the `558bd6a` record as historical evidence. Do not move the tag or relabel old
+  CI results to complete the pin.
+
 ## Demo coverage model
 
 The docker-compose demo stacks (`scripts/run-demos-ci.sh`) are the automated E2E
