@@ -18,7 +18,7 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! PKCS#11 cryptographic provider for hardware HSMs.
+//! PKCS#11 cryptographic provider for tokens.
 //!
 //! Wraps the PKCS#11 C API via the [`cryptoki`] crate (safe Rust bindings).
 //! `SoftHSM2` is supported as a software token loaded into this process. Its

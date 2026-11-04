@@ -370,6 +370,10 @@ default, and the legacy single `provider:` configuration. Ordinary keys retain
 the ordinary entry's permissions; the wrapping entry creates derive-only
 AES-256 resident roots, which cannot encrypt or decrypt application data.
 Parent and child descriptors must name that same dedicated provider identity.
+Parent admission checks the exact resident object and its attributes, including
+AES-256, derive-only permissions, sensitivity, non-extractability and refusal to
+read `CKA_VALUE`. It does not prove which client originally created the object;
+an externally provisioned parent with those exact attributes is also accepted.
 Configuration validation alone does not qualify a token: startup must also
 complete the native derive/wrap/unwrap self-test, reject a wrong context, and
 read back `Sensitive=true` and `Extractable=false` on derived KEKs and opened
@@ -388,10 +392,15 @@ Derived KEKs are sensitive, non-extractable session objects with only
 wrap/unwrap permission; opened children are sensitive, non-extractable session
 objects with only encrypt/decrypt permission. The KEK is destroyed before an
 opened child is handed to a use lease, and the child is closed through the
-lease cleanup owner. Startup self-test objects, including its temporary parent,
-are session objects. Creation closure evidence requires the original creation
+lease cleanup owner. Generation and rewrap explicitly attempt destruction of
+every temporary KEK and child on error as well as success. A failed destruction
+is reported and disables further wrapping in that module until process restart;
+original-session cleanup is still attempted. Startup self-test objects, including
+its temporary parent, are session objects. Creation closure evidence requires the original creation
 session's exact binding and closure; ordinary lease cleanup does not establish
-that evidence.
+that evidence. Only the issuing provider may use a lease. Ordinary provider
+lookups and destruction select persistent token objects and reject lease labels,
+even when both provider entries share a token and can see its session objects.
 
 SoftHSM is a software token loaded into KeyRack's process. Its storage
 permissions and PIN protect keys; this code path does not establish hardware

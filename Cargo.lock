@@ -2803,6 +2803,8 @@ dependencies = [
 name = "keyrack-pkcs11"
 version = "0.5.0"
 dependencies = [
+ "aes",
+ "aes-kw",
  "async-trait",
  "blake3",
  "cryptoki",

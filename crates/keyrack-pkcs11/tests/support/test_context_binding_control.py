@@ -41,9 +41,32 @@ class CargoTargetEnvironment(unittest.TestCase):
         self.assertNotIn("#![allow", changed_engine)
         self.assertIn("    #[allow(dead_code)]\n    Kek,", changed_native)
         self.assertNotIn("native::self_test(provider, &profile)?;", changed_engine)
-        derive = changed_native.split("fn derive(", 1)[1].split("fn unwrapped_policy(", 1)[0]
+        derive = changed_native.split("    fn derive(", 1)[1].split("    pub(super) fn new(", 1)[0]
         self.assertIn("Ok(parent)", derive)
         self.assertNotIn("derive_key", derive)
+        self.assertIn("&self, parent: ObjectHandle", derive)
+
+    def test_cleanup_retains_children_and_borrows_resident_parent(self):
+        root = Path(__file__).resolve().parents[4]
+        native = (root / "crates/keyrack-pkcs11/src/provider/context_wrapping/native.rs").read_text()
+        engine = (root / "crates/keyrack-pkcs11/src/provider/context_wrapping.rs").read_text()
+        changed, _ = counterfactual_sources(native, engine)
+        cleanup = changed.split("    fn destroy_objects(", 1)[1].split("    fn temporary_objects(", 1)[0]
+        self.assertIn(".get_attributes(*key, &[AttributeType::Token])", cleanup)
+        self.assertIn("== [Attribute::Token(true)]", cleanup)
+        self.assertIn("continue; // Counterfactual source only: borrowed resident parent.", cleanup)
+        self.assertIn("session.destroy_object(*key)", cleanup)
+        self.assertIn("super::finish(outcome, self.destroy_objects(&keys))", changed)
+        self.assertIn("let destroyed = self.destroy_objects(&[kek]);", changed)
+        self.assertIn("keys.push(child);", changed)
+        self.assertNotIn("counterfactual resident readback", native)
+
+    def test_ambiguous_derivation_anchor_refuses_mutation(self):
+        root = Path(__file__).resolve().parents[4]
+        native = (root / "crates/keyrack-pkcs11/src/provider/context_wrapping/native.rs").read_text()
+        engine = (root / "crates/keyrack-pkcs11/src/provider/context_wrapping.rs").read_text()
+        with self.assertRaisesRegex(RuntimeError, "exactly one owned derivation method"):
+            counterfactual_sources(native + "\n    fn derive(\n", engine)
 
 
 if __name__ == "__main__":

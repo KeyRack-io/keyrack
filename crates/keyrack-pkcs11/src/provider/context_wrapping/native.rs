@@ -22,6 +22,9 @@ use keyrack_core::wrapping::WrappingContext;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+#[cfg(all(test, feature = "softhsm-tests"))]
+mod tests;
+
 struct Admission(Arc<SharedModule>);
 
 pub(super) fn ensure_cleanup_confirmed(module: &SharedModule) -> Result<()> {
@@ -52,6 +55,10 @@ pub(super) struct Owner {
     pub(super) fault: Option<Fault>,
     #[cfg(test)]
     pub(super) close_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(super) destroy_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    known_generated_value: Option<Vec<u8>>,
     #[cfg(test)]
     pub(super) release_close_failure: Option<Box<Owner>>,
     #[cfg(test)]
@@ -91,7 +98,34 @@ impl MigrationPause {
 pub(super) enum Fault {
     AfterGenerate,
     AfterOpen,
+    DerivedPolicy,
+    DerivedUnreadable,
+    #[cfg(feature = "softhsm-tests")]
+    DerivedSensitiveFalse,
+    #[cfg(feature = "softhsm-tests")]
+    DerivedExtractableTrue,
+    KnownGeneratedValue,
+    WrapLengthMismatch,
+    RewrapAfterUnwrap,
+    RewrapAfterDerive,
     CloseBeforeNative,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SELF_TEST_FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "softhsm-tests"))]
+fn with_self_test_fault<T>(fault: Fault, operation: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Fault>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SELF_TEST_FAULT.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(SELF_TEST_FAULT.with(|slot| slot.replace(Some(fault))));
+    operation()
 }
 
 impl Drop for Owner {
@@ -181,26 +215,6 @@ fn context_digest(context: &WrappingContext) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-fn derive(
-    session: &Session,
-    parent: ObjectHandle,
-    context: &WrappingContext,
-    label: &str,
-) -> Result<ObjectHandle> {
-    let digest = context_digest(context)?;
-    let expected = template(Role::Kek, 32, false, label);
-    let key = session
-        .derive_key(
-            &Mechanism::AesCbcEncryptData(AesCbcDeriveParams::new([0; 16], &digest)),
-            parent,
-            &expected,
-        )
-        .map_err(|e| map_pkcs11_error("context-derived KEK derive (not retried)", &e))?;
-    policy(session, key, &expected)?;
-    unreadable(session, key)?;
-    Ok(key)
-}
-
 fn unwrapped_policy(
     session: &Session,
     key: ObjectHandle,
@@ -227,6 +241,90 @@ fn opened_policy(session: &Session, key: ObjectHandle, size: usize, label: &str)
 }
 
 impl Owner {
+    /// Attempt every explicit destruction, even after one fails. A failed
+    /// destruction is reported and fences new wrapping admission.
+    fn destroy_objects(&self, keys: &[ObjectHandle]) -> Result<()> {
+        let session = self.session()?;
+        let mut cleanup = Ok(());
+        for key in keys {
+            #[cfg(test)]
+            self.destroy_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            cleanup = super::finish(
+                cleanup,
+                session.destroy_object(*key).map_err(|e| {
+                    map_pkcs11_error("context-derived temporary object destruction", &e)
+                }),
+            );
+        }
+        self.record_cleanup(cleanup)
+    }
+
+    fn temporary_objects<T>(
+        &self,
+        operation: impl FnOnce(&Session, &mut Vec<ObjectHandle>) -> Result<T>,
+    ) -> Result<T> {
+        let mut keys = Vec::new();
+        let outcome = operation(self.session()?, &mut keys);
+        super::finish(outcome, self.destroy_objects(&keys))
+    }
+
+    fn derive(
+        &self,
+        parent: ObjectHandle,
+        context: &WrappingContext,
+        label: &str,
+    ) -> Result<ObjectHandle> {
+        let session = self.session()?;
+        let digest = context_digest(context)?;
+        let expected = template(Role::Kek, 32, false, label);
+        #[cfg(all(test, feature = "softhsm-tests"))]
+        let requested = {
+            let mut requested = expected.clone();
+            for attribute in &mut requested {
+                match (self.fault, &*attribute) {
+                    #[cfg(feature = "softhsm-tests")]
+                    (Some(Fault::DerivedSensitiveFalse), Attribute::Sensitive(_)) => {
+                        *attribute = Attribute::Sensitive(false);
+                    }
+                    #[cfg(feature = "softhsm-tests")]
+                    (Some(Fault::DerivedExtractableTrue), Attribute::Extractable(_)) => {
+                        *attribute = Attribute::Extractable(true);
+                    }
+                    _ => (),
+                }
+            }
+            requested
+        };
+        #[cfg(all(test, feature = "softhsm-tests"))]
+        let requested = requested.as_slice();
+        #[cfg(not(all(test, feature = "softhsm-tests")))]
+        let requested = expected.as_slice();
+        let key = session
+            .derive_key(
+                &Mechanism::AesCbcEncryptData(AesCbcDeriveParams::new([0; 16], &digest)),
+                parent,
+                requested,
+            )
+            .map_err(|e| map_pkcs11_error("context-derived KEK derive (not retried)", &e))?;
+        let checked = (|| {
+            #[cfg(test)]
+            if self.fault == Some(Fault::DerivedPolicy) {
+                return Err(failure("injected derived KEK policy rejection"));
+            }
+            policy(session, key, &expected)?;
+            #[cfg(test)]
+            if self.fault == Some(Fault::DerivedUnreadable) {
+                return Err(failure("injected derived KEK unreadable rejection"));
+            }
+            unreadable(session, key)
+        })();
+        if checked.is_err() {
+            return super::finish(checked.map(|()| key), self.destroy_objects(&[key]));
+        }
+        Ok(key)
+    }
+
     pub(super) fn new(provider: &Pkcs11Provider) -> Result<Self> {
         ensure_cleanup_confirmed(&provider.module)?;
         provider.module.gate.admit()?;
@@ -249,6 +347,10 @@ impl Owner {
             fault: None,
             #[cfg(test)]
             close_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            destroy_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            known_generated_value: None,
             #[cfg(test)]
             release_close_failure: None,
             #[cfg(test)]
@@ -289,7 +391,7 @@ impl Owner {
         Ok(())
     }
 
-    fn record_close(&self, result: Result<()>) -> Result<()> {
+    fn record_cleanup(&self, result: Result<()>) -> Result<()> {
         if result.is_err() {
             self.module
                 .wrapping_cleanup_unconfirmed
@@ -308,13 +410,13 @@ impl Owner {
                 // its destructor. The live regression observes the object.
                 drop(session);
                 return self
-                    .record_close(Err(failure("injected close failure before native close")));
+                    .record_cleanup(Err(failure("injected close failure before native close")));
             }
         }
         let result = session
             .close()
             .map_err(|e| map_pkcs11_error("context-derived original session close", &e));
-        self.record_close(result)
+        self.record_cleanup(result)
     }
 
     fn parent(&self, handle: &KeyHandle) -> Result<ObjectHandle> {
@@ -334,6 +436,7 @@ impl Owner {
             found[0],
             &template(Role::Parent, 32, true, &handle.key_id),
         )?;
+        unreadable(session, found[0])?;
         Ok(found[0])
     }
 
@@ -371,30 +474,48 @@ impl Owner {
         parent: ObjectHandle,
         label: &str,
     ) -> Result<Vec<u8>> {
-        let session = self.session()?;
         let size = key_size(&context.child_spec)?;
-        let kek = derive(session, parent, context, label)?;
-        let expected = template(Role::Generated, size, false, label);
-        let child = session
-            .generate_key(&Mechanism::AesKeyGen, &expected)
-            .map_err(|e| map_pkcs11_error("context-derived child generation (not retried)", &e))?;
-        #[cfg(test)]
-        if self.fault == Some(Fault::AfterGenerate) {
-            return Err(failure("injected after child generation"));
-        }
-        policy(session, child, &expected)?;
-        let bytes = session
-            .wrap_key(&Mechanism::AesKeyWrap, kek, child)
-            .map_err(|e| map_pkcs11_error("context-derived child wrap (no fallback)", &e))?;
-        if bytes.len() != size + 8 {
-            return Err(failure("native AES-KW output length mismatch"));
-        }
-        for key in [child, kek] {
-            session
-                .destroy_object(key)
-                .map_err(|e| map_pkcs11_error("context-derived temporary cleanup", &e))?;
-        }
-        Ok(bytes)
+        self.temporary_objects(|session, keys| {
+            let kek = self.derive(parent, context, label)?;
+            keys.push(kek);
+            let expected = template(Role::Generated, size, false, label);
+            #[cfg(test)]
+            let known_value = self.known_generated_value.clone().or_else(|| {
+                (self.fault == Some(Fault::KnownGeneratedValue))
+                    .then(|| (0..u8::try_from(size).expect("AES size")).collect())
+            });
+            #[cfg(test)]
+            let generated = if let Some(value) = &known_value {
+                let mut attributes = expected.clone();
+                attributes.retain(|a| !matches!(a, Attribute::ValueLen(_)));
+                attributes.push(Attribute::Value(value.clone()));
+                session.create_object(&attributes)
+            } else {
+                session.generate_key(&Mechanism::AesKeyGen, &expected)
+            };
+            #[cfg(not(test))]
+            let generated = session.generate_key(&Mechanism::AesKeyGen, &expected);
+            let child = generated.map_err(|e| {
+                map_pkcs11_error("context-derived child generation (not retried)", &e)
+            })?;
+            keys.push(child);
+            #[cfg(test)]
+            if self.fault == Some(Fault::AfterGenerate) {
+                return Err(failure("injected after child generation"));
+            }
+            policy(session, child, &expected)?;
+            let bytes = session
+                .wrap_key(&Mechanism::AesKeyWrap, kek, child)
+                .map_err(|e| map_pkcs11_error("context-derived child wrap (no fallback)", &e))?;
+            #[cfg(test)]
+            if self.fault == Some(Fault::WrapLengthMismatch) {
+                return Err(failure("native AES-KW output length mismatch"));
+            }
+            if bytes.len() != size + 8 {
+                return Err(failure("native AES-KW output length mismatch"));
+            }
+            Ok(bytes)
+        })
     }
 
     pub(super) fn open(
@@ -417,15 +538,15 @@ impl Owner {
     ) -> Result<()> {
         let session = self.session()?;
         let size = key_size(&context.child_spec)?;
-        let kek = derive(session, parent, context, label)?;
+        let kek = self.derive(parent, context, label)?;
         let mut expected = template(Role::Opened, size, false, label);
         expected.retain(|a| !matches!(a, Attribute::ValueLen(_)));
         let opened = session.unwrap_key(&Mechanism::AesKeyWrap, kek, wrapped, &expected);
         // No session KEK survives an ordinary successful open.
-        let destroyed = session.destroy_object(kek);
+        let destroyed = self.destroy_objects(&[kek]);
         let child = super::finish(
             opened.map_err(|e| map_pkcs11_error("context-derived child unwrap (not retried)", &e)),
-            destroyed.map_err(|e| map_pkcs11_error("context-derived KEK destruction", &e)),
+            destroyed,
         )?;
         #[cfg(test)]
         if self.fault == Some(Fault::AfterOpen) {
@@ -459,41 +580,47 @@ impl Owner {
             }
             let old_parent = self.parent(old_parent)?;
             let new_parent = self.parent(new_parent)?;
-            let session = self.session()?;
-            let old_kek = derive(session, old_parent, old, label)?;
             let size = key_size(&old.child_spec)?;
-            let mut attributes = template(Role::Migration, size, false, label);
-            attributes.retain(|a| !matches!(a, Attribute::ValueLen(_)));
-            let child = session
-                .unwrap_key(&Mechanism::AesKeyWrap, old_kek, wrapped, &attributes)
-                .map_err(|e| {
-                    map_pkcs11_error("temporary migration child unwrap (not retried)", &e)
-                })?;
-            unwrapped_policy(session, child, size, label, Role::Migration)?;
-            #[cfg(test)]
-            if let Some(pause) = &self.migration_pause {
-                pause.arrive();
-            }
-            let new_kek = derive(session, new_parent, new, label)?;
-            let output = session
-                .wrap_key(&Mechanism::AesKeyWrap, new_kek, child)
-                .map_err(|e| {
-                    map_pkcs11_error("temporary migration child wrap (no fallback)", &e)
-                })?;
-            if output.len() != size + 8 {
-                return Err(failure("rewrap output length mismatch"));
-            }
-            let mut cleanup = Ok(());
-            for key in [old_kek, new_kek, child] {
-                cleanup = super::finish(
-                    cleanup,
-                    session
-                        .destroy_object(key)
-                        .map_err(|e| map_pkcs11_error("rewrap temporary object destruction", &e)),
-                );
-            }
-            cleanup?;
-            Ok(output)
+            self.temporary_objects(|session, keys| {
+                let old_kek = self.derive(old_parent, old, label)?;
+                keys.push(old_kek);
+                let mut attributes = template(Role::Migration, size, false, label);
+                attributes.retain(|a| !matches!(a, Attribute::ValueLen(_)));
+                let child = session
+                    .unwrap_key(&Mechanism::AesKeyWrap, old_kek, wrapped, &attributes)
+                    .map_err(|e| {
+                        map_pkcs11_error("temporary migration child unwrap (not retried)", &e)
+                    })?;
+                keys.push(child);
+                #[cfg(test)]
+                if self.fault == Some(Fault::RewrapAfterUnwrap) {
+                    return Err(failure("injected after migration unwrap"));
+                }
+                unwrapped_policy(session, child, size, label, Role::Migration)?;
+                #[cfg(test)]
+                if let Some(pause) = &self.migration_pause {
+                    pause.arrive();
+                }
+                let new_kek = self.derive(new_parent, new, label)?;
+                keys.push(new_kek);
+                #[cfg(test)]
+                if self.fault == Some(Fault::RewrapAfterDerive) {
+                    return Err(failure("injected after migration derivation"));
+                }
+                let output = session
+                    .wrap_key(&Mechanism::AesKeyWrap, new_kek, child)
+                    .map_err(|e| {
+                        map_pkcs11_error("temporary migration child wrap (no fallback)", &e)
+                    })?;
+                #[cfg(test)]
+                if self.fault == Some(Fault::WrapLengthMismatch) {
+                    return Err(failure("rewrap output length mismatch"));
+                }
+                if output.len() != size + 8 {
+                    return Err(failure("rewrap output length mismatch"));
+                }
+                Ok(output)
+            })
         })();
         let output = super::finish(outcome, self.close())?;
         #[cfg(test)]
@@ -529,24 +656,21 @@ impl Owner {
                 0x60, 0x89,
             ]
         };
-        let session = self.session()?;
-        let mut attributes = template(Role::Generated, size, false, label);
-        attributes.retain(|a| !matches!(a, Attribute::ValueLen(_) | Attribute::Modifiable(_)));
-        attributes.push(Attribute::Value(public_key));
-        attributes.push(Attribute::Modifiable(false));
-        let known = session
-            .create_object(&attributes)
-            .map_err(|e| map_pkcs11_error("public AES known-answer fixture", &e))?;
-        let kek = derive(session, parent, context, label)?;
-        let wrapped = session
-            .wrap_key(&Mechanism::AesKeyWrap, kek, known)
-            .map_err(|e| map_pkcs11_error("known-answer wrap", &e))?;
-        session
-            .destroy_object(kek)
-            .map_err(|e| map_pkcs11_error("known-answer KEK cleanup", &e))?;
-        session
-            .destroy_object(known)
-            .map_err(|e| map_pkcs11_error("known-answer input cleanup", &e))?;
+        let wrapped = self.temporary_objects(|session, keys| {
+            let mut attributes = template(Role::Generated, size, false, label);
+            attributes.retain(|a| !matches!(a, Attribute::ValueLen(_) | Attribute::Modifiable(_)));
+            attributes.push(Attribute::Value(public_key));
+            attributes.push(Attribute::Modifiable(false));
+            let known = session
+                .create_object(&attributes)
+                .map_err(|e| map_pkcs11_error("public AES known-answer fixture", &e))?;
+            keys.push(known);
+            let kek = self.derive(parent, context, label)?;
+            keys.push(kek);
+            session
+                .wrap_key(&Mechanism::AesKeyWrap, kek, known)
+                .map_err(|e| map_pkcs11_error("known-answer wrap", &e))
+        })?;
         self.open_under(context, parent, &wrapped, label)?;
         let opened = self.opened.take().expect("successful known-answer open");
         let session = self.session()?;
@@ -646,6 +770,10 @@ fn self_test_observed(
         .find_objects(&[])
         .map_err(|e| map_pkcs11_error("self-test baseline", &e))?;
     let mut owner = Owner::new(provider)?;
+    #[cfg(test)]
+    {
+        owner.fault = SELF_TEST_FAULT.with(std::cell::Cell::take);
+    }
     let outcome = (|| {
         let label = format!("kr-wrap-self-test-{}", uuid::Uuid::new_v4());
         let expected = template(Role::Parent, 32, false, &label);
@@ -673,36 +801,39 @@ fn self_test_observed(
                 .map_err(|e| map_pkcs11_error("self-test opened cleanup", &e))?;
             let mut wrong = context.clone();
             wrong.child.version = std::num::NonZeroU64::new(2).expect("nonzero");
-            let session = owner.session()?;
-            let kek = derive(session, parent, &wrong, &label)?;
-            let mut opened_template =
-                template(Role::Opened, key_size(&context.child_spec)?, false, &label);
-            opened_template.retain(|a| !matches!(a, Attribute::ValueLen(_)));
-            let count = session
-                .find_objects(&[])
-                .map_err(|e| map_pkcs11_error("self-test refusal baseline", &e))?
-                .len();
-            match session.unwrap_key(&Mechanism::AesKeyWrap, kek, &bytes, &opened_template) {
-                Err(Error::Pkcs11(RvError::GeneralError, Function::UnwrapKey)) => (),
-                Err(e) => {
-                    return Err(map_pkcs11_error(
-                        "unexpected self-test wrong-context refusal",
-                        &e,
-                    ))
+            owner.temporary_objects(|session, keys| {
+                let kek = owner.derive(parent, &wrong, &label)?;
+                keys.push(kek);
+                let mut opened_template =
+                    template(Role::Opened, key_size(&context.child_spec)?, false, &label);
+                opened_template.retain(|a| !matches!(a, Attribute::ValueLen(_)));
+                let count = session
+                    .find_objects(&[])
+                    .map_err(|e| map_pkcs11_error("self-test refusal baseline", &e))?
+                    .len();
+                match session.unwrap_key(&Mechanism::AesKeyWrap, kek, &bytes, &opened_template) {
+                    Err(Error::Pkcs11(RvError::GeneralError, Function::UnwrapKey)) => (),
+                    Err(e) => {
+                        return Err(map_pkcs11_error(
+                            "unexpected self-test wrong-context refusal",
+                            &e,
+                        ))
+                    }
+                    Ok(child) => {
+                        keys.push(child);
+                        return Err(failure("wrong context passed startup unwrap"));
+                    }
                 }
-                Ok(_) => return Err(failure("wrong context passed startup unwrap")),
-            }
-            if session
-                .find_objects(&[])
-                .map_err(|e| map_pkcs11_error("self-test refusal inventory", &e))?
-                .len()
-                != count
-            {
-                return Err(failure("failed startup unwrap created an object"));
-            }
-            session
-                .destroy_object(kek)
-                .map_err(|e| map_pkcs11_error("self-test wrong KEK cleanup", &e))?;
+                if session
+                    .find_objects(&[])
+                    .map_err(|e| map_pkcs11_error("self-test refusal inventory", &e))?
+                    .len()
+                    != count
+                {
+                    return Err(failure("failed startup unwrap created an object"));
+                }
+                Ok(())
+            })?;
             owner.open_under(&context, parent, &bytes, &label)?;
             let opened = owner.opened.take().expect("successful control open");
             owner

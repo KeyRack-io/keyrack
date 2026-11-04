@@ -26,6 +26,8 @@ sha2 = "0.10"
 blake3 = "1"
 
 [dev-dependencies]
+aes = "0.8"
+aes-kw = "0.2"
 keyrack-test-support = { workspace = true }
 keyrack-sqlite = { workspace = true }
 

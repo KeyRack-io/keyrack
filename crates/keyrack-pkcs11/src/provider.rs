@@ -27,7 +27,7 @@ use cryptoki::mechanism::aead::GcmParams;
 use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
-use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::types::AuthPin;
 use keyrack_core::error::{KeyRackError, Result};
@@ -798,8 +798,25 @@ fn find_slot_by_label(ctx: &Pkcs11, label: &str) -> Result<cryptoki::slot::Slot>
     )))
 }
 
+fn require_resident_label(label: &str) -> Result<()> {
+    // Session objects are visible across this process's token sessions. Their
+    // labels must never fall back to a resident lookup, even if a token object
+    // happens to carry the same label. Only the issuing owner may use a lease.
+    if label.starts_with(context_wrapping::LEASE_LABEL_PREFIX)
+        || label.starts_with("kr-native-a2-use-")
+    {
+        return Err(KeyRackError::Provider(
+            "wrapped leases must close through their original session owner; not a resident key handle"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn find_object(session: &Session, label: &str, class: ObjectClass) -> Result<ObjectHandle> {
+    require_resident_label(label)?;
     let template = vec![
+        Attribute::Token(true),
         Attribute::Label(label.as_bytes().to_vec()),
         Attribute::Class(class),
     ];
@@ -1224,11 +1241,27 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
 }
 
 fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
-    let template = vec![Attribute::Label(label.as_bytes().to_vec())];
+    require_resident_label(label)?;
+    let template = vec![
+        Attribute::Token(true),
+        Attribute::Label(label.as_bytes().to_vec()),
+    ];
     let objects = session
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find for destroy", &e))?;
 
+    // Refuse session objects even if a module violates the search template.
+    // Validate the entire result before destroying any resident object.
+    for &obj in &objects {
+        let attributes = session
+            .get_attributes(obj, &[AttributeType::Token])
+            .map_err(|e| map_pkcs11_error("resident object readback for destroy", &e))?;
+        if attributes != [Attribute::Token(true)] {
+            return Err(KeyRackError::Provider(
+                "ordinary key destruction requires a resident token object".into(),
+            ));
+        }
+    }
     for obj in objects {
         session
             .destroy_object(obj)
@@ -1388,6 +1421,8 @@ impl CryptoProvider for Pkcs11Provider {
         if let Some(engine) = &self.wrapping {
             return engine.encrypt(handle, plaintext, aad).await;
         }
+        // Reject nonresident identities before entering the module recovery path.
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let plaintext = plaintext.to_vec();
         let aad = aad.to_vec();
@@ -1405,6 +1440,7 @@ impl CryptoProvider for Pkcs11Provider {
         if let Some(engine) = &self.wrapping {
             return engine.decrypt(handle, ciphertext, aad).await;
         }
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let ciphertext = ciphertext.to_vec();
         let aad = aad.to_vec();
@@ -1419,6 +1455,7 @@ impl CryptoProvider for Pkcs11Provider {
         algorithm: SigningAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>> {
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let message = message.to_vec();
 
@@ -1433,6 +1470,7 @@ impl CryptoProvider for Pkcs11Provider {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let message = message.to_vec();
         let signature = signature.to_vec();
@@ -1454,11 +1492,7 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
-        if self.wrapping.is_some() && handle.key_id.starts_with("kr-cbc-") {
-            return Err(KeyRackError::Provider(
-                "wrapped leases must close through their original session owner".into(),
-            ));
-        }
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
 
         self.run(move |session| destroy_objects_by_label(session, &label))
@@ -1521,6 +1555,18 @@ impl CryptoProvider for Pkcs11Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_handles_refuse_reserved_lease_namespaces() {
+        for label in ["kr-cbc-owner-child", "kr-native-a2-use-child"] {
+            assert!(matches!(
+                require_resident_label(label),
+                Err(KeyRackError::Provider(message))
+                    if message.contains("not a resident key handle")
+            ));
+        }
+        assert!(require_resident_label("resident-key").is_ok());
+    }
 
     // If you flip either flag to true you MUST have overridden the
     // corresponding method to keep plaintext in-boundary AND added a

@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 pub const CONTEXT_DERIVED_WRAPPING_MECHANISM: &str = "pkcs11:aes256-cbc-sha256-kw:v1";
 const FRAME: &[u8; 8] = b"KRCBKW01";
+pub(super) const LEASE_LABEL_PREFIX: &str = "kr-cbc-";
 // Closed evidence is retained; restart clears it, never reconstructs closure.
 const MAX_OWNERS: usize = 4096;
 
@@ -282,7 +283,11 @@ impl ContextWrapping {
                 ));
             }
         }
-        let id = format!("kr-cbc-{}-{}", self.incarnation, Uuid::new_v4());
+        let id = format!(
+            "{LEASE_LABEL_PREFIX}{}-{}",
+            self.incarnation,
+            Uuid::new_v4()
+        );
         let label = creation
             .as_ref()
             .map_or_else(|| id.clone(), |c| c.correlation().to_owned());

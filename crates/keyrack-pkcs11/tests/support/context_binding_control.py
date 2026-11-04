@@ -37,18 +37,31 @@ def counterfactual_sources(native: str, engine: str) -> tuple[str, str]:
                           "Attribute::Wrap(matches!(role, Role::Kek | Role::Parent)),")
     native = replace_once(native, "Attribute::Unwrap(matches!(role, Role::Kek)),",
                           "Attribute::Unwrap(matches!(role, Role::Kek | Role::Parent)),")
-    start = native.index("fn derive(")
-    end = native.index("fn unwrapped_policy(", start)
-    native = native[:start] + """fn derive(
-    _session: &Session, parent: ObjectHandle, _context: &WrappingContext, _label: &str,
-) -> Result<ObjectHandle> {
-    Ok(parent)
-}
+    derive_start = "    fn derive(\n"
+    derive_end = "    pub(super) fn new(provider: &Pkcs11Provider) -> Result<Self> {"
+    if native.count(derive_start) != 1 or native.count(derive_end) != 1:
+        raise RuntimeError("counterfactual requires exactly one owned derivation method")
+    start = native.index(derive_start)
+    end = native.index(derive_end, start)
+    native = native[:start] + """    fn derive(
+        &self, parent: ObjectHandle, _context: &WrappingContext, _label: &str,
+    ) -> Result<ObjectHandle> {
+        Ok(parent)
+    }
 
 """ + native[end:]
-    native = replace_once(native, "for key in [child, kek] {", "for key in [child] {")
-    native = replace_once(native, "let destroyed = session.destroy_object(kek);",
-                          "let destroyed: cryptoki::error::Result<()> = Ok(());")
+    # Derivation now returns the resident parent, not a temporary session KEK.
+    # Preserve explicit cleanup of temporary children but never destroy this
+    # borrowed parent in the isolated counterfactual. Both open and the
+    # generation/rewrap cleanup scopes use this same destruction helper.
+    native = replace_once(native, "        for key in keys {", """        for key in keys {
+            if session
+                .get_attributes(*key, &[AttributeType::Token])
+                .map_err(|e| map_pkcs11_error("counterfactual resident readback", &e))?
+                == [Attribute::Token(true)]
+            {
+                continue; // Counterfactual source only: borrowed resident parent.
+            }""")
     engine = replace_once(engine, "native::self_test(provider, &profile)?;",
                           "let _ = provider; // Counterfactual source only: bypass admission.")
     # Removing derivation and startup admission makes these exact items unused.

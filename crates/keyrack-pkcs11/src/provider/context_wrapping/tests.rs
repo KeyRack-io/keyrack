@@ -12,7 +12,7 @@ fn identifier(value: &str) -> WrappingIdentifier {
     WrappingIdentifier::new(value).unwrap()
 }
 
-fn config() -> Pkcs11ProviderConfig {
+pub(super) fn config() -> Pkcs11ProviderConfig {
     let token_label = std::env::var("KMS_PKCS11_TOKEN_LABEL").expect("fresh token required");
     assert_eq!(token_label, "keyrack-wrapping-probe");
     Pkcs11ProviderConfig {
@@ -22,7 +22,7 @@ fn config() -> Pkcs11ProviderConfig {
     }
 }
 
-fn configured(config: &Pkcs11ProviderConfig) -> Pkcs11Provider {
+pub(super) fn configured(config: &Pkcs11ProviderConfig) -> Pkcs11Provider {
     Pkcs11Provider::new_with_wrapping(
         config,
         ProviderRef::new("wrapping"),
@@ -32,7 +32,7 @@ fn configured(config: &Pkcs11ProviderConfig) -> Pkcs11Provider {
     .unwrap()
 }
 
-fn request(parent: Option<VersionedKeyId>, spec: KeySpec) -> CreationRequest {
+pub(super) fn request(parent: Option<VersionedKeyId>, spec: KeySpec) -> CreationRequest {
     let (_, mut request) = keyrack_test_support::creation_conformance::fixture();
     let material = request.material().unwrap();
     let parent = parent.unwrap_or(material.parent());
@@ -238,6 +238,17 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             .open_wrapped_key(&context, &parent, &first_bytes)
             .await
             .unwrap();
+        // A separate provider shares the token and can see process-wide session
+        // objects, but possession of the lease label does not grant their use.
+        let foreign_encrypt = ordinary
+            .encrypt(lease.handle(), b"foreign application data", b"associated")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(foreign_encrypt, KeyRackError::Provider(ref message)
+            if message == "wrapped leases must close through their original session owner; not a resident key handle"),
+            "unexpected foreign encrypt refusal: {foreign_encrypt}"
+        );
         assert!(provider
             .destroy_key(lease.handle())
             .await
@@ -248,6 +259,24 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             .encrypt(lease.handle(), b"wrapped application data", b"associated")
             .await
             .unwrap();
+        let foreign_decrypt = ordinary
+            .decrypt(lease.handle(), &output.ciphertext, b"associated")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(foreign_decrypt, KeyRackError::Provider(ref message)
+            if message == "wrapped leases must close through their original session owner; not a resident key handle"),
+            "unexpected foreign decrypt refusal: {foreign_decrypt}"
+        );
+        let foreign_destroy = ordinary.destroy_key(lease.handle()).await.unwrap_err();
+        assert!(
+            matches!(foreign_destroy, KeyRackError::Provider(ref message)
+            if message == "wrapped leases must close through their original session owner; not a resident key handle"),
+            "unexpected foreign destroy refusal: {foreign_destroy}"
+        );
+        assert_eq!(object_count(&provider).await, baseline + 1);
+        // Both operations still work through the issuing provider after all
+        // foreign attempts, including the attempted destruction.
         assert!(provider
             .decrypt(lease.handle(), &output.ciphertext, b"associated")
             .await
@@ -255,6 +284,21 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             .expose()
             .as_slice()
             .eq(b"wrapped application data"));
+        let after_foreign_attempts = provider
+            .encrypt(lease.handle(), b"owner retains lease", b"associated")
+            .await
+            .unwrap();
+        assert!(provider
+            .decrypt(
+                lease.handle(),
+                &after_foreign_attempts.ciphertext,
+                b"associated"
+            )
+            .await
+            .unwrap()
+            .expose()
+            .as_slice()
+            .eq(b"owner retains lease"));
         assert!(provider
             .decrypt(lease.handle(), &output.ciphertext, b"tampered")
             .await
