@@ -17,7 +17,7 @@ use keyrack_service::hierarchy::{WrappingProfile, WrappingProfiles};
 use keyrack_service::proto::{self, key_service_server::KeyService};
 use keyrack_service::routing::ProviderRouter;
 use keyrack_service::state::ServiceState;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
@@ -874,4 +874,268 @@ async fn competing_replica_intents_return_conflict_from_reservation_on_both_surf
     drop(first);
     drop(second);
     std::fs::remove_file(path).unwrap();
+}
+
+/// Exercise the actual caller crypto handlers, including their state gates.
+async fn caller_crypto(
+    state: &Arc<ServiceState>,
+    record: &KeyRecord,
+    payload: &[u8],
+    decrypt: bool,
+    rest: bool,
+) -> Result<Vec<u8>, u16> {
+    use base64::Engine as _;
+    if rest {
+        let action = if decrypt { "decrypt" } else { "encrypt" };
+        let field = if decrypt {
+            "ciphertext_blob"
+        } else {
+            "plaintext"
+        };
+        let body =
+            serde_json::json!({field: base64::engine::general_purpose::STANDARD.encode(payload)});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/keys/{}/actions-{action}", record.lid))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = keyrack_service::rest::router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        if !response.status().is_success() {
+            return Err(response.status().as_u16());
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let output = if decrypt {
+            "plaintext"
+        } else {
+            "ciphertext_blob"
+        };
+        Ok(base64::engine::general_purpose::STANDARD
+            .decode(body[output].as_str().unwrap())
+            .unwrap())
+    } else {
+        let service = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
+        let result = if decrypt {
+            service
+                .decrypt(tonic::Request::new(proto::DecryptRequest {
+                    key_id: record.lid.to_string(),
+                    ciphertext_blob: payload.to_vec(),
+                    encryption_context: HashMap::default(),
+                }))
+                .await
+                .map(|response| response.into_inner().plaintext)
+        } else {
+            service
+                .encrypt(tonic::Request::new(proto::EncryptRequest {
+                    key_id: record.lid.to_string(),
+                    plaintext: payload.to_vec(),
+                    encryption_context: HashMap::default(),
+                }))
+                .await
+                .map(|response| response.into_inner().ciphertext_blob)
+        };
+        result.map_err(|error| match error.code() {
+            tonic::Code::FailedPrecondition => 409,
+            tonic::Code::PermissionDenied => 403,
+            tonic::Code::Unavailable => 503,
+            _ => 500,
+        })
+    }
+}
+
+#[tokio::test]
+async fn both_surfaces_drain_disabled_source_without_enabling_it_and_preserve_every_version() {
+    use keyrack_core::key::KeyState;
+    for rest in [false, true] {
+        let (state, _, audit) = state(None, false);
+        let old = create(&state, None).await;
+        let new = create(&state, None).await;
+        let mut child = create(&state, Some(&old)).await;
+        let mut ciphertexts = Vec::new();
+        for version in 1..=3 {
+            let plaintext = format!("retained version {version}").into_bytes();
+            let ciphertext = caller_crypto(&state, &child, &plaintext, false, rest)
+                .await
+                .unwrap();
+            ciphertexts.push((plaintext, ciphertext));
+            if version != 3 {
+                domain::rotate_key(&state, &child.lid, &child.lid.to_string())
+                    .await
+                    .unwrap();
+                child = state.storage.get_key(&child.lid).await.unwrap();
+            }
+        }
+        // Public disabling cascades. Enable only the child for maintenance;
+        // the source never receives an EnableKey transition.
+        domain::disable_key(&state, &old.lid, &old.lid.to_string())
+            .await
+            .unwrap();
+        child = domain::enable_key(&state, &child.lid.to_string())
+            .await
+            .unwrap();
+        let source = state.storage.get_key(&old.lid).await.unwrap();
+        assert_eq!(source.state, KeyState::Disabled);
+        assert_eq!(
+            caller_crypto(&state, &source, b"must stay denied", false, rest).await,
+            Err(409)
+        );
+        let operation = uuid::Uuid::new_v4();
+        let (code, body) = request(&state, &child, Some(&new), &operation.to_string(), rest).await;
+        assert_eq!(code, 200, "rest={rest}: {body}");
+        let migrated = state.storage.get_key(&child.lid).await.unwrap();
+        assert_eq!(migrated.lid, child.lid);
+        assert_eq!(migrated.state, KeyState::Enabled);
+        assert_eq!(migrated.parent_lid, Some(new.lid));
+        assert_eq!(migrated.current_key_version, child.current_key_version);
+        assert_eq!(migrated.key_versions.len(), 3);
+        for (plaintext, ciphertext) in &ciphertexts {
+            assert_eq!(
+                caller_crypto(&state, &migrated, ciphertext, true, rest)
+                    .await
+                    .unwrap(),
+                *plaintext
+            );
+        }
+        let source_after = state.storage.get_key(&old.lid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&source_after).unwrap(),
+            serde_json::to_value(&source).unwrap()
+        );
+        assert_eq!(
+            caller_crypto(&state, &source_after, b"still denied", false, rest).await,
+            Err(409)
+        );
+        let journal = state
+            .storage
+            .get_migration(operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.request.old_parent.state, KeyState::Disabled);
+        assert_eq!(journal.request.old_parent.occ_version, source.occ_version);
+        assert!(state
+            .storage
+            .destruction_dependencies(&old.lid)
+            .await
+            .unwrap()
+            .is_empty());
+        let retry = request(&state, &child, Some(&new), &operation.to_string(), rest).await;
+        assert_eq!(retry.0, 200);
+        assert_eq!(retry.1["result"], body["result"]);
+        assert!(!audit
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.action == AuditAction::EnableKey));
+    }
+}
+
+#[tokio::test]
+async fn both_surfaces_refuse_unsafe_source_states_and_disabled_child_or_destination() {
+    use keyrack_core::key::KeyState;
+    for rest in [false, true] {
+        for case in [
+            "scheduled",
+            "disabled_scheduled",
+            "compromised",
+            "destroyed",
+            "compromise_history",
+            "child_disabled",
+            "destination_disabled",
+            "same_parent_disabled",
+        ] {
+            let (state, _, _) = state(None, false);
+            let old = create(&state, None).await;
+            let new = create(&state, None).await;
+            let child = create(&state, Some(&old)).await;
+            let mut changed = match case {
+                "child_disabled" => child.clone(),
+                "destination_disabled" => new.clone(),
+                _ => old.clone(),
+            };
+            match case {
+                "scheduled" => {
+                    changed.state = KeyState::PendingDeletion;
+                    changed.scheduled_deletion_at =
+                        Some(chrono::Utc::now() + chrono::Duration::days(7));
+                }
+                "disabled_scheduled" => {
+                    changed.state = KeyState::Disabled;
+                    changed.scheduled_deletion_at =
+                        Some(chrono::Utc::now() + chrono::Duration::days(7));
+                }
+                "compromised" => changed.state = KeyState::Compromised,
+                "destroyed" => changed.state = KeyState::Destroyed,
+                "compromise_history" => {
+                    changed.state = KeyState::Disabled;
+                    changed.was_compromised = true;
+                }
+                _ => changed.state = KeyState::Disabled,
+            }
+            changed.occ_version += 1;
+            if case == "destroyed" {
+                // Deliberate data loss uses the real durable destruction claim;
+                // a direct Destroyed update is correctly refused by storage.
+                let scheduled = state
+                    .storage
+                    .schedule_destruction(
+                        &old.lid,
+                        old.occ_version,
+                        chrono::Utc::now() - chrono::Duration::seconds(1),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                let claim = state
+                    .storage
+                    .claim_destruction(&old.lid, scheduled.record.occ_version, chrono::Utc::now())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let provider = state
+                    .providers
+                    .resolve(&ProviderRef::new("default"))
+                    .unwrap()
+                    .provider;
+                for version in &claim.record().key_versions {
+                    provider
+                        .destroy_key(version.resident_handle().unwrap())
+                        .await
+                        .unwrap();
+                }
+                state.storage.complete_destruction(claim).await.unwrap();
+            } else {
+                state.storage.update_key(&changed).await.unwrap();
+            }
+            let operation = uuid::Uuid::new_v4();
+            let destination = if case == "same_parent_disabled" {
+                None
+            } else {
+                Some(&new)
+            };
+            let (code, body) =
+                request(&state, &child, destination, &operation.to_string(), rest).await;
+            assert_eq!(code, 409, "{case} rest={rest}: {body}");
+            assert!(
+                state
+                    .storage
+                    .get_migration(operation)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case} must refuse before reservation"
+            );
+            assert_eq!(
+                state.storage.get_key(&child.lid).await.unwrap().parent_lid,
+                Some(old.lid)
+            );
+        }
+    }
 }

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS kr_migration_envelopes (
  operation_id TEXT NOT NULL, version TEXT NOT NULL, envelope BYTEA NOT NULL CHECK(octet_length(envelope) BETWEEN 1 AND 65536),
  PRIMARY KEY(operation_id,version)
 );
+CREATE TABLE IF NOT EXISTS kr_migration_schema (version INTEGER PRIMARY KEY CHECK(version=2));
 CREATE TABLE IF NOT EXISTS kr_retired_creation_journal (operation_id TEXT PRIMARY KEY, journal_json JSONB NOT NULL);
 ";
 
@@ -127,7 +128,11 @@ async fn save(conn: &mut PgConnection, value: &MigrationJournal) -> Result<()> {
     Ok(())
 }
 
-async fn snapshots(conn: &mut PgConnection, request: &MigrationRequest) -> Result<()> {
+async fn snapshots(
+    conn: &mut PgConnection,
+    request: &MigrationRequest,
+    admitted: bool,
+) -> Result<()> {
     let child = load_key(conn, &request.child.lid)
         .await?
         .ok_or(KeyRackError::KeyNotFound(request.child.lid))?;
@@ -140,7 +145,12 @@ async fn snapshots(conn: &mut PgConnection, request: &MigrationRequest) -> Resul
     for record in [&child, &old, &new] {
         crate::destruction::guard(conn, &record.lid).await?;
     }
-    request.validate_snapshots(&child, &old, &new)
+    match request.validate_snapshots(&child, &old, &new) {
+        Err(KeyRackError::ProviderUnavailable(_)) if admitted => Err(invalid(
+            "reserved key snapshot changed; immutable migration intent cannot advance",
+        )),
+        result => result,
+    }
 }
 
 async fn envelope_ref(conn: &mut PgConnection, reference: &str) -> Result<Vec<u8>> {
@@ -178,6 +188,71 @@ async fn envelope_ref(conn: &mut PgConnection, reference: &str) -> Result<Vec<u8
     Err(invalid("unknown wrapped envelope reference"))
 }
 
+/// Upgrade once under the storage writer transaction, never during journal reads.
+pub(super) async fn upgrade_schema(conn: &mut PgConnection) -> Result<()> {
+    let initialized: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kr_migration_schema WHERE version=2)")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(database_error)?;
+    if initialized {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT operation_id,journal_json,child_lid,old_parent_lid,new_parent_lid,committed FROM kr_migration_journal ORDER BY committed DESC",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(database_error)?;
+    for row in rows {
+        let operation: String = row.try_get("operation_id").map_err(database_error)?;
+        let mut value: MigrationJournal =
+            serde_json::from_value(row.try_get("journal_json").map_err(database_error)?)
+                .map_err(|_| invalid("invalid legacy journal"))?;
+        let child: String = row.try_get("child_lid").map_err(database_error)?;
+        let old: String = row.try_get("old_parent_lid").map_err(database_error)?;
+        let new: String = row.try_get("new_parent_lid").map_err(database_error)?;
+        let committed: bool = row.try_get("committed").map_err(database_error)?;
+        if operation != value.request.operation.to_string()
+            || child != value.request.child.lid.to_string()
+            || old != value.request.old_parent.lid.to_string()
+            || new != value.request.new_parent.lid.to_string()
+            || committed != (value.phase == MigrationPhase::Committed)
+        {
+            return Err(invalid("legacy journal index mismatch"));
+        }
+        if value.schema_version == 1 {
+            let old = if value.phase == MigrationPhase::Committed {
+                Vec::new()
+            } else {
+                source_envelopes(conn, &value.request).await?
+            };
+            value.upgrade_legacy(&old)?;
+            save(conn, &value).await?;
+        }
+        required(conn, value.request.operation).await?;
+    }
+    sqlx::query("INSERT INTO kr_migration_schema(version) VALUES(2)")
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(())
+}
+
+async fn source_envelopes(
+    conn: &mut PgConnection,
+    request: &MigrationRequest,
+) -> Result<Vec<Vec<u8>>> {
+    let mut envelopes = Vec::new();
+    for version in &request.child.key_versions {
+        let KeyMaterial::ParentWrapped(material) = &version.material else {
+            return Err(invalid("resident child version"));
+        };
+        envelopes.push(envelope_ref(conn, material.wrapped_material_ref().as_str()).await?);
+    }
+    Ok(envelopes)
+}
+
 impl PostgresStorage {
     pub(super) async fn migration_reserve(
         &self,
@@ -193,7 +268,7 @@ impl PostgresStorage {
             }
             return Ok(existing);
         }
-        snapshots(&mut tx, request).await?;
+        snapshots(&mut tx, request, false).await?;
         for record in [&request.child, &request.old_parent, &request.new_parent] {
             guard(&mut tx, &record.lid).await?;
             let pending: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kr_creation_journal WHERE phase!='committed' AND (child_lid=$1 OR parent_lid=$1))")
@@ -202,7 +277,10 @@ impl PostgresStorage {
                 return Err(migration_busy());
             }
         }
-        let value = MigrationJournal::reserved(request.clone());
+        let value = MigrationJournal::reserved(
+            request.clone(),
+            &source_envelopes(&mut tx, request).await?,
+        )?;
         sqlx::query("INSERT INTO kr_migration_journal(operation_id,child_lid,old_parent_lid,new_parent_lid,committed,journal_json) VALUES($1,$2,$3,$4,false,$5)")
             .bind(request.operation.to_string()).bind(request.child.lid.to_string()).bind(request.old_parent.lid.to_string()).bind(request.new_parent.lid.to_string())
             .bind(serde_json::to_value(&value).map_err(|_|invalid("journal encoding"))?).execute(&mut *tx).await.map_err(database_error)?;
@@ -223,6 +301,7 @@ impl PostgresStorage {
     ) -> Result<MigrationJournal> {
         let mut tx = write_transaction(&self.pool).await?;
         let mut value = required(&mut tx, operation).await?;
+        snapshots(&mut tx, &value.request, true).await?;
         value.claim(owner, expected_epoch)?;
         save(&mut tx, &value).await?;
         tx.commit().await.map_err(database_error)?;
@@ -237,6 +316,7 @@ impl PostgresStorage {
     ) -> Result<MigrationJournal> {
         let mut tx = write_transaction(&self.pool).await?;
         let mut value = required(&mut tx, operation).await?;
+        snapshots(&mut tx, &value.request, true).await?;
         value.begin_dispatch(ownership, retry_safe)?;
         save(&mut tx, &value).await?;
         tx.commit().await.map_err(database_error)?;
@@ -302,7 +382,7 @@ impl PostgresStorage {
                 "provider dispatch belongs to another ownership epoch",
             ));
         }
-        snapshots(&mut tx, &value.request).await?;
+        snapshots(&mut tx, &value.request, true).await?;
         for (version, envelope) in value.request.proposed.key_versions.iter().zip(envelopes) {
             sqlx::query("INSERT INTO kr_migration_envelopes(operation_id,version,envelope) VALUES($1,$2,$3)")
                 .bind(operation.to_string()).bind(version.version_number.to_string()).bind(envelope).execute(&mut *tx).await.map_err(database_error)?;
@@ -328,7 +408,7 @@ impl PostgresStorage {
         if value.phase != MigrationPhase::Staged {
             return Err(invalid("envelopes not staged"));
         }
-        snapshots(&mut tx, &value.request).await?;
+        snapshots(&mut tx, &value.request, true).await?;
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM kr_migration_envelopes WHERE operation_id=$1")
                 .bind(operation.to_string())

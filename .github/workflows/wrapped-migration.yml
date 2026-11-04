@@ -10,7 +10,7 @@ jobs:
   migration:
     name: Migration PostgreSQL parity and reverted fences
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
-          for test in migration_atomic_publication_and_retirement migration_all_writer_fences migration_creation_and_occ_preempt migration_deny_paths migration_intent_binds_every_condition migration_ownership_epoch_and_unknown_outcome migration_terminal_result_and_reader_snapshots migration_concurrent_reader_snapshots migration_ordinary_updates_and_aliases migration_destruction_dependency_query_tracks_migration; do
+          for test in migration_atomic_publication_and_retirement migration_all_writer_fences migration_creation_and_occ_preempt migration_deny_paths migration_intent_binds_every_condition migration_ownership_epoch_and_unknown_outcome migration_terminal_result_and_reader_snapshots migration_concurrent_reader_snapshots migration_ordinary_updates_and_aliases migration_destruction_dependency_query_tracks_migration migration_disabled_source_maintenance_binds_state; do
             grep -Fxq "$test: test" <<< "$listing"
           done
           cargo test -p keyrack-postgres --features live-tests --test conformance migration -- --nocapture

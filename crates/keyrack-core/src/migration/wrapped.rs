@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub fn migration_invalid(message: &str) -> KeyRackError {
-    KeyRackError::Storage(format!("wrapped-key migration: {message}"))
+    KeyRackError::MigrationRejected {
+        reason: format!("wrapped-key migration: {message}"),
+    }
 }
 
 pub fn migration_busy() -> KeyRackError {
@@ -54,6 +56,9 @@ pub struct MigrationRequest {
     pub requested_parent: Option<Lid>,
     pub conditions: MigrationConditions,
     pub child: KeyRecord,
+    /// Immutable source snapshot, including lifecycle state, compromise history and OCC.
+    /// The maintenance allowance does not alter caller lifecycle permissions
+    /// or re-enable the source.
     pub old_parent: KeyRecord,
     pub new_parent: KeyRecord,
     pub proposed: KeyRecord,
@@ -169,10 +174,17 @@ impl MigrationRequest {
                 "invalid migration identity or child state",
             ));
         }
+        if !matches!(old.state, KeyState::Enabled | KeyState::Disabled) {
+            return Err(migration_invalid(
+                "source parent must be enabled or disabled",
+            ));
+        }
+        if new.state != KeyState::Enabled {
+            return Err(migration_invalid("destination parent must be enabled"));
+        }
         for parent in [old, new] {
             if parent.parent_lid.is_some()
                 || parent.has_compromise_history()
-                || parent.state != KeyState::Enabled
                 || parent.scheduled_deletion_at.is_some()
                 || parent.exportability != Exportability::NonExportable
                 || parent.first_exported_at.is_some()
@@ -184,7 +196,7 @@ impl MigrationRequest {
                     .any(|v| !matches!(v.material, KeyMaterial::ProviderResident { .. }))
             {
                 return Err(migration_invalid(
-                    "parent must be an enabled, resident, non-exportable wrapping key",
+                    "parent must be an unscheduled, uncompromised, resident, non-exportable wrapping key",
                 ));
             }
         }
@@ -269,6 +281,16 @@ impl MigrationRequest {
         new: &KeyRecord,
     ) -> Result<()> {
         self.validate()?;
+        // Recovery must not silently advance the accepted maintenance authority.
+        // Even Disabled -> Enabled changes the reserved source-state intent.
+        if self.old_parent.state != old.state
+            || self.old_parent.has_compromise_history() != old.has_compromise_history()
+            || self.old_parent.scheduled_deletion_at != old.scheduled_deletion_at
+        {
+            return Err(migration_invalid(
+                "source parent state changed since reservation",
+            ));
+        }
         for (expected, actual) in [
             (&self.child, child),
             (&self.old_parent, old),
@@ -300,6 +322,12 @@ pub enum MigrationPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationJournal {
+    /// Version 2 binds the source envelope digests before erasure. Version 1 is
+    /// accepted only by the explicit transactional database upgrade.
+    #[serde(default = "legacy_journal_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub old_envelope_digests: Vec<[u8; 32]>,
     pub owner: Option<Uuid>,
     pub epoch: u64,
     pub dispatch: Option<MigrationDispatch>,
@@ -355,9 +383,18 @@ pub struct WrappedKeySnapshot {
     pub envelope: Vec<u8>,
 }
 
+fn legacy_journal_version() -> u32 {
+    1
+}
+
 impl MigrationJournal {
-    pub fn reserved(request: MigrationRequest) -> Self {
-        Self {
+    pub fn reserved(request: MigrationRequest, old_envelopes: &[Vec<u8>]) -> Result<Self> {
+        let value = Self {
+            schema_version: 2,
+            old_envelope_digests: old_envelopes
+                .iter()
+                .map(|bytes| *blake3::hash(bytes).as_bytes())
+                .collect(),
             request,
             phase: MigrationPhase::Reserved,
             envelope_digests: Vec::new(),
@@ -365,7 +402,45 @@ impl MigrationJournal {
             epoch: 0,
             dispatch: None,
             result: None,
+        };
+        value.validate_envelopes(old_envelopes)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// One-time storage upgrade only; never call as a fallback from normal load.
+    /// Committed v1 rows erased their old bytes, so this freezes their existing
+    /// receipt rather than asserting retroactive verification of those bytes.
+    pub fn upgrade_legacy(&mut self, old_envelopes: &[Vec<u8>]) -> Result<()> {
+        if self.schema_version != 1 {
+            return self.validate();
         }
+        if !self.old_envelope_digests.is_empty() {
+            return Err(migration_invalid(
+                "legacy journal unexpectedly binds old digests",
+            ));
+        }
+        self.old_envelope_digests = if self.phase == MigrationPhase::Committed {
+            self.result
+                .as_ref()
+                .ok_or_else(|| migration_invalid("legacy terminal result absent"))?
+                .versions
+                .iter()
+                .map(|entry| {
+                    blake3::Hash::from_hex(&entry.old_envelope_digest)
+                        .map(|hash| *hash.as_bytes())
+                        .map_err(|_| migration_invalid("invalid legacy source digest"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.validate_envelopes(old_envelopes)?;
+            old_envelopes
+                .iter()
+                .map(|bytes| *blake3::hash(bytes).as_bytes())
+                .collect()
+        };
+        self.schema_version = 2;
+        self.validate()
     }
 
     pub fn ownership(&self) -> Result<MigrationOwnership> {
@@ -431,6 +506,16 @@ impl MigrationJournal {
 
     pub fn terminal_result(&self, old_envelopes: &[Vec<u8>]) -> Result<MigrationResult> {
         self.validate_envelopes(old_envelopes)?;
+        if old_envelopes
+            .iter()
+            .map(|bytes| *blake3::hash(bytes).as_bytes())
+            .collect::<Vec<_>>()
+            != self.old_envelope_digests
+        {
+            return Err(migration_invalid(
+                "source envelopes changed since reservation",
+            ));
+        }
         let mut versions = Vec::new();
         for ((old, new), bytes) in self
             .request
@@ -475,6 +560,13 @@ impl MigrationJournal {
 
     pub fn validate(&self) -> Result<()> {
         self.request.validate()?;
+        if self.schema_version != 2
+            || self.old_envelope_digests.len() != self.request.child.key_versions.len()
+        {
+            return Err(migration_invalid(
+                "source envelope digest binding absent or unsupported journal version",
+            ));
+        }
         if self.owner.is_some_and(|owner| owner.is_nil())
             || self.owner.is_some() != (self.epoch > 0)
             || self
@@ -518,11 +610,10 @@ impl MigrationJournal {
                     || entry.new_reference != new_material.wrapped_material_ref().as_str()
                     || entry.new_envelope_digest
                         != blake3::Hash::from_bytes(*digest).to_hex().as_str()
-                    || entry.old_envelope_digest.len() != 64
-                    || !entry
-                        .old_envelope_digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || entry.old_envelope_digest
+                        != blake3::Hash::from_bytes(self.old_envelope_digests[index])
+                            .to_hex()
+                            .as_str()
                 {
                     return Err(migration_invalid("terminal version binding mismatch"));
                 }

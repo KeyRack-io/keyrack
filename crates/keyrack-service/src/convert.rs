@@ -295,6 +295,7 @@ pub fn error_to_status(err: keyrack_core::error::KeyRackError) -> tonic::Status 
         | KeyRackError::DeletionDependencyRefused { .. }
         | KeyRackError::WrappingParentDestroyed
         | KeyRackError::MigrationIntentConflict { .. }
+        | KeyRackError::MigrationRejected { .. }
         | KeyRackError::OperationNotPermitted { .. }
         | KeyRackError::ImmutableTag { .. }
         | KeyRackError::DepthLimitExceeded { .. }

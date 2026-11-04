@@ -1555,11 +1555,11 @@ fn assert_wrapped_refusal(status: &tonic::Status) {
         return;
     }
     // The deliberately invalid fixture has no envelope. Preserve the storage
-    // error instead of disguising every snapshot failure as unsupported custody.
-    assert_eq!(status.code(), tonic::Code::Internal);
+    // rejection instead of disguising every snapshot failure as unsupported custody.
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         status.message(),
-        "storage error: wrapped-key migration: unknown wrapped envelope reference"
+        "migration rejected: wrapped-key migration: unknown wrapped envelope reference"
     );
 }
 

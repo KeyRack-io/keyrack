@@ -750,3 +750,47 @@ async fn rewrap_authenticates_old_material_and_is_safe_to_repeat() {
     provider.close_wrapped_key(&a).await.unwrap();
     provider.close_wrapped_key(&b).await.unwrap();
 }
+
+#[tokio::test]
+async fn rewrap_missing_or_wrong_type_parent_material_is_a_deterministic_rejection() {
+    use keyrack_core::error::KeyRackError;
+
+    let (provider, parent, ctx) = parented().await;
+    let generated = provider
+        .generate_wrapped_key(&ctx, &parent, &binding(&ctx))
+        .await
+        .unwrap();
+    provider.close_wrapped_key(&generated.lease).await.unwrap();
+    let missing = provider.generate_key(&KeySpec::Aes256).await.unwrap();
+    provider.destroy_key(&missing).await.unwrap();
+    let mut wrong_type = provider.generate_key(&KeySpec::Aes128).await.unwrap();
+    // The metadata claims a wrapping key; validate the actual stored material.
+    wrong_type.key_spec = KeySpec::Aes256;
+    for source in [true, false] {
+        for candidate in [&missing, &wrong_type] {
+            let (old, new) = if source {
+                (candidate, &parent)
+            } else {
+                (&parent, candidate)
+            };
+            let error = provider
+                .rewrap_wrapped_key(&ctx, old, &generated.envelope, &ctx, new)
+                .await
+                .unwrap_err();
+            if candidate.key_id == missing.key_id {
+                assert!(matches!(error, KeyRackError::WrappingParentDestroyed));
+            } else {
+                assert!(matches!(error, KeyRackError::MigrationRejected { .. }));
+            }
+        }
+    }
+    let result = provider
+        .rewrap_wrapped_key(&ctx, &parent, &generated.envelope, &ctx, &parent)
+        .await
+        .unwrap();
+    let lease = provider
+        .open_wrapped_key(&ctx, &parent, &result)
+        .await
+        .unwrap();
+    provider.close_wrapped_key(&lease).await.unwrap();
+}

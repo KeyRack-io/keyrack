@@ -2820,6 +2820,7 @@ name = "keyrack-postgres"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "keyrack-core",
  "keyrack-test-support",
