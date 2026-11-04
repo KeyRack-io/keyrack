@@ -121,6 +121,16 @@ never refused. Watch `keyrack_wrapped_lease_slots_in_use`,
 `keyrack_wrapped_lease_cleanup_pending` and
 `keyrack_wrapped_lease_cleanup_total{outcome}`.
 
+### Deletion scheduling observations
+
+Successful gRPC `ScheduleKeyDeletion` and REST
+`POST /v1/keys/{key_id}/actions-schedule-deletion` responses include
+`logical_only_children`. It counts direct persisted child records with exclusively
+resident material once each, regardless of lifecycle state or number of versions.
+Grandchildren and wrapped dependencies are excluded. These logical-only links do
+not block scheduling. The count comes from the admission observation and does
+not reserve the graph; destruction rechecks dependencies under its writer fence.
+
 ### Compromised-key default denial and dangerous legacy opt-in
 
 Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.

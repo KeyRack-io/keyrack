@@ -39,6 +39,10 @@ use std::sync::{Arc, Mutex};
 
 #[path = "integration/compromised_domain.rs"]
 mod compromised_domain;
+#[path = "integration/deletion_dependencies.rs"]
+mod deletion_dependencies;
+#[path = "integration/lifecycle_metadata.rs"]
+mod lifecycle_metadata;
 use tonic::Request;
 
 use base64::Engine as _;
@@ -1700,14 +1704,28 @@ async fn mixed_material_lifecycle_refuses_before_resident_sibling_side_effects()
     assert_eq!(after.occ_version, nonexportable.occ_version);
     assert_eq!(after.exportability, nonexportable.exportability);
 
-    // Scheduling is a metadata operation. Actual deletion must preflight the
-    // entire history and retain both the resident material and pending state.
-    svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
-        key_id: key_id.clone(),
-        grace_period_days: 7,
-    }))
-    .await
-    .unwrap();
+    // Admission now refuses wrapped history before changing lifecycle state.
+    let status = svc
+        .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            key_id: key_id.clone(),
+            grace_period_days: 7,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("own_parent_wrapped_versions=1"));
+    assert_eq!(
+        state.storage.get_key(&lid).await.unwrap().occ_version,
+        nonexportable.occ_version
+    );
+    // A legacy/imported pending record still needs the authoritative claim
+    // check before any resident sibling is destroyed.
+    let mut pending = state.storage.get_key(&lid).await.unwrap();
+    pending
+        .transition_to(keyrack_core::key::KeyState::PendingDeletion)
+        .unwrap();
+    pending.scheduled_deletion_at = Some(chrono::Utc::now());
+    state.storage.update_key(&pending).await.unwrap();
     backdate_scheduled_deletion(&state, &key_id).await;
     keyrack_service::workers::run_deletion_scan(&state)
         .await
@@ -8057,13 +8075,17 @@ async fn cross_surface_disable_cascade_handles_non_enabled_descendants_alike() {
     // that cannot transition to Disabled.
     let (grpc_root, grpc_child, grpc_grandchild) = seed_three_generations(&state).await;
     let (rest_root, rest_child, rest_grandchild) = seed_three_generations(&state).await;
+    // Imported or legacy pending records remain possible even though new
+    // scheduling refuses these wrapped children. Seed that state directly so
+    // this test continues to exercise cascade parity rather than admission.
     for child in [&grpc_child, &rest_child] {
-        svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
-            key_id: child.clone(),
-            grace_period_days: 7,
-        }))
-        .await
-        .expect("schedule child deletion");
+        let lid: keyrack_core::lid::Lid = child.parse().expect("parse child lid");
+        let mut record = state.storage.get_key(&lid).await.unwrap();
+        record
+            .transition_to(keyrack_core::key::KeyState::PendingDeletion)
+            .unwrap();
+        record.scheduled_deletion_at = Some(chrono::Utc::now() + chrono::Duration::days(7));
+        state.storage.update_key(&record).await.unwrap();
     }
 
     svc.disable_key(Request::new(proto::DisableKeyRequest {

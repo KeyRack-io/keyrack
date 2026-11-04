@@ -1276,10 +1276,19 @@ async fn metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_m
                 domain::disable_key(&state, &record.lid, &key_id).await,
                 Err(KeyRackError::ProviderUnavailable(_))
             ));
-            assert!(matches!(
-                domain::schedule_key_deletion(&state, &key_id, 7).await,
-                Err(DomainError::ProviderUnavailable(_))
-            ));
+            let scheduling_error = domain::schedule_key_deletion(&state, &key_id, 7)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&scheduling_error, DomainError::FailedPrecondition(message)
+                    if message.contains("migration_journal_rows=1")),
+                "scheduling must report the shared migration dependency for {key_id}, staged={staged}: {scheduling_error}"
+            );
+            assert!(keyrack_core::creation::same_json(
+                record,
+                &state.storage.get_key(&record.lid).await.unwrap()
+            )
+            .unwrap());
             assert!(matches!(
                 domain::cancel_key_deletion(&state, &key_id).await,
                 Err(DomainError::ProviderUnavailable(_))

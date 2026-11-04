@@ -339,10 +339,48 @@ creating ──► enabled ◄──► disabled
 
 The state predicates above are also constrained by persisted logical-key
 compromise history: `KeyRecord` refuses encrypt/decrypt/export if
-`was_compromised` is set, regardless of the current enum. The legacy exception
-applies only while the current state is Compromised, with per-use evidence.
-Verification retains its separate mathematical predicate; see
+`was_compromised` is set, regardless of the current enum. A live `Compromised`
+state also counts as compromise history, including records written before the
+persisted marker existed. The legacy exception applies only while the current
+state is `Compromised`, with per-use evidence; see
 [the operator guide](OPERATOR.md#compromised-key-default-denial-and-dangerous-legacy-opt-in).
+
+Starting in 0.5.0, gRPC key and version metadata and REST key and nested version
+DTOs expose these two independent facts:
+
+| Field | Meaning |
+|---|---|
+| `lifecycle_state` | The owning logical key's current stored lifecycle state. Versions have no independent lifecycle. |
+| `has_compromise_history` | Whether the logical key is or was compromised: persisted `was_compromised` or current state `Compromised`. Applies to every version, including retained non-primary versions. |
+
+The existing key-level `state` remains the live lifecycle state. The existing
+gRPC `KeyVersionMetadata.state` is deprecated but keeps its compatibility
+meaning: it reports `Compromised` whenever `has_compromise_history` is true,
+otherwise the live lifecycle state. In particular, a destroyed key with
+compromise history still has version `state = Compromised`, while its new
+`lifecycle_state = Destroyed`. Clients should read the explicit fields together;
+the deprecated field alone does not establish operation eligibility. REST
+versions expose the two new fields without adding that legacy `state` field.
+
+Metadata does not authorize operations. Enforcement continues to read the
+stored key record. Decrypt (including a `ReEncrypt` source) and raw export have
+the following lifecycle/history eligibility, subject to the ordinary
+authorization, scope, exportability and provider checks:
+
+| Live lifecycle | History | Decrypt, legacy off | Decrypt, legacy on | Raw export |
+|---|---|---|---|---|
+| `enabled` | no | yes | yes | yes |
+| `disabled` | no | yes | yes | no |
+| `enabled` / `disabled` | yes | no | no | no |
+| `compromised` | always yes | no | yes | no |
+| `creating` / `pending_deletion` / `destroyed` | either | no | no | no |
+
+Verification is separate from decrypt and export. `Verify` and `VerifyMac`
+permit mathematical verification in `Enabled`, `Disabled` and `Compromised`,
+regardless of compromise history or `legacy_compromised_key_decrypt`. They deny
+`Creating`, `PendingDeletion` and `Destroyed`. A valid signature or MAC does not
+establish trustworthy provenance for compromised material; provider material
+availability and the ordinary authorization and scope checks still apply.
 
 | From | To | API | Notes |
 |---|---|---|---|
@@ -394,7 +432,7 @@ Invalid transitions return `Err((from, to))` and leave the record unchanged.
 ### 7.5 KeyVersionRecord fields
 
 Each rotation creates a new `KeyVersionRecord`. Old versions are retained
-for decrypt/verify of existing ciphertext. The ciphertext header's
+for decrypt of existing ciphertext. The ciphertext header's
 `key_version` field (§4) references `version_number`.
 
 | Field | Type | Notes |
@@ -405,13 +443,13 @@ for decrypt/verify of existing ciphertext. The ciphertext header's
 | `is_primary` | `bool` | `true` for the current encrypt/sign version |
 
 A version carries no lifecycle state of its own. `GetKeyVersion` and
-`ListKeyVersions` therefore report the owning logical key's state, and report
-retention separately in `is_primary`. Being non-primary is an ordinal fact about
-rotation order, not a policy state: a retained version of an enabled key stays
-usable for decrypt and as a `ReEncrypt` source, which is what the ciphertext
-header's `key_version` selects. Compromise history (§7.2) is reported as
-`Compromised` even where the live state has moved on, so a version can never be
-reported usable while the key record refuses to decrypt under it.
+`ListKeyVersions` report the owning logical key's live `lifecycle_state` and
+`has_compromise_history`, and report retention separately in `is_primary`.
+Being non-primary is an ordinal fact about rotation order, not a policy state:
+a retained version of an enabled key without compromise history stays usable
+for decrypt and as a `ReEncrypt` source, which is what the ciphertext header's
+`key_version` selects. The deprecated version `state` preserves its
+history-overrides-lifecycle meaning, including after destruction; see §7.2.
 
 ### 7.6 Version semantics
 

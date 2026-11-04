@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    # Long-lived integration branches receive PRs that never target main
-    # directly, so restricting to main leaves that work unverified.
-    branches: [main, "feat/**", "fix/**", "handback/**"]
+    # Run required checks for every PR, including dependency stacks.
 
 env:
   CARGO_TERM_COLOR: always
@@ -129,13 +127,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Run the two persistent-compromise regressions (no zero-test pass)
+      - name: Run persistent-compromise and destruction regressions (no zero-test pass)
         shell: bash
         run: |
           set -euo pipefail
           tests=(
             conformance_compromise_history_is_monotonic
             conformance_compromised_live_state_normalizes_history
+            destruction_conformance::one_shot_and_terminal_fence
+            destruction_conformance::eligibility_and_cancel_first
+            destruction_conformance::creation_references_fence_destruction
+            destruction_conformance::raw_wrapped_edges_and_new_references
+            destruction_conformance::dependency_counts_cover_all_material_and_kinds
+            destruction_conformance::dependency_snapshot_is_rechecked_at_claim
           )
           listing=$(cargo test -p keyrack-postgres --features live-tests --test conformance -- --list)
           for test_name in "${tests[@]}"; do

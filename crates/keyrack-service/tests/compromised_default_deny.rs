@@ -1,9 +1,9 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Black-box acceptance for compromised-key default denial. All twelve tests
-//! use the real service binary and only APIs available before this change, so
-//! a baseline run measures security assertions, not missing Rust APIs.
+//! Black-box acceptance for compromised-key default denial through the real
+//! service binary. The restart regression also checks explicit lifecycle and
+//! compromise-history metadata introduced in 0.5.0.
 
 use base64::Engine as _;
 use keyrack_service::proto;
@@ -406,72 +406,149 @@ async fn acceptance_06_deletion_cancellation_does_not_restore_raw_export() {
     );
 }
 
-#[tokio::test]
-async fn acceptance_07_compromise_history_survives_real_process_restart() {
-    let mut fixture = Fixture::start(Some(false), false).await;
-    let compromised = fixture.create("AES_256", false).await;
-    let blob = fixture.encrypt(&compromised).await;
-    let never_compromised = fixture.create("AES_256", false).await;
-    fixture.compromise(&compromised).await;
-    fixture.schedule(&compromised).await;
-    fixture.schedule(&never_compromised).await;
-    let old_pid = fixture.child.as_ref().unwrap().id();
-    fixture.restart().await;
-    assert_ne!(fixture.child.as_ref().unwrap().id(), old_pid);
-
-    // Both live states were PendingDeletion before restart. The difference
-    // must therefore survive in storage, not be reconstructed from live state.
-    for key in [&compromised, &never_compromised] {
-        let metadata = fixture
-            .grpc()
-            .await
-            .get_key(proto::GetKeyRequest {
-                key_id: key.clone(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .metadata
-            .unwrap();
-        assert_eq!(metadata.state, i32::from(proto::KeyState::PendingDeletion));
-    }
-    for action in ["cancel-deletion", "enable"] {
-        let (status, body) = fixture.action(&never_compromised, action, json!({})).await;
-        assert!(
-            status.is_success(),
-            "never-compromised deletion cancellation must remain supported: {body}"
-        );
-    }
-    fixture.cancel_and_enable(&compromised).await;
-    let metadata = fixture
-        .grpc()
-        .await
-        .get_key(proto::GetKeyRequest {
-            key_id: compromised.clone(),
-        })
+#[allow(deprecated)] // Check the compatibility projection alongside explicit fields.
+async fn assert_restart_metadata(
+    fixture: &Fixture,
+    key: &str,
+    live: proto::KeyState,
+    history: bool,
+) {
+    let mut grpc = fixture.grpc().await;
+    let metadata = grpc
+        .get_key(proto::GetKeyRequest { key_id: key.into() })
         .await
         .unwrap()
         .into_inner()
         .metadata
         .unwrap();
-    // Check lifecycle state, not merely a failed decrypt: the software
-    // provider loses its process-local keys on restart, which would otherwise
-    // make a broken implementation appear secure by returning ProviderError.
-    assert_ne!(
-        metadata.state,
-        i32::from(proto::KeyState::Enabled),
-        "persisted compromise history must block rehabilitation after restart"
-    );
-    assert_state_denial(
-        fixture.decrypt(&compromised, &blob).await,
-        "restart denial must be lifecycle failure, never missing provider material",
-    );
-    let fresh = fixture.create("AES_256", false).await;
-    let fresh_blob = fixture.encrypt(&fresh).await;
-    assert_eq!(
-        fixture.decrypt(&fresh, &fresh_blob).await.unwrap(),
-        PLAINTEXT
-    );
+    assert_eq!(metadata.state, i32::from(live));
+    assert_eq!(metadata.lifecycle_state, i32::from(live));
+    assert_eq!(metadata.has_compromise_history, history);
+    assert_eq!(metadata.current_key_version, 3);
+    let versions = grpc
+        .list_key_versions(proto::ListKeyVersionsRequest {
+            key_id: key.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 3);
+    for version in &versions {
+        assert_eq!(version.lifecycle_state, i32::from(live));
+        assert_eq!(version.has_compromise_history, history);
+        assert_eq!(version.is_primary, version.version == 3);
+        assert_eq!(
+            version.state,
+            i32::from(if history {
+                proto::KeyState::Compromised
+            } else {
+                live
+            })
+        );
+        let fetched = grpc
+            .get_key_version(proto::GetKeyVersionRequest {
+                key_id: key.into(),
+                version: version.version,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .version
+            .unwrap();
+        assert_eq!(&fetched, version);
+    }
+    let response = fixture
+        .client
+        .get(format!("{}/v1/keys/{key}", fixture.rest))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let rest_state = live.as_str_name().to_ascii_lowercase();
+    assert_eq!(body["state"], json!(rest_state));
+    assert_eq!(body["lifecycle_state"], json!(rest_state));
+    assert_eq!(body["has_compromise_history"], json!(history));
+    let versions = body["key_versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 3);
+    for version in versions {
+        assert_eq!(version["lifecycle_state"], json!(rest_state));
+        assert_eq!(version["has_compromise_history"], json!(history));
+        assert_eq!(version["is_primary"], json!(version["version_number"] == 3));
+        assert!(version.get("state").is_none());
+    }
+}
+
+#[tokio::test]
+async fn acceptance_07_compromise_history_survives_real_process_restart() {
+    for legacy in [false, true] {
+        let mut fixture = Fixture::start(Some(legacy), false).await;
+        let compromised = fixture.create("AES_256", false).await;
+        let never_compromised = fixture.create("AES_256", false).await;
+        let mut blobs = Vec::new();
+        for version in 1..=3 {
+            if version > 1 {
+                for key in [&compromised, &never_compromised] {
+                    let (status, body) = fixture.action(key, "rotate", json!({})).await;
+                    assert!(status.is_success(), "positive rotation control: {body}");
+                }
+            }
+            blobs.push(fixture.encrypt(&compromised).await);
+        }
+        fixture.compromise(&compromised).await;
+        fixture.schedule(&compromised).await;
+        fixture.schedule(&never_compromised).await;
+        for (key, history) in [(&compromised, true), (&never_compromised, false)] {
+            assert_restart_metadata(&fixture, key, proto::KeyState::PendingDeletion, history).await;
+        }
+        let old_pid = fixture.child.as_ref().unwrap().id();
+        fixture.restart().await;
+        assert_ne!(fixture.child.as_ref().unwrap().id(), old_pid);
+
+        // Identical live states and retention before restart: the history
+        // distinction must survive in storage, independently of both facts.
+        for (key, history) in [(&compromised, true), (&never_compromised, false)] {
+            assert_restart_metadata(&fixture, key, proto::KeyState::PendingDeletion, history).await;
+        }
+        for blob in &blobs {
+            assert_state_denial(
+                fixture.decrypt(&compromised, blob).await,
+                "pending deletion after restart must deny every version, including legacy opt-in",
+            );
+        }
+        for action in ["cancel-deletion", "enable"] {
+            let (status, body) = fixture.action(&never_compromised, action, json!({})).await;
+            assert!(
+                status.is_success(),
+                "never-compromised deletion cancellation must remain supported: {body}"
+            );
+        }
+        fixture.cancel_and_enable(&compromised).await;
+        assert_restart_metadata(
+            &fixture,
+            &never_compromised,
+            proto::KeyState::Enabled,
+            false,
+        )
+        .await;
+        assert_restart_metadata(&fixture, &compromised, proto::KeyState::Disabled, true).await;
+        // The software provider loses process-local material on restart. Require
+        // lifecycle denial so ProviderError cannot make a regression look secure.
+        for blob in &blobs {
+            assert_state_denial(
+                fixture.decrypt(&compromised, blob).await,
+                "restart denial must be lifecycle failure, never missing provider material",
+            );
+        }
+        let fresh = fixture.create("AES_256", false).await;
+        let fresh_blob = fixture.encrypt(&fresh).await;
+        assert_eq!(
+            fixture.decrypt(&fresh, &fresh_blob).await.unwrap(),
+            PLAINTEXT
+        );
+    }
 }
 
 #[tokio::test]

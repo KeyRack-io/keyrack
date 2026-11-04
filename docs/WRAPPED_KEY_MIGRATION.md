@@ -183,7 +183,8 @@ migration fence.
 
 | Operation while Reserved or Staged | Behavior |
 | --- | --- |
-| Child/old-parent/new-parent metadata changes, enable/disable, schedule/cancel deletion | Fenced; refused as retryable. The transaction repeats the check after service preflight. |
+| Child/old-parent/new-parent metadata changes, enable/disable, cancel deletion | Fenced; refused as retryable. The transaction repeats the check after service preflight. |
+| Schedule deletion | Refused by the shared deletion-dependency query (`FAILED_PRECONDITION` / HTTP 409), including `migration_journal_rows` for child/source/target. A migration admitted after that query is caught by the transactional update fence with a retryable refusal. |
 | Child rotation, either parent rotation, new child creation under either parent | Fenced; a competing committed change instead makes reservation fail OCC. Wrapped-child rotation remains unsupported outside migration. |
 | Another migration involving any reserved identity | Fenced. |
 | Destruction claim for child or either parent | Refused while the journal is nonterminal. |
@@ -294,11 +295,11 @@ not native PKCS#11 qualification.
 | Every intent field, optional OCC and version set | `every_caller_intent_field_is_bound_on_both_surfaces`, `initial_occ_and_covered_version_assertions_refuse_without_reservation`, `migration_intent_binds_every_condition` |
 | Continuity of every version at every phase | `retained_versions_decrypt_continuously_in_reserve_stage_commit_and_after_erasure`, `reader_paused_before_open_survives_commit_and_parent_destruction_on_both_paths`, `migration_concurrent_reader_snapshots` |
 | Unchanged identity/material and old ciphertext | `every_version_survives_rewrap_and_reparent_and_old_parent_is_destroyable`; software wrapping tests |
-| Rotation, creation and ordinary updates | `cancellation_retains_the_fence_and_retry_finishes_the_migration`, `migration_all_writer_fences`, `migration_creation_and_occ_preempt`, `metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_migration`, `migration_ordinary_updates_and_aliases`, `lifecycle_updates_are_retryable_fenced_on_both_surfaces_before_state_validation` |
+| Rotation, creation and ordinary updates | `cancellation_retains_the_fence_and_retry_finishes_the_migration`, `migration_all_writer_fences`, `migration_creation_and_occ_preempt`, `metadata_and_lifecycle_updates_are_fenced_but_aliases_are_safe_during_migration`, `migration_ordinary_updates_and_aliases`, `lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation` |
 | Lost replies, retries and restarts | `terminal_receipt_binds_envelopes_and_survives_lost_reply_and_later_changes`, `recovery_resumes_each_phase_and_committed_replay_is_idempotent`, `migration_reopens_at_every_durable_phase`, `migration_reconnects_at_each_phase_and_rolls_back_failed_commit`, `simultaneous_same_operation_retries_share_the_committed_result`, `independently_prepared_same_operation_keeps_the_first_reserved_intent` |
 | Partial/unknown provider outcomes | `partial_repeatable_provider_failure_preserves_every_reader_until_recovery`, `unknown_nonrepeatable_provider_outcome_retains_reservation_without_redispatch`, `migration_ownership_epoch_and_unknown_outcome` |
 | Stale worker rejected after takeover | `migration_ownership_epoch_and_unknown_outcome`; ownership stage/commit reversion controls |
-| Terminal result, original parent block and erasure | `migration_terminal_result_and_reader_snapshots`, `migration_atomic_publication_and_retirement`, `migration_commit_rollback_restores_old_envelopes_and_fence`, `migration_blocks_due_unreferenced_target_destruction` |
+| Terminal result, original parent block and erasure | `migration_terminal_result_and_reader_snapshots`, `migration_atomic_publication_and_retirement`, `migration_commit_rollback_restores_old_envelopes_and_fence`, `migration_blocks_due_unreferenced_target_destruction`, `migration_destruction_dependency_query_tracks_migration` |
 | Restore with destroyed source parent | `restoring_pre_migration_database_after_parent_destruction_fails_explicitly` |
 | PDP on child and both parents | `both_surfaces_deny_missing_permission_on_either_parent_before_reservation`, `same_parent_still_has_two_parent_grants_and_replayed_permit_is_refused`, `committed_replay_authorizes_fresh_parent_metadata_beyond_cache_ttl` |
 

@@ -19,7 +19,10 @@ SQLITE = "crates/keyrack-sqlite/src/"
 CONTROLS = [
     ("writer", SQLITE + "lib.rs", "async fn update_key(", "migration::guard_update(conn, &previous, record)?;", "let _ = migration::guard_update;", "tests::migration_all_writer_fences"),
     ("creation", SQLITE + "creation.rs", "fn reserve_a2(", "crate::migration::guard_record(conn, &request.record)?;", "", "tests::migration_all_writer_fences"),
-    ("destruction", SQLITE + "destruction.rs", "fn destruction_claim(", "crate::migration::guard(conn, lid)?;", "", "migration::tests::migration_blocks_due_unreferenced_target_destruction"),
+    ("destruction", SQLITE + "destruction.rs", "fn dependencies(", "committed=0 AND (child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1)", "committed=0 AND 0 AND (child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1)", "migration::tests::migration_blocks_due_unreferenced_target_destruction"),
+    ("migration_child_dependency", SQLITE + "destruction.rs", "fn dependencies(", "child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1", "old_parent_lid=?1 OR new_parent_lid=?1", "tests::migration_destruction_dependency_query_tracks_migration"),
+    ("migration_old_parent_dependency", SQLITE + "destruction.rs", "fn dependencies(", "child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1", "child_lid=?1 OR new_parent_lid=?1", "tests::migration_destruction_dependency_query_tracks_migration"),
+    ("migration_new_parent_dependency", SQLITE + "destruction.rs", "fn dependencies(", "child_lid=?1 OR old_parent_lid=?1 OR new_parent_lid=?1", "child_lid=?1 OR old_parent_lid=?1", "tests::migration_destruction_dependency_query_tracks_migration"),
     ("pending_creation", SQLITE + "migration.rs", "fn migration_reserve(", "if pending { return Err(migration_busy()); }", "let _ = pending;", "tests::migration_creation_and_occ_preempt"),
     ("overlapping_migration", SQLITE + "migration.rs", "fn migration_reserve(", "guard(conn, &record.lid)?;", "", "tests::migration_all_writer_fences"),
     ("reservation_occ", SQLITE + "migration.rs", "fn snapshots(", "request.validate_snapshots(&child, &old, &new)", "{ let _ = (&child, &old, &new); Ok(()) }", "tests::migration_creation_and_occ_preempt"),

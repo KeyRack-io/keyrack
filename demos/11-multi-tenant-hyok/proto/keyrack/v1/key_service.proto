@@ -88,6 +88,27 @@ service KeyService {
   rpc AcknowledgeRotationJob(AcknowledgeRotationJobRequest) returns (AcknowledgeRotationJobResponse);
   rpc CompleteRotationJob(CompleteRotationJobRequest) returns (CompleteRotationJobResponse);
   rpc FailRotationJob(FailRotationJobRequest) returns (FailRotationJobResponse);
+
+  // ── Routing explain (read-only dry-run) ─────────────────────────────
+
+  rpc ExplainRouting(ExplainRoutingRequest) returns (ExplainRoutingResponse);
+
+  // ── Exportable key operations ──────────────────────────────────────
+
+  rpc GetKeyMaterial(GetKeyMaterialRequest) returns (GetKeyMaterialResponse);
+  rpc MakeKeyExportable(MakeKeyExportableRequest) returns (MakeKeyExportableResponse);
+  // Soft-revoke: marks the key NonExportable at the KeyRack policy layer so
+  // GetKeyMaterial is refused. No backend key material is destroyed or
+  // re-keyed. On backends whose exportable flag is one-way (e.g. Vault
+  // Transit), this is a POLICY revocation only — the backend key retains its
+  // flag. Full backend-level (cryptographic) revocation requires a separate
+  // explicit destroy/crypto-shred operation.
+  rpc RevokeKeyExportability(RevokeKeyExportabilityRequest) returns (RevokeKeyExportabilityResponse);
+
+  // ── Key import ──────────────────────────────────────────────────────
+  // Import externally-generated key material into a governed key. The
+  // provider must support key import (supports_key_import capability).
+  rpc ImportKey(ImportKeyRequest) returns (ImportKeyResponse);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -190,17 +211,34 @@ message KeyMetadata {
   optional google.protobuf.Timestamp scheduled_deletion_at = 13;
   // The crypto backend bound to this key's primary version.
   optional string backend_id = 14;
+  // Whether this key's material may be exported via GetKeyMaterial.
+  bool exportable = 15;
+  // Timestamp of the first successful export (write-once latch).
+  optional google.protobuf.Timestamp first_exported_at = 16;
+  // Current lifecycle state of the logical key, identical to state.
+  KeyState lifecycle_state = 17;
+  // Whether the logical key is or has ever been marked compromised.
+  // Applies to every version and remains true after lifecycle transitions.
+  bool has_compromise_history = 18;
 }
 
 message KeyVersionMetadata {
   uint32 version = 1;
   google.protobuf.Timestamp created_at = 2;
-  // Lifecycle state of the owning logical key. A version has no lifecycle of
-  // its own: retention is reported by is_primary, not by this field.
-  KeyState state = 3;
+  // Deprecated compatibility projection: COMPROMISED whenever the owning key
+  // has compromise history; otherwise its current lifecycle state. This can
+  // remain COMPROMISED after the key is disabled, pending deletion or destroyed.
+  // Use lifecycle_state and has_compromise_history instead. A version has no
+  // lifecycle of its own; retention is reported by is_primary.
+  KeyState state = 3 [deprecated = true];
   // Whether this version is the current primary for encrypt and sign.
-  // Retained non-primary versions stay usable for decrypt and rewrap.
+  // Retention alone does not determine decrypt or rewrap eligibility.
   bool is_primary = 4;
+  // Current lifecycle state of the owning logical key, without history overlay.
+  KeyState lifecycle_state = 5;
+  // Whether the owning logical key is or has ever been marked compromised.
+  // Applies equally to primary and retained versions.
+  bool has_compromise_history = 6;
 }
 
 // Lineage entry for hierarchy queries (§5.5).
@@ -369,6 +407,9 @@ message CreateKeyRequest {
   // dynamic HSM connection). Supersedes hsm_connection_id; the reserved
   // attribute keyrack.provider also folds into this and deprecates.
   optional string backend_id = 9;
+  // Create the key as exportable (material may be retrieved via GetKeyMaterial).
+  // Default false. Requires separate kms:MakeKeyExportable authorization.
+  bool exportable = 10;
 }
 
 message CreateKeyResponse {
@@ -841,4 +882,116 @@ message FailRotationJobRequest {
 
 message FailRotationJobResponse {
   RotationJobMetadata job = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Routing explain (read-only dry-run)
+// ═══════════════════════════════════════════════════════════════════
+
+// Previews how a set of routing-relevant inputs resolves to a backend
+// WITHOUT creating a key or any other side effect. Uses the same
+// resolve_create_provider path as CreateKey so the explanation cannot
+// drift from reality.
+message ExplainRoutingRequest {
+  // Key attributes (identity tags for routing rule matching).
+  map<string, string> attributes = 1;
+  // Optional namespace (folded into identity tags as "namespace" tag).
+  optional string namespace = 2;
+  // Explicit backend selector (the unified backend_id field).
+  optional string backend_id = 3;
+  // Deprecated alias for backend_id; if both set they must agree.
+  optional string hsm_connection_id = 4;
+}
+
+// The resolution outcome — always returned (denials are reported here,
+// not as RPC errors).
+enum RoutingOutcome {
+  ROUTING_OUTCOME_UNSPECIFIED = 0;
+  // A routing rule pinned the provider (route action).
+  ROUTED = 1;
+  // A delegate rule authorized caller selection.
+  DELEGATED = 2;
+  // No rule matched; the default provider was used.
+  DEFAULT = 3;
+  // Resolution would be DENIED (fail-closed).
+  DENIED = 4;
+  // The backend_id / hsm_connection_id / keyrack.provider inputs conflict.
+  CLASH = 5;
+}
+
+message ExplainRoutingResponse {
+  // The outcome category of the resolution.
+  RoutingOutcome outcome = 1;
+  // The selected backend_id (empty when outcome is DENIED or CLASH).
+  string selected_backend_id = 2;
+  // Which rule matched: 0-based index into the operator routing table,
+  // or -1 when no rule matched (DEFAULT / DENIED / CLASH).
+  int32 matched_rule_index = 3;
+  // Human-readable deny reason (non-empty only for DENIED / CLASH).
+  string deny_reason = 4;
+  // Whether routing rules are configured (affects default-deny behavior).
+  bool policy_configured = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Exportable key operations
+// ═══════════════════════════════════════════════════════════════════
+
+message GetKeyMaterialRequest {
+  string key_id = 1;
+  // Version to export. 0 => primary (current) version.
+  uint32 key_version = 2;
+  // Optional wrapping key for wrapped export (reserved for Phase 2+).
+  optional bytes wrapping_key = 3;
+}
+
+message GetKeyMaterialResponse {
+  bytes key_material = 1;
+  KeySpec key_spec = 2;
+  uint32 key_version = 3;
+  bool wrapped = 4;
+}
+
+message MakeKeyExportableRequest {
+  string key_id = 1;
+}
+
+message MakeKeyExportableResponse {
+  KeyMetadata metadata = 1;
+}
+
+message RevokeKeyExportabilityRequest {
+  string key_id = 1;
+}
+
+message RevokeKeyExportabilityResponse {
+  KeyMetadata metadata = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Key import
+// ═══════════════════════════════════════════════════════════════════
+
+message ImportKeyRequest {
+  // The raw key material to import. Treated as Sensitive end-to-end.
+  bytes key_material = 1;
+  KeySpec key_spec = 2;
+  string description = 3;
+  map<string, string> tags = 4;
+  map<string, string> attributes = 5;
+  optional string namespace = 6;
+  // The crypto backend for the import. Same semantics as CreateKey.
+  optional string hsm_connection_id = 7;
+  optional string backend_id = 8;
+  // Whether the imported key may have its material retrieved via
+  // GetKeyMaterial. Unset means NON-exportable: this is a plain proto3 bool, so
+  // omitting it yields false on gRPC, and the REST `/v1/keys/import` handler
+  // likewise defaults it to false. A KMIP keystore front-end that needs the
+  // material back (the `Register` then `Get` flow) must set this to true
+  // EXPLICITLY; it is not implied by the import being external.
+  bool exportable = 9;
+}
+
+message ImportKeyResponse {
+  KeyMetadata metadata = 1;
 }
