@@ -419,6 +419,7 @@ async fn legacy_flag_is_not_an_override_for_historically_compromised_disabled_ke
     compromise(&service, &key).await;
     service
         .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            allow_dependent_data_loss: false,
             key_id: key.clone(),
             grace_period_days: 30,
         }))

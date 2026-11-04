@@ -88,6 +88,7 @@ struct KeyResponse {
     parent_lid: Option<String>,
     current_key_version: u64,
     key_versions: Vec<KeyVersionResponse>,
+    wrapping_parent_destroyed_versions: Vec<u64>,
 }
 
 impl From<&KeyRecord> for KeyResponse {
@@ -114,6 +115,7 @@ impl From<&KeyRecord> for KeyResponse {
             scheduled_deletion_at: r.scheduled_deletion_at,
             parent_lid: r.parent_lid.as_ref().map(ToString::to_string),
             current_key_version: r.current_key_version,
+            wrapping_parent_destroyed_versions: Vec::new(),
             key_versions: r
                 .key_versions
                 .iter()
@@ -137,8 +139,29 @@ struct KeyListResponse {
     next_cursor: Option<String>,
 }
 
-fn key_json(record: &KeyRecord) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(KeyResponse::from(record)).unwrap_or_default())
+// Query loss markers for every metadata-bearing response. No stale record or
+// failed marker query may silently become an empty loss-status list.
+async fn key_response(state: &ServiceState, record: &KeyRecord) -> Result<KeyResponse, RestError> {
+    let mut response = KeyResponse::from(record);
+    response.wrapping_parent_destroyed_versions =
+        crate::domain::destroyed_wrapping_versions(state, &record.lid)
+            .await
+            .map_err(map_core_err)?;
+    Ok(response)
+}
+
+async fn key_json(
+    state: &ServiceState,
+    record: &KeyRecord,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let response = key_response(state, record).await?;
+    serde_json::to_value(response).map(Json).map_err(|error| {
+        ops::rest_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &error.to_string(),
+        )
+    })
 }
 
 pub fn router(state: AppState) -> Router {
@@ -222,6 +245,9 @@ fn map_core_err(err: keyrack_core::error::KeyRackError) -> RestError {
     let (code, kind) = match &err {
         KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
         KeyRackError::OptimisticConcurrencyConflict { .. } => (StatusCode::CONFLICT, "OccConflict"),
+        KeyRackError::DeletionDependencyRefused { .. } | KeyRackError::WrappingParentDestroyed => {
+            (StatusCode::CONFLICT, "FailedPrecondition")
+        }
         KeyRackError::KeyDestructionFenced(_) => (StatusCode::CONFLICT, "KeyDestructionFenced"),
         KeyRackError::InvalidStateTransition { .. } => {
             (StatusCode::CONFLICT, "InvalidStateTransition")
@@ -472,7 +498,7 @@ async fn create_key(
                 state.storage.create_key(&record).await.map_err(map_core_err)?;
                 record
             };
-            Ok((StatusCode::CREATED, key_json(&record)))
+            Ok((StatusCode::CREATED, key_json(&state, &record).await?))
         },
     ).await
 }
@@ -489,7 +515,7 @@ async fn get_key(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        Ok(key_json(&record))
+        key_json(&state, &record).await
     })
     .await
 }
@@ -506,7 +532,7 @@ async fn describe_key(
     ops::execute_rest(&state, op_ctx, |state| async move {
         let lid = parse_lid_rest(&key_id)?;
         let record = state.storage.get_key(&lid).await.map_err(map_core_err)?;
-        Ok(key_json(&record))
+        key_json(&state, &record).await
     })
     .await
 }
@@ -534,7 +560,7 @@ async fn update_key(
             .update_key(&record)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&record))
+        key_json(&state, &record).await
     })
     .await
 }
@@ -579,8 +605,12 @@ async fn list_keys(
             .list_keys(&filter)
             .await
             .map_err(map_core_err)?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for record in &page.items {
+            items.push(key_response(&state, record).await?);
+        }
         let resp = KeyListResponse {
-            items: page.items.iter().map(KeyResponse::from).collect(),
+            items,
             next_cursor: page.next_cursor,
         };
         Ok(Json(serde_json::to_value(&resp).unwrap_or_default()))
@@ -617,7 +647,7 @@ async fn enable_key(
             .update_key(&record)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&record))
+        key_json(&state, &record).await
     })
     .await
 }
@@ -636,7 +666,7 @@ async fn disable_key(
         let outcome = crate::domain::disable_key(&state, &lid, &key_id)
             .await
             .map_err(map_core_err)?;
-        Ok(key_json(&outcome.record))
+        key_json(&state, &outcome.record).await
     })
     .await
 }
@@ -649,37 +679,41 @@ async fn schedule_key_deletion(
 ) -> Result<impl IntoResponse, RestError> {
     let request_id = ops::extract_request_id_rest(&headers);
     let principal = ops::extract_principal_rest(&state, &headers).await?;
-    let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
-    op_ctx.request_id = request_id;
-    ops::execute_rest(&state, op_ctx, |state| async move {
-        let lid = parse_lid_rest(&key_id)?;
-        let mut record = state
-            .storage
-            .get_key_for_use(&lid)
-            .await
-            .map_err(map_core_err)?;
-        let days = body
-            .get("grace_period_days")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(7);
-        let dependencies = crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
-            .await
-            .map_err(|error| error.to_rest_error())?;
-        record
-            .transition_to(keyrack_core::key::KeyState::PendingDeletion)
-            .map_err(|(f, t)| transition_err(f, t))?;
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            record.scheduled_deletion_at =
-                Some(chrono::Utc::now() + chrono::Duration::days(days as i64));
+    let allow = match body.get("allow_dependent_data_loss") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(ops::rest_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "allow_dependent_data_loss must be a boolean",
+            ))
         }
-        state
-            .storage
-            .update_key(&record)
-            .await
-            .map_err(map_core_err)?;
-        let Json(mut response) = key_json(&record);
-        response["logical_only_children"] = serde_json::json!(dependencies.logical_only_children);
+    };
+    let days = match body.get("grace_period_days") {
+        None => 7,
+        Some(value) => value
+            .as_u64()
+            .and_then(|days| u32::try_from(days).ok())
+            .ok_or_else(|| {
+                ops::rest_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "grace_period_days must be an unsigned 32-bit integer",
+                )
+            })?,
+    };
+    let mut op_ctx = OpContext::deletion_schedule(principal, &key_id, allow);
+    op_ctx.request_id = request_id;
+    let record_snapshot = op_ctx.deletion_snapshot_recorder();
+    ops::execute_rest(&state, op_ctx, |state| async move {
+        let scheduled =
+            crate::domain::schedule_key_deletion_with_intent(&state, &key_id, days, allow)
+                .await
+                .map_err(|error| error.to_rest_error())?;
+        record_snapshot(scheduled.approved_dependents.clone());
+        let Json(mut response) = key_json(&state, &scheduled.record).await?;
+        response["logical_only_children"] = serde_json::json!(scheduled.logical_only_children);
         Ok(Json(response))
     })
     .await
@@ -695,34 +729,10 @@ async fn cancel_key_deletion(
     let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
     op_ctx.request_id = request_id;
     ops::execute_rest(&state, op_ctx, |state| async move {
-        let lid = parse_lid_rest(&key_id)?;
-        state
-            .storage
-            .check_migration_fence(&lid)
+        let record = crate::domain::cancel_key_deletion(&state, &key_id)
             .await
-            .map_err(map_core_err)?;
-        let mut record = state
-            .storage
-            .get_key_for_use(&lid)
-            .await
-            .map_err(map_core_err)?;
-        if record.state != keyrack_core::key::KeyState::PendingDeletion {
-            return Err(ops::rest_error(
-                StatusCode::CONFLICT,
-                "InvalidStateTransition",
-                "can only cancel deletion from PendingDeletion",
-            ));
-        }
-        record
-            .transition_to(keyrack_core::key::KeyState::Disabled)
-            .map_err(|(f, t)| transition_err(f, t))?;
-        record.scheduled_deletion_at = None;
-        state
-            .storage
-            .update_key(&record)
-            .await
-            .map_err(map_core_err)?;
-        Ok(key_json(&record))
+            .map_err(|error| error.to_rest_error())?;
+        key_json(&state, &record).await
     })
     .await
 }
@@ -760,7 +770,7 @@ async fn report_key_compromise(
                 tracing::warn!(lid = %lid, error = %e, "NATS state-changed publish failed");
             }
         }
-        Ok(key_json(&record))
+        key_json(&state, &record).await
     })
     .await
 }
@@ -779,7 +789,7 @@ async fn rotate_key(
         let outcome = crate::domain::rotate_key(&state, &lid, &key_id)
             .await
             .map_err(|e| e.to_rest_error())?;
-        Ok(key_json(&outcome.record))
+        key_json(&state, &outcome.record).await
     })
     .await
 }
@@ -825,7 +835,7 @@ async fn rewrap_key(
     .await
     .map_err(|error| error.to_rest_error())?;
     Ok(Json(serde_json::json!({
-        "metadata": KeyResponse::from(&outcome.record),
+        "metadata": key_response(&state, &outcome.record).await?,
         "operation_id": body.operation_id,
         "result": {
             "operation_id": outcome.result.operation_id.to_string(),
@@ -1044,7 +1054,7 @@ async fn import_key(
             .create_key(&record)
             .await
             .map_err(map_core_err)?;
-        Ok((StatusCode::CREATED, key_json(&record)))
+        Ok((StatusCode::CREATED, key_json(&state, &record).await?))
     })
     .await
 }

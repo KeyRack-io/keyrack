@@ -51,6 +51,7 @@ rand = "0.8"
 cryptoki = "0.12"
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 keyrack-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 blake3 = { workspace = true }

@@ -427,6 +427,9 @@ pub trait CryptoProvider: Send + Sync {
     /// Providers should zeroize any cached material and delete
     /// the backend object. Not all providers support true destruction
     /// (HSMs may merely mark the object as destroyed).
+    /// Destruction is retried with the identical durable handle after interruption.
+    /// Confirmed absence must return success; access/transport errors must not.
+    /// Handles must not be reused for replacement material.
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()>;
 
     /// Report the algorithms, key specs, and operations this provider

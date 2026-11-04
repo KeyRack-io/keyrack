@@ -237,6 +237,17 @@ impl KmipProvider {
         Ok(())
     }
 
+    fn check_destroy_response(resp: &messages::KmipResponse) -> Result<()> {
+        // KMIP 1.4 §9.1.3.2.29: Item Not Found = 0x00000001.
+        // Only Destroy may turn this exact failed-operation reason into success.
+        if resp.result_status == ttlv::result_status::OPERATION_FAILED
+            && resp.result_reason == Some(0x0000_0001)
+        {
+            return Ok(());
+        }
+        Self::check_response(resp)
+    }
+
     fn key_spec_to_kmip(spec: &KeySpec) -> Result<(u32, i32, bool)> {
         Ok(match spec {
             KeySpec::Aes256 => (ttlv::crypto_algorithm::AES, 256, true),
@@ -470,7 +481,7 @@ impl CryptoProvider for KmipProvider {
         let request = messages::destroy_request(&handle.key_id);
 
         let resp = self.send_request(&request).await?;
-        Self::check_response(&resp)?;
+        Self::check_destroy_response(&resp)?;
 
         tracing::info!(
             key_id = %handle.key_id,
@@ -526,6 +537,33 @@ impl CryptoProvider for KmipProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_destroy_accepts_only_wire_item_not_found() {
+        use crate::ttlv::{enumeration, structure};
+        // Literal tags/status/reasons form an independent wire oracle for the parser.
+        for (status, reason, accepted) in [
+            (1, Some(1), true),
+            (1, Some(12), false),
+            (1, None, false),
+            (2, Some(1), false),
+        ] {
+            let mut fields = vec![enumeration(0x0042_007f, status)];
+            if let Some(reason) = reason {
+                fields.push(enumeration(0x0042_007e, reason));
+            }
+            let frame = structure(0x0042_007b, vec![structure(0x0042_000f, fields)]);
+            let response = crate::messages::parse_response(&frame).unwrap();
+            assert_eq!(
+                super::KmipProvider::check_destroy_response(&response).is_ok(),
+                accepted
+            );
+            assert!(
+                super::KmipProvider::check_response(&response).is_err(),
+                "absence must not make non-destroy operations succeed"
+            );
+        }
+    }
+
     use super::*;
 
     fn test_config() -> KmipProviderConfig {

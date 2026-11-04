@@ -20,9 +20,9 @@
 
 //! Background workers for periodic maintenance tasks.
 //!
-//! Scanners keep lifecycle state in storage. Destruction uses a durable one-shot
-//! claim before provider effects; interrupted/ambiguous claims remain fenced for
-//! reconciliation, never automatic redispatch on restart.
+//! Scanners keep lifecycle state in storage. Destruction uses one durable
+//! claim before provider effects; interrupted claims retain their fence and are
+//! resumed from the durable snapshot using idempotent provider deletion.
 
 use crate::state::ServiceState;
 use keyrack_core::audit::{
@@ -61,12 +61,20 @@ pub async fn deletion_worker(state: Arc<ServiceState>, cancel: CancellationToken
 /// Public so tests can drive a single deterministic scan instead of waiting on
 /// [`deletion_worker`]'s timer.
 pub async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::error::Error>> {
+    run_deletion_scan_at(state, chrono::Utc::now()).await
+}
+
+/// Deterministic scan time; storage still authoritatively checks each due row
+/// under its writer fence. Tests can advance time without modifying approvals.
+pub async fn run_deletion_scan_at(
+    state: &ServiceState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let filter = KeyFilter {
         state: Some(KeyState::PendingDeletion),
         ..KeyFilter::default()
     };
     let page = state.storage.list_keys(&filter).await?;
-    let now = chrono::Utc::now();
 
     let mut destroyed = 0u64;
     let mut failed = 0u64;
@@ -78,25 +86,89 @@ pub async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::
 
         let claim = match state
             .storage
-            .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
+            .claim_destruction(&record.lid, record.occ_version, now)
             .await
         {
             Ok(Some(claim)) => claim,
             Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(lid = %record.lid, %error, "destruction claim refused; no provider effect");
+                let reason = match &error {
+                    keyrack_core::error::KeyRackError::DeletionDependencyRefused {
+                        reason, ..
+                    } => match reason.as_str() {
+                        "in_flight_journal" => "in_flight_journal",
+                        "dependent_data_loss_not_approved" => "dependent_data_loss_not_approved",
+                        "dependent_outside_approved_snapshot" => {
+                            "dependent_outside_approved_snapshot"
+                        }
+                        _ => "storage_refusal",
+                    },
+                    _ => "storage_refusal",
+                };
+                metrics::counter!("keyrack_deletion_claim_refusals_total", "reason" => reason)
+                    .increment(1);
+                let mut event = AuditEvent::new(
+                    EventType::KeyDeleted,
+                    AuditAction::KeyDestructionRefused,
+                    system_principal(),
+                    AuditResource {
+                        id: record.lid.to_string(),
+                        resource_type: "Key".into(),
+                    },
+                    AuditResult::Error,
+                );
+                event.add_metadata("reason", reason);
+                if let keyrack_core::error::KeyRackError::DeletionDependencyRefused {
+                    counts, ..
+                } = &error
+                {
+                    event.add_metadata("dependency_counts", counts.as_str());
+                }
+                let _ = state.audit.emit(&event).await;
                 failed += 1;
                 continue;
             }
         };
-        // The fresh, transactionally fenced snapshot, NEVER the scan row.
+        if claim.is_recovered() {
+            emit_destruction_progress(
+                state,
+                &claim,
+                AuditAction::KeyDestructionRetried,
+                "durable_claim_resumed",
+            )
+            .await;
+            metrics::counter!("keyrack_deletion_retries_total").increment(1);
+        }
+        // The transactionally fenced snapshot, NEVER the scan row.
         if !destroy_backend_material(state, claim.record()).await {
+            emit_destruction_progress(
+                state,
+                &claim,
+                AuditAction::KeyDestructionDeferred,
+                "provider_outcome_unconfirmed",
+            )
+            .await;
             failed += 1;
             continue;
         }
 
+        let operation_id = claim.operation();
         if let Err(e) = state.storage.complete_destruction(claim).await {
-            tracing::warn!(lid = %record.lid, error = %e, "destruction completion ambiguous; fence retained");
+            tracing::warn!(lid = %record.lid, %operation_id, error = %e, "destruction completion ambiguous; fence retained");
+            let mut event = AuditEvent::new(
+                EventType::KeyDeleted,
+                AuditAction::KeyDestructionDeferred,
+                system_principal(),
+                AuditResource {
+                    id: record.lid.to_string(),
+                    resource_type: "Key".into(),
+                },
+                AuditResult::Error,
+            );
+            event.add_metadata("operation_id", operation_id.to_string());
+            event.add_metadata("reason", "completion_unconfirmed");
+            let _ = state.audit.emit(&event).await;
             failed += 1;
             continue;
         }
@@ -122,10 +194,31 @@ pub async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::
         tracing::error!(
             failed,
             "deletion worker could not destroy backend material; keys left in \
-             pending_deletion; claimed operations require reconciliation"
+             pending_deletion; retained claims will be retried"
         );
     }
     Ok(())
+}
+
+async fn emit_destruction_progress(
+    state: &ServiceState,
+    claim: &keyrack_core::destruction::DestructionClaim,
+    action: AuditAction,
+    reason: &str,
+) {
+    let mut event = AuditEvent::new(
+        EventType::KeyDeleted,
+        action,
+        system_principal(),
+        AuditResource {
+            id: claim.record().lid.to_string(),
+            resource_type: "Key".into(),
+        },
+        AuditResult::Error,
+    );
+    event.add_metadata("operation_id", claim.operation().to_string());
+    event.add_metadata("reason", reason);
+    let _ = state.audit.emit(&event).await;
 }
 
 /// Destroy the provider-side material of every version of `record`.
@@ -134,22 +227,28 @@ pub async fn run_deletion_scan(state: &ServiceState) -> Result<(), Box<dyn std::
 /// first provider-resolution or delete failure, having audited that failure —
 /// the caller must then leave the record in `PendingDeletion`.
 ///
-/// No automatic retry follows failure: some versions/effects may already be
-/// destroyed even when a provider reports an error. The durable fence remains.
+/// A retained claim may retry the same immutable handles after restart. Providers
+/// must treat confirmed absence as success; unknown outcomes keep the fence.
 async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> bool {
-    // Preflight the entire history before deleting even a resident sibling.
-    // Wrapped envelope cleanup is a different lifecycle, not destroy_key.
-    for version in &record.key_versions {
-        if let Err(e) = version.resident_handle() {
-            let reason = e.to_string();
-            tracing::error!(lid = %record.lid, error = %reason,
-                "unsupported material lifecycle; key NOT destroyed");
-            emit_destroy_event(state, record, version.version_number, Err(&reason)).await;
-            return false;
-        }
+    // Envelope bytes are erased only by fenced storage completion. Never ask a
+    // provider to destroy the wrapped child's parent handle or transient lease.
+    if let Err(error) = keyrack_core::destruction::validate_destruction_history(record) {
+        emit_destroy_event(
+            state,
+            record,
+            record.current_key_version,
+            Err(&error.to_string()),
+        )
+        .await;
+        return false;
     }
     let mut providers = std::collections::HashMap::new();
-    for version in &record.key_versions {
+    for version in record.key_versions.iter().filter(|v| {
+        matches!(
+            v.material,
+            keyrack_core::key::KeyMaterial::ProviderResident { .. }
+        )
+    }) {
         let binding = record
             .effective_provider_ref(version.version_number)
             .cloned()
@@ -173,7 +272,12 @@ async fn destroy_backend_material(state: &ServiceState, record: &KeyRecord) -> b
     }
     // Pin one instance per effective binding before the first effect; a registry
     // replacement cannot redirect later versions mid-destruction.
-    for version in &record.key_versions {
+    for version in record.key_versions.iter().filter(|v| {
+        matches!(
+            v.material,
+            keyrack_core::key::KeyMaterial::ProviderResident { .. }
+        )
+    }) {
         let Ok(handle) = version.resident_handle() else {
             return false;
         };

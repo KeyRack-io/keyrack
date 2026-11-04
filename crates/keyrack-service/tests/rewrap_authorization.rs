@@ -738,19 +738,26 @@ async fn lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation()
                         .oneshot(request)
                         .await
                         .unwrap();
-                    let expected = if action == "schedule-deletion" {
-                        409
-                    } else {
-                        503
-                    };
-                    assert_eq!(response.status(), expected, "{action} on {}", record.lid);
+                    assert_eq!(
+                        response.status(),
+                        if action == "schedule-deletion" {
+                            409
+                        } else {
+                            503
+                        },
+                        "{action} on {}",
+                        record.lid
+                    );
                     if action == "schedule-deletion" {
-                        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                        let body = axum::body::to_bytes(response.into_body(), 65536)
                             .await
                             .unwrap();
-                        assert!(String::from_utf8(bytes.to_vec())
-                            .unwrap()
-                            .contains("migration_journal_rows=1"));
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        assert!(
+                            body.contains("in_flight_journal")
+                                && body.contains("migration_journal_rows=1"),
+                            "schedule refusal must identify the migration dependency: {body}"
+                        );
                     }
                 } else {
                     let service = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
@@ -769,6 +776,7 @@ async fn lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation()
                                 proto::ScheduleKeyDeletionRequest {
                                     key_id,
                                     grace_period_days: 7,
+                                    allow_dependent_data_loss: false,
                                 },
                             ))
                             .await
@@ -784,6 +792,7 @@ async fn lifecycle_updates_are_fenced_on_both_surfaces_before_state_validation()
                     let error = response.unwrap_err();
                     let expected = if action == "schedule-deletion" {
                         assert!(error.message().contains("migration_journal_rows=1"));
+                        assert!(error.message().contains("in_flight_journal"));
                         tonic::Code::FailedPrecondition
                     } else {
                         tonic::Code::Unavailable

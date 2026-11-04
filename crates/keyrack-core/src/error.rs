@@ -31,6 +31,9 @@ pub enum KeyRackError {
     #[error("key not found: {0}")]
     KeyNotFound(Lid),
 
+    #[error("deletion refused: {reason}; {counts}")]
+    DeletionDependencyRefused { reason: String, counts: String },
+
     #[error("key {0} is destruction-fenced; lifecycle reconciliation is required")]
     KeyDestructionFenced(Lid),
 

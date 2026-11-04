@@ -131,6 +131,65 @@ Grandchildren and wrapped dependencies are excluded. These logical-only links do
 not block scheduling. The count comes from the admission observation and does
 not reserve the graph; destruction rechecks dependencies under its writer fence.
 
+### Dependency-aware deletion
+
+Deletion checks KeyRack's own keys, versions, wrapped edges and journals. It does
+not discover application ciphertext or external dependencies. Logical-only
+children do not block deletion. Wrapped dependents do, unless you explicitly
+approve their data loss:
+
+```json
+{"grace_period_days": 7, "allow_dependent_data_loss": true}
+```
+
+Send this body to `POST /v1/keys/{key_id}/actions-schedule-deletion`, or set the
+same fields on gRPC `ScheduleKeyDeletion`. The flag defaults to `false`; REST
+requires a JSON boolean. An override requires both `kms:ScheduleKeyDeletion`
+and `kms:ScheduleKeyDeletionWithDependentDataLoss` on the parent. An ordinary
+schedule grant alone is insufficient. Add the separate action to custom PDP
+registries/Cedar schemas and grant it only to principals allowed to approve
+this loss; see the [action contract](PDP_ACTION_CROSSREF.md#deletion-overrides-require-a-second-permission).
+
+The schedule audit event includes the approved edge list.
+Scheduling atomically persists the intent and the server-observed dependent
+version/parent-version/envelope snapshot in SQLite or PostgreSQL. At the due
+time, the worker rechecks under the storage writer fence. A new dependent or
+changed binding outside that snapshot refuses the claim and leaves the key
+PendingDeletion. Nonterminal creation or migration journals always refuse,
+even with approval. Watch `kms:KeyDestructionRefused` audit events and
+`keyrack_deletion_claim_refusals_total{reason}`; audit emission is best-effort.
+Cancel before a claim to clear the intent and snapshot and return the key to
+Disabled, then schedule again if a fresh approval is appropriate. A legacy
+pending record with no intent never inherits data-loss permission.
+
+An approved deletion destroys the parent's material and leaves dependent keys
+and envelopes in place. Responses carrying key metadata, including lists and
+mutation results, report affected versions as soon as the destruction claim
+commits, before any provider effect, in
+`wrapping_parent_destroyed_versions`, read freshly from storage and matched to
+the current parent LID/version. Retained markers for old wrapping bindings do
+not mark a new binding as lost. Later opens of
+those versions fail explicitly with `wrapping parent destroyed` (gRPC
+`FAILED_PRECONDITION`, HTTP 409). This is not recursive deletion or migration.
+Deleting a wrapped child itself is supported: completion erases its envelopes
+without opening it or destroying the wrapping parent.
+
+Upgrade all writers together so they honor the new approval and loss-marker
+schema. A committed destruction claim is permanent: cancellation, crashes,
+provider errors or partial destruction do not release it. Later worker passes
+resume the same operation and frozen handles, treating confirmed provider-key
+absence as done. A failed SQL completion remains recoverable after restart.
+Watch `kms:KeyDestructionDeferred`, `kms:KeyDestructionRetried` and
+`keyrack_deletion_retries_total`; audit emission is best-effort. Vault recovery
+also needs read access to `transit/keys/<key>` and the existing mount-tuning
+health endpoint to distinguish an absent key from an unavailable route. KMIP
+accepts Item Not Found only for Destroy, not for cryptographic operations.
+Do not reuse provider handles or manually remove the journal to force a retry.
+Database row deletion is not physical backup/media erasure; no
+exported material or already-open working set is recalled. See
+[destruction fencing](DESTRUCTION_FENCING.md) for the transaction contract and
+recovery limits.
+
 ### Compromised-key default denial and dangerous legacy opt-in
 
 Ordinary Decrypt and the source side of ReEncrypt deny a `Compromised` key.
@@ -410,7 +469,8 @@ shared deferred-provider wrapper. Before construction succeeds, operations
 return `ProviderUnavailable`. Construction failures, including revoked permissions,
 remain unavailable and are logged with the provider name, cause and next retry
 delay. After construction, operations and their errors pass through unchanged;
-operations are never automatically replayed. Malformed
+that wrapper does not replay operations. The deletion worker separately retries
+journaled destruction as described in [dependency-aware deletion](#dependency-aware-deletion). Malformed
 addresses, invalid configuration, missing local libraries and unreadable local
 secret references still fail startup. A configured Vault `ca_cert` is read and
 validated before deferral; missing files, empty bundles, malformed PEM and invalid
@@ -918,6 +978,8 @@ metadata likewise does not establish live availability.
 | `keyrack_pdp_request_duration_seconds` | PDP evaluation latency |
 | `keyrack_pdp_errors_total` | PDP transport/evaluation failures |
 | `keyrack_audit_emit_errors_total` | Audit sink write failures |
+| `keyrack_deletion_claim_refusals_total{reason}` | Destruction claims refused before provider effects, including unapproved dependents and in-flight journals |
+| `keyrack_deletion_retries_total` | Retained destruction operations resumed from their durable journal |
 | `keyrack_wrapped_lease_cleanup_total{outcome}` | Wrapped-child lease closes after a cancelled request: `scheduled`, then `closed_after_return`, `close_failed` or `abandoned`. Unverified; never closure evidence |
 | `keyrack_wrapped_lease_cleanup_pending` | Those closes still outstanding |
 | `keyrack_wrapped_lease_slots_in_use` | Wrapped-key uses holding a slot, from before the open until the close returns or its cleanup ends; at `wrapped_lease_cleanup_limit`, new uses are refused as unavailable |

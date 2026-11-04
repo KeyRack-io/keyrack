@@ -328,6 +328,7 @@ async fn phase_lifecycle(grpc: &mut KeyServiceClient<Channel>) -> (u32, u32, Str
     if !aes_key_id.is_empty() {
         match grpc
             .schedule_key_deletion(proto::ScheduleKeyDeletionRequest {
+                allow_dependent_data_loss: false,
                 key_id: aes_key_id.clone(),
                 grace_period_days: 7,
             })

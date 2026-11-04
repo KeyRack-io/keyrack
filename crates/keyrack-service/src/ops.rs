@@ -83,6 +83,11 @@ pub struct OpContext {
     re_encrypt_destination: Option<String>,
     // Bound only from a decoded version request, never caller metadata.
     requested_version: Option<u32>,
+    // Only bound from a decoded schedule request, never untrusted metadata.
+    allow_dependent_data_loss: bool,
+    approved_deletion_edges: std::sync::Arc<
+        std::sync::Mutex<Option<Vec<keyrack_core::destruction::DestructionDependent>>>,
+    >,
 }
 
 impl OpContext {
@@ -96,6 +101,28 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
+        }
+    }
+
+    /// Scheduling with dependent data loss requires both the ordinary action
+    /// and a separate permission on the same key, even when no dependents exist.
+    pub fn deletion_schedule(principal: Principal, key_id: &str, allow: bool) -> Self {
+        let mut ctx = Self::key(AuditAction::ScheduleKeyDeletion, principal, key_id);
+        ctx.allow_dependent_data_loss = allow;
+        ctx
+    }
+
+    /// Capture only the exact snapshot returned by committed storage admission.
+    pub fn deletion_snapshot_recorder(
+        &self,
+    ) -> impl FnOnce(Vec<keyrack_core::destruction::DestructionDependent>) + Send + 'static {
+        let captured = self.approved_deletion_edges.clone();
+        move |edges| {
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(edges);
         }
     }
 
@@ -150,6 +177,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -168,6 +197,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -181,6 +212,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 }
@@ -325,6 +358,18 @@ async fn emit_audit(
     )
     .with_request_id(ctx.request_id.clone());
 
+    if ctx.action == AuditAction::ScheduleKeyDeletion {
+        event.add_metadata("allow_dependent_data_loss", ctx.allow_dependent_data_loss);
+        if let Some(edges) = ctx
+            .approved_deletion_edges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            event.add_metadata("approved_dependents", serde_json::json!(edges));
+        }
+    }
+
     if let Some(code) = authorization_status {
         event.add_metadata("failure_phase", "authorization");
         event.add_metadata("authorization_status", format!("{code:?}"));
@@ -365,11 +410,10 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
     for (index, request) in authorization_requests(ctx)?.iter().enumerate() {
         if let Err(error) = authorize_request(state, request).await {
             if index == 1 {
-                // The executor also records the overall source operation as
-                // denied. Name the refused destination explicitly, without
-                // inventing a successful standalone Encrypt operation.
+                // Name the actual second permission that was refused. The
+                // executor also records the overall operation as denied.
                 let mut denied = OpContext::key(
-                    AuditAction::ReEncryptTo,
+                    request.action.clone(),
                     ctx.principal.clone(),
                     &request.resource.id,
                 );
@@ -402,6 +446,30 @@ fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::S
         },
         context: ctx.authorization_context()?,
     };
+    if ctx.allow_dependent_data_loss {
+        if ctx.action != AuditAction::ScheduleKeyDeletion || ctx.resource_type != "Key" {
+            return Err(tonic::Status::internal(
+                "invalid deletion authorization context",
+            ));
+        }
+        let mut override_request = request.clone();
+        override_request.action = AuditAction::ScheduleKeyDeletionWithDependentDataLoss;
+        override_request.request_id = new_request_id();
+        override_request.context.entries.insert(
+            "operation_request_id".into(),
+            keyrack_core::pdp::AttributeValue::String(ctx.request_id.clone()),
+        );
+        override_request.context.entries.insert(
+            "allow_dependent_data_loss".into(),
+            keyrack_core::pdp::AttributeValue::Bool(true),
+        );
+        return Ok(vec![request, override_request]);
+    }
+    if ctx.action == AuditAction::ScheduleKeyDeletionWithDependentDataLoss {
+        return Err(tonic::Status::internal(
+            "deletion override requires the schedule executor",
+        ));
+    }
     if ctx.action != AuditAction::ReEncryptFrom {
         if ctx.re_encrypt_destination.is_some() || ctx.action == AuditAction::ReEncryptTo {
             return Err(tonic::Status::internal(
@@ -877,6 +945,7 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::EnableKey
         | AuditAction::DisableKey
         | AuditAction::ScheduleKeyDeletion
+        | AuditAction::ScheduleKeyDeletionWithDependentDataLoss
         | AuditAction::CancelKeyDeletion
         | AuditAction::UpdateKey => EventType::KeyStateChanged,
         AuditAction::ReportKeyCompromise => EventType::KeyCompromised,
@@ -932,7 +1001,11 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
-        AuditAction::KeyDestroyed | AuditAction::ProviderDestroyKey => EventType::KeyDeleted,
+        AuditAction::KeyDestroyed
+        | AuditAction::ProviderDestroyKey
+        | AuditAction::KeyDestructionRefused
+        | AuditAction::KeyDestructionRetried
+        | AuditAction::KeyDestructionDeferred => EventType::KeyDeleted,
         AuditAction::AccessSecret | AuditAction::GetKeyMaterial => EventType::SecretAccess,
         AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
         AuditAction::MakeKeyExportable | AuditAction::RevokeKeyExportability => {
@@ -964,11 +1037,15 @@ pub async fn authorize_with_resource_attrs(
     // two-key executor; neither a generic nor bound context can bypass it here.
     if matches!(
         ctx.action,
-        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo | AuditAction::RewrapKey
+        AuditAction::ReEncryptFrom
+            | AuditAction::ReEncryptTo
+            | AuditAction::RewrapKey
+            | AuditAction::ScheduleKeyDeletionWithDependentDataLoss
     ) || ctx.re_encrypt_destination.is_some()
+        || ctx.allow_dependent_data_loss
     {
         return Err(tonic::Status::internal(
-            "ReEncrypt requires the two-key executor",
+            "operation requires its dedicated authorization executor",
         ));
     }
     let request = AuthzRequest {
@@ -1246,6 +1323,54 @@ mod migration_bound_tests {
                 AuditResult::Attempt,
                 AuditResult::Error
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod deletion_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn dependent_data_loss_requires_a_separate_correlated_permission() {
+        let ctx = OpContext::deletion_schedule(default_principal(), "key-id", true);
+        let requests = authorization_requests(&ctx).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, AuditAction::ScheduleKeyDeletion);
+        assert_eq!(
+            requests[1].action,
+            AuditAction::ScheduleKeyDeletionWithDependentDataLoss
+        );
+        assert_ne!(requests[0].request_id, requests[1].request_id);
+        assert_eq!(requests[0].resource.id, requests[1].resource.id);
+        assert_eq!(
+            requests[1].context.entries["operation_request_id"],
+            keyrack_core::pdp::AttributeValue::String(ctx.request_id)
+        );
+        assert_eq!(
+            requests[1].context.entries["allow_dependent_data_loss"],
+            keyrack_core::pdp::AttributeValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn normal_schedule_does_not_request_data_loss_permission() {
+        let ctx = OpContext::deletion_schedule(default_principal(), "key-id", false);
+        let requests = authorization_requests(&ctx).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, AuditAction::ScheduleKeyDeletion);
+    }
+
+    #[test]
+    fn generic_override_action_cannot_bypass_ordinary_schedule_permission() {
+        let ctx = OpContext::key(
+            AuditAction::ScheduleKeyDeletionWithDependentDataLoss,
+            default_principal(),
+            "key-id",
+        );
+        assert_eq!(
+            authorization_requests(&ctx).unwrap_err().code(),
+            tonic::Code::Internal
         );
     }
 }

@@ -258,6 +258,17 @@ impl PostgresStorage {
         let KeyMaterial::ParentWrapped(material) = &entry.material else {
             return Err(invalid("version is not wrapped"));
         };
+        // Read the loss decision live under the same writer fence as this
+        // descriptor. A historical marker for a different parent must not block
+        // a version that was rewrapped in place. The exact parent's durable
+        // claim also covers a pre-upgrade journal before marker backfill.
+        let lost: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kr_destroyed_wrapping_parents WHERE child_lid=$1 AND child_version=$2 AND parent_lid=$3 AND parent_version=$4) OR EXISTS(SELECT 1 FROM kr_destruction_journal WHERE lid=$3)")
+            .bind(lid.to_string()).bind(version.to_string())
+            .bind(material.parent().lid.to_string()).bind(material.parent().version.get().to_string())
+            .fetch_one(&mut *tx).await.map_err(database_error)?;
+        if lost {
+            return Err(KeyRackError::WrappingParentDestroyed);
+        }
         let envelope = envelope_ref(&mut tx, material.wrapped_material_ref().as_str()).await?;
         let parent = load_key(&mut tx, &material.parent().lid)
             .await?

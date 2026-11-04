@@ -41,6 +41,8 @@ use std::sync::{Arc, Mutex};
 mod compromised_domain;
 #[path = "integration/deletion_dependencies.rs"]
 mod deletion_dependencies;
+#[path = "integration/deletion_override.rs"]
+mod deletion_override;
 #[path = "integration/lifecycle_metadata.rs"]
 mod lifecycle_metadata;
 use tonic::Request;
@@ -1549,9 +1551,15 @@ fn unsupported_wrapped_material() -> keyrack_core::key::KeyMaterial {
 }
 
 fn assert_wrapped_refusal(status: &tonic::Status) {
-    assert!(
-        status.message().contains("parent-wrapped"),
-        "unexpected refusal: {status}"
+    if status.message().contains("parent-wrapped") {
+        return;
+    }
+    // The deliberately invalid fixture has no envelope. Preserve the storage
+    // error instead of disguising every snapshot failure as unsupported custody.
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert_eq!(
+        status.message(),
+        "storage error: wrapped-key migration: unknown wrapped envelope reference"
     );
 }
 
@@ -1704,16 +1712,18 @@ async fn mixed_material_lifecycle_refuses_before_resident_sibling_side_effects()
     assert_eq!(after.occ_version, nonexportable.occ_version);
     assert_eq!(after.exportability, nonexportable.exportability);
 
-    // Admission now refuses wrapped history before changing lifecycle state.
+    // The stale primary flags make this synthetic history invalid. Admission
+    // validates all versions before any resident material can be destroyed.
     let status = svc
         .schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            allow_dependent_data_loss: false,
             key_id: key_id.clone(),
             grace_period_days: 7,
         }))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains("own_parent_wrapped_versions=1"));
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert!(status.message().contains("invalid material history"));
     assert_eq!(
         state.storage.get_key(&lid).await.unwrap().occ_version,
         nonexportable.occ_version
@@ -6778,6 +6788,7 @@ async fn seed_keys_in_three_states(
     .expect("disable_key");
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: pending.clone(),
         grace_period_days: 7,
     }))
@@ -7219,6 +7230,7 @@ async fn get_key_material_refused_once_deletion_scheduled() {
     );
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7261,6 +7273,7 @@ async fn get_key_material_refused_after_reaper_destroys_key() {
 
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7317,6 +7330,7 @@ async fn deletion_reaper_destroys_provider_material() {
     assert_eq!(handles.len(), 2, "expected two key versions after rotation");
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7377,6 +7391,7 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
 
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7419,8 +7434,8 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
         .unwrap();
     assert_eq!(
         provider.destroyed_handles().len(),
-        1,
-        "ambiguous failure must not redispatch"
+        2,
+        "retained claim retries the same handle without releasing its fence"
     );
     assert!(svc
         .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
@@ -7429,7 +7444,7 @@ async fn deletion_reaper_fails_closed_when_provider_destroy_fails() {
 }
 
 #[tokio::test]
-async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_call() {
+async fn destruction_claim_blocks_cancel_and_reapers_retry_the_same_operation() {
     use tower::ServiceExt;
 
     let gate = Arc::new(DestroyGate::default());
@@ -7444,6 +7459,7 @@ async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_c
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7478,11 +7494,26 @@ async fn destruction_claim_blocks_cancel_and_competing_reapers_during_provider_c
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-    keyrack_service::workers::run_deletion_scan(&state)
+    let retry_state = state.clone();
+    let retry = tokio::spawn(async move {
+        keyrack_service::workers::run_deletion_scan(&retry_state)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
         .await
         .unwrap();
-    assert_eq!(provider.destroyed_handles().len(), 1);
-    gate.resume.notify_one();
+    let handles = provider.destroyed_handles();
+    assert_eq!(handles.len(), 2);
+    assert_eq!(
+        handles[0], handles[1],
+        "recovery must retain the immutable provider handle"
+    );
+    gate.resume.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), scan)
         .await
         .unwrap()
@@ -7504,6 +7535,7 @@ async fn cancellation_before_destruction_claim_has_no_provider_effect() {
     let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
     let key_id = create_exportable_key(&svc).await;
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7578,6 +7610,7 @@ async fn destruction_pins_provider_across_runtime_registry_replacement() {
         .collect();
     state.storage.update_key(&record).await.unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7642,6 +7675,7 @@ async fn unknown_provider_on_later_version_prevents_all_destruction_effects() {
     record.occ_version += 1;
     state.storage.update_key(&record).await.unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7663,7 +7697,7 @@ async fn unknown_provider_on_later_version_prevents_all_destruction_effects() {
 }
 
 #[tokio::test]
-async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
+async fn partial_destruction_retains_fence_then_retries_same_handles_to_completion() {
     let mut recording = RecordingProvider::new(false);
     recording.fail_destroy_at = Some(2);
     let provider = Arc::new(recording);
@@ -7678,6 +7712,7 @@ async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
     .await
     .unwrap();
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: key_id.clone(),
         grace_period_days: 7,
     }))
@@ -7687,22 +7722,39 @@ async fn partial_destruction_retains_fence_and_does_not_audit_completion() {
     keyrack_service::workers::run_deletion_scan(&state)
         .await
         .unwrap();
-    keyrack_service::workers::run_deletion_scan(&state)
-        .await
-        .unwrap();
     assert_eq!(provider.destroyed_handles().len(), 2);
     assert_eq!(
         key_state(&state, &key_id).await,
         keyrack_core::key::KeyState::PendingDeletion
     );
     assert!(svc
-        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest { key_id }))
+        .cancel_key_deletion(Request::new(proto::CancelKeyDeletionRequest {
+            key_id: key_id.clone()
+        }))
         .await
         .is_err());
     assert!(!audit
         .events()
         .iter()
         .any(|e| e.action == keyrack_core::audit::AuditAction::KeyDestroyed));
+    keyrack_service::workers::run_deletion_scan(&state)
+        .await
+        .unwrap();
+    let handles = provider.destroyed_handles();
+    assert_eq!(handles.len(), 4);
+    assert_eq!(
+        &handles[..2],
+        &handles[2..],
+        "retry must use the frozen version history"
+    );
+    assert_eq!(
+        key_state(&state, &key_id).await,
+        keyrack_core::key::KeyState::Destroyed
+    );
+    assert!(audit
+        .events()
+        .iter()
+        .any(|event| event.action == keyrack_core::audit::AuditAction::KeyDestroyed));
 }
 
 /// `ReEncrypt` reached both a decrypt and an encrypt with no state gate on
@@ -7717,6 +7769,7 @@ async fn re_encrypt_refused_when_source_state_forbids_decrypt() {
     let dst = create_aes_key(&svc).await;
 
     svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+        allow_dependent_data_loss: false,
         key_id: src.clone(),
         grace_period_days: 7,
     }))

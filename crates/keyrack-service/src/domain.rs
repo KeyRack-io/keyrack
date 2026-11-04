@@ -34,8 +34,8 @@
 //!   [`enforce_state_for_key_op`], [`enforce_born_exportable`],
 //!   [`enforce_no_child_under_exportable_parent`], [`generate_key_lid_from_attrs`],
 //!   [`explain_routing`] — are genuinely called by both `grpc.rs` and `rest.rs`.
-//! - [`disable_key`] is genuinely shared: it is the single implementation behind
-//!   both surfaces' `DisableKey` handler.
+//! - [`disable_key`], deletion scheduling and cancellation are shared by both
+//!   surfaces; deletion intent is captured atomically by storage.
 //! - Most of the remaining **full lifecycle functions here have no callers at
 //!   all** (`create_key`, `rotate_key`, `list_keys`, the alias/tag/HSM/rotation-job
 //!   functions, and the whole [`crypto`] submodule). They are `pub` in a library
@@ -68,6 +68,7 @@
 //! themselves — `ops` is the real structural choke point for both surfaces.
 
 use crate::state::ServiceState;
+use keyrack_core::error::KeyRackError;
 use keyrack_core::key::{KeyMaterial, KeyRecord, KeySpec, KeyState, KeyUsage, KeyVersionRecord};
 use keyrack_core::lid::Lid;
 use keyrack_core::provider::{CryptoProvider, KeyHandle};
@@ -109,16 +110,12 @@ impl std::fmt::Display for DomainError {
 
 impl From<keyrack_core::error::KeyRackError> for DomainError {
     fn from(e: keyrack_core::error::KeyRackError) -> Self {
-        use keyrack_core::error::KeyRackError;
         match &e {
             KeyRackError::KeyNotFound(_) => Self::NotFound(e.to_string()),
             KeyRackError::Storage(msg) if msg.contains("not found") => {
                 Self::NotFound(e.to_string())
             }
-            KeyRackError::InvalidStateTransition { .. }
-            | KeyRackError::KeyDestructionFenced(_)
-            | KeyRackError::WrappingParentDestroyed
-            | KeyRackError::MigrationIntentConflict { .. }
+            KeyRackError::DeletionDependencyRefused { .. }
             | KeyRackError::OperationNotPermitted { .. } => Self::FailedPrecondition(e.to_string()),
             KeyRackError::ImmutableTag { .. }
             | KeyRackError::InvalidIdentity(_)
@@ -126,7 +123,11 @@ impl From<keyrack_core::error::KeyRackError> for DomainError {
             | KeyRackError::DepthLimitExceeded { .. }
             | KeyRackError::CycleDetected { .. } => Self::InvalidArgument(e.to_string()),
             KeyRackError::ProviderUnavailable(_) => Self::ProviderUnavailable(e.to_string()),
-            KeyRackError::OptimisticConcurrencyConflict { .. } => Self::Core(e),
+            KeyRackError::OptimisticConcurrencyConflict { .. }
+            | KeyRackError::InvalidStateTransition { .. }
+            | KeyRackError::KeyDestructionFenced(_)
+            | KeyRackError::MigrationIntentConflict { .. }
+            | KeyRackError::WrappingParentDestroyed => Self::Core(e),
             _ => Self::Internal(e.to_string()),
         }
     }
@@ -142,7 +143,6 @@ impl DomainError {
             Self::ProviderUnavailable(msg) => tonic::Status::unavailable(msg),
             Self::Internal(msg) => tonic::Status::internal(msg),
             Self::Core(e) => {
-                use keyrack_core::error::KeyRackError;
                 let msg = e.to_string();
                 match e {
                     KeyRackError::KeyNotFound(_) => tonic::Status::not_found(msg),
@@ -151,6 +151,7 @@ impl DomainError {
                     }
                     KeyRackError::InvalidStateTransition { .. }
                     | KeyRackError::KeyDestructionFenced(_)
+                    | KeyRackError::DeletionDependencyRefused { .. }
                     | KeyRackError::WrappingParentDestroyed
                     | KeyRackError::MigrationIntentConflict { .. }
                     | KeyRackError::OperationNotPermitted { .. }
@@ -179,41 +180,41 @@ impl DomainError {
                 (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
             }
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
-            Self::Core(e) => {
-                use keyrack_core::error::KeyRackError;
-                match e {
-                    KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
-                    KeyRackError::OptimisticConcurrencyConflict { .. } => {
-                        (StatusCode::CONFLICT, "OccConflict")
-                    }
-                    KeyRackError::KeyDestructionFenced(_) => {
-                        (StatusCode::CONFLICT, "KeyDestructionFenced")
-                    }
-                    KeyRackError::MigrationIntentConflict { .. } => {
-                        (StatusCode::CONFLICT, "MigrationIntentConflict")
-                    }
-                    KeyRackError::WrappingParentDestroyed => {
-                        (StatusCode::CONFLICT, "WrappingParentDestroyed")
-                    }
-                    KeyRackError::InvalidStateTransition { .. } => {
-                        (StatusCode::CONFLICT, "InvalidStateTransition")
-                    }
-                    KeyRackError::OperationNotPermitted { .. } => {
-                        (StatusCode::FORBIDDEN, "OperationNotPermitted")
-                    }
-                    KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
-                    KeyRackError::EncryptionContextMismatch => {
-                        (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
-                    }
-                    KeyRackError::AuthorizationDenied { .. } => {
-                        (StatusCode::FORBIDDEN, "AuthorizationDenied")
-                    }
-                    KeyRackError::ProviderUnavailable(_) => {
-                        (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
-                    }
-                    _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            Self::Core(e) => match e {
+                KeyRackError::KeyNotFound(_) => (StatusCode::NOT_FOUND, "KeyNotFound"),
+                KeyRackError::OptimisticConcurrencyConflict { .. } => {
+                    (StatusCode::CONFLICT, "OccConflict")
                 }
-            }
+                KeyRackError::DeletionDependencyRefused { .. } => {
+                    (StatusCode::CONFLICT, "FailedPrecondition")
+                }
+                KeyRackError::KeyDestructionFenced(_) => {
+                    (StatusCode::CONFLICT, "KeyDestructionFenced")
+                }
+                KeyRackError::WrappingParentDestroyed => {
+                    (StatusCode::CONFLICT, "WrappingParentDestroyed")
+                }
+                KeyRackError::MigrationIntentConflict { .. } => {
+                    (StatusCode::CONFLICT, "MigrationIntentConflict")
+                }
+                KeyRackError::InvalidStateTransition { .. } => {
+                    (StatusCode::CONFLICT, "InvalidStateTransition")
+                }
+                KeyRackError::OperationNotPermitted { .. } => {
+                    (StatusCode::FORBIDDEN, "OperationNotPermitted")
+                }
+                KeyRackError::ImmutableTag { .. } => (StatusCode::BAD_REQUEST, "ImmutableTag"),
+                KeyRackError::EncryptionContextMismatch => {
+                    (StatusCode::BAD_REQUEST, "EncryptionContextMismatch")
+                }
+                KeyRackError::AuthorizationDenied { .. } => {
+                    (StatusCode::FORBIDDEN, "AuthorizationDenied")
+                }
+                KeyRackError::ProviderUnavailable(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "ProviderUnavailable")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            },
         };
         crate::ops::rest_error(code, kind, &self.to_string())
     }
@@ -956,8 +957,6 @@ pub async fn disable_key(
     lid: &Lid,
     key_id: &str,
 ) -> Result<DisableKeyResult, keyrack_core::error::KeyRackError> {
-    use keyrack_core::error::KeyRackError;
-
     let lid = *lid;
     state.storage.check_migration_fence(&lid).await?;
     let mut record = state.storage.get_key_for_use(&lid).await?;
@@ -1018,17 +1017,15 @@ pub async fn disable_key(
     })
 }
 
-/// Admission check shared by the library, gRPC and REST scheduling paths.
-/// This observation does not reserve destruction: the storage claim repeats the
-/// same dependency query under its writer fence immediately before claiming.
+/// Advisory admission check for callers inspecting ordinary deletion eligibility.
+/// Scheduling captures its own observation atomically in storage; the claim
+/// repeats the same dependency query under its writer fence before claiming.
 pub async fn ensure_deletion_can_be_scheduled(
     state: &Arc<ServiceState>,
     lid: &Lid,
 ) -> Result<keyrack_core::destruction::DestructionDependencies, DomainError> {
     let dependencies = state.storage.destruction_dependencies(lid).await?;
-    if !dependencies.is_empty() {
-        return Err(DomainError::FailedPrecondition(dependencies.summary()));
-    }
+    dependencies.approval(false).map_err(DomainError::from)?;
     Ok(dependencies)
 }
 
@@ -1037,29 +1034,36 @@ pub async fn schedule_key_deletion(
     key_id: &str,
     grace_period_days: u32,
 ) -> Result<KeyRecord, DomainError> {
+    Ok(
+        schedule_key_deletion_with_intent(state, key_id, grace_period_days, false)
+            .await?
+            .record,
+    )
+}
+
+/// Atomic storage admission captures the approved dependency snapshot. The
+/// caller must authorize dependent data loss separately before setting `allow`.
+pub async fn schedule_key_deletion_with_intent(
+    state: &Arc<ServiceState>,
+    key_id: &str,
+    grace_period_days: u32,
+    allow: bool,
+) -> Result<keyrack_core::destruction::ScheduledDeletion, DomainError> {
     let lid = parse_lid(key_id)?;
-    let mut record = state
-        .storage
-        .get_key_for_use(&lid)
-        .await
-        .map_err(DomainError::from)?;
+    let record = state.storage.get_key_for_use(&lid).await?;
     let days = if grace_period_days == 0 {
         7
     } else {
         grace_period_days
     };
-    ensure_deletion_can_be_scheduled(state, &lid).await?;
-    record
-        .transition_to(KeyState::PendingDeletion)
-        .map_err(|(f, t)| transition_err(f, t))?;
-    record.scheduled_deletion_at =
-        Some(chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
+    let at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(i64::from(days)))
+        .ok_or_else(|| DomainError::InvalidArgument("deletion date is out of range".into()))?;
     state
         .storage
-        .update_key(&record)
+        .schedule_destruction(&lid, record.occ_version, at, allow)
         .await
-        .map_err(DomainError::from)?;
-    Ok(record)
+        .map_err(DomainError::from)
 }
 
 pub async fn cancel_key_deletion(
@@ -1072,26 +1076,17 @@ pub async fn cancel_key_deletion(
         .check_migration_fence(&lid)
         .await
         .map_err(DomainError::from)?;
-    let mut record = state
-        .storage
-        .get_key_for_use(&lid)
-        .await
-        .map_err(DomainError::from)?;
+    let record = state.storage.get_key_for_use(&lid).await?;
     if record.state != KeyState::PendingDeletion {
         return Err(DomainError::FailedPrecondition(
             "can only cancel deletion from PendingDeletion".into(),
         ));
     }
-    record
-        .transition_to(KeyState::Disabled)
-        .map_err(|(f, t)| transition_err(f, t))?;
-    record.scheduled_deletion_at = None;
     state
         .storage
-        .update_key(&record)
+        .cancel_destruction(&lid, record.occ_version)
         .await
-        .map_err(DomainError::from)?;
-    Ok(record)
+        .map_err(DomainError::from)
 }
 
 pub async fn report_key_compromise(
@@ -1179,6 +1174,7 @@ async fn open_usable(
     mut prepared: PreparedUse,
     provider: &Arc<dyn CryptoProvider>,
 ) -> Result<OpenedUse, DomainError> {
+    let mut refreshed_parent = false;
     loop {
         match prepared {
             PreparedUse::Resident(handle) => {
@@ -1207,6 +1203,12 @@ async fn open_usable(
                         })
                     }
                     Err(keyrack_core::error::KeyRackError::WrappingParentDestroyed) => {
+                        if refreshed_parent {
+                            return Err(DomainError::from(
+                                keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+                            ));
+                        }
+                        refreshed_parent = true;
                         // A committed migration may retire and destroy the old
                         // parent between the atomic read and the provider open.
                         // Refresh only the binding, before any caller crypto is
@@ -1248,6 +1250,29 @@ async fn prepare_usable(
     }
 }
 
+/// Loss status is read live and applies only to the current wrapping edge.
+pub async fn destroyed_wrapping_versions(
+    state: &ServiceState,
+    lid: &Lid,
+) -> keyrack_core::error::Result<Vec<u64>> {
+    let record = state.storage.get_key_for_use(lid).await?;
+    let markers = state.storage.destroyed_wrapping_parents(lid).await?;
+    let mut versions: Vec<_> = markers
+        .into_iter()
+        .filter(|lost| {
+            record.get_version(lost.version).is_some_and(|version| {
+                matches!(&version.material,
+            KeyMaterial::ParentWrapped(material) if material.parent().lid == lost.parent_lid
+                && material.parent().version.get() == lost.parent_version)
+            })
+        })
+        .map(|lost| lost.version)
+        .collect();
+    versions.sort_unstable();
+    versions.dedup();
+    Ok(versions)
+}
+
 /// One transaction reads the current descriptor, its envelope and its exact
 /// parent. A caller retaining pre-migration metadata therefore cannot observe
 /// the gap between publishing a new descriptor and erasing the old envelope.
@@ -1260,10 +1285,7 @@ async fn prepare_wrapped(
         .storage
         .wrapped_key_snapshot(lid, version_number)
         .await
-        .map_err(|error| match error {
-            keyrack_core::error::KeyRackError::WrappingParentDestroyed => DomainError::from(error),
-            _ => DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()),
-        })?;
+        .map_err(DomainError::from)?;
     let record = snapshot.record;
     let parent = snapshot.parent;
     if parent.state == KeyState::Destroyed {
@@ -1277,6 +1299,21 @@ async fn prepare_wrapped(
     let KeyMaterial::ParentWrapped(material) = &version.material else {
         return Err(DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()));
     };
+    if state
+        .storage
+        .destroyed_wrapping_parents(lid)
+        .await?
+        .iter()
+        .any(|lost| {
+            lost.version == version_number
+                && lost.parent_lid == material.parent().lid
+                && lost.parent_version == material.parent().version.get()
+        })
+    {
+        return Err(DomainError::from(
+            keyrack_core::error::KeyRackError::WrappingParentDestroyed,
+        ));
+    }
     let parent_version = parent
         .get_version(material.parent().version.get())
         .ok_or_else(|| {

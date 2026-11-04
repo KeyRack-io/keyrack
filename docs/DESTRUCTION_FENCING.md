@@ -1,86 +1,127 @@
-# Resident-key destruction fencing
+# Dependency-aware destruction fencing
 
-This slice implements pre-destruction storage fencing. It does **not** activate
-provider-wrapped hierarchy, subtree erasure, trusted-worker execution or global
-revocation.
+KeyRack checks its own persisted keys, versions, wrapped edges and creation and
+migration journals before scheduling or claiming destruction. This does not
+inventory application ciphertext or external dependencies, recursively erase a
+subtree, or establish global revocation.
 
-## Execution contract
+## Scheduling and approval
 
-`ScheduleKeyDeletion` refuses before changing the lifecycle when the key has any
-`ParentWrapped` version, another key has a `ParentWrapped` version naming it as
-parent, any creation-journal row names it as parent or child, or a nonterminal
-migration names it as child, old parent or new parent. This applies to
-the domain/library, gRPC and REST paths. gRPC returns `FAILED_PRECONDITION`; REST
-returns HTTP 409 with `FailedPrecondition`. The diagnostic contains counts named
-`own_parent_wrapped_versions`, `dependent_parent_wrapped_versions` and
-`creation_journal_rows` and `migration_journal_rows`, never the LIDs of other keys.
-Counts cover all versions, every creation-journal phase and nonterminal migration
-journals; a row matching multiple roles counts once. Committed migration receipts
-do not block the retired parent. Logical
-`parent_lid` relationships alone do not block scheduling. Successful gRPC and REST
-schedule responses include `logical_only_children`: the number of direct
-persisted child records whose versions all contain resident material, observed
-by the same admission query. Each child counts once, regardless of lifecycle
-state or version count; grandchildren and actual wrapped dependencies are not
-included. The count is informational, not a reservation or approval of data loss.
+`ScheduleKeyDeletion` and REST
+`POST /v1/keys/{key_id}/actions-schedule-deletion` accept
+`allow_dependent_data_loss`, default `false`. Both require
+`kms:ScheduleKeyDeletion`. Setting the flag also requires the separate
+`kms:ScheduleKeyDeletionWithDependentDataLoss` permission on the same key,
+even when it currently has no dependents. See the
+[PDP action cross-reference](PDP_ACTION_CROSSREF.md#deletion-overrides-require-a-second-permission).
 
+Without an override, another key's live wrapped version blocks deletion of its
+parent. Logical `parent_lid` relationships alone remain nonblocking. Successful schedule
+responses include `logical_only_children`, counting direct persisted children
+with nonempty all-resident histories once each, regardless of lifecycle state.
+Grandchildren and actual wrapped dependencies are excluded. The count is from
+the fenced admission observation, not a reservation or data-loss approval. A key's own
+wrapped versions are supported: destruction removes their stored envelopes
+instead of opening the child or destroying its parent. Missing, malformed or
+unsupported envelope bindings fail closed.
 
-Scheduling and claiming share `StorageBackend::destruction_dependencies` and
-the backend's transaction query. Scheduling is an early observation, not a
-reservation: a dependency introduced after scheduling still causes the claim to
-refuse. The authoritative recheck remains under the same writer fence as claim
-insertion. Unsupported storage implementations fail closed; cache wrappers must
-query the underlying store. Dependency scans currently visit persisted key
-histories, so this check adds database work to scheduling.
+Nonterminal creation journals naming the key as parent or child, and nonterminal
+migration journals naming it as child, old parent or new parent, always refuse
+scheduling and claiming, including with an override. Completed receipts alone do
+not block deletion; live envelopes and current wrapped descriptors still count
+as dependencies. A committed migration retires old envelopes and creation
+references atomically, so its old-parent receipt is not a live wrapping edge.
 
-1. The reaper's scan result is only a candidate. `claim_destruction` re-reads the
-   record under the storage writer lock and checks its OCC, due PendingDeletion
-   state and entire resident version history. Empty/duplicate/malformed histories
-   and any ParentWrapped version fail closed.
-2. The same transaction rejects every parent/child creation-journal reference,
-   including pending child rotations, and scans existing material references for
-   legacy or directly stored ParentWrapped records. Logical `parent_lid` alone is
-   not a wrapping dependency.
-   It also refuses every nonterminal migration naming the key as child, old
-   parent or new parent. Migration reservations and destruction claims share
-   the writer lock, so either winning reservation excludes the other. Committed
-   migration metadata is an idempotency receipt, not an active old-parent
-   dependency: commit removes old envelopes and active creation references
-   atomically. Current descriptors retain the new-parent dependency.
-3. The transaction inserts a permanent claim journal and advances key OCC. Only
-   successful commit of a **new** claim returns an execution ticket. Existing
-   claims return no ticket. Generic updates, cancellation, reactivation and new
-   wrapping references are fenced using the same writer protocol.
-4. The service uses the claimed snapshot and pins provider instances once per
-   effective provider binding before the first delete. It does not resolve a
-   provider again between versions. Provider operations run outside SQL locks.
-5. Only successful destruction of **every** version permits
-   `complete_destruction`, which verifies operation identity and the exact stored
-   snapshot before atomically publishing Destroyed. The journal remains as a
-   terminal tombstone; generic CRUD cannot resurrect the record or publish
-   Destroyed in place of this completion path.
+SQLite and PostgreSQL persist the scheduled time, override intent and a
+server-captured snapshot in `deletion_schedules` (SQLite) or
+`kr_deletion_schedules` (PostgreSQL), in the same writer transaction as the
+lifecycle transition. Each approved edge binds the dependent LID,
+dependent version, parent version and envelope reference. Clients cannot supply
+the snapshot. This requires the storage schema migrations on upgrade; the
+approval survives restart. A legacy PendingDeletion record without an approval
+has no data-loss authorization: live dependents or nonterminal journals refuse
+its claim, while dependency-free destruction remains eligible.
 
-SQLite uses its existing immediate writer transaction; PostgreSQL uses the same
+Scheduling and claiming use the same dependency query, including live envelope
+indexes as well as key histories. Scheduling does not reserve future dependents.
+The claim transaction rechecks the full set under the writer fence. Any current
+edge outside the approved snapshot refuses the claim, including a new version
+or envelope binding on an already approved child. Retired edges do not require
+renewed approval. Unsupported storage implementations fail closed; metadata
+caches must delegate these queries to authoritative storage.
+
+A dependency refusal leaves the key PendingDeletion and performs no provider
+destruction. The worker emits `kms:KeyDestructionRefused` with a reason and
+blocking counts, and increments
+`keyrack_deletion_claim_refusals_total{reason}`. Reasons distinguish
+`in_flight_journal`, `dependent_data_loss_not_approved` and
+`dependent_outside_approved_snapshot`; other claim errors use `storage_refusal`.
+Audit delivery remains best-effort. Scheduling refusals return gRPC
+`FAILED_PRECONDITION` or HTTP 409 with `FailedPrecondition`. Diagnostics include
+counts, not other keys' LIDs.
+
+Cancellation before a claim atomically removes the persisted intent and snapshot,
+clears the scheduled date and returns the key to Disabled. Rescheduling needs a
+new authorization and snapshot; cancellation never leaves reusable approval.
+
+## Claim and completion
+
+1. The reaper's scan is only a candidate. `claim_destruction` rereads the record
+   under the storage writer lock, checks its OCC, due PendingDeletion state,
+   full version history, envelope bindings and the approval against current
+   dependencies. Empty, duplicate or malformed histories fail closed.
+2. A successful claim inserts a permanent destruction journal and advances OCC.
+   The claim transaction also persists loss markers before any provider effect.
+   Later scans recover the same operation ID and exact snapshot from an incomplete
+   journal; completed journals return no ticket. Generic updates, cancellation, reactivation, new
+   wrapping references and conflicting migration reservations use the same
+   writer fence. After a claim, cancellation returns gRPC FailedPrecondition or
+   HTTP 409; a stale OCC can instead produce a concurrency-conflict error.
+3. The service uses the claimed snapshot, pins provider instances once per
+   effective provider binding and destroys all resident versions. Provider
+   operations run outside SQL locks. Wrapped versions require no provider open
+   or temporary child handle for destruction.
+4. `complete_destruction` verifies the operation identity and exact snapshot,
+   removes the key's own creation/migration envelopes, and publishes Destroyed
+   atomically. It retains idempotency receipts without their envelope bytes and
+   the permanent destruction tombstone. Generic CRUD cannot resurrect the key
+   or publish Destroyed instead of this completion path.
+5. With a valid override, the parent is destroyed without deleting or migrating
+   dependents. Their records, lifecycle states and envelopes remain, while
+   the claim transaction records the affected versions in the loss-marker table. All API responses
+   carrying key metadata, including lists and mutation responses, read these
+   markers freshly into `wrapping_parent_destroyed_versions`, matching the current
+   material's parent LID and version. Historical markers do not block a different
+   current wrapping edge. A marker-query
+   failure fails the response rather than reporting an empty list. Later opens
+   of affected wrapped versions return `wrapping parent destroyed` with gRPC
+   `FAILED_PRECONDITION` / HTTP 409, before envelope or provider dispatch.
+
+SQLite uses an immediate writer transaction; PostgreSQL uses the same
 transaction-scoped advisory lock and READ COMMITTED protocol as creation/CRUD.
-An unsupported storage implementation fails closed, rather than emulating these
-operations with separate reads/writes. The metadata cache delegates claims and
-completion directly to storage and invalidates locally on both success and error.
-
-Cancellation that wins before the claim still succeeds and returns the key to
-Disabled. After a claim, a fresh cancellation returns gRPC FailedPrecondition or
-HTTP 409. A stale OCC can instead produce the existing concurrency-conflict error.
+Claims, approvals and completion must not be emulated by independent reads and
+writes. Cache wrappers delegate them to storage and invalidate local metadata.
 
 ## Failures and operational limits
 
+- The parent fence also rejects ordinary writes that still reference it,
+  including attempted rewrapping after its destruction. A dependent child can
+  still use its own fenced envelope-erasure lifecycle; the loss marker is not
+  a recovery or reactivation mechanism.
 - A lost response, task cancellation, process crash, provider error, partial
-  success or completion error **does not release the fence**. Later scans do not
-  retry destruction. An error is not evidence that material survived unchanged.
-  There is no automatic takeover, timeout release or recovery/abort API in this
-  slice. Do not clear journal rows manually to get retries: that discards the
-  one-shot guarantee without resolving potentially completed external effects.
+  success or completion error **does not release the fence**. Later scans resume
+  the same journal operation and immutable provider handles. Confirmed absence
+  counts as a successful provider delete; access and transport failures retain
+  PendingDeletion. Completion is idempotent for the same operation and snapshot.
+  Loss markers remain visible even if the provider effect succeeded and SQL
+  completion rolled back. `kms:KeyDestructionRetried` and
+  `kms:KeyDestructionDeferred` report the operation ID and retry/failure reason;
+  `keyrack_deletion_retries_total` counts resumed attempts. Audit is best-effort.
+  Never clear the journal manually or reuse a provider handle for new material.
+  There is no timeout fence release or abort API.
 - Storage completion trusts the service's provider-success decision; the ticket
   is a storage execution capability, not PDP authority, signed evidence or a
-  malicious-coordinator proof. `DestructionClaim::committed` is for trusted
+  malicious-coordinator proof. `DestructionClaim::committed` and `DestructionClaim::recovered` are for trusted
   storage implementors. Non-Clone/move discipline is not in-process authenticity.
 - Provider instances are pinned within an attempt, not independently qualified
   hardware identities. Reconfiguration before resolution and out-of-band backend
@@ -92,8 +133,11 @@ HTTP 409. A stale OCC can instead produce the existing concurrency-conflict erro
   revocation. Metadata cache TTL is not a crypto lease or HYOK cutoff guarantee.
 - Material-reference scans and the existing global PostgreSQL writer lock are
   correctness-first, not cloud-scale throughput claims. The existing reaper list
-  path also retains its limited/non-exhaustive pagination; this slice does not
+  path also retains its limited/non-exhaustive pagination; the worker does not
   claim starvation-free collection of all due keys.
+- Envelope erasure removes live database rows, not forensic copies in database
+  free pages, WAL, replicas or backups. Their retention and physical erasure need
+  separate storage controls.
 - All writers must honor this protocol. Mixed deployment with older binaries
   that ignore the journal is unsafe; use a coordinated writer cutover. Direct SQL
   administrators, restoration of old database snapshots, qualified recovery and
@@ -101,42 +145,42 @@ HTTP 409. A stale OCC can instead produce the existing concurrency-conflict erro
 
 ## Executable checks
 
-`keyrack-test-support::destruction_conformance` is shared by SQLite and live
-PostgreSQL: eligibility, one-shot claims, stale/fresh mutation rejection, exact
-completion binding, all creation phases, pending child rotation, raw historical
-wrapping references and terminal resurrection denial. Backend-specific tests add
-independent connections/pools, restart/reconnect and injected transaction rollback.
-Service tests pause a provider call while REST/gRPC cancellation and another reaper
-compete, and exercise cancellation-first and partial-provider-failure outcomes.
-The `integration::deletion_dependencies` tests cover each scheduling refusal on
-gRPC and REST, the domain path, unchanged records after refusal, and logical-only
-children. Reverted controls remove the shared scheduling check and require each
-of the eight surface refusal tests to fail on its own assertion.
-
-Dependent-data-loss override intent is outside this release. There is no flag to
-bypass these checks or erase journal rows to make a key eligible.
+The shared `keyrack-test-support::destruction_conformance` suite exercises the
+storage claim protocol for SQLite and live PostgreSQL. Backend tests cover
+approval persistence, cancellation, restart, envelope removal and transaction
+rollback. Service tests cover gRPC/REST scheduling, separate override permission,
+claim-time refusals and parent-loss reporting. These are executable checks, not
+a claim that a particular invocation has passed.
 
 ```sh
 cargo test -p keyrack-sqlite
 cargo test -p keyrack-service
 # Against a disposable database; never a deployment database:
 cargo test -p keyrack-postgres --features live-tests
-# New or empty directory outside disposable build storage; retain it as evidence:
+# New or empty directory outside disposable build storage; retain the evidence:
 python3 scripts/test-deletion-scheduling-controls.py --output /path/to/deletion-controls
+python3 scripts/test-deletion-approval-controls.py --output /path/to/approval-controls
+python3 scripts/test-destruction-recovery-controls.py --output /path/to/recovery-controls
 ```
 
-The control runner copies the current source into a disposable directory, verifies
-all ten baseline tests, then removes only the shared scheduling refusal in that
-copy. It requires eight surface refusals and the domain refusal to fail for
-unexpected successful scheduling, while the logical-only positive still passes.
-The checkout is never edited. Source hashes, commands, logs and the result remain
-in `--output`; a nonempty output directory is refused. `CARGO_TARGET_DIR` is
-honored, and `--timeout` bounds each Cargo invocation (default 1,800 seconds).
+The scheduling control runner copies the source into a disposable directory,
+runs the baseline, then removes the shared dependency refusal in that copy.
+It requires each selected surface/domain refusal to fail because scheduling
+succeeded, while logical-only scheduling still passes. It retains source hashes,
+commands and logs in `--output`; it does not edit the checkout. This runner covers
+scheduling admission, not every claim, provider or completion failure. Existing
+live-provider tests remain separate invocations.
 
-These are implementation tests, not a new Tamarin proof or a production hierarchy
-qualification. Existing ignored live-provider tests remain separate invocations.
+The approval control runner separately removes snapshot comparison, journal
+refusal, the extra PDP authorization, the claim recheck, envelope erasure and
+the refusal counter, strict boolean decoding, claim-time loss markers, recovered
+claims, parent-binding matching, legacy defaults and audit evidence. Each run
+must fail its named test with the specific unsafe
+outcome; compilation failures do not qualify. It restores the source and reruns
+the baseline, retaining per-mutation hashes, logs and diagnostics. Surface
+controls run gRPC and REST separately so a failure on one cannot mask the other.
 
-The same runner separately replaces the shared logical-only count and each
-transport's reported count with zero. The count assertion must fail for its
-specific domain, gRPC or REST response while all refusal tests keep passing.
-A final restored run must pass, with hashes and diagnostics retained in the receipt.
+The provider recovery control runner removes the Vault and KMIP absence checks
+in a disposable copy and checks both failure to recover a missing key and
+incorrect acceptance of other failures. Those fixtures exercise HTTP/TTLV
+responses, not a claim of live hardware qualification.
