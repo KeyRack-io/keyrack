@@ -1,6 +1,6 @@
 # KeyRack 0.5.0 release checklist
 
-Draft prepared on 2026-11-04. An unchecked item is work still to verify, not
+Draft prepared on 2026-11-04; updated 2026-11-05. An unchecked item is work still to verify, not
 evidence of a passing gate. This document does not cut a release, create a tag,
 or qualify an experimental provider profile. Follow [Releasing KeyRack](RELEASING.md)
 for the release workflow.
@@ -37,6 +37,25 @@ Later main merges must be tracked separately from that baseline:
   Group overlapping implementation entries; remove intermediate descriptions that
   the final merged code supersedes. Set the release date only when cutting the
   release and retain an empty `[Unreleased]` section for subsequent changes.
+- [ ] Account for [#70](https://github.com/KeyRack-io/keyrack/pull/70) through
+  [#74](https://github.com/KeyRack-io/keyrack/pull/74) explicitly in the
+  consolidation: #70 clarifies destruction recovery audit outcomes;
+  [#71](https://github.com/KeyRack-io/keyrack/pull/71) guards resident rotation,
+  audits panics and cleans up unpublished keys after a known OCC refusal;
+  #74 fixes custody-proof initialization retries and stops on prerequisite
+  failure without reducing its assertions. Verify the included merge commits.
+- [ ] Keep [draft #72](https://github.com/KeyRack-io/keyrack/pull/72),
+  disabled-source wrapped-key maintenance, out of the 0.5.0 changelog's delivered
+  features and out of the release commit. It is implemented for the first release
+  after 0.5.0 and held until after the tag; do not suggest temporary re-enablement
+  as a maintenance workaround.
+- [ ] Document [#73](https://github.com/KeyRack-io/keyrack/pull/73)'s temporary
+  `RUSTSEC-2026-0441` exception: the unmaintained `pin-utils@0.1.0` dependency is
+  transitive through the AWS SDK (`aws-config`/Smithy) in `keyrack-aws-proxy`.
+  Record the advisory-specific scope and removal condition. After 0.5.0, check
+  for a contained AWS SDK upgrade that removes `pin-utils`, then remove the
+  exception and rerun dependency-policy controls. Do not present the exception
+  as an advisory fix or a global policy relaxation.
 - [ ] Describe wrapped-child creation, all-version `RewrapKey`/reparenting,
   wrapped-child rotation and dependency-aware deletion separately. Explain that
   parent rotation does not itself migrate old child envelopes. Replace the
@@ -78,6 +97,12 @@ publishing build or configuration instructions.
   token/module/version and algorithms, and unresolved limitations. SoftHSM is a
   software token; its qualification does not establish hardware custody or
   qualify another token.
+- [ ] Check every 0.5.0 document, changelog entry, example and support claim for
+  assertions that the experimental native profile is formally verified or
+  hardware-custodied. Neither claim is supported by this release: formal proof
+  work continues after 0.5.0, and SoftHSM qualification does not establish
+  hardware custody. Keep functional conformance results distinct from those
+  claims.
 - [ ] Document every actual build and runtime gate. If the final implementation
   adds a Cargo feature, record its exact name, default status and image build
   setting. Do not invent a feature flag or imply that compiling the provider
