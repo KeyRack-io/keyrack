@@ -10,10 +10,13 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
 
 ### Not in this release
 
-- Wrapped-child custody. Wrapped-child creation needs a `wrapping:` profile, and
-  the only mechanism a profile can name is the software one, which is shape, not
-  custody. Native PKCS#11 wrapping is not reachable through the service, for any
-  token, SoftHSM included.
+- Qualified hardware custody for wrapped children. The experimental, explicitly
+  configured SoftHSM profile exercises native PKCS#11 wrapping in a software
+  token loaded into KeyRack's process; no hardware token is qualified.
+- Export of wrapped material remains refused. Wrapped-child deletion erases its
+  stored envelopes under the dependency-aware deletion contract.
+  Rotating a resident root does not automatically migrate its existing children;
+  an explicit same-provider rewrap is required.
 - The crypto worker remains a provisional harness that the service does not use.
 - Cross-provider unwrap is not implemented.
 - REST/gRPC gaps and feature gates remain as listed in
@@ -52,8 +55,23 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   retain their reservations. Readers keep access through commit and erasure.
   The committed result records exact parent versions, references and encrypted
   envelope digests and is returned unchanged on retry.
-  Only the software provider currently implements the new provider primitive;
-  it provides no token custody. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
+  The software provider and the explicitly selected native SoftHSM profile
+  implement the primitive. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
+- Experimental native PKCS#11 wrapping selected explicitly with
+  `pkcs11:aes256-cbc-sha256-kw:v1`. The provider derives a temporary KEK from a
+  domain-separated digest of the complete wrapping context and uses AES-KW;
+  startup must pass derive/wrap/unwrap, context-mismatch and sensitive,
+  non-extractable readback checks before declaring the capability. There is no
+  mechanism negotiation or fallback. A dedicated provider identity creates
+  derive-only resident roots and cannot be the resolved default, including
+  implicit and legacy defaults; an ordinary entry may use the same token.
+  SoftHSM is a software token, not a hardware custody boundary, and raw PIN
+  holders remain trusted. Operator guidance records these limits and the
+  construction's 64-bit AES-KW integrity bound. Rewrap and reparent derive the
+  old and new KEKs in one owned session, use a sensitive temporary child with
+  no use permissions, and return the new envelope only after confirmed original
+  session cleanup. Unconfirmed cleanup refuses further wrapping until process
+  restart.
 
 - **Rotate a wrapped child.** `RotateKey` and REST
   `POST /v1/keys/{key_id}/actions-rotate` on a child wrapped under its parent
@@ -152,9 +170,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   recorded in the service log and metrics only as an unverified cleanup
   outcome, never as verified closure. A close still pending when the shutdown
   drain ends is recorded as abandoned. A cancelled request records no audit
-  outcome for its operation. Native PKCS#11 wrapping is not reachable through
-  the service in 0.5.0, for any token, SoftHSM included. Re-encrypt involving a
-  wrapped version closes the source lease before opening the destination. Cleanup
+  outcome for its operation. The explicitly selected experimental SoftHSM
+  profile uses this same lease cleanup path. Re-encrypt involving a wrapped
+  version closes the source lease before opening the destination. Cleanup
   outcomes are counted in `keyrack_wrapped_lease_cleanup_total{outcome}`, and
   shutdown keeps its single 30-second deadline. Wrapped-key uses holding a
   lease — from before the open until the close returns or its cleanup reaches a
@@ -164,8 +182,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   are never refused. The handle is whatever the issuing
   provider returned for that open: possessing it is not a grant. A planted
   wrapped descriptor that does not name a journaled envelope is still refused
-  without talking to the provider. Export and destroy of wrapped material stay
-  refused — those are different lifecycles.
+  without talking to the provider. Export of wrapped material stays refused;
+  deletion erases its stored envelopes under the dependency-aware deletion
+  contract.
 - **Wrapping is activated per provider in configuration.** A new `wrapping:`
   block names the provider, the mechanism and the security domain. It is absent
   by default, and then creating a key with a parent is refused everywhere:

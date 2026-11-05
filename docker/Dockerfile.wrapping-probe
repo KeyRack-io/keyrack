@@ -4,8 +4,15 @@ FROM rust:1.98.0-bookworm
 ENV RUSTUP_TOOLCHAIN=1.98.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        softhsm2 libsofthsm2 pkg-config protobuf-compiler libprotobuf-dev \
+        autoconf automake libtool pkg-config libssl-dev build-essential \
+        curl ca-certificates python3 protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/install-softhsm-wrapping-fixture.sh /tmp/install-softhsm-wrapping-fixture.sh
+RUN bash /tmp/install-softhsm-wrapping-fixture.sh /opt/softhsm-2.7.0 \
+    && rm /tmp/install-softhsm-wrapping-fixture.sh
+ENV PATH="/opt/softhsm-2.7.0/bin:${PATH}"
+ENV KMS_PKCS11_LIB=/opt/softhsm-2.7.0/lib/softhsm/libsofthsm2.so
 
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -18,6 +25,9 @@ RUN cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
     --test wrapping_probe --no-run
 RUN cargo test --locked -p keyrack-pkcs11 --features softhsm-tests,native-a2-conformance \
     --lib --no-run
+RUN cargo test --locked -p keyrack-pkcs11 --features softhsm-tests \
+    --test context_derived_probe --no-run
+RUN cargo test --locked -p keyrack-service --test softhsm_wrapped_service --no-run
 ENV CARGO_NET_OFFLINE=true
 
 # No token or initialized key material is baked into this image. Every run uses a

@@ -17,7 +17,7 @@
 
 use super::{refused, NativeA2Session, NativeEnvelope, NativeWrapMode, Pkcs11Provider};
 use keyrack_core::creation::{A2ClosureFact, CreationBinding};
-use keyrack_core::error::Result;
+use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::provider::{
     EncryptOutput, GeneratedWrappedKey, KeyHandle, WrappedKeyClosure, WrappedKeyLease,
 };
@@ -33,6 +33,15 @@ const MAX_OWNERS: usize = 256;
 // qualified ParentWrapped envelope. The explicit mode prohibits KW fallback.
 const FRAME: &[u8; 8] = b"KRTEST01";
 const HEADER: usize = 8 + 1 + 12 + 32;
+
+fn failed_open_error(original: KeyRackError, close: impl FnOnce() -> Result<()>) -> KeyRackError {
+    match close() {
+        Ok(()) => original,
+        Err(cleanup) => refused(&format!(
+            "Open failed ({original}); explicit original-session close failed ({cleanup}); cleanup unconfirmed"
+        )),
+    }
+}
 
 fn encode(envelope: &NativeEnvelope) -> Vec<u8> {
     let mut bytes = FRAME.to_vec();
@@ -295,8 +304,9 @@ impl NativeA2ConformanceAdapter {
             if let Err(error) = result {
                 // An errored Unwrap can still have made objects. Retain its owner
                 // and explicitly close; failure remains unconfirmed, not evidence.
-                let _ = entry.owner()?.close_wrapped_key();
-                return Err(error);
+                return Err(failed_open_error(error, || {
+                    entry.owner()?.close_wrapped_key()
+                }));
             }
             #[cfg(test)]
             tests::pause(adapter, true, &id);

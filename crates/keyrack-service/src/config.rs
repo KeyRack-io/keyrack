@@ -338,12 +338,13 @@ impl ServiceConfig {
     ///
     /// # Errors
     /// Returns a configuration error for an unknown, customer-custody or repeated
-    /// provider, or for a mechanism or security domain that is not a valid identifier.
+    /// provider, a derive-only wrapping profile on the resolved default provider,
+    /// or a mechanism or security domain that is not a valid identifier.
     pub fn validate_wrapping(&self) -> Result<(), String> {
         if self.wrapping.is_empty() {
             return Ok(());
         }
-        let (providers, _) = self.resolved_providers()?;
+        let (providers, default_name) = self.resolved_providers()?;
         let mut seen = std::collections::BTreeSet::new();
         for profile in &self.wrapping {
             let Some(provider) = providers.iter().find(|p| p.name == profile.provider) else {
@@ -359,6 +360,18 @@ impl ServiceConfig {
                 return Err(format!(
                     "config error: `wrapping` provider '{}' must have platform custody; \
                      customer-custody wrapping is not supported",
+                    profile.provider
+                ));
+            }
+            // This profile creates derive-only resident roots, not ordinary
+            // encryption keys. Reject the resolved default, including the
+            // implicit single-provider and legacy "default" cases.
+            if profile.mechanism == keyrack_pkcs11::CONTEXT_DERIVED_WRAPPING_MECHANISM
+                && profile.provider == default_name
+            {
+                return Err(format!(
+                    "config error: wrapping provider '{}' uses derive-only roots and must be a \
+                     dedicated provider entry, never the default provider",
                     profile.provider
                 ));
             }
@@ -1080,6 +1093,82 @@ wrapping:
         assert_eq!(config.wrapping[0].provider, "default");
         assert_eq!(config.wrapping[0].mechanism, "software:aes-256-gcm:v1");
         assert_eq!(config.wrapping[0].security_domain, "dev-single-process");
+    }
+
+    fn context_derived_wrapping_config() -> serde_json::Value {
+        serde_json::json!({
+            "pdp": {"type": "always_allow"},
+            "storage": {"type": "memory"},
+            "default_provider": "ordinary",
+            "providers": [
+                {"name": "ordinary", "type": "pkcs11", "lib_path": "/unused/token.so",
+                 "token_label": "shared-token", "pin_ref": "file:user-pin"},
+                {"name": "wrapping", "type": "pkcs11", "lib_path": "/unused/token.so",
+                 "token_label": "shared-token", "pin_ref": "file:user-pin"}
+            ],
+            "wrapping": [{"provider": "wrapping",
+                "mechanism": "pkcs11:aes256-cbc-sha256-kw:v1",
+                "security_domain": "token-domain"}]
+        })
+    }
+
+    #[test]
+    fn context_derived_wrapping_rejects_explicit_default() {
+        let mut value = context_derived_wrapping_config();
+        value["default_provider"] = serde_json::json!("wrapping");
+        let config: ServiceConfig = serde_json::from_value(value).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("'wrapping' uses derive-only roots"),
+            "{error}"
+        );
+        assert!(error.contains("never the default provider"), "{error}");
+    }
+
+    #[test]
+    fn context_derived_wrapping_rejects_implicit_single_provider_default() {
+        let mut value = context_derived_wrapping_config();
+        value.as_object_mut().unwrap().remove("default_provider");
+        value["providers"].as_array_mut().unwrap().remove(0);
+        let config: ServiceConfig = serde_json::from_value(value).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("'wrapping' uses derive-only roots"),
+            "{error}"
+        );
+        assert!(error.contains("never the default provider"), "{error}");
+    }
+
+    #[test]
+    fn context_derived_wrapping_rejects_legacy_default() {
+        let mut value = context_derived_wrapping_config();
+        let mut provider = value["providers"][1].clone();
+        provider.as_object_mut().unwrap().remove("name");
+        value.as_object_mut().unwrap().remove("providers");
+        value["provider"] = provider;
+        // The legacy path synthesizes "default", regardless of this setting.
+        value["default_provider"] = serde_json::json!("ordinary");
+        value["wrapping"][0]["provider"] = serde_json::json!("default");
+        let config: ServiceConfig = serde_json::from_value(value).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("'default' uses derive-only roots"),
+            "{error}"
+        );
+        assert!(error.contains("never the default provider"), "{error}");
+    }
+
+    #[test]
+    fn context_derived_wrapping_allows_dedicated_entry_on_same_token() {
+        let config: ServiceConfig =
+            serde_json::from_value(context_derived_wrapping_config()).unwrap();
+        // Only validate configuration: this does not load a module or qualify
+        // the live token. The two distinct provider identities share a token.
+        config.validate().unwrap();
+        let (providers, default) = config.resolved_providers().unwrap();
+        assert_eq!(default, "ordinary");
+        assert_eq!(providers.len(), 2);
+        assert_eq!(config.wrapping[0].provider, "wrapping");
     }
 
     #[test]

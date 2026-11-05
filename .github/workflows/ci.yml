@@ -62,14 +62,27 @@ jobs:
   wrapping-probe:
     name: SoftHSM wrapping mechanism probe
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
-      RUSTUP_TOOLCHAIN: "1.92.0"
+      RUSTUP_TOOLCHAIN: "1.98.0"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y softhsm2 libsofthsm2 protobuf-compiler libprotobuf-dev
+      - name: Install pinned native fixture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool pkg-config libssl-dev build-essential curl ca-certificates python3 protobuf-compiler libprotobuf-dev
+          bash scripts/install-softhsm-wrapping-fixture.sh "$RUNNER_TEMP/softhsm-2.7.0"
+          echo "$RUNNER_TEMP/softhsm-2.7.0/bin" >> "$GITHUB_PATH"
+          echo "KMS_PKCS11_LIB=$RUNNER_TEMP/softhsm-2.7.0/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
       - run: bash scripts/test-pkcs11-wrapping.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: softhsm-wrapping-build
+          path: ${{ runner.temp }}/softhsm-2.7.0/BUILD-MANIFEST.txt
+          if-no-files-found: error
 
   custody-recovery:
     name: Custody loss by permission removal
