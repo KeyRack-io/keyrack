@@ -26,6 +26,8 @@ fi
 native_test=provider::native_a2::tests::native_a2_soft_hsm
 provider_test=provider::context_wrapping::tests::context_wrapped_provider_roundtrip_swap_restart_and_exact_closure
 native_policy_tests=(
+    provider::context_wrapping::tests::planted_resident_lease_labels_are_refused_before_lookup
+    provider::context_wrapping::tests::wrapping_provider_rejects_another_providers_live_lease
     provider::context_wrapping::native::tests::native_provider_envelope_matches_independent_cbc_and_kw
     provider::context_wrapping::native::tests::native_failure_cleanup_precedes_original_session_close
     provider::context_wrapping::native::tests::native_startup_refuses_failed_self_test_and_preserves_inventory

@@ -32,8 +32,28 @@ TESTS = [
     ("keyrack-vault", None, "tests::destroy_recovers_only_confirmed_absence"),
     ("keyrack-kmip", None, "provider::tests::repeated_destroy_accepts_only_wire_item_not_found"),
     ("keyrack-service", "wrapped_key_migration", "successive_parent_retirements_refresh_the_open_binding_only_once"),
+    ("keyrack-service", None, "rest::error_mapping_tests::core_and_domain_preserve_wrapping_parent_destroyed_kind"),
+    ("keyrack-service", "integration", "deletion_override::destruction_completion_failure_recovers_after_restart_on_both_surfaces"),
 ]
 CONTROLS = [
+    (
+        "direct_rest_loss_kind", 3, "crates/keyrack-service/src/rest.rs",
+        'KeyRackError::WrappingParentDestroyed => (StatusCode::CONFLICT, "WrappingParentDestroyed")',
+        'KeyRackError::WrappingParentDestroyed => { (StatusCode::CONFLICT, "FailedPrecondition") }',
+        ['left: String("FailedPrecondition")', 'right: "WrappingParentDestroyed"'],
+    ),
+    (
+        "absence_audit_reason", 4, "crates/keyrack-service/src/workers.rs",
+        'event.add_metadata("reason", "provider_key_already_absent");',
+        'event.add_metadata("reason", "provider_delete_completed");',
+        ["recovery must report confirmed absence explicitly"],
+    ),
+    (
+        "retry_audit_result", 4, "crates/keyrack-service/src/workers.rs",
+        'if action == AuditAction::KeyDestructionRetried { AuditResult::Success }',
+        'if action == AuditAction::KeyDestructionRetried { AuditResult::Error }',
+        ["resuming a claim is not itself an error"],
+    ),
     (
         "bounded_parent_refresh", 2, "crates/keyrack-service/src/domain.rs",
         "if refreshed_parent {", "if false && refreshed_parent {",
@@ -125,7 +145,7 @@ def main():
             work = Path(directory)
             write_json(output / "source-sha256.json", scheduling.copy_source(work, output, target))
             for selection, (package, _, _) in enumerate(TESTS):
-                name = f"baseline-{package}"
+                name = f"baseline-{selection}-{package}"
                 run(work, output, env, args.timeout, name, selection)
                 result["verified"].append(name)
             for name, selection, path, before, after, diagnostics in CONTROLS:
@@ -148,7 +168,7 @@ def main():
                 finally:
                     file.write_text(original)
             for selection, (package, _, _) in enumerate(TESTS):
-                name = f"restored-{package}"
+                name = f"restored-{selection}-{package}"
                 run(work, output, env, args.timeout, name, selection)
                 result["verified"].append(name)
         result["status"] = "passed"

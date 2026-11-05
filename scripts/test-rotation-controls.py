@@ -77,6 +77,17 @@ CONTROLS = [
      "Err(DomainError::FailedPrecondition(WRAPPED_UNSUPPORTED.into()))",
      "Ok(record.parent_lid.is_some())",
      SERVICE_ROTATION, "wrapped_child_rotation_refuses_ineligible_keys_and_mixed_history"),
+    ("resident_rotation_slot", SERVICE + "domain.rs", "pub async fn rotate_key(",
+     "let _slot = crate::hierarchy::RotationInFlight::take(lid)?;", "",
+     SERVICE_ROTATION, "resident_rotation_holds_one_slot_per_key_across_dropped_requests"),
+    ("unpublished_version_cleanup", SERVICE + "domain.rs", "async fn rotate_resident(",
+     "if matches!(error, KeyRackError::OptimisticConcurrencyConflict { .. }) {",
+     "if false && matches!(error, KeyRackError::OptimisticConcurrencyConflict { .. }) {",
+     SERVICE_ROTATION, "resident_rotation_losing_occ_destroys_and_audits_its_unpublished_key"),
+    ("panic_audited", SERVICE + "ops.rs", "fn poll(",
+     "Err(panic) => std::task::Poll::Ready(Err(panic)),",
+     "Err(panic) => std::panic::resume_unwind(panic),",
+     SERVICE_ROTATION, "executors_audit_a_panicking_operation_as_an_error"),
 ]
 
 POSTGRES_CONTROLS = [

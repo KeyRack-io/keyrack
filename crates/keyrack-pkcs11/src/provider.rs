@@ -33,8 +33,8 @@ use cryptoki::types::AuthPin;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use std::collections::HashMap;
@@ -824,10 +824,19 @@ fn find_object(session: &Session, label: &str, class: ObjectClass) -> Result<Obj
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find_objects", &e))?;
 
-    objects
+    let object = objects
         .into_iter()
         .next()
-        .ok_or_else(|| KeyRackError::Provider(format!("object not found: {label}")))
+        .ok_or_else(|| KeyRackError::Provider(format!("object not found: {label}")))?;
+    let attributes = session
+        .get_attributes(object, &[AttributeType::Token])
+        .map_err(|e| map_pkcs11_error("resident object readback", &e))?;
+    if attributes != [Attribute::Token(true)] {
+        return Err(KeyRackError::Provider(
+            "ordinary key use requires a resident token object".into(),
+        ));
+    }
+    Ok(object)
 }
 
 fn generate_aes_key(session: &Session, label: &str) -> Result<()> {
@@ -1240,7 +1249,7 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
+fn destroy_objects_by_label(session: &Session, label: &str) -> Result<DestroyKeyOutcome> {
     require_resident_label(label)?;
     let template = vec![
         Attribute::Token(true),
@@ -1250,6 +1259,12 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find for destroy", &e))?;
 
+    // This is absence in the authenticated session's resident label-search
+    // view, not proof that no object exists outside that view. Lease labels
+    // have already been refused, even if no resident object matches them.
+    if objects.is_empty() {
+        return Ok(DestroyKeyOutcome::AlreadyAbsent);
+    }
     // Refuse session objects even if a module violates the search template.
     // Validate the entire result before destroying any resident object.
     for &obj in &objects {
@@ -1267,7 +1282,7 @@ fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
             .destroy_object(obj)
             .map_err(|e| map_pkcs11_error("destroy_object", &e))?;
     }
-    Ok(())
+    Ok(DestroyKeyOutcome::Completed)
 }
 
 #[async_trait]
@@ -1492,6 +1507,10 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
         require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
 
@@ -2070,10 +2089,20 @@ mod concurrent_login_tests {
         drop(anchor);
         let cold_wrong_pin_denied = Pkcs11Provider::new(&wrong_config).is_err();
         let cold_correct_pin_accepted = Pkcs11Provider::new(&config).is_ok();
-        first
-            .destroy_key(&handle)
-            .await
-            .expect("regression key cleanup");
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("regression key cleanup"),
+            DestroyKeyOutcome::Completed
+        );
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("empty authenticated label search"),
+            DestroyKeyOutcome::AlreadyAbsent
+        );
         assert!(
             ambient_wrong_pin_denied,
             "constructor bypassed credential validation"

@@ -249,17 +249,9 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
-
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
-    };
-    emit_audit(state, &ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-
-    result
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
 }
 
 /// [`execute`] for an operation whose effects must not stop halfway.
@@ -293,11 +285,12 @@ where
         status.message().to_owned()
     })
     .await
-    .unwrap_or_else(|| Err(tonic::Status::internal("operation task failed")))
+    .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
 }
 
 /// Run an authorized operation and record its outcome in one task. `None` means
-/// the task itself failed, so no outcome was recorded.
+/// the operation panicked, recorded as an error outcome, or the task was
+/// cancelled by runtime shutdown, recording nothing.
 async fn run_detached<T, E, Fut>(
     state: &Arc<ServiceState>,
     ctx: OpContext,
@@ -311,11 +304,31 @@ where
     E: Send + 'static,
 {
     let state = Arc::clone(state);
-    tokio::spawn(async move {
-        let result = operation.await;
-        let (audit_result, result_str) = match &result {
-            Ok(_) => (AuditResult::Success, "success"),
-            Err(error) => {
+    tokio::spawn(async move { complete(&state, &ctx, start, operation, Some(describe)).await })
+        .await
+        .map_err(|error| tracing::error!(error = %error, "detached operation task failed"))
+        .ok()
+        .flatten()
+}
+
+/// Drive an authorized operation to its end and record its outcome. A panic
+/// is recorded as an error outcome and yields `None`, so no operation ends
+/// unaudited while the process runs.
+async fn complete<T, E, Fut>(
+    state: &Arc<ServiceState>,
+    ctx: &OpContext,
+    start: Instant,
+    operation: Fut,
+    describe: Option<fn(&E) -> String>,
+) -> Option<Result<T, E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let outcome = CatchUnwind(Box::pin(operation)).await;
+    let (audit_result, result_str) = match &outcome {
+        Ok(Ok(_)) => (AuditResult::Success, "success"),
+        Ok(Err(error)) => {
+            if let Some(describe) = describe {
                 tracing::warn!(
                     request_id = %ctx.request_id,
                     action = %ctx.action,
@@ -323,16 +336,47 @@ where
                     error = %describe(error),
                     "op.failed"
                 );
-                (AuditResult::Error, "error")
             }
-        };
-        emit_audit(&state, &ctx, audit_result, None, None).await;
-        crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-        result
-    })
-    .await
-    .map_err(|error| tracing::error!(error = %error, "detached operation task failed"))
-    .ok()
+            (AuditResult::Error, "error")
+        }
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            tracing::error!(
+                request_id = %ctx.request_id,
+                action = %ctx.action,
+                resource = %ctx.resource_id,
+                panic = %message,
+                "op.panicked"
+            );
+            (AuditResult::Error, "error")
+        }
+    };
+    emit_audit(state, ctx, audit_result, None, None).await;
+    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
+    outcome.ok()
+}
+
+/// Resolves to `Err` with the payload if polling the inner future panics.
+struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
 }
 
 async fn emit_audit(
@@ -849,17 +893,17 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(rest_operation_failed()))
+}
 
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
-    };
-    emit_audit(state, &ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-
-    result
+fn rest_operation_failed() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    rest_error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+        "operation failed",
+    )
 }
 
 /// REST twin of [`execute_detached`].
@@ -895,13 +939,7 @@ where
         format!("{code}: {}", body.0)
     })
     .await
-    .unwrap_or_else(|| {
-        Err(rest_error(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            "operation task failed",
-        ))
-    })
+    .unwrap_or_else(|| Err(rest_operation_failed()))
 }
 
 async fn authorize_rest(
@@ -1113,17 +1151,9 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
-
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
-    };
-    emit_audit(state, &ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-
-    result
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
 }
 
 /// Extract the authenticated principal from a tonic gRPC request.

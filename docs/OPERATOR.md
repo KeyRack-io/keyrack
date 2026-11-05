@@ -185,7 +185,19 @@ Watch `kms:KeyDestructionDeferred`, `kms:KeyDestructionRetried` and
 `keyrack_deletion_retries_total`; audit emission is best-effort. Vault recovery
 also needs read access to `transit/keys/<key>` and the existing mount-tuning
 health endpoint to distinguish an absent key from an unavailable route. KMIP
-accepts Item Not Found only for Destroy, not for cryptographic operations.
+accepts Item Not Found only for Destroy, not for cryptographic operations. PKCS#11
+"not found" means an empty label search in the authenticated session: a session
+that cannot see an existing object can therefore complete destruction. Search,
+login, and delete errors still refuse completion. Keep the token, credentials,
+and object visibility stable for the lifetime of each stored handle.
+
+A resumed claim emits `kms:KeyDestructionRetried` with result `Success`, meaning
+only that the attempt resumed. When the provider distinguishes confirmed absence,
+`kms:ProviderDestroyKey` records `reason: provider_key_already_absent` with
+`Success`, the `operation_id`, `key_version`, and `recovered` flag. Providers using
+the default outcome method report completion without an absence reason; unit
+success alone is never evidence of prior absence. `kms:KeyDestructionDeferred`
+continues to report an error when provider or storage completion is unconfirmed.
 Do not reuse provider handles or manually remove the journal to force a retry.
 Database row deletion is not physical backup/media erasure; no
 exported material or already-open working set is recalled. See

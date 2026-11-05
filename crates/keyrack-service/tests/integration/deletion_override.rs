@@ -924,6 +924,39 @@ async fn destruction_completion_failure_recovers_after_restart_on_both_surfaces(
                 && event.metadata["operation_id"] == operation),
             "durable retry must be audited"
         );
+        let events = audit.events();
+        let retry = events
+            .iter()
+            .find(|event| {
+                event.action == keyrack_core::audit::AuditAction::KeyDestructionRetried
+                    && event.metadata["operation_id"] == operation
+            })
+            .unwrap();
+        assert_eq!(
+            retry.result,
+            keyrack_core::audit::AuditResult::Success,
+            "resuming a claim is not itself an error"
+        );
+        let deletes: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.action == keyrack_core::audit::AuditAction::ProviderDestroyKey
+                    && event.metadata["operation_id"] == operation
+            })
+            .collect();
+        assert_eq!(deletes.len(), 2);
+        assert_eq!(deletes[0].metadata["recovered"], false);
+        assert!(
+            !deletes[0].metadata.contains_key("reason"),
+            "a successful first delete must not claim prior absence"
+        );
+        assert_eq!(deletes[1].metadata["recovered"], true);
+        assert_eq!(deletes[1].metadata["key_version"], 1);
+        assert_eq!(
+            deletes[1].metadata["reason"], "provider_key_already_absent",
+            "recovery must report confirmed absence explicitly"
+        );
+        assert_eq!(deletes[1].result, keyrack_core::audit::AuditResult::Success);
         assert_parent_loss(restarted.clone(), surface, &child, &ciphertext, true).await;
         assert_parent_loss(
             restarted.clone(),

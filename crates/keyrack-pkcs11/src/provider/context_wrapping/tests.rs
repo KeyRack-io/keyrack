@@ -140,6 +140,189 @@ async fn generate(
     generated.envelope
 }
 
+fn assert_provider_refusal(error: &KeyRackError, cause: &str) {
+    assert!(
+        matches!(error, KeyRackError::Provider(message) if message.contains(cause)),
+        "expected provider refusal {cause:?}, got {error}"
+    );
+}
+
+#[tokio::test]
+async fn planted_resident_lease_labels_are_refused_before_lookup() {
+    use cryptoki::object::{Attribute, AttributeType, ObjectClass};
+
+    let config = config();
+    let ordinary = Pkcs11Provider::new(&config).unwrap();
+    let wrapping = configured(&config);
+    for prefix in [LEASE_LABEL_PREFIX, "kr-native-a2-use-"] {
+        let original = ordinary.generate_key(&KeySpec::Aes256).await.unwrap();
+        let ciphertext = ordinary
+            .encrypt(&original, b"resident control", b"aad")
+            .await
+            .unwrap();
+        let planted = KeyHandle {
+            key_id: format!("{prefix}planted-{}", uuid::Uuid::new_v4()),
+            key_spec: KeySpec::Aes256,
+        };
+        let old_label = original.key_id.clone();
+        let planted_label = planted.key_id.clone();
+        ordinary
+            .run(move |session| {
+                let object =
+                    crate::provider::find_object(session, &old_label, ObjectClass::SECRET_KEY)?;
+                session
+                    .update_attributes(
+                        object,
+                        &[Attribute::Label(planted_label.as_bytes().to_vec())],
+                    )
+                    .map_err(|e| crate::provider::map_pkcs11_error("plant resident label", &e))?;
+                let attributes = session
+                    .get_attributes(object, &[AttributeType::Token])
+                    .map_err(|e| crate::provider::map_pkcs11_error("planted token readback", &e))?;
+                assert_eq!(attributes, [Attribute::Token(true)]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let baseline = object_count(&ordinary).await;
+        for (provider, use_cause) in [
+            (&ordinary, "original session owner"),
+            (&wrapping, "unknown/foreign handle"),
+        ] {
+            assert_provider_refusal(
+                &provider
+                    .encrypt(&planted, b"refused", b"aad")
+                    .await
+                    .unwrap_err(),
+                use_cause,
+            );
+            assert_provider_refusal(
+                &provider
+                    .decrypt(&planted, &ciphertext.ciphertext, b"aad")
+                    .await
+                    .unwrap_err(),
+                use_cause,
+            );
+            assert_provider_refusal(
+                &provider
+                    .destroy_key_with_outcome(&planted)
+                    .await
+                    .unwrap_err(),
+                "original session owner",
+            );
+            assert_provider_refusal(
+                &provider.destroy_key(&planted).await.unwrap_err(),
+                "original session owner",
+            );
+        }
+        assert_eq!(object_count(&ordinary).await, baseline);
+        // Bypass provider lookup only to prove the planted object survived and
+        // remove this test's resident object from the disposable token.
+        let label = planted.key_id;
+        ordinary
+            .run(move |session| {
+                let objects = session
+                    .find_objects(&[
+                        Attribute::Token(true),
+                        Attribute::Label(label.as_bytes().to_vec()),
+                    ])
+                    .map_err(|e| {
+                        crate::provider::map_pkcs11_error("planted object inventory", &e)
+                    })?;
+                assert_eq!(objects.len(), 1);
+                session
+                    .destroy_object(objects[0])
+                    .map_err(|e| crate::provider::map_pkcs11_error("planted object cleanup", &e))
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn wrapping_provider_rejects_another_providers_live_lease() {
+    let config = config();
+    let owner = configured(&config);
+    let foreign = Pkcs11Provider::new_with_wrapping(
+        &config,
+        ProviderRef::new("other-wrapping"),
+        identifier(CONTEXT_DERIVED_WRAPPING_MECHANISM),
+        identifier("token-domain"),
+    )
+    .unwrap();
+    let parent = owner.generate_key(&KeySpec::Aes256).await.unwrap();
+    let request = request(None, KeySpec::Aes256);
+    let context = request.context().unwrap();
+    let envelope = generate(&owner, &parent, &request).await;
+    let baseline = object_count(&owner).await;
+    let lease = owner
+        .open_wrapped_key(&context, &parent, &envelope)
+        .await
+        .unwrap();
+    let output = owner
+        .encrypt(lease.handle(), b"issuing provider only", b"aad")
+        .await
+        .unwrap();
+    assert_provider_refusal(
+        &foreign
+            .encrypt(lease.handle(), b"refused", b"aad")
+            .await
+            .unwrap_err(),
+        "unknown/foreign handle",
+    );
+    assert_provider_refusal(
+        &foreign
+            .decrypt(lease.handle(), &output.ciphertext, b"aad")
+            .await
+            .unwrap_err(),
+        "unknown/foreign handle",
+    );
+    assert_provider_refusal(
+        &foreign.destroy_key(lease.handle()).await.unwrap_err(),
+        "original session owner",
+    );
+    assert_provider_refusal(
+        &foreign
+            .destroy_key_with_outcome(lease.handle())
+            .await
+            .unwrap_err(),
+        "original session owner",
+    );
+    assert_provider_refusal(
+        &foreign.close_wrapped_key(&lease).await.unwrap_err(),
+        "unknown/foreign lease",
+    );
+    assert_eq!(object_count(&owner).await, baseline + 1);
+    assert!(owner
+        .decrypt(lease.handle(), &output.ciphertext, b"aad")
+        .await
+        .unwrap()
+        .expose()
+        .as_slice()
+        .eq(b"issuing provider only"));
+    let second = owner
+        .encrypt(lease.handle(), b"still usable", b"aad")
+        .await
+        .unwrap();
+    assert!(owner
+        .decrypt(lease.handle(), &second.ciphertext, b"aad")
+        .await
+        .unwrap()
+        .expose()
+        .as_slice()
+        .eq(b"still usable"));
+    owner.close_wrapped_key(&lease).await.unwrap();
+    assert_eq!(object_count(&owner).await, baseline);
+    assert_eq!(
+        owner.destroy_key_with_outcome(&parent).await.unwrap(),
+        keyrack_core::provider::DestroyKeyOutcome::Completed
+    );
+    assert_eq!(
+        owner.destroy_key_with_outcome(&parent).await.unwrap(),
+        keyrack_core::provider::DestroyKeyOutcome::AlreadyAbsent
+    );
+}
+
 #[tokio::test]
 async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
     let config = config();
@@ -274,6 +457,13 @@ async fn context_wrapped_provider_roundtrip_swap_restart_and_exact_closure() {
             if message == "wrapped leases must close through their original session owner; not a resident key handle"),
             "unexpected foreign destroy refusal: {foreign_destroy}"
         );
+        for resident_provider in [&ordinary, &provider] {
+            let outcome = resident_provider
+                .destroy_key_with_outcome(lease.handle())
+                .await
+                .unwrap_err();
+            assert!(outcome.to_string().contains("original session owner"));
+        }
         assert_eq!(object_count(&provider).await, baseline + 1);
         // Both operations still work through the issuing provider after all
         // foreign attempts, including the attempted destruction.
