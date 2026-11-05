@@ -31,6 +31,54 @@ pass() { printf '  PASS  %s\n' "$1"; passes=$((passes + 1)); }
 fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 step() { printf '\n== %s\n' "$1"; }
 
+# Every later check depends on what failed, so report it once and stop rather
+# than letting the rest of the suite fail for the same reason.
+abort() {
+    printf '\n::error title=PKCS#11 custody proof stopped::%s\n' "$1"
+    printf '  STOPPED  %s (%d passed, %d failed so far)\n' "$1" "$passes" "$failures"
+    printf '\nToken directories:\n'
+    ls -la "$TOKENS" "$AWAY" 2>&1 | sed 's/^/  /'
+    printf '\nSlots:\n'
+    softhsm2-util --show-slots 2>&1 | sed 's/^/  /'
+    if [[ -f "$LOG" ]]; then
+        printf '\nService log tail:\n'
+        tail -40 "$LOG"
+    fi
+    exit 1
+}
+
+# Whether a token with this label is visible as initialized with its user PIN set.
+token_ready() {
+    softhsm2-util --show-slots 2>/dev/null | awk -v want="$1" '
+        /^Slot /                  { init = 0; pin = 0 }
+        /Initialized: +yes/       { init = 1 }
+        /User PIN init\.: +yes/   { pin = 1 }
+        /^ +Label:/               { $1 = ""; sub(/^ +/, "")
+                                    if (init && pin && $0 == want) found = 1 }
+        END                       { exit !found }'
+}
+
+# softhsm2-util finds a free slot by reading every token's info, and a token
+# busy in the running service can refuse that read, so initialization can fail
+# without creating anything. Retry only while no token directory has appeared:
+# once one has, a retry would add a second token, so wait for it to be visible.
+TOKEN_INIT_ATTEMPTS=10
+init_token() {
+    local label="$1" pin="$2" before attempt
+    local out="/tmp/evidence/init-token-$label.txt"
+    before=$(ls "$TOKENS" | wc -l)
+    : >"$out"
+    for attempt in $(seq 1 "$TOKEN_INIT_ATTEMPTS"); do
+        if (( $(ls "$TOKENS" | wc -l) == before )); then
+            printf '# attempt %d\n' "$attempt" >>"$out"
+            softhsm2-util --init-token --free --label "$label" --pin "$pin" --so-pin 0000 >>"$out" 2>&1
+        fi
+        token_ready "$label" && return 0
+        sleep 1
+    done
+    abort "token '$label' was not initialized after $TOKEN_INIT_ATTEMPTS attempts: $(grep -v '^#' "$out" | tail -1)"
+}
+
 cleanup() {
     [[ -n "${HAMMER_STOP:-}" ]] && : >"$HAMMER_STOP"
     [[ -f "$LOG" ]] && cp "$LOG" /tmp/evidence/service.log
@@ -44,7 +92,7 @@ trap cleanup EXIT
 # ── tokens ───────────────────────────────────────────────────────────────
 step "Start with only the sibling token"
 mkdir -p "$TOKENS" "$AWAY" /tmp/evidence
-softhsm2-util --init-token --free --label sibling --pin 5678 --so-pin 0000 >/dev/null
+init_token sibling 5678
 SIBLING_DIR=$(ls "$TOKENS")
 
 # ── the real binary ──────────────────────────────────────────────────────
@@ -59,9 +107,7 @@ done
 if curl -sf --connect-timeout 2 --max-time 15 "$BASE/healthz" >/dev/null 2>&1; then
     pass "service is up (pid $SVC_PID)"
 else
-    fail "service never became healthy; log follows"
-    tail -30 "$LOG"
-    exit 1
+    abort "service never became healthy"
 fi
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -138,12 +184,18 @@ fi
 code=$(curl -s --connect-timeout 2 --max-time 15 -o /tmp/startup-create -w '%{http_code}' "$BASE/v1/keys" -H 'Content-Type: application/json' -d '{"key_spec":"AES_256","attributes":{"token":"custody"}}')
 [[ "$code" == 503 ]] && pass "absent token refuses creation with 503" || fail "absent token creation returned $code"
 sibling_resp=$(create_key sibling)
+jq -e '.lid != null' <<<"$sibling_resp" >/dev/null 2>&1 \
+    || abort "the sibling key was not created: $sibling_resp"
 SIBLING_KEY=$(jq -r '.lid' <<<"$sibling_resp")
 start_hammer
 sleep 1
-softhsm2-util --init-token --free --label custody --pin 1234 --so-pin 0000 >/dev/null
+init_token custody 1234
 CUSTODY_DIR=$(ls "$TOKENS" | grep -Fxv "$SIBLING_DIR")
-[[ $(ls "$TOKENS" | wc -l) -eq 2 ]] && pass "two tokens initialized on one library" || fail "token initialization failed"
+if [[ $(ls "$TOKENS" | wc -l) -eq 2 && -n "$CUSTODY_DIR" ]]; then
+    pass "two tokens initialized on one library"
+else
+    abort "expected the sibling and custody token directories, found: $(ls "$TOKENS" | tr '\n' ' ')"
+fi
 started=$SECONDS
 custody_resp='{}'
 while (( SECONDS - started < 180 )); do
@@ -165,6 +217,9 @@ if (( startup_total >= MIN_SIBLING_REQUESTS && startup_bad == 0 )) && [[ $(ls "$
 else
     fail "startup sibling failed $startup_bad of $startup_total requests"
 fi
+
+jq -e '.lid != null' <<<"$custody_resp" >/dev/null 2>&1 \
+    || abort "no custody key could be created, so no later check can run: $custody_resp"
 
 step "A key in each token"
 CUSTODY_KEY=$(jq -r '.lid' <<<"$custody_resp")
