@@ -1,7 +1,8 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Wrapped-child rotation through domain, gRPC, and REST with migration fences.
+//! `RotateKey` through domain, gRPC, and REST: wrapped children with migration
+//! fences, resident keys, and the request executor around both.
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -92,11 +93,15 @@ impl PolicyDecisionPoint for DenyRotatePdp {
     }
 }
 
-/// Pauses inside provider work; counts wrapped-key generation.
+/// Pauses inside provider work; counts generation and records destruction.
 struct ObservedProvider {
     inner: SoftwareProvider,
     generates: AtomicUsize,
+    resident_generates: AtomicUsize,
     paused: AtomicBool,
+    resident_paused: AtomicBool,
+    fail_destroy: AtomicBool,
+    destroyed: Mutex<Vec<KeyHandle>>,
     entered: Semaphore,
     release: Semaphore,
 }
@@ -106,9 +111,20 @@ impl ObservedProvider {
         Self {
             inner: SoftwareProvider::scoped(ProviderRef::new("default"), name(DOMAIN)),
             generates: AtomicUsize::new(0),
+            resident_generates: AtomicUsize::new(0),
             paused: AtomicBool::new(false),
+            resident_paused: AtomicBool::new(false),
+            fail_destroy: AtomicBool::new(false),
+            destroyed: Mutex::new(Vec::new()),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
+        }
+    }
+
+    async fn pause_point(&self, paused: &AtomicBool) {
+        if paused.load(Ordering::SeqCst) {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
         }
     }
 
@@ -122,6 +138,7 @@ impl ObservedProvider {
 
     fn release_blocked(&self, count: usize) {
         self.paused.store(false, Ordering::SeqCst);
+        self.resident_paused.store(false, Ordering::SeqCst);
         self.release.add_permits(count);
     }
 }
@@ -140,6 +157,8 @@ impl CryptoProvider for ObservedProvider {
         self.inner.wrapping_closure_verifier()
     }
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
+        self.resident_generates.fetch_add(1, Ordering::SeqCst);
+        self.pause_point(&self.resident_paused).await;
         self.inner.generate_key(spec).await
     }
     async fn encrypt(
@@ -181,6 +200,10 @@ impl CryptoProvider for ObservedProvider {
         self.inner.generate_random(length).await
     }
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroyed.lock().unwrap().push(handle.clone());
+        if self.fail_destroy.load(Ordering::SeqCst) {
+            return Err(KeyRackError::ProviderUnavailable("destroy refused".into()));
+        }
         self.inner.destroy_key(handle).await
     }
     async fn generate_wrapped_key(
@@ -190,10 +213,7 @@ impl CryptoProvider for ObservedProvider {
         creation: &keyrack_core::creation::CreationBinding,
     ) -> Result<GeneratedWrappedKey> {
         self.generates.fetch_add(1, Ordering::SeqCst);
-        if self.paused.load(Ordering::SeqCst) {
-            self.entered.add_permits(1);
-            self.release.acquire().await.unwrap().forget();
-        }
+        self.pause_point(&self.paused).await;
         self.inner
             .generate_wrapped_key(context, parent, creation)
             .await
@@ -1385,4 +1405,206 @@ async fn seed_descendant(state: &Arc<ServiceState>, parent: &KeyRecord) -> Lid {
     );
     state.storage.create_key(&record).await.unwrap();
     record.lid
+}
+
+fn audited_state() -> (Arc<ServiceState>, Arc<ObservedProvider>, Arc<CaptureAudit>) {
+    let provider = Arc::new(ObservedProvider::new());
+    let audit = Arc::new(CaptureAudit::default());
+    let state = service_state_audited(
+        Arc::new(keyrack_sqlite::SqliteStorage::in_memory().unwrap()),
+        provider.clone(),
+        Arc::new(AlwaysAllow),
+        audit.clone(),
+    );
+    (state, provider, audit)
+}
+
+#[tokio::test]
+async fn resident_rotation_holds_one_slot_per_key_across_dropped_requests() {
+    for rest in [false, true] {
+        let (state, provider, audit) = audited_state();
+        let key = domain::create_key(&state, input(None)).await.unwrap();
+        let id = key.lid.to_string();
+        let generated = provider.resident_generates.load(Ordering::SeqCst);
+
+        provider.resident_paused.store(true, Ordering::SeqCst);
+        let request = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                if rest {
+                    rotate_rest(&state, &id).await;
+                } else {
+                    rotate_grpc(&state, &id).await;
+                }
+            }
+        });
+        provider.wait_entered().await;
+        request.abort();
+        assert!(request.await.is_err_and(|join| join.is_cancelled()));
+
+        // Without the slot, a retry would block in the paused provider as a
+        // second generation instead of being refused.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if rest {
+                rotate_rest(&state, &id).await == (503, 0)
+            } else {
+                rotate_grpc(&state, &id).await == (tonic::Code::Unavailable, 0)
+            }
+        })
+        .await;
+        assert!(
+            second.is_ok_and(|refused| refused),
+            "a second rotation must be refused as retryable while the first runs"
+        );
+        assert_eq!(
+            provider.resident_generates.load(Ordering::SeqCst),
+            generated + 1
+        );
+        provider.release_blocked(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !audit
+                .rotate_outcomes(&id)
+                .contains(&keyrack_core::audit::AuditResult::Success)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped request's rotation is audited");
+        assert_eq!(
+            state
+                .storage
+                .get_key(&key.lid)
+                .await
+                .unwrap()
+                .current_key_version,
+            2
+        );
+        if rest {
+            assert_eq!(rotate_rest(&state, &id).await, (200, 3));
+        } else {
+            assert_eq!(rotate_grpc(&state, &id).await, (tonic::Code::Ok, 3));
+        }
+    }
+}
+
+#[tokio::test]
+async fn resident_rotation_losing_occ_destroys_and_audits_its_unpublished_key() {
+    for fail_destroy in [false, true] {
+        let (state, provider, audit) = audited_state();
+        let key = domain::create_key(&state, input(None)).await.unwrap();
+        provider.fail_destroy.store(fail_destroy, Ordering::SeqCst);
+        provider.resident_paused.store(true, Ordering::SeqCst);
+        let rotation = tokio::spawn({
+            let state = state.clone();
+            let lid = key.lid;
+            async move { domain::rotate_key(&state, &lid, &lid.to_string()).await }
+        });
+        provider.wait_entered().await;
+        let mut concurrent = state.storage.get_key(&key.lid).await.unwrap();
+        concurrent.occ_version += 1;
+        concurrent.updated_at = chrono::Utc::now();
+        state.storage.update_key(&concurrent).await.unwrap();
+        provider.release_blocked(1);
+
+        let error = expect_rotate_err(rotation.await.unwrap());
+        assert!(
+            matches!(
+                error,
+                DomainError::Core(KeyRackError::OptimisticConcurrencyConflict { .. })
+            ),
+            "{error}"
+        );
+        let stored = state.storage.get_key(&key.lid).await.unwrap();
+        assert_eq!(stored.key_versions.len(), 1);
+        let destroyed = provider.destroyed.lock().unwrap().clone();
+        assert_eq!(destroyed.len(), 1, "the unpublished key is destroyed");
+
+        let events = audit.0.lock().unwrap().clone();
+        let cleanup: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.metadata.get("phase").and_then(|value| value.as_str())
+                    == Some("unpublished_version_cleanup")
+            })
+            .collect();
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].action, AuditAction::RotateKey);
+        assert_eq!(cleanup[0].resource.id, key.lid.to_string());
+        assert_eq!(cleanup[0].principal.principal_type, "System");
+        assert_eq!(
+            cleanup[0].metadata["provider_key_id"],
+            destroyed[0].key_id.as_str()
+        );
+        assert_eq!(
+            cleanup[0].result,
+            if fail_destroy {
+                keyrack_core::audit::AuditResult::Error
+            } else {
+                keyrack_core::audit::AuditResult::Success
+            }
+        );
+    }
+}
+
+fn panicking<E>() -> impl std::future::Future<Output = std::result::Result<(), E>> + Send {
+    std::future::poll_fn(|_| panic!("operation panicked"))
+}
+
+#[tokio::test]
+async fn executors_audit_a_panicking_operation_as_an_error() {
+    use keyrack_service::ops::{self, OpContext};
+    let (state, _, audit) = audited_state();
+    let ctx = |id: &str| {
+        OpContext::key(
+            AuditAction::RotateKey,
+            keyrack_core::pdp::Principal::system(),
+            id,
+        )
+    };
+
+    let status = ops::execute(&state, ctx("execute"), |_| panicking::<tonic::Status>())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Internal);
+    let status = ops::execute_with_resource_attrs(
+        &state,
+        ctx("execute_with_resource_attrs"),
+        BTreeMap::new(),
+        |_| panicking::<tonic::Status>(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Internal);
+    let status = ops::execute_detached(&state, ctx("execute_detached"), |_| {
+        panicking::<tonic::Status>()
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Internal);
+    let (code, _) = ops::execute_rest(&state, ctx("execute_rest"), |_| panicking())
+        .await
+        .unwrap_err();
+    assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let (code, _) =
+        ops::execute_rest_detached(&state, ctx("execute_rest_detached"), |_| panicking())
+            .await
+            .unwrap_err();
+    assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    for executor in [
+        "execute",
+        "execute_with_resource_attrs",
+        "execute_detached",
+        "execute_rest",
+        "execute_rest_detached",
+    ] {
+        assert_eq!(
+            audit.rotate_outcomes(executor),
+            [keyrack_core::audit::AuditResult::Error],
+            "{executor}"
+        );
+    }
 }

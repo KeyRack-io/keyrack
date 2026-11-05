@@ -1564,9 +1564,13 @@ pub async fn rotate_key(
         }
     }
 
+    // One rotation per key in this process, so callers that disconnect and
+    // retry cannot pile provider generation up behind each other.
     let record = if wrapped {
-        crate::hierarchy::rotate_wrapped_child(state, lid).await?
+        let slot = crate::hierarchy::RotationInFlight::take(lid)?;
+        crate::hierarchy::rotate_wrapped_child(state, lid, &slot).await?
     } else {
+        let _slot = crate::hierarchy::RotationInFlight::take(lid)?;
         rotate_resident(state, record, new_version).await?
     };
     let new_version = record.current_key_version;
@@ -1663,6 +1667,7 @@ async fn rotate_resident(
         .generate_key(&record.key_spec)
         .await
         .map_err(DomainError::from)?;
+    let generated = new_handle.clone();
 
     // Persist the binding actually used for generation, including a version
     // override or the registry default. A record-level default can differ.
@@ -1687,12 +1692,60 @@ async fn rotate_resident(
     record.current_key_version = new_version;
     record.occ_version += 1;
     record.updated_at = chrono::Utc::now();
-    state
-        .storage
-        .update_key(&record)
-        .await
-        .map_err(DomainError::from)?;
+    if let Err(error) = state.storage.update_key(&record).await {
+        if matches!(error, KeyRackError::OptimisticConcurrencyConflict { .. }) {
+            discard_unpublished_version(state, &entry.provider, &record.lid, &generated).await;
+        } else {
+            tracing::error!(
+                key = %record.lid,
+                provider_key_id = %generated.key_id,
+                error = %error,
+                "rotation's write failed with an unknown outcome; its new provider key is retained"
+            );
+        }
+        return Err(DomainError::from(error));
+    }
     Ok(record)
+}
+
+/// Destroy a provider key generated for a rotation whose write lost its OCC
+/// check. That refusal wrote nothing, so nothing references the key. Cleanup
+/// is best-effort; its outcome is audited either way.
+async fn discard_unpublished_version(
+    state: &ServiceState,
+    provider: &Arc<dyn CryptoProvider>,
+    lid: &Lid,
+    handle: &KeyHandle,
+) {
+    let destroyed = provider.destroy_key(handle).await;
+    if let Err(error) = &destroyed {
+        tracing::error!(
+            key = %lid,
+            provider_key_id = %handle.key_id,
+            error = %error,
+            "failed to destroy the unpublished provider key of a refused rotation"
+        );
+    }
+    let system = keyrack_core::pdp::Principal::system();
+    let mut event = keyrack_core::audit::AuditEvent::new(
+        keyrack_core::audit::EventType::KeyRotated,
+        keyrack_core::audit::AuditAction::RotateKey,
+        keyrack_core::audit::AuditPrincipal {
+            id: system.id,
+            principal_type: system.principal_type,
+        },
+        keyrack_core::audit::AuditResource::key(lid),
+        if destroyed.is_ok() {
+            keyrack_core::audit::AuditResult::Success
+        } else {
+            keyrack_core::audit::AuditResult::Error
+        },
+    );
+    event.add_metadata("phase", "unpublished_version_cleanup");
+    event.add_metadata("provider_key_id", handle.key_id.clone());
+    if let Err(error) = state.audit.emit(&event).await {
+        tracing::warn!(key = %lid, error = %error, "failed to emit rotation cleanup audit");
+    }
 }
 
 // ── State gating (shared by gRPC + REST) ────────────────────────────
