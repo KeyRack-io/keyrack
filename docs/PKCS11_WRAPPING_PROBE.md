@@ -1,5 +1,11 @@
 # Provider-native wrapping: experimental mechanism probe
 
+This document scopes the original mechanism probe. The shared runner now also
+exercises the separate experimental context-derived service profile; its
+configuration and support limits are in the
+[operator guide](OPERATOR.md#experimental-context-derived-wrapping-profile).
+A pass of the original probe alone does not qualify that service profile.
+
 This is the first executable mechanism experiment for a provider-wrapped key
 hierarchy. **It does not enable hierarchical keys in the service or establish a
 conforming authenticated wrapping profile.** Existing key records and API behavior

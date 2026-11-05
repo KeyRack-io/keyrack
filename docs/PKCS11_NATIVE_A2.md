@@ -1,12 +1,19 @@
 # Native PKCS#11 A2 candidate
 
-Status: **unqualified, conformance-only internals**, not an enabled service
+This document records the earlier GCM candidate and bare AES-KW mechanics
+conformance paths. Their limitations remain as stated below. The separate
+experimental service profile `pkcs11:aes256-cbc-sha256-kw:v1` uses context-derived
+KEKs; see the [current operator guide](OPERATOR.md#experimental-context-derived-wrapping-profile).
+The candidate results here do not qualify that profile or a hardware token.
+
+Candidate status: **unqualified, conformance-only internals**, not an enabled service
 provider. The `native-a2-conformance` feature compiles native Generate/Wrap,
 Unwrap/use and original-session Close in `keyrack-pkcs11`. Default builds omit
-this developer entry point. `wrapping_capabilities()` remains empty, including
-when the feature is enabled. The native engine and async conformance adapter now
-consume `CreationBinding` from the shared contract. No qualified production
-`CryptoProvider` wrapping adapter or creation-journal verifier is enabled.
+this developer entry point. The ordinary provider's `wrapping_capabilities()`
+remains empty, including when the feature is enabled. The native engine and
+async conformance adapter consume `CreationBinding` from the shared contract.
+These candidate modes enable no `CryptoProvider` wrapping adapter or
+creation-journal verifier.
 
 ## What the engine establishes
 

@@ -105,10 +105,11 @@ Remaining migration work includes:
 Parent-child relationships recorded before 0.5.0 do not establish a wrapping
 chain. From 0.5.0, `CreateKey` with a
 parent creates a wrapped child only under a `wrapping:` profile on a
-platform-custody provider, one level deep, and is refused without one; the only
-mechanism in this release is software, which unwraps the child into service
-memory, so it is not custody. Keys created before 0.5.0 that name a parent carry
-the earlier, logical meaning and are refused as wrapping parents. Native PKCS#11
-wrapping is not reachable through the service, for any token, SoftHSM included.
+platform-custody provider, one level deep, and is refused without one. The
+software AES-GCM profile unwraps into service memory. The experimental opt-in
+[context-derived PKCS#11 profile](../OPERATOR.md#experimental-context-derived-wrapping-profile)
+uses temporary token objects and is tested with SoftHSM 2.7.0; it provides no
+hardware custody and is not formally verified. Keys created before 0.5.0 that
+name a parent carry the earlier, logical meaning and are refused as wrapping parents.
 See [Using a child](../KEY_MATERIAL_REPRESENTATION.md#using-a-child) for how a
 wrapped child's use lease is closed.

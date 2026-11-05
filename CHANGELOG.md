@@ -4,696 +4,246 @@ All notable changes to KeyRack will be documented in this file.
 
 ## [Unreleased]
 
-Release preparation sets the eighteen workspace crates previously at 0.4.0 to
-0.5.0. The unpublished `keyrack-crypto-worker` and `keyrack-surface-contract`
-remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
+## [0.5.0] — Pending release tag
 
-### Not in this release
+Prepared release notes; the release date and immutable tag are pending.
+The eighteen workspace crates previously at 0.4.0 are now 0.5.0. The unpublished
+`keyrack-crypto-worker` and `keyrack-surface-contract` remain at 0.1.0; the
+unpublished examples and fuzz packages remain at 0.0.0.
 
-- Qualified hardware custody for wrapped children. The experimental, explicitly
-  configured SoftHSM profile exercises native PKCS#11 wrapping in a software
-  token loaded into KeyRack's process; no hardware token is qualified.
-- Export of wrapped material remains refused. Wrapped-child deletion erases its
-  stored envelopes under the dependency-aware deletion contract.
-  Rotating a resident root does not automatically migrate its existing children;
-  an explicit same-provider rewrap is required.
-- The crypto worker remains a provisional harness that the service does not use.
-- Cross-provider unwrap is not implemented.
-- REST/gRPC gaps and feature gates remain as listed in
-  [the generated API surface inventory](docs/generated/api-surface-parity.md).
+### Breaking changes and upgrade requirements
 
-### Breaking changes
+- **Parent bindings now mean wrapping.** `CreateKey` with `parent_key_id`
+  creates a wrapped child and requires an explicit per-provider `wrapping:`
+  profile. Without one, child creation is refused. The child must be a
+  non-exportable symmetric encryption key under an eligible, independently
+  resident wrapping parent in the same provider/security domain. Vault Transit
+  does not implement this wrapping path; native PKCS#11 wrapping requires the
+  experimental profile described below. Pre-0.5.0 keys with lineage-only parent
+  bindings are refused as wrapping parents, and startup warns about them.
+- **Vault Transit authenticates encryption context through `associated_data`.**
+  It previously sent the ignored `context` field on non-derived keys.
+  Ciphertexts created before this fix cannot decrypt with the required header
+  and context; create fresh keys. There is no unauthenticated fallback. Vault
+  HTTP requests now have a 5-second connection timeout and a 15-second request
+  timeout; connection failures, timeouts and HTTP 503 return `ProviderUnavailable`.
+- **ReEncrypt requires directional authorization.** Grant `kms:ReEncryptFrom`
+  on the source and `kms:ReEncryptTo` on the destination, including same-key
+  requests. The aggregate `kms:ReEncrypt` action has no compatibility alias;
+  update custom PDP schemas and policies. Standalone Decrypt/Encrypt grants
+  are not required by this operation. Both decisions precede provider calls,
+  and source scope checks use the ciphertext's historical version.
+- **PDP responses must match their request.** HTTP and gRPC validate the echoed
+  `request_id`; gRPC PDPs that previously left it empty must now populate it.
+  The optional `pdp_api_version` accepts absent or `1.0` and refuses unknown
+  versions. A `Permit` carrying obligations is denied because no obligation
+  handlers exist, with the refusal attributed to `keyrack:pep`. The unused
+  `AuthzResponse::rate_limit_class()` accessor is removed; rate limiting remains
+  unimplemented.
+- **Authorization configuration must be explicit.** Omitting `pdp:` is a startup
+  error, including when no configuration file is selected. Explicit `always_allow`
+  remains available and logs a startup warning.
+- **Audit signing requires a persistent key.** With `sign_audit_events: true`,
+  set `audit_signing_key_path` (created on first start if absent), or explicitly
+  opt into `audit_signing_key_ephemeral: true` for a throwaway key and startup
+  warning. Existing signed-log verification is unchanged.
+- **Compromised keys deny decrypt by default**, including the source of
+  ReEncrypt. Persisted compromise history prevents deletion cancellation or
+  rotation from restoring decrypt/export. Upgrade service/storage writers
+  together: older writers can discard the history marker. Deploy the companion
+  shim plaintext-cache bypass fix when applicable. The default-off
+  `legacy_compromised_key_decrypt` flag permits dangerous legacy decrypt only
+  while the live state is Compromised, with startup/per-use warnings and
+  best-effort audit markers. This is not controlled recovery or audit-failure
+  release suppression. Disabled-key and mathematical verification semantics
+  remain distinct; see [the operator guide](docs/OPERATOR.md).
+- **SAN-pinned delegation uses the matched SAN as `delegating_peer_id`.**
+  Update policies that relied on the certificate's first SPIFFE URI or CN.
+  Allowlist order chooses among multiple matches; matching is exact and
+  case-sensitive, and email/IP SANs are ineligible. Standalone mTLS principal
+  selection and delegation without a SAN pin are unchanged.
+- **REST lifecycle behavior matches gRPC.** Disable now cascades to descendants;
+  existing keys are not retroactively revisited. Rotation queues descendant
+  jobs. A non-Enabled rotation still returns HTTP 409, with the shared
+  `FailedPrecondition` error spelling instead of `InvalidState`.
+- `KmipProviderConfig` no longer implements `Debug`, preventing accidental
+  formatting of its plaintext password. Embedders must stop formatting the
+  configuration with `{:?}`.
 
-- Vault Transit now authenticates encryption AAD using `associated_data` instead
-  of the ignored `context` field on non-derived keys. Vault ciphertext created
-  before this fix no longer decrypts with the required header and encryption
-  context; create fresh keys. There is no unauthenticated-decryption fallback.
-- Vault HTTP operations now have a 5-second connection timeout and a 15-second
-  request timeout. Connection failures, timeouts and HTTP 503 return
-  `ProviderUnavailable`; other error classes are unchanged.
+### Wrapped-key lifecycle
 
-### Added
+- **Journaled creation and per-operation leases.** The software mechanism
+  `software:aes-256-gcm:v1` and the explicit native profile support wrapped-child
+  creation. Startup validates the configured mechanism and closure evidence;
+  cache-backed storage forwards journal operations without caching the journal.
+  Encrypt, decrypt, re-encrypt and data-key operations open wrapped material
+  for the operation and close it before a normal return; failed close fails the
+  call. Unjournaled envelopes are refused before provider dispatch.
+- **Bounded cleanup.** Cancellation transfers lease cleanup to an independent
+  owner; scheduling cleanup does not establish verified closure or an operation
+  audit outcome. Unconfirmed cleanup outcomes remain visible in logs and
+  `keyrack_wrapped_lease_cleanup_total`. `wrapped_lease_cleanup_limit` defaults
+  to 1024 and counts outstanding opens through cleanup completion; excess uses
+  fail as retryable before opening material. The shutdown drain has one
+  30-second deadline, after which unfinished cleanup is recorded as abandoned.
+- **Rewrap or reparent every retained version.** `RewrapKey` and REST
+  `POST /v1/keys/{key_id}/rewrap` use a required operation UUID, the same provider
+  and security domain, and separate authorization on the child and both parents.
+  Reservation pins exact parent versions and caller intent, fences conflicting
+  writers, and preserves reader access. Publication changes all descriptors and
+  `parent_lid` atomically, retiring the old envelopes and dependencies. Recovery
+  uses the same UUID; identical committed retries return the original immutable
+  binding receipt. Unknown nonrepeatable provider outcomes retain reservations
+  for reconciliation. Child identity, key material and version numbers do not
+  change, and application ciphertext is not rewritten. SQLite and PostgreSQL
+  share recovery/fence conformance tests. (#66)
+- **Rotate wrapped children through the creation journal.** A new child version
+  uses the parent's current version; older child versions retain their exact
+  bindings. Parent rotation queues descendant jobs and does not migrate existing
+  child envelopes; use RewrapKey for that. Rotation and migration reservations
+  exclude conflicting writers, stale snapshots retry within a bound, and
+  attempts that may own provider objects require reconciliation. Authorized
+  rotation continues in a detached task after request cancellation, including
+  descendant jobs, NATS events and the ordinary audit outcome. (#68)
+- **Dependency-aware deletion.** Scheduling and destruction claims share the
+  SQLite/PostgreSQL dependency query. Logical-only direct resident children
+  remain nonblocking and are reported as `logical_only_children`; the count
+  does not reserve future dependencies. Blocking dependencies return
+  `FAILED_PRECONDITION` / HTTP 409 with counts. (#64)
+- **Explicit dependent-data-loss approval.** `allow_dependent_data_loss`
+  requires the separate `kms:ScheduleKeyDeletionWithDependentDataLoss` grant.
+  Scheduling persists a server-captured dependency snapshot, cancellation clears
+  it, and claim-time checks refuse new dependents or nonterminal creation and
+  migration journals. Older pending records receive no implicit approval.
+  Wrapped-child deletion erases its own envelopes without opening the child or
+  destroying its parent. Approved parent destruction retains dependent keys and
+  envelopes while recording affected versions in
+  `wrapping_parent_destroyed_versions`; subsequent opens fail explicitly.
+  These markers precede provider deletion and do not prove physical erasure.
+  Incomplete destruction resumes after restart using frozen handles. (#69)
+- Destruction audit outcomes distinguish provider-confirmed absence from ordinary
+  success; resumed attempts are not themselves errors. PKCS#11 absence checks
+  are limited to labels visible in the session. REST preserves the explicit
+  `WrappingParentDestroyed` error. See
+  [destruction fencing](docs/DESTRUCTION_FENCING.md). (#70)
+- **Explicit lifecycle and compromise metadata.** Key and version metadata expose
+  `lifecycle_state` and `has_compromise_history` through gRPC and REST. Retention
+  is reported by `is_primary`, independently of lifecycle. The deprecated gRPC
+  version `state` retains its history overlay: it reports Compromised even after
+  destruction when compromise history exists. Eligibility continues to use the
+  stored record, with verification documented separately from decrypt/export in
+  [SPEC §7.2](docs/SPEC.md#72-valid-transitions). (#67)
 
-- Deletion scheduling and claiming share the SQLite/PostgreSQL dependency query,
-  with gRPC `FAILED_PRECONDITION` / HTTP 409 and blocking-kind counts on refusal.
-  Logical-only children remain allowed. The dependency-aware deletion contract
-  below adds explicit data-loss approval and wrapped-child envelope destruction.
+### Experimental native wrapping
 
-- **Rewrap and reparent every version of a wrapped key.** `RewrapKey` and REST
-  `POST /v1/keys/{key_id}/rewrap` share one synchronous primitive and a required
-  operation UUID. Omit `new_parent_key_id` to use the current parent's current
-  version; name a different resident parent to reparent. Both require the same
-  provider and security domain. `kms:RewrapKey` is authorized separately on the
-  child and both parents, with attempt and outcome audit events. Reservation
-  pins the target version and fences conflicting writes; staged envelopes and
-  all-version commit recover through the same operation ID. Commit changes
-  `parent_lid` and retires old envelopes atomically, releasing the old wrapping
-  dependency. Generic parent mutation is refused. SQLite and PostgreSQL share
-  conformance tests, with live PostgreSQL and reverted-fence controls in CI.
-  Caller OCC assertions and version coverage bind immutable intent. Ownership
-  epochs reject stale publishers, and unknown nonrepeatable provider outcomes
-  retain their reservations. Readers keep access through commit and erasure.
-  The committed result records exact parent versions, references and encrypted
-  envelope digests and is returned unchanged on retry.
-  The software provider and the explicitly selected native SoftHSM profile
-  implement the primitive. See [migration semantics](docs/WRAPPED_KEY_MIGRATION.md).
-- Experimental native PKCS#11 wrapping selected explicitly with
-  `pkcs11:aes256-cbc-sha256-kw:v1`. The provider derives a temporary KEK from a
-  domain-separated digest of the complete wrapping context and uses AES-KW;
-  startup must pass derive/wrap/unwrap, context-mismatch and sensitive,
-  non-extractable readback checks before declaring the capability. There is no
-  mechanism negotiation or fallback. A dedicated provider identity creates
-  derive-only resident roots and cannot be the resolved default, including
-  implicit and legacy defaults; an ordinary entry may use the same token.
-  SoftHSM is a software token, not a hardware custody boundary, and raw PIN
-  holders remain trusted. Operator guidance records these limits and the
-  construction's 64-bit AES-KW integrity bound. Rewrap and reparent derive the
-  old and new KEKs in one owned session, use a sensitive temporary child with
-  no use permissions, and return the new envelope only after confirmed original
-  session cleanup. Unconfirmed cleanup refuses further wrapping until process
-  restart.
+- The explicit `pkcs11:aes256-cbc-sha256-kw:v1` profile derives a temporary KEK
+  from a domain-separated digest of the complete wrapping context and uses
+  AES-KW. A dedicated named provider creates derive-only AES-256 resident roots
+  and AES-128/256 wrapped children; it cannot be the resolved default provider,
+  including implicit or legacy defaults. An ordinary provider entry may use
+  the same token. There is no mechanism negotiation or fallback. (#65)
+- Startup must pass derive/wrap/unwrap, wrong-context rejection and sensitive,
+  non-extractable attribute readback before declaring support. Native rewrap
+  uses an owned session and a session-only temporary child with no application
+  use permissions, returning an envelope only after confirmed cleanup.
+  Deterministic derivation and key wrap make qualified rewrap retries
+  byte-identical. Native creation remains nonrepeatable; unknown effects on
+  creation or a provider without a rewrap retry-safety declaration require
+  reconciliation. Unconfirmed session cleanup refuses further wrapping until
+  process restart, which does not reconstruct earlier closure evidence.
+- Qualification covers SoftHSM 2.7.0, a software token loaded into the service process.
+  It establishes neither hardware custody nor formal verification; formal proof
+  work continues after 0.5.0. Raw token PIN holders remain trusted. The operator
+  guide records the finite ownership ledger, context-derivation assumptions,
+  AES-KW's 64-bit integrity check and recovery limits. See
+  [the experimental profile](docs/OPERATOR.md#experimental-context-derived-wrapping-profile).
 
-- **Rotate a wrapped child.** `RotateKey` and REST
-  `POST /v1/keys/{key_id}/actions-rotate` on a child wrapped under its parent
-  add a version generated already wrapped under the parent's current version,
-  journaled exactly like creation. Older versions keep the parent versions they
-  name and keep decrypting. Rotating a parent does not rewrap its children; it
-  queues their rotation jobs, and `RewrapKey` moves existing versions. A
-  rotation racing a migration ends with every version under the new parent, or
-  is refused as retryable. A stale read is retried a bounded number of times,
-  then refused as a conflict (`ABORTED`, HTTP 409). A second rotation of a key
-  while one runs is refused as retryable, in the same process or another.
-  Once authorized, any `RotateKey` runs detached from its request: a dropped
-  request still records the rotation's descendant jobs, NATS event and audit
-  outcome. An interrupted attempt that never reached the
-  provider is withdrawn by the next rotation. One that may hold a provider
-  object refuses rotation until it is reconciled. The creation journal now
-  refuses a version that names anything other than the parent's current
-  version, or a parent other than the record's. A history mixing resident and
-  wrapped versions is still refused. SQLite and PostgreSQL share conformance
-  tests, including recovery at each journal phase, with live PostgreSQL and
-  reverted-fence controls in CI. See [rotation](docs/KEY_ROTATION.md#rotating-a-wrapped-child).
+### Providers, availability and compatibility
 
-- Key and version metadata expose `lifecycle_state` and
-  `has_compromise_history` over gRPC and REST. The existing gRPC version `state`
-  is deprecated and retains its compatibility meaning: compromise history
-  reports `Compromised` even after the live lifecycle advances to destruction.
-  Operation eligibility is unchanged; see [SPEC §7.2](docs/SPEC.md#72-valid-transitions).
-- Delegated identity accepts `required_sans`, an exact-match allowlist of DNS or
-  URI SANs on the delegating client certificate. Any listed SAN may match;
-  `required_sans` and the existing singular `required_san` are mutually exclusive.
-  The optional OU restriction still applies in addition to the SAN check. (#50)
-
-- Vault Transit accepts an optional `ca_cert` PEM bundle. Configuring it replaces
-  built-in trust roots for that client while retaining chain and hostname
-  verification. Invalid CA files fail construction with the provider and path;
-  TLS verification failures are `Provider` errors instead of availability errors.
+- Vault Transit accepts an optional `ca_cert` bundle that replaces built-in
+  trust roots while retaining certificate and hostname validation. Invalid
+  bundles fail configuration; TLS verification failures remain provider errors.
 - Named providers accept `custody: platform | customer` (default `platform`).
-  Optional Vault Transit and PKCS#11 backends construct with bounded retries;
-  construction failures return `ProviderUnavailable` and are logged with retry
-  context, while local configuration errors still fail startup. After construction,
-  backend errors pass through unchanged. PKCS#11 construction retries begin at
-  30 seconds. Deferred Vault construction and readiness honor `ca_cert`; invalid
-  local CA material fails startup, while TLS verification refusal is reported as
-  `tls_verification_failed` without gating optional-provider readiness.
-- `/readyz` reports `provider_states` and `connection_states`; optional provider
-  outages and failed tenant-owned stored connections do not gate readiness.
-  Platform-owned, ownerless and blank tenant-owned stored connections retain
-  the readiness guard.
-  Known limitation: a stored connection that fails boot rehydration stays
-  unavailable until a restart successfully loads it.
+  Optional Vault/PKCS#11 backends construct with bounded retries. `/readyz`
+  reports provider and connection states; optional outages and failed
+  tenant-owned stored connections do not gate readiness, while platform-owned,
+  ownerless and blank-owner connections retain the guard. Invalid configuration
+  still fails startup. A stored connection that fails boot rehydration requires
+  a restart to become available.
+- Ordinary PKCS#11 operations recover from token loss through bounded module
+  reinitialization and request retry. Calls sharing a module drain before
+  reinitialization; abandoned attempts do not consume the retry interval.
+  An uninitialized module can retry recovery immediately. Waiting callers have
+  a bounded admission window, and errors distinguish reinitialized, deferred,
+  abandoned and failed recovery. `CKR_GENERAL_ERROR` and
+  `CKR_CRYPTOKI_NOT_INITIALIZED` are retryable. Native wrapping retains its
+  stricter closure-failure behavior described above.
+- REST reports unavailable providers as HTTP 503, matching gRPC `UNAVAILABLE`.
+- The KMIP provider is selectable through single- and multi-provider
+  configuration. Corrected wire constants, KMIP 1.4 request framing,
+  activate/revoke lifecycle calls, AES-GCM tag exchange, authenticated encryption
+  context, variable nonce/tag lengths and readable server errors enable tested
+  interoperability with PyKMIP. RNGRetrieve encoding is corrected but remains
+  unqualified against that server; embedding without a rustls crypto provider
+  returns an error instead of panicking.
+- Delegated identity accepts `required_sans`, an exact-match DNS/URI SAN
+  allowlist, mutually exclusive with singular `required_san`; the optional OU
+  restriction still applies. GetKeyVersion authorization includes the requested
+  integer `key_version` before key-ID parsing, and version zero is invalid.
+- Resident rotation admits one concurrent rotation per key per process. A known
+  OCC publication refusal triggers best-effort destruction and an audit record
+  for the unpublished provider key; an unknown write outcome retains it because
+  publication may have committed. Descendant job counts reflect successful
+  writes, with failures logged separately. (#71)
+- Panics while polling authorized operation futures through the shared
+  `complete` executor produce an Error audit outcome, metrics and an INTERNAL /
+  HTTP 500 response. This covers the ordinary gRPC/REST executors, their detached
+  variants and the resource-attribute executor. The separate detached RewrapKey
+  executor is outside this panic-audit coverage. (#71)
 
+### Audit, security and release controls
 
-- **Wrapping operations exist and can be called.** `crates/keyrack-core` defined
-  `WrappingContext`, the capability tuples and `WrappingCapabilities::require()`,
-  and storage and the creation journal handled `ParentWrapped` material, but
-  `CryptoProvider` had only `wrapping_capabilities()` — a complete contract with
-  no operation any caller could invoke, so no provider implemented one. The three
-  ADR-0005 operations `generate_wrapped_key`, `open_wrapped_key` and
-  `close_wrapped_key` are now on the trait, refusing by default so untouched
-  providers fail closed, and `WrappingCreationProvider` drives the existing
-  creation journal from them. Closure evidence comes from the provider's own
-  verifier and a provider without one cannot be installed, so no adapter turns a
-  successful call into proof that a creation object was cleaned up. Preflight
-  requires Generate, Open and Close together: a child that cannot be opened
-  again must not be created. Generation carries a `CreationBinding` — operation,
-  attempt, owner, correlation and request fingerprint — which the provider keeps
-  with the object and its verifier compares, so a genuine closure of one attempt
-  is refused when presented for another; canonical context cannot make that
-  distinction, because two attempts at the same child have identical context.
-  The adapter reserves that owner before Generate rather than after it returns,
-  refuses a second generation, and keeps the reservation through failures,
-  wrong-context responses and caller cancellation, each of which can leave an
-  object only that attempt can close.
-- **The software provider implements them, which activates the path and is not
-  custody.** The mechanism is `software:aes-256-gcm:v1` — the name leads with
-  `software` so a capability dump reads as unqualified on sight — and it declares
-  the `SessionObject` lifetime because that is what is true: the child is
-  unwrapped into the same process heap that holds the parent, and stays there
-  until the lease is closed. A software-wrapped child is exactly as contained as
-  the parent wrapping it, which is not at all. No provider with a custody
-  boundary implements these operations yet, so the KEK-wrapping-hierarchy claim
-  stays down; it returns when one does, not because a mechanism exists.
-- **`CreateKey` with a `parent_key_id` now creates a wrapped child.** The
-  operations above had no caller: a parent binding was recorded as lineage and
-  the child got its own independent key, so the record claimed a relationship
-  the material did not have. A parent now means the material is wrapped under
-  that parent, created through the crash-safe creation journal, with the exact
-  parent version, mechanism and security domain written into the descriptor.
-  All three surfaces take the same branch. Encrypt, decrypt, re-encrypt and
-  generate-data-key open wrapped material for the call and close it before a
-  normal return, on success and on the operation's error: the call returns only
-  after the provider has answered the close, and a failed close fails the call.
-  If the request is cancelled first (client disconnect, client deadline,
-  shutdown), closing passes to a cleanup owner independent of the request: it
-  is scheduled, not verified, before the request ends, and its outcome is
-  recorded in the service log and metrics only as an unverified cleanup
-  outcome, never as verified closure. A close still pending when the shutdown
-  drain ends is recorded as abandoned. A cancelled request records no audit
-  outcome for its operation. The explicitly selected experimental SoftHSM
-  profile uses this same lease cleanup path. Re-encrypt involving a wrapped
-  version closes the source lease before opening the destination. Cleanup
-  outcomes are counted in `keyrack_wrapped_lease_cleanup_total{outcome}`, and
-  shutdown keeps its single 30-second deadline. Wrapped-key uses holding a
-  lease — from before the open until the close returns or its cleanup reaches a
-  final outcome — are bounded by `wrapped_lease_cleanup_limit` (default 1024)
-  and exposed as `keyrack_wrapped_lease_slots_in_use`; at the limit, new uses
-  are refused as unavailable (retryable) before anything is opened, and closes
-  are never refused. The handle is whatever the issuing
-  provider returned for that open: possessing it is not a grant. A planted
-  wrapped descriptor that does not name a journaled envelope is still refused
-  without talking to the provider. Export of wrapped material stays refused;
-  deletion erases its stored envelopes under the dependency-aware deletion
-  contract.
-- **Wrapping is activated per provider in configuration.** A new `wrapping:`
-  block names the provider, the mechanism and the security domain. It is absent
-  by default, and then creating a key with a parent is refused everywhere:
-  keys that exist only inside a hierarchy have their own recovery properties,
-  so this is stated rather than inferred from what a provider happens to
-  support. Startup refuses to run if the named provider does not declare that
-  mechanism for generate, open and close, or cannot evidence its own closures,
-  and says plainly when a software mechanism means the hierarchy is shape only.
-- **The key cache no longer makes wrapped children uncreatable.** `CachingStorage`
-  wraps a `StorageBackend` and inherited the default creation-journal methods,
-  which refuse; with a `cache:` block configured — as in every demo and most
-  deployments — creating a child failed with "transactional creation
-  unsupported" from a backend that supports it perfectly well. The journal
-  methods are forwarded, nothing about a journal is cached, and a published
-  child lands in the cache as a created one does. No test caught this: the
-  service tests built state over bare storage, so the wrapper every deployment
-  has was the one configuration never exercised. Running demo 08 caught it, and
-  the test that should have now exists.
-- **Demo 01 no longer sends `parent_key_id`.** Vault Transit does not implement
-  wrapping operations, and this deployment has no `wrapping:` profile. Creating
-  a child under the tenant key is therefore refused. The canary is the
-  no-parent path: two independent keys, encrypt and rotate on the DEK. The
-  wrapping-aware hierarchy lives in demo 08.
+- Audit chaining is unconditional, independently of signing. The CLI's
+  `keyrack audit verify` accepts an optional key: without it, only the chain is
+  checked; with it, Ed25519 signatures are checked too. Chain-only checks cannot
+  detect a fully rewritten log or tail truncation; signing and an external
+  anchor address those respective limits.
+- Public documentation now checks configuration defaults, claimed Kani harness
+  names and audit-verification bounds against source. The generated API surface
+  inventory records remaining REST/gRPC differences and feature gates.
+- Added private vulnerability reporting guidance and CI dependency checks for
+  advisories, licenses, bans and sources. The TLS/advisory lockfile refresh
+  addresses RUSTSEC-2026-0381, -0382, -0385 and -0386 and updates async-nats to
+  0.47.0. Software P-256/P-384 now use the 0.14 dependency family, resolving
+  RUSTSEC-2026-0387 with DER/pre-hash compatibility checks. (#63)
+- A temporary advisory-specific exception covers `RUSTSEC-2026-0441`, the
+  unmaintained `pin-utils@0.1.0` transitive dependency through `aws-config`/Smithy
+  in `keyrack-aws-proxy`. This is not a vulnerability fix or a global policy
+  relaxation. After 0.5.0, check for a contained AWS SDK update that removes
+  `pin-utils`; once adopted, remove the exception and rerun dependency-policy
+  controls. (#73)
+- KMIP interoperability and PKCS#11 custody-loss/restoration harnesses exercise
+  the service binary, including concurrent load on another token. Custody-proof
+  token initialization now retries and stops on prerequisite failure without
+  weakening assertions. (#74)
+- Demo 01 uses independent keys because its Vault profile does not support child
+  wrapping; demo 08 exercises the wrapping hierarchy. Release qualification
+  includes migration, rotation and deletion conformance with deliberate reverted
+  controls. See [the 0.5.0 checklist](docs/RELEASE_CHECKLIST_0.5.0.md).
 
-- **The KMIP provider is now selectable, and works.** `provider: {type: kmip}`
-  parsed and then failed at startup with "KMIP provider not yet implemented",
-  so no deployment could use the backend the operator guide documents. Both
-  documented shapes — the single `provider:` block and an entry in the
-  `providers:` list with tag routing — now construct the provider.
-- **`conformance/kmip-provider/`: the KMIP backend is proven against a
-  third-party server.** The harness boots the service from the documented YAML
-  against PyKMIP and exercises create, encrypt, decrypt, tamper rejection,
-  describe, rotate, decrypt-after-rotate, disable, disabled-refuses-encrypt and
-  enable. A server nobody here wrote is the point: the client's unit tests
-  encoded and decoded with the same tables, so they agreed with themselves
-  whatever the values were. `check-constants.py` compares every wire constant
-  against that implementation's, and `crates/keyrack-kmip/tests/neutral_server.rs`
-  asserts what only a live server can settle — including that it binds the
-  encryption context rather than accepting the field and ignoring it. Pointing
-  the harness at another server is how to qualify that server.
-- **`conformance/pkcs11-custody/`: custody loss and restoration, proven against
-  the real binary.** The harness runs `keyrack-service` against two SoftHSM
-  tokens on one library, takes one away, gives it back, and asserts service
-  returns in the same process. It is a binary-level proof because the defect it
-  guards lived in state that only exists in a long-running process, which is
-  the class that passes in-process tests and fails in deployment. The second
-  token is held under continuous load for the whole window, which is how the
-  crash described below was found.
+### Deferred and unsupported
 
-### Changed
-
-- **Breaking: `parent_key_id` means wrapping, not lineage.** Creating a key
-  under a parent now requires a provider with an activated wrapping profile, so
-  child creation stops working on PKCS#11 until it implements the operations,
-  and on Vault until its worker-mediated path lands (ADR-0007 D4). Splitting
-  lineage and wrapping into two fields was considered and rejected: one field
-  with one meaning is what makes a parent binding trustworthy on read. A child
-  must also be a non-exportable symmetric encryption key under an enabled,
-  non-exportable, independently resident parent in the same security domain,
-  and each of those is a refusal with its own test.
-- **Breaking: keys created before 0.5.0 that name a parent are refused.** Their
-  parent binding carries the earlier lineage-only meaning, which 0.5 cannot
-  tell apart from a wrapped child by intent — only by what the material is. Such
-  a key is refused as a wrapping parent, naming the semantics change, and
-  startup warns when any are present so an operator learns before traffic
-  arrives. There is no migration script until someone needs one. This is the
-  same posture taken for V1 canonicalization records, so `keyrack-core` has no
-  legacy tolerance left anywhere.
-
-### Fixed
-
-- **Rotating a provider-resident key.** A request repeated while the same key's
-  rotation was still generating started another provider generation. Now only
-  one rotation of a key runs per process, and a second is refused as retryable
-  (`UNAVAILABLE`, HTTP 503). A rotation whose write lost its concurrency check
-  used to leave its new provider key behind. Now it destroys that key,
-  best-effort, and audits the cleanup. If the write's outcome is unknown, the
-  key is kept and logged, because the write may have committed.
-
-- **A panicking operation went unaudited.** Every request executor now records
-  the panic as an `Error` audit outcome and in metrics, then answers `INTERNAL`
-  (HTTP 500).
-
-- `GetKeyVersion` authorization is bound to the requested version through the
-  integer `key_version` attribute from the decoded request. Version 0 returns
-  `InvalidArgument`. Authorization precedes key-ID parsing, so a denied version
-  can return `PermissionDenied` even when the key ID is invalid. (#50)
-
-- **A failed PKCS#11 reinitialization left the library unusable and then
-  rationed the repair.** When custody of a token is lost by its storage
-  becoming unreadable rather than disappearing, `C_Initialize` during recovery
-  can itself fail. `C_Finalize` has already succeeded at that point, so the
-  library is left finalized: every later call answers
-  `CKR_CRYPTOKI_NOT_INITIALIZED`, a code that appeared nowhere in the provider
-  and so was classified as a permanent provider defect. Callers were told their
-  request could never succeed when a reinitialization was the only thing
-  standing in the way. Worse, the failed attempt armed the interval that
-  rations reinitialization, so custody returning *inside* that interval — the
-  common case, since the interval is two seconds — was answered by deferring
-  the one operation that would have fixed it. Three changes: the code now reads
-  as retryable; a library left uninitialized is never rationed, because
-  rationing protects the providers still using the library and a library that
-  is down has none; and an incomplete recovery is reported as retryable rather
-  than as the operation's own failure.
-- **A caller could not tell why recovery had not happened.** Reinitialized,
-  deferred by the interval, abandoned because calls would not drain, and
-  attempted-and-now-down were one boolean, indistinguishable to the caller, the
-  logs and any test. Each is now named in the answer and logged, so the next
-  occurrence can be attributed from the caller's own error rather than from the
-  module's logs on someone else's host.
-- **PKCS#11 recovery could not be triggered by the failure that needed it.**
-  The recovery added in the previous entry was reached only when a failure had
-  been classified retryable. That classification comes from the return code the
-  module chose, so whether a lost token could recover at all depended on a
-  vendor's choice of code: SoftHSM answers `CKR_GENERAL_ERROR` and recovers,
-  while a module answering a code that maps to a permanent fault was never
-  offered recovery. A rotation could therefore report a permanent provider
-  error on a token that an encrypt would have recovered. Any provider-side
-  failure now reaches the recovery path, and the decision no longer depends on
-  the distinction KeyRack draws for the client's benefit. The cost is that an
-  invalid request can provoke at most one reinitialization per library per
-  interval, which is latency for the tokens sharing that library; a token that
-  never comes back is worse.
-- **A recovery window could refuse a healthy token on the same library.** A
-  caller waiting for a reinitialization to finish used the same bound as the
-  one recovery uses to wait for calls to drain, so its patience could run out
-  at the moment the window it was waiting for closed — answering 503 for a
-  token that was never affected. The caller's bound is now twice the drain
-  bound, which exceeds the longest window a recovery can hold.
-
-  **This retracts a claim made with the previous entry.** It said providers
-  sharing the library keep serving throughout a recovery, and pointed at
-  `conformance/pkcs11-custody/` as proof. That harness ran one request at a
-  time, so the module was almost always idle, draining was instant and the
-  window was far too short for the failure to appear. The harness now runs
-  concurrent load, and the case the bound gets wrong is covered by a unit test
-  on the admission gate, which is where it can be made deterministic.
-- **A skipped PKCS#11 recovery consumed the interval it never used.** The
-  interval between reinitializations was armed before the attempt, so an
-  attempt abandoned because calls would not drain — which touches nothing —
-  suppressed the next genuine attempt. It is now recorded once an attempt has
-  actually run.
-- **A retained key version was reported as `Disabled`, so rewrapping older
-  ciphertext could be refused after a rotation.** `GetKeyVersion` and
-  `ListKeyVersions` derived a version's state from whether it was the primary,
-  which conflated an ordinal fact about rotation order with a lifecycle state.
-  Any caller that gated on the reported state saw every retained version as
-  unusable, so a rewrap left pending during an outage could be refused on retry
-  once the healthy key rotated underneath it — for data that was decryptable
-  the whole time, since the ciphertext header names the version and KeyRack
-  decrypts under it regardless of which version is primary. The version RPCs
-  now report the owning key's lifecycle state and report retention separately
-  in the new `KeyVersionMetadata.is_primary` field, matching what the REST
-  surface has always exposed. `is_primary` is proto field 4 on
-  `KeyVersionMetadata`; a consumer that needs to distinguish the primary
-  version should read it rather than inferring one from the reported state,
-  which no longer varies between versions of the same key.
-
-  The same derivation was wrong in the permissive direction, and that half is a
-  security fix: because the primary version was reported `Enabled` whatever the
-  key's state, a compromised or disabled key's current version was reported
-  usable. It is now reported `Compromised` or `Disabled`, and compromise
-  history is reported even where the live state has moved on, so a version can
-  never be reported usable while the key record refuses to decrypt under it.
-  This grants no new latitude: which keys may be decrypted is unchanged, and
-  compromised keys remain default-denied.
-
-- **A PKCS#11 token that came back stayed dead until KeyRack was restarted.**
-  When a token became unreachable under a running process — an HSM restart, a
-  re-attached partition, a token volume that went away — the module was left
-  holding an unusable view of it, and that view did not clear when the token
-  returned. Every later call kept failing, including on a brand-new session,
-  so restoring custody restored nothing and the only remedy was restarting the
-  process. Sessions were never the problem: KeyRack already opens a fresh one
-  per operation, and re-resolving the slot did not help either. The module
-  itself has to be reinitialized, so KeyRack now does that on the first
-  request that fails against a token and retries that request. Recovery is
-  bounded: at most one reinitialization per library every two seconds, and it
-  is **abandoned** rather than forced if calls already inside the library do
-  not drain within five seconds — finalizing a library under an active call
-  terminates the process rather than returning an error. Providers sharing the
-  library wait for the window rather than failing, within the bound described
-  in the operator guide; `conformance/pkcs11-custody/` holds one under
-  continuous concurrent load across the whole recovery.
-- **REST reported an unreachable backend as an internal error.** `map_core_err`
-  had no arm for `ProviderUnavailable`, so REST answered 500 where gRPC
-  answered `UNAVAILABLE` for the identical failure. This is the difference
-  between a client that retries and one that gives up, and after the fix above
-  a retry is what restores service — so the wrong status actively prolonged the
-  outage. REST now answers 503 `ProviderUnavailable`, matching gRPC.
-- **A wedged PKCS#11 module reported a permanent fault.** `CKR_GENERAL_ERROR`
-  was classified as a provider defect rather than a connectivity failure, which
-  is both wrong and, again, the difference between a caller retrying and not.
-  It now reads as unavailable, alongside the device and session errors already
-  classified that way.
-- **Compromised keys now deny decrypt by default, including ReEncrypt sources.**
-  Persisted compromise history prevents deletion cancellation or rotation from
-  restoring decrypt or raw export. Security-sensitive reads bypass metadata
-  caches, including a fresh export check after PDP authorization. An explicit,
-  default-off `legacy_compromised_key_decrypt` flag restores only dangerous legacy
-  decrypt behavior with startup/per-use warnings and structured, best-effort
-  audit markers. It is not controlled recovery or audit-failure release
-  suppression. Disabled and mathematical verification behavior are unchanged.
-  Upgrade all service/storage writers together and deploy the companion shim
-  plaintext-cache bypass fix; old writers can discard the sticky JSON marker.
-  See the operator guide for migration limits and per-use marker semantics.
-- **KMIP wire format: four constants named the wrong thing.** Each collided
-  with a value the specification does define, so requests were well-formed and
-  meant something else: `SymmetricKey` was `0x01` (Certificate) — which is
-  what every symmetric `Create` sent — `GCM` was `0x0E` (X9.102 AESKW),
-  `RNGRetrieve` was `0x2C` (Log), and `Ed25519` was `0x1B` (One Time Pad).
-- **KMIP protocol version: 2.1 was announced over 1.x payloads.** `Create`
-  carries a `TemplateAttribute`, which KMIP 2.0 removed, so the combination was
-  unusable at either version — a 1.x server refuses the major version and a 2.x
-  server cannot parse the body. The client now announces 1.4, which is what it
-  encodes.
-- **KMIP keys were created and never activated.** KMIP forbids cryptographic
-  use of a Pre-Active object, so `generate_key` returned a handle to a key that
-  refused every operation. Keys are now activated on creation, and revoked
-  before destruction, which KMIP likewise requires.
-- **KMIP AES-GCM discarded the authentication tag.** The tag was never read
-  from the `Encrypt` response, never sent on `Decrypt`, and no tag length was
-  requested, so the mode was authenticated in name only and the ciphertext
-  could not be decrypted. The tag is now carried, and the encryption context is
-  transmitted as `AuthenticatedEncryptionAdditionalData` instead of being
-  refused — the refusal existed because the tag could not be verified, which is
-  no longer the case.
-- **KMIP ciphertexts now record their own framing.** The blob assumed a 12-byte
-  nonce; a server that picks another length (the one this is proven against
-  picks 16) could not be decrypted at all. Nonce and tag lengths are written
-  into the blob. No migration concern: no deployment could reach this provider
-  before, so no ciphertext in the old shape exists.
-- **KMIP `RNGRetrieve` sent the byte count in `Data` instead of
-  `DataLength`,** producing a request no server can parse. Corrected, but still
-  unproven: the server this backend is proven against does not implement the
-  operation, and `docs/OPERATOR.md` now says so rather than leaving it to be
-  inferred.
-- **A KMIP connection panicked when no rustls provider was installed.** The
-  service installs one at startup, so this was reachable only by other
-  embedders, for whom a panic inside a connection attempt is the wrong report
-  of a missing initialisation step. It is now an error naming the omission.
-- **ReEncrypt now authorizes both keys before crypto (gRPC and REST).** A
-  source-key permit alone no longer permits re-encryption into an unauthorized
-  destination. Policies must grant `kms:ReEncryptFrom` on the source and
-  `kms:ReEncryptTo` on the destination, even for same-key requests; standalone
-  `Decrypt`/`Encrypt` grants are not required. The two PDP requests have distinct
-  IDs and independently validated responses, with the outer request ID retained
-  for audit correlation. Destination denial names the destination in the audit
-  log and prevents all provider calls. Source provider-scope checks now use the
-  ciphertext's historical key version rather than the current primary binding.
-  The old aggregate `kms:ReEncrypt` action is removed without an alias; policies
-  and custom PDP action schemas must use the directional names. The API remains
-  `ReEncrypt`.
-- **PDP responses are now checked against the request they answer.** Both PDP
-  clients returned any response that parsed, without confirming its
-  `request_id` echoed the request's, so a well-formed decision belonging to a
-  *different* authorization request was applied to the operation in hand.
-  Calibrated honestly: this is a correlation gap, not a fail-open one. The
-  non-success status path already returned `Decision::Forbid` and the
-  parse-error path already returned `Err`, so neither failure mode admitted
-  anything; the exploit shape is response substitution or a confused proxy —
-  a shared forward proxy, or a connection-pooling bug that crosses two
-  in-flight authorizations — rather than an unauthenticated allow. It also
-  required a PDP endpoint reachable and trusted enough to answer at all.
-  Uncorrelated responses now fail the operation instead of authorizing it.
-  Validation lives on `AuthzResponse::into_enforceable` in `keyrack-core`
-  and is called by both transports, because the gap was present in *both* the
-  HTTP and gRPC clients and a per-transport check is how they drifted in the
-  first place.
-- **BREAKING (PDP behaviour): a `Permit` carrying an obligation is now
-  denied.** Obligations are conditions the enforcement point must discharge
-  before acting on a permit, and no obligation handlers are implemented, so
-  the permit was previously honoured as though it carried no condition at all
-  — granting more than the policy author wrote. Such a decision is now denied,
-  with the refusal attributed to `policy_id: "keyrack:pep"` so it is
-  distinguishable in the audit trail from a policy denial. There is
-  deliberately no list of "understood" obligations to opt out with, because
-  such a list would assert handling that does not exist. Obligations on a
-  non-`Permit` decision are unaffected: the operation is refused regardless.
-- **Removed: `AuthzResponse::rate_limit_class()`.** The accessor was public
-  with no callers in the workspace, and its doc comment told the reader the
-  class "is expressed as an obligation" — describing a capability that was
-  never implemented, which is exactly what a shipped artifact must not do.
-  Under the rule above it would also have been unreachable, since a `Permit`
-  carrying that obligation is now denied before any caller could read it.
-  **Rate limiting is not implemented and this does not change that**: nothing
-  in KeyRack enforced a rate limit before this release or after it. Planned
-  single-node enforcement will make the obligation dischargeable, at which
-  point a `Permit` carrying it can be honoured rather than denied;
-  cluster-wide enforcement is a commercial extension.
-- **Added: optional `pdp_api_version` on the authorization response** (proto
-  field 6 on `PdpAuthorizeResponse`). A PDP may state the schema version of
-  its response. Absent is accepted, so PDPs predating the field are unaffected
-  and proto3's inability to distinguish absent from empty is not a problem; a
-  version other than `1.0` is refused, because the remaining fields cannot be
-  read with confidence under an unknown schema. Refused as a protocol failure
-  rather than a denial, for the same reason as an uncorrelated response.
-- **BREAKING (PDP implementers, gRPC only): a PDP must echo `request_id`.**
-  HTTP PDPs already had to, since the field is required to deserialize. A gRPC
-  PDP that never set it was previously accepted, because proto3 transmits `""`
-  rather than an absent value, and is now refused with a message naming that
-  specific cause. The bundled Cedar PDP and the `always_allow` / `always_deny`
-  fixtures echo the id by construction and are unaffected.
-
-- **Docs: the audit-detection claim control now matches the claim rather than
-  one phrasing of it.** The first version of
-  `keyless_audit_claims_state_their_bounds` triggered only on wording that
-  mentions the absence of a key, so it missed `docs/WHY_KEYRACK.md`, which
-  asserts detection without mentioning keys at all ("is detectable by
-  replaying the hash chain") and stated only one of the two bounds. That file
-  is now correct and the trigger matches assertions of detectability. Two
-  further tightenings: the bounds must appear in the same section as the
-  claim, not anywhere in the file, and a mention of truncation only counts as
-  the truncation bound when the section also names the remedy — otherwise
-  unrelated prose satisfies it, as the TLV "truncation attacks" discussion in
-  `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` would have.
-
-- **Docs: three docs still said an ephemeral audit signing key is the
-  default.** Making `audit_signing_key_ephemeral` an explicit opt-in left
-  `README.md`, `docs/CRYPTO_AND_COMPLIANCE_ANALYSIS.md` and
-  `docs/WHY_KEYRACK.md` describing the behaviour it replaced — signing now
-  requires a persistent `audit_signing_key_path`, and a throwaway key must be
-  asked for. No behaviour change. A claim about a configuration default is
-  mechanically checkable, so a new control,
-  `documented_config_defaults_match_config_rs` in
-  `crates/keyrack-service/tests/doc_config_claims.rs`, parses
-  `ServiceConfig::default()` and fails when prose asserts a default that
-  contradicts it. Flipping a default in `config.rs` changes what the control
-  demands of the docs, rather than leaving the expectation hard-coded in a
-  test.
-
-- **Docs: the keyless audit-verification claim now states its bounds
-  everywhere it is made.** Making chaining unconditional was correct, but the
-  documentation of it landed unevenly: `docs/OPERATOR.md` and the
-  `09-audit-tamper-evidence` demo said what keyless verification does *not*
-  cover, while `QUICKSTART.md`, `docs/INTEGRATION_GUIDE.md` and
-  `docs/compliance/COMPLIANCE_POSTURE.md` claimed detection flatly — the
-  compliance posture said interior tampering is "always detectable". It is not:
-  repairing the chain after an edit only means recomputing every link from that
-  point forward, so anyone able to rewrite the whole log defeats the keyless
-  check, and tail-truncation breaks no link at all. All three now state both
-  bounds and which mechanism closes each (signing for the first, an external
-  anchor for the second). No behaviour change. A new control,
-  `keyless_audit_claims_state_their_bounds` in
-  `crates/keyrack-core/tests/doc_claims.rs`, fails if any doc makes the keyless
-  claim without both bounds, since review of the prose is what let the split
-  through.
-- **The audit hash chain no longer depends on signing.** `previous_hash` was
-  assigned in exactly one place, `AuditSigner::sign_event`, and
-  `sign_audit_events` defaults to `false`. A default deployment therefore wrote
-  an audit log with no signatures *and* no chain, while the `previous_hash`
-  field stayed in the schema implying tamper evidence that was not being
-  produced. Chaining is now unconditional: it is owned by a new `AuditChain`
-  and applied by a new `ChainingAuditSink` when signing is off, and
-  `AuditSigner` composes the same chain when signing is on. Chaining gives
-  tamper evidence, signing gives authenticity, and the two are now separately
-  available. The signed chain rule is byte-for-byte unchanged — a signed event
-  still links via BLAKE3 over the predecessor's signature hex — so logs written
-  by earlier versions verify exactly as before. An unsigned event links via
-  BLAKE3 over its canonical JSON, which is precisely the bytes the sink wrote,
-  so an unsigned chain is re-derivable from the log with no key.
-- **`keyrack audit verify` no longer requires a signing key.** `--key` is now
-  optional. Without it the command checks the hash chain alone, which is the
-  only mode available to a deployment that has not enabled signing — the same
-  deployments that previously had no chain to check. With `--key` it checks the
-  chain and the Ed25519 signatures, as before. The summary line states which
-  checks ran, so a chain-only pass is not mistakable for an authenticity pass.
-- **BREAKING (config): `sign_audit_events: true` now requires a persistent
-  signing key.** The signing key path defaulted to `None`, and the service then
-  generated a fresh Ed25519 key on every startup, so nothing written before a
-  restart could ever be verified — signing was configured but its stated
-  property did not hold. Enabling signing now requires `audit_signing_key_path`
-  (created on first start if absent). A deployment that genuinely wants a
-  throwaway key must set the new `audit_signing_key_ephemeral: true`, which logs
-  a `WARN` at every startup. Three demos that enabled signing without a key path
-  now set the flag explicitly.
-- **BREAKING (config): omitting the `pdp:` block is now a startup error.**
-  `ServiceConfig::pdp` carried a serde default and `AlwaysAllow` was the
-  `#[default]` variant, so a config with no `pdp:` block silently disabled
-  authorization with no warning. `PdpConfig` no longer implements `Default` and
-  the field is now optional at parse time and mandatory at startup: the service
-  refuses to serve and prints the accepted variants. This also closes the
-  built-in-defaults path used when `KEYRACK_CONFIG` is unset. `always_allow`
-  remains available but must be written out, and now logs a prominent `WARN`
-  naming it on every startup. Scope note: no shipped config omitted `pdp:`, so
-  this was a latent trap rather than a live hole — every demo, docker, and
-  example config already set it explicitly.
-- **`docs/FORMAL_VERIFICATION.md` no longer documents a Kani harness that does
-  not exist.** The doc told readers to run
-  `cargo kani -p keyrack-core --harness audit_event_serialization_no_plaintext_leak`;
-  no such harness exists in `crates/keyrack-core/`. The property is a proptest,
-  and the doc's own limitations section explains why it cannot be a Kani
-  harness. The instruction is corrected to point at the proptest, and
-  `crates/keyrack-core/tests/doc_claims.rs` now asserts that every `--harness`
-  name in the document resolves to a real `#[kani::proof]`.
-- **KMIP server error messages are now readable.** Three TTLV tag constants in
-  the KMIP client were wrong. Because KMIP assigns tags in alphabetical order of
-  item name, `RESULT_MESSAGE` and `RESULT_REASON` held the values for
-  *Revocation Reason* (`0x420081`) and *Revocation Message* (`0x420080`) instead
-  of `0x42007D` and `0x42007E`, and `MAC_DATA` held *Data Length* (`0x4200C4`)
-  instead of `0x4200C6`. `RESULT_MESSAGE` was live: `parse_response` looks it up
-  on every response, so a server's failure text was never found and every KMIP
-  error surfaced as `"unknown error"`. Diagnosing a KMIP-backed deployment was
-  effectively impossible. `RESULT_REASON` and `MAC_DATA` had no call sites yet
-  and were latent. The bundled KMIP server had all three correct, so client and
-  server disagreed on the wire.
-- **BREAKING (behaviour): the KMIP provider no longer discards additional
-  authenticated data.** `KmipProvider::encrypt` and `KmipProvider::decrypt`
-  accepted an `aad` argument and never transmitted it, so every caller that
-  supplied an encryption context against a KMIP-backed key believed in a
-  binding that did not exist. KMIP 2.1 does define the transport
-  (`Authenticated Encryption Additional Data`, tag `0x4200FE`, paired with
-  `Authenticated Encryption Tag`, `0x4200FF`), but this client implements
-  neither the AAD field nor the tag exchange that would authenticate it, so
-  the binding cannot be delivered or verified. Both operations now **fail
-  closed** on a non-empty `aad`; an empty `aad` asserts no binding and still
-  succeeds. `re_encrypt` and `generate_data_key` inherit the refusal through
-  the default trait implementations. A deployment that was passing an
-  encryption context to a KMIP-backed key was already not getting one and will
-  now see the operation rejected instead of silently unbound.
-- **BREAKING (behaviour): REST `DisableKey` now cascades to descendants, as
-  gRPC already did.** The gRPC handler walked the key hierarchy and disabled
-  every enabled descendant, emitted a `kms:CascadeDisable` audit record, and
-  published a NATS state-changed event; the REST handler transitioned only the
-  target key and left the entire subtree enabled and usable. The admin CLI
-  speaks gRPC, which is why the gap went unnoticed. Both surfaces now call a
-  single `domain::disable_key`, so they share the traversal, the fail-closed
-  behaviour on a descendant write failure, the audit records, and the NATS
-  events. A deployment that disabled keys over REST should expect descendants
-  that were previously left enabled to be disabled from now on; existing keys
-  are not retroactively re-evaluated.
-- **REST `RotateKey` now queues descendant rotation jobs, as gRPC already
-  did**, via the same single `domain::rotate_key`. A key rotated over REST
-  previously left every dependent bound to the superseded version with no
-  `RotationJob` scheduled to re-key it. REST's error body for rotating a
-  non-`Enabled` key keeps its `409` status but its `error` field changes from
-  `InvalidState` to `FailedPrecondition`, which is the shared mapper's spelling.
-- **Rotation now reports the number of descendant jobs it actually created.**
-  The recursive walk incremented its job counter even when
-  `create_rotation_job` failed, so the log line told operators a job was queued
-  for a dependent that had none. Failures are counted separately and logged at
-  `error` naming the dependents that will not be re-keyed. The rotation itself
-  still succeeds, because the new key version is already committed by that
-  point and failing the call would report a rotation that did happen.
-- **`KmipProviderConfig` no longer derives `Debug`.** It holds `password` in
-  plain text, so any log line or error that formatted the config leaked the
-  KMIP credential. It now follows `Pkcs11ProviderConfig` and omits `Debug`
-  entirely. Callers that were formatting the config with `{:?}` will no longer
-  compile.
-
-### Delegated peer identity
-
-- SAN-pinned delegated authentication records the matched DNS or URI SAN as
-  `delegating_peer_id`, including the singular `required_san` setting. If several
-  configured values match, allowlist order selects the peer; certificate SAN
-  order and extra unlisted SANs do not select another identity. Matching remains
-  exact and case-sensitive; email and IP SANs are ineligible. Standalone trusted
-  mTLS principal selection and delegation without a SAN pin are unchanged. SAN-pinned
-  policies must stop relying on the former peer identity: the certificate's first
-  SPIFFE URI, or its CN when no SPIFFE URI was present.
-
-### Security reporting and dependency checks
-
-- Add a root security policy using GitHub private vulnerability reporting, with
-  support for the latest 0.5.x patch and explicit response targets.
-- Check dependency advisories, licenses, bans, and sources with cargo-deny on
-  every pull request and push to main. Dependency exceptions are recorded in
-  `deny.toml`; external sources are restricted to crates.io.
-
-### Dependency maintenance
-
-- Refresh the locked TLS and advisory set for RUSTSEC-2026-0381, RUSTSEC-2026-0382,
-  RUSTSEC-2026-0385 and RUSTSEC-2026-0386; upgrade async-nats to 0.47.0.
-
-- Upgrade software P-256/P-384 ECDSA to the 0.14 dependency family, resolving
-  RUSTSEC-2026-0387 while retaining DER signatures and pre-hash behavior.
-
-### Deletion scheduling responses
-
-- Report `logical_only_children` in successful gRPC and REST deletion schedules,
-  counted once per direct persisted child with resident material by the shared
-  admission query. Logical-only links remain nonblocking; the count is an
-  observation and does not reserve future dependencies.
-
-### Dependency-aware deletion
-
-- Add `allow_dependent_data_loss` to gRPC and REST scheduling, requiring the
-  separate `kms:ScheduleKeyDeletionWithDependentDataLoss` permission alongside
-  ordinary scheduling. SQLite/PostgreSQL atomically persist the intent and
-  approved dependent-edge snapshot; cancellation clears both. Claims recheck
-  under the writer fence and refuse new dependents or any nonterminal creation
-  or migration journal, with an audit event and refusal metric. Logical-only
-  children remain nonblocking; old pending records acquire no override.
-- Support deleting wrapped children by erasing their stored envelopes. Approved
-  parent destruction leaves dependent keys and envelopes alone, records affected
-  versions in fresh `wrapping_parent_destroyed_versions` metadata on key
-  responses, and makes subsequent opens fail with `wrapping parent destroyed`.
-  The assurance covers KeyRack's own keys, versions, wrapped edges and journals;
-  physical storage copies and externally retained material remain outside it.
-
-- Destruction claims persist dependent-loss status before provider deletion and
-  recover incomplete operations after restart using the same frozen handles.
-  Confirmed provider-key absence permits completion; deferred and retried
-  operations are audited. Loss markers match current wrapping parent bindings.
-
-- Preserve `WrappingParentDestroyed` in the direct REST error mapper. Destruction
-  audit records distinguish provider-confirmed absence from ordinary success;
-  resumed attempts are no longer themselves classified as errors. Document
-  PKCS#11's session-visible label-search limit for absence confirmation.
+- Disabled-source wrapped-key maintenance is implemented in draft #72 but held
+  until after the 0.5.0 tag, targeting the first release after 0.5.0. Do not
+  re-enable a disabled source as a maintenance workaround.
+- Nested-parent moves with grandchildren are deferred to 0.6.0. Both wrapping
+  parents must currently be eligible unparented resident keys; cycles and
+  self-parenting remain refused.
+- Managed-key cross-provider/cross-security-domain unwrap or migration is not
+  implemented. RewrapKey never rewrites application ciphertext.
+- Wrapped-key raw export remains refused. The worker remains a provisional
+  harness not used by the service. Software-provider resident material remains
+  process-memory-only; persistent metadata alone does not make it durable.
 
 ## [0.4.0] — 2026-08-30
 

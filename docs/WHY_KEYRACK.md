@@ -56,10 +56,13 @@ Switch providers without changing application code. Your key hierarchy, policies
 Tenants provision their own supported crypto backend. KeyRack tracks
 parent-child relationships on top. These do not establish a root → KEK → DEK
 wrapping chain on a tenant backend: wrapped children are created only under a
-`wrapping:` profile, a profile may only name a platform-custody provider, and
-the only mechanism in 0.5.0 is software, which unwraps the child into service
-memory. Native PKCS#11 wrapping is not reachable through the service, for any
-token, SoftHSM included. The backend relationship operates in one of two modes:
+`wrapping:` profile, and a profile may only name a platform-custody provider.
+The software AES-GCM profile unwraps into service memory. The experimental
+opt-in [context-derived PKCS#11 profile](OPERATOR.md#experimental-context-derived-wrapping-profile)
+uses temporary token objects and is tested with SoftHSM 2.7.0. SoftHSM provides
+no hardware custody, and the construction is not formally verified. Neither
+profile enables customer-custody wrapping. The backend relationship operates in
+one of two modes:
 
 - **Custody / managed mode** — the database or application uses server-side Encrypt/Decrypt via KMIP; key material never leaves the HSM or Vault (e.g. MongoDB KMIP default). KeyRack holds only opaque handles.
 - **Sovereign / keystore mode** — for appliances that pull raw keys (MySQL/Percona, vSphere), KeyRack serves an exportable key. Material intentionally leaves the backend, so the value proposition is governance (hierarchy, policy, audit, per-key exportability), not "keys never leave."
@@ -136,9 +139,10 @@ implementation; pointing them at the Core service is not sufficient.
 The service records ancestry and enforces lifecycle checks along it. The
 following is a logical layout, not a shipped wrapping chain. `CreateKey` with a
 parent creates a wrapped child only under a `wrapping:` profile on a
-platform-custody provider, and only one level deep; in 0.5.0 the only mechanism
-is software, which unwraps the child into service memory for each use, so it is
-not custody. Without a profile, `CreateKey` with a parent is refused, and keys
+platform-custody provider, and only one level deep. The software AES-GCM profile
+unwraps into service memory; the experimental opt-in context-derived PKCS#11
+profile uses temporary token objects and is tested with SoftHSM 2.7.0. Neither
+establishes hardware custody; the native construction is not formally verified. Without a profile, `CreateKey` with a parent is refused, and keys
 created before 0.5.0 that name a parent are refused as wrapping parents. How a
 child's use lease is closed, including on cancellation, is stated in
 [Using a child](KEY_MATERIAL_REPRESENTATION.md#using-a-child).

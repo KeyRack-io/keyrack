@@ -49,12 +49,14 @@ rotation tooling. The capability gap is universal.
 **Key Lifecycle Coordination**
 - Key hierarchies with parent-child dependency tracking. A parent on `CreateKey`
   creates a child wrapped under it: one level, opt-in through a `wrapping:`
-  profile on a platform-custody provider. The only mechanism in 0.5.0 is the
-  software one, which unwraps the child into service memory for each use, so
-  this is not KEK-wrapped custody. Without a profile, `CreateKey` with a parent
-  is refused; keys created before 0.5.0 that name a parent are refused as
-  wrapping parents. Native PKCS#11 wrapping is not reachable through the
-  service, for any token, SoftHSM included. How a child's use lease is closed,
+  profile on a platform-custody provider. The software AES-GCM profile unwraps
+  the child into service memory. The experimental opt-in
+  [context-derived PKCS#11 profile](OPERATOR.md#experimental-context-derived-wrapping-profile)
+  uses temporary token objects and is tested with SoftHSM 2.7.0; this software
+  token provides no hardware custody, and the construction is not formally
+  verified. Without a profile, `CreateKey` with a parent is refused; keys created
+  before 0.5.0 that name a parent are refused as wrapping parents. How a child's
+  use lease is closed,
   including on cancellation, is stated in
   [Using a child](KEY_MATERIAL_REPRESENTATION.md#using-a-child).
 - Content-addressed key identity via Logical IDs (LIDs)

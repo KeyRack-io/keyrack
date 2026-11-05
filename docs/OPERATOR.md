@@ -386,10 +386,19 @@ Parent admission checks the exact resident object and its attributes, including
 AES-256, derive-only permissions, sensitivity, non-extractability and refusal to
 read `CKA_VALUE`. It does not prove which client originally created the object;
 an externally provisioned parent with those exact attributes is also accepted.
-Configuration validation alone does not qualify a token: startup must also
-complete the native derive/wrap/unwrap self-test, reject a wrong context, and
+The profile currently admits only a module whose manufacturer identifies
+SoftHSM and whose reported library version is 2.7; conformance pins SoftHSM
+2.7.0. Older SoftHSM versions and hardware modules are refused. Configuration
+validation alone does not qualify a token: startup must also complete the
+native derive/wrap/unwrap self-test, reject a wrong context, and
 read back `Sensitive=true` and `Extractable=false` on derived KEKs and opened
 children before declaring the capability. A failed self-test refuses startup.
+
+This profile is experimental in 0.5.0, not formally verified. Functional and
+adversarial conformance, startup checks and local cleanup observations do not
+prove the complete construction or establish hardware custody. Formal proof and
+further profile qualification continue after the release; they are not implied
+by enabling this configuration.
 
 The mechanism hashes the complete canonical wrapping context, with a versioned
 domain separator, into 32 bytes. The token applies AES-CBC encrypt-data with a

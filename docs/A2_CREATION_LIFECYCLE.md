@@ -1,10 +1,13 @@
 # A2 creation lifecycle driver
 
-`keyrack_core::creation_driver` implements unregistered orchestration for the
-[A2 storage protocol](A2_CREATION_STORAGE.md). It does **not** qualify a provider,
-enable hierarchy creation in REST/gRPC, or implement cross-provider transport.
-No runtime implementation of `A2CreationProvider` is installed. Its SQLite tests
-use a scripted, non-cryptographic provider; they test orchestration only.
+`keyrack_core::creation_driver` implements orchestration for the
+[A2 storage protocol](A2_CREATION_STORAGE.md). The service uses it through
+`WrappingCreationProvider` for wrapped-child creation and rotation under an
+explicitly activated profile. This does not qualify a provider or implement
+cross-provider transport. The driver's SQLite tests use a scripted,
+non-cryptographic provider; they test orchestration only. Native profile support
+and qualification limits are described in the
+[operator guide](OPERATOR.md#experimental-context-derived-wrapping-profile).
 
 ## Implemented sequence
 
@@ -70,17 +73,18 @@ The accepted shared custody codecs and frozen material/wrapping types are unchan
 The storage/integration are trusted here. The dispatch bit, owner identity and
 unkeyed digest are not authorization, cryptographic evidence or protection against
 a malicious coordinator/database administrator. The preflight-to-publish sequence
-is not an atomic distributed revocation barrier. Full authority/lease/result-release
-and fencing semantics remain activation requirements.
+is not an atomic distributed revocation barrier. Full external
+authority/lease/result-release and fencing semantics remain requirements for the
+stronger custody contract; the experimental service profile does not establish them.
 
-Service activation also requires dependency-aware fencing **before destructive
-provider effects**, complete per-version lifecycle, recursive resolution and
-cache invalidation. Current ordinary deletion workers can call provider Destroy
-before guarded metadata updates; the storage guard alone cannot protect a parent
-already destroyed that way. The service caching wrapper does not support these
-creation transactions. The PostgreSQL global write lock is a correctness-first
-choice, not cloud-scale performance evidence. See storage documentation for the
-intentional experimental-journal upgrade incompatibility.
+The service supplies dependency-aware fencing
+[before destructive provider effects](DESTRUCTION_FENCING.md), and the cache
+wrapper delegates creation transactions to storage. These service integrations
+need their own conformance evidence; they are not established by the scripted
+driver tests. Recursive wrapping remains unsupported. The PostgreSQL global write
+lock is a correctness-first choice, not cloud-scale performance evidence. See
+storage documentation for the intentional experimental-journal upgrade
+incompatibility.
 
 ## Executable checks
 

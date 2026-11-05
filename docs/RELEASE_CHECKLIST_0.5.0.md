@@ -1,6 +1,7 @@
 # KeyRack 0.5.0 release checklist
 
-Draft prepared on 2026-11-04; updated 2026-11-05. An unchecked item is work still to verify, not
+Release preparation on [#75](https://github.com/KeyRack-io/keyrack/pull/75),
+updated 2026-11-05. An unchecked item is work still to verify, not
 evidence of a passing gate. This document does not cut a release, create a tag,
 or qualify an experimental provider profile. Follow [Releasing KeyRack](RELEASING.md)
 for the release workflow.
@@ -21,120 +22,134 @@ Later main merges must be tracked separately from that baseline:
 | [#68: wrapped-child rotation](https://github.com/KeyRack-io/keyrack/pull/68) | `994dfc0c3341260adc6ded8ac3764b29fcbf3ddf` | Creation-journal rotation, retained-version behavior, migration fences and `rotation-fence-controls`. |
 | [#69: dependency-aware deletion](https://github.com/KeyRack-io/keyrack/pull/69) | `07f65ec918a443b3d9cf8ab2e14a78d67bed33b1` | Persisted explicit data-loss approval, claim-time rechecks, destruction recovery and `deletion-refusal-controls`. |
 
-- [ ] Record the full proposed release commit and tree SHA, included PRs and
-  remaining dependencies. Verify ancestry from `2c93cfa`, and explicitly verify
-  inclusion of #68 and #69 rather than attributing them to #66.
-- [ ] Resolve the experimental native wrapping inclusion gate before release.
-  At `2c93cfa`, service wrapping supports the software mechanism only. A probe,
-  branch implementation or planned qualification is not merged release support.
-- [ ] Recheck the final source, generated API inventory and public docs together
-  after the remaining merges. Preserve the distinctions between software wrapping,
-  experimental native wrapping, the worker harness and cross-provider unwrap.
+The release branch now includes main at
+[`01347a4f771260bc13322de386e7460fb938325b`](https://github.com/KeyRack-io/keyrack/commit/01347a4f771260bc13322de386e7460fb938325b),
+the merge of [#65](https://github.com/KeyRack-io/keyrack/pull/65). It includes
+#63–#71, #73 and #74. Draft #72 remains excluded and held until after the tag.
+The final PR head, tree, check runs and manual receipts are recorded on #75;
+this source document does not claim that its own commit is the eventual tag.
+
+- [x] Verify ancestry from `2c93cfa`, including the distinct #68/#69 merges.
+- [x] Resolve native inclusion: #65 is merged. The explicit experimental
+  `pkcs11:aes256-cbc-sha256-kw:v1` profile is in scope with its qualification
+  limits; it is not hardware custody or formal verification.
+- [x] Review final source and public support claims together, distinguishing
+  software wrapping, experimental native wrapping, the worker harness and
+  unimplemented cross-provider managed-key migration.
+- [ ] Record the final release commit/tree and exact-source evidence after merge.
 
 ## Consolidate the changelog and upgrade guidance
 
-- [ ] Consolidate `[Unreleased]` into a readable 0.5.0 account of final behavior.
+- [x] Consolidate `[Unreleased]` into a readable 0.5.0 account of final behavior.
   Group overlapping implementation entries; remove intermediate descriptions that
   the final merged code supersedes. Set the release date only when cutting the
   release and retain an empty `[Unreleased]` section for subsequent changes.
-- [ ] Account for [#70](https://github.com/KeyRack-io/keyrack/pull/70) through
+- [x] Account for [#70](https://github.com/KeyRack-io/keyrack/pull/70) through
   [#74](https://github.com/KeyRack-io/keyrack/pull/74) explicitly in the
   consolidation: #70 clarifies destruction recovery audit outcomes;
   [#71](https://github.com/KeyRack-io/keyrack/pull/71) guards resident rotation,
   audits panics and cleans up unpublished keys after a known OCC refusal;
   #74 fixes custody-proof initialization retries and stops on prerequisite
   failure without reducing its assertions. Verify the included merge commits.
-- [ ] Keep [draft #72](https://github.com/KeyRack-io/keyrack/pull/72),
+- [x] Keep [draft #72](https://github.com/KeyRack-io/keyrack/pull/72),
   disabled-source wrapped-key maintenance, out of the 0.5.0 changelog's delivered
   features and out of the release commit. It is implemented for the first release
   after 0.5.0 and held until after the tag; do not suggest temporary re-enablement
   as a maintenance workaround.
-- [ ] Document [#73](https://github.com/KeyRack-io/keyrack/pull/73)'s temporary
+- [x] Document [#73](https://github.com/KeyRack-io/keyrack/pull/73)'s temporary
   `RUSTSEC-2026-0441` exception: the unmaintained `pin-utils@0.1.0` dependency is
   transitive through the AWS SDK (`aws-config`/Smithy) in `keyrack-aws-proxy`.
   Record the advisory-specific scope and removal condition. After 0.5.0, check
   for a contained AWS SDK upgrade that removes `pin-utils`, then remove the
   exception and rerun dependency-policy controls. Do not present the exception
   as an advisory fix or a global policy relaxation.
-- [ ] Describe wrapped-child creation, all-version `RewrapKey`/reparenting,
+- [x] Describe wrapped-child creation, all-version `RewrapKey`/reparenting,
   wrapped-child rotation and dependency-aware deletion separately. Explain that
   parent rotation does not itself migrate old child envelopes. Replace the
   earlier unconditional schedule-refusal description with the final #69 approval
   and snapshot contract if that merge is included.
-- [ ] Retain the explicit `lifecycle_state` and `has_compromise_history` addition,
+- [x] Retain the explicit `lifecycle_state` and `has_compromise_history` addition,
   the deprecated version `state` compatibility meaning, and the unchanged
   enforcement rules. Link [SPEC §7.2](SPEC.md#72-valid-transitions), including the
   distinction between verification, decrypt and raw export.
-- [ ] Retain actionable breaking-change guidance for Vault AAD and the bounded
+- [x] Retain actionable breaking-change guidance for Vault AAD and the bounded
   connection/request timeouts. Reconcile dependency updates, TLS trust changes,
   and ECDSA compatibility evidence with the final lockfile and security checks.
-- [ ] State supported storage/provider combinations, experimental-journal upgrade
+- [x] State supported storage/provider combinations, experimental-journal upgrade
   constraints, recovery limits and unsupported combinations. Do not describe
   software wrapping as token custody or worker code as service integration.
   Cross-provider unwrap remains outside 0.5.0.
-- [ ] Verify the eighteen intended workspace crates remain at 0.5.0 and preserve
-  the intentional unpublished-package exceptions recorded in the changelog.
-  Check lockfiles, image examples, SDK examples and vendored protos against the
-  final source; recompile consumers of changed protobuf definitions.
-- [ ] Run the documentation/source claim and SDK contract checks from
+- [x] Verify the eighteen intended workspace crates are already at 0.5.0;
+  preserve six unpublished tooling/example exceptions. Align all four lockfiles,
+  including the E2E lockfile's stale package entry. No second version bump is needed.
+- [ ] Recompile commercial consumers of the final protobuf definitions before tagging.
+- [ ] Retain exact-head documentation/source claim and SDK contract checks from
   [`release-doc-sdk.yml`](../.github/workflows/release-doc-sdk.yml), and regenerate
   the API inventory through the existing surface-parity workflow. Review public
   text for names or details that belong only in private integration records.
 
 ## Document the experimental native opt-in
 
-This section is a release dependency, not an announcement that the profile has
-shipped. The inspected candidate is
-[`078f8f5c4ba4f55979f85065fc381a63a1298cbd`](https://github.com/KeyRack-io/keyrack/commit/078f8f5c4ba4f55979f85065fc381a63a1298cbd)
-on `feat/softhsm-context-wrapping`. Its
-[operator documentation](https://github.com/KeyRack-io/keyrack/blob/078f8f5c4ba4f55979f85065fc381a63a1298cbd/docs/OPERATOR.md#experimental-context-derived-wrapping-profile)
-describes a configuration opt-in. Its service manifest does not define a
-separate experimental Cargo feature. Recheck the merged implementation before
-publishing build or configuration instructions.
+The implementation merged in #65 at `01347a4` is included. The
+[operator guide](OPERATOR.md#experimental-context-derived-wrapping-profile)
+documents the runtime configuration opt-in; there is no separate experimental
+Cargo feature. Qualification is restricted to SoftHSM 2.7.0. The pinned native
+fixture and its negative controls are distinct from the ordinary distribution
+SoftHSM persistence image, which does not establish native-profile qualification.
 
-- [ ] Record the reviewed native implementation merge and qualification evidence
-  for the exact release candidate. Publish its experimental status, supported
+- [x] Record the reviewed native implementation merge (#65, `01347a4`);
+  require fresh exact-candidate qualification evidence in the validation gates.
+  Publish its experimental status, supported
   token/module/version and algorithms, and unresolved limitations. SoftHSM is a
   software token; its qualification does not establish hardware custody or
   qualify another token.
-- [ ] Check every 0.5.0 document, changelog entry, example and support claim for
+- [x] Check every 0.5.0 document, changelog entry, example and support claim for
   assertions that the experimental native profile is formally verified or
   hardware-custodied. Neither claim is supported by this release: formal proof
   work continues after 0.5.0, and SoftHSM qualification does not establish
   hardware custody. Keep functional conformance results distinct from those
   claims.
-- [ ] Document every actual build and runtime gate. If the final implementation
+- [x] Document every actual build and runtime gate. If the final implementation
   adds a Cargo feature, record its exact name, default status and image build
   setting. Do not invent a feature flag or imply that compiling the provider
   enables native wrapping automatically.
-- [ ] Verify the opt-in example selects the exact mechanism
+- [x] Verify the opt-in example selects the exact mechanism
   `pkcs11:aes256-cbc-sha256-kw:v1` in a `wrapping:` entry with an explicit
-  `security_domain`, bound to a dedicated named PKCS#11 provider. The candidate
+  `security_domain`, bound to a dedicated named PKCS#11 provider. The implementation
   requires that provider to be non-default; ordinary keys use a separate provider
   entry even on the same token. Document refusal of explicit/implicit default and
   legacy single-provider configurations that violate this constraint.
-- [ ] Document the candidate's AES-256 derive-only resident roots and AES-128/256
+- [x] Document the implementation's AES-256 derive-only resident roots and AES-128/256
   children, same-provider/security-domain restriction, context-derived KEK and
   no-fallback behavior. Do not broaden these into generic PKCS#11 or asymmetric
   wrapping support without new evidence.
-- [ ] Require startup qualification to succeed for the configured token: native
+- [x] Require startup qualification to succeed for the configured token: native
   derive/wrap/unwrap, wrong-context rejection, and sensitive/non-extractable
   derived KEKs and opened children. Record refusal behavior when qualification
   fails; keep the self-test's temporary objects session-only.
-- [ ] Retain the construction assumptions and limits from the reviewed design:
+- [x] Retain the construction assumptions and limits from the reviewed design:
   context binding is supplied by derivation, not plain AES-KW AAD; it is not an
   SP 800-108 or 256-bit PRF claim. Retain the raw-token-PIN trust assumption and
   absence of qualified hardware tokens.
-- [ ] Verify and document operational limits from the final code: finite ownership
+- [x] Verify and document operational limits from the final code: finite ownership
   ledger capacity and restart behavior, module-wide refusal after unconfirmed
   session closure, bounded leases, and unresolved creation evidence. Restart
   must not be described as reconstructing verified closure.
-- [ ] Update changelog, operator guide, configuration examples and support matrix
+- [x] Update changelog, operator guide, configuration examples and support matrix
   together. Preserve ordinary SoftHSM key support while accurately distinguishing
   the experimental child-wrapping profile from the existing mechanism probe and
   persistent SoftHSM deployment profile.
 
 ## Validate the release candidate
+
+Preparation checks run locally: full locked workspace tests, Format and Clippy.
+The SDK removal controls must reject all four absent methods and accept all four
+restoration controls. The documentation controls deliberately reintroduce retired
+claims and remove their guards. Environment-dependent native and PostgreSQL tests
+require the corresponding CI lanes; ignored local tests are not qualified results.
+CI status and run URLs for the exact head belong in #75's execution receipt below
+its description; all pre-merge gates must pass before merge. Remaining main/tag
+steps are intentionally unchecked until owner-authorized release work.
 
 - [ ] Record successful Check, Test, Clippy and Format jobs, dependency/security
   checks, release documentation/SDK checks and REST/gRPC surface parity for the
@@ -147,9 +162,11 @@ publishing build or configuration instructions.
   deliberate regression to fail for its intended reason and the restored source
   to pass.
 - [ ] Record the experimental native profile's own qualification and integration
-  results on the final candidate. General CI, the old mechanism probe, software
+  results on the final candidate. General CI, a pre-#65 mechanism-only probe, software
   migration tests and ordinary-key SoftHSM persistence tests do not substitute
-  for that profile's evidence.
+  for that profile's evidence. In current CI the expanded native lane is still
+  named **SoftHSM wrapping mechanism probe**: retain its pinned build manifest,
+  seven native service tests and context-binding negative control.
 - [ ] Use the `release` label on the release PR and retain the full demo E2E and
   native amd64/arm64 image-build results. Complete the manual Demo 07 check
   described in [Releasing KeyRack](RELEASING.md#demo-coverage-model).
@@ -159,7 +176,8 @@ publishing build or configuration instructions.
 
 ## Re-pin #66 evidence to the eventual release
 
-Complete this handoff when the release is authorized and the tag exists. Preserve
+Complete this handoff only after owner authorization and an existing `v0.5.0`
+tag. Do not create a tag as part of #75 preparation. Preserve
 the `2c93cfa` baseline and historical receipts; do not replace their commit or run
 identifiers with release identifiers.
 

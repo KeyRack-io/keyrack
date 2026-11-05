@@ -125,14 +125,17 @@ establish wrapping.
 From 0.5.0, `CreateKey.parent_key_id` creates a wrapped child: one level of
 wrapping, under an independently resident parent (a wrapped key cannot itself
 wrap children). It is opt-in per provider through a `wrapping:` profile, and a
-profile may only name a platform-custody provider. The only mechanism in this
-release is the software one, `software:aes-256-gcm:v1`, which unwraps the child
-into service memory for each use: the hierarchy has the shape of key wrapping,
-not custody. Two consequences are breaking: `CreateKey` with a parent is refused
+profile may only name a platform-custody provider. The
+`software:aes-256-gcm:v1` mechanism unwraps the child into service memory. The
+experimental opt-in `pkcs11:aes256-cbc-sha256-kw:v1` mechanism uses temporary
+token objects and is tested with SoftHSM 2.7.0. Neither provides hardware
+custody; the native construction is not formally verified. Two consequences are
+breaking: `CreateKey` with a parent is refused
 on any provider without a profile, and keys created before 0.5.0 that name a
-parent are refused as wrapping parents (and listed at startup). Native PKCS#11
-wrapping is not reachable through the service in 0.5.0, for any token, SoftHSM
-included. See [Key-version material
+parent are refused as wrapping parents (and listed at startup). Native activation
+requires a dedicated non-default provider entry and a successful startup
+self-test; see the [operator configuration](OPERATOR.md#experimental-context-derived-wrapping-profile).
+See [Key-version material
 representation](KEY_MATERIAL_REPRESENTATION.md#creating-a-child).
 
 Wrapped material is opened for the call and closed before a normal return, on
