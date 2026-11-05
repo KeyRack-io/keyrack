@@ -72,6 +72,47 @@ pub struct AliasRecord {
 /// Each method documents its OCC and error semantics.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    /// Read all destruction blockers in one consistent storage snapshot. Count
+    /// material versions and all parent/child creation journal rows, not logical
+    /// parent links. This is advisory: claim MUST recheck under its writer fence.
+    /// Unsupported implementations fail closed, never return empty counts.
+    async fn destruction_dependencies(
+        &self,
+        _lid: &Lid,
+    ) -> Result<crate::destruction::DestructionDependencies> {
+        Err(crate::destruction::invalid("dependency query unsupported"))
+    }
+    /// Atomically schedule with a server-observed approved dependency snapshot.
+    /// The logical-only child count comes from that same fenced observation.
+    async fn schedule_destruction(
+        &self,
+        _lid: &Lid,
+        _expected_occ: u64,
+        _at: chrono::DateTime<chrono::Utc>,
+        _allow: bool,
+    ) -> Result<crate::destruction::ScheduledDeletion> {
+        Err(crate::destruction::invalid("atomic scheduling unsupported"))
+    }
+    async fn cancel_destruction(&self, _lid: &Lid, _expected_occ: u64) -> Result<KeyRecord> {
+        Err(crate::destruction::invalid(
+            "atomic cancellation unsupported",
+        ))
+    }
+    async fn deletion_intent(
+        &self,
+        _lid: &Lid,
+    ) -> Result<Option<crate::destruction::DeletionIntent>> {
+        Err(crate::destruction::invalid("deletion intent unsupported"))
+    }
+    async fn destroyed_wrapping_parents(
+        &self,
+        _lid: &Lid,
+    ) -> Result<Vec<crate::destruction::DestroyedWrappingParent>> {
+        Err(crate::destruction::invalid(
+            "wrapping parent status unsupported",
+        ))
+    }
+
     /// Migration methods are atomic writer-fenced transactions. Unsupported backends fail closed.
     async fn reserve_migration(
         &self,
@@ -163,23 +204,12 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
-    /// Read all destruction blockers in one consistent storage snapshot. Count
-    /// material versions, all parent/child creation journal rows, and nonterminal
-    /// migrations naming the key as child/source/target, not logical parent links.
-    /// This is advisory: claim MUST recheck under its writer fence.
-    /// Unsupported implementations fail closed, never return empty counts.
-    async fn destruction_dependencies(
-        &self,
-        _lid: &Lid,
-    ) -> Result<crate::destruction::DestructionDependencies> {
-        Err(crate::destruction::invalid("dependency query unsupported"))
-    }
-
-    /// Commit a one-shot resident destruction fence before any provider effect.
-    /// Re-read state, due time, OCC and full material history in the transaction;
-    /// reject creation references and nonterminal migration participants. All
-    /// writers must honor the fence. None means already claimed, NEVER permission to dispatch again.
-    /// A commit/response failure is ambiguous and must not be retried as work.
+    /// Commit the destruction fence and dependent loss markers before effects.
+    /// Re-read state, due time, OCC and full material history in the transaction.
+    /// Existing incomplete journals resume the same operation and frozen material
+    /// snapshot at the current OCC; stale scans and completed operations return
+    /// None. All writers honor the permanent fence. Provider deletes must be
+    /// idempotent, including an already-absent key.
     async fn claim_destruction(
         &self,
         _lid: &Lid,
@@ -192,7 +222,8 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Atomically publish Destroyed for the exact claim after ALL provider
-    /// destroys succeeded. Consume the ticket; errors retain the durable fence.
+    /// destroys succeeded. Repeated completion of the same operation is
+    /// idempotent; errors retain the durable fence for a later worker pass.
     /// This is a trusted service/storage boundary, not external authorization.
     async fn complete_destruction(
         &self,
@@ -286,6 +317,39 @@ pub trait StorageBackend: Send + Sync {
         _after: Option<uuid::Uuid>,
         _limit: u32,
     ) -> Result<crate::creation::CreationPage> {
+        Err(crate::creation::invalid(
+            "transactional creation unsupported",
+        ))
+    }
+    /// Every nonterminal creation of a new version of `child`, read from the
+    /// recovery pages. A read, not a reservation: the answer can be stale by
+    /// the time it is used, and every writer still rechecks under its lock.
+    async fn pending_creations(
+        &self,
+        child: &Lid,
+    ) -> Result<Vec<crate::creation::CreationJournal>> {
+        let mut found = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .recoverable_creations(after, crate::creation::MAX_CREATION_PAGE_SIZE)
+                .await?;
+            found.extend(
+                page.items
+                    .into_iter()
+                    .filter(|journal| journal.request.record.lid == *child),
+            );
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => return Ok(found),
+            }
+        }
+    }
+    /// Remove a nonterminal entry that [`crate::creation::CreationJournal::withdrawable`]
+    /// admits, under the writer transaction, from any owner. Withdrawing an
+    /// entry that is already gone succeeds; one that still owes cleanup, or is
+    /// committed, is refused and left as it was.
+    async fn withdraw_creation(&self, _operation: uuid::Uuid) -> Result<()> {
         Err(crate::creation::invalid(
             "transactional creation unsupported",
         ))

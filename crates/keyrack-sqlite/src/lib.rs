@@ -86,9 +86,17 @@ impl SqliteStorage {
             .map_err(|e| map_sql(&e))?;
         conn.execute_batch(creation::SCHEMA)
             .map_err(|e| map_sql(&e))?;
-        Ok(Self {
+        let storage = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        // Explicit, idempotent deletion-intent migration under the same writer
+        // fence used by all key and journal mutations. Existing schedules have
+        // no approval row and therefore retain the fail-closed default.
+        storage.creation_tx(|conn| {
+            conn.execute_batch(destruction::SCHEMA)
+                .map_err(|e| map_sql(&e))
+        })?;
+        Ok(storage)
     }
 
     /// Create an in-memory database (tests / ephemeral use).
@@ -101,9 +109,17 @@ impl SqliteStorage {
             .map_err(|e| map_sql(&e))?;
         conn.execute_batch(creation::SCHEMA)
             .map_err(|e| map_sql(&e))?;
-        Ok(Self {
+        let storage = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        // Explicit, idempotent deletion-intent migration under the same writer
+        // fence used by all key and journal mutations. Existing schedules have
+        // no approval row and therefore retain the fail-closed default.
+        storage.creation_tx(|conn| {
+            conn.execute_batch(destruction::SCHEMA)
+                .map_err(|e| map_sql(&e))
+        })?;
+        Ok(storage)
     }
 
     fn with_conn<F, R>(&self, f: F) -> Result<R>
@@ -133,6 +149,37 @@ fn state_to_string(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for SqliteStorage {
+    async fn schedule_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        allow: bool,
+    ) -> Result<keyrack_core::destruction::ScheduledDeletion> {
+        self.destruction_schedule(lid, expected_occ, at, allow)
+    }
+    async fn cancel_destruction(&self, lid: &Lid, expected_occ: u64) -> Result<KeyRecord> {
+        self.destruction_cancel(lid, expected_occ)
+    }
+    async fn deletion_intent(
+        &self,
+        lid: &Lid,
+    ) -> Result<Option<keyrack_core::destruction::DeletionIntent>> {
+        self.destruction_intent(lid)
+    }
+    async fn destroyed_wrapping_parents(
+        &self,
+        lid: &Lid,
+    ) -> Result<Vec<keyrack_core::destruction::DestroyedWrappingParent>> {
+        self.destruction_parent_markers(lid)
+    }
+
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        self.destruction_dependency_counts(lid)
+    }
     async fn reserve_migration(
         &self,
         request: &keyrack_core::migration::MigrationRequest,
@@ -192,13 +239,6 @@ impl StorageBackend for SqliteStorage {
     }
     async fn check_migration_fence(&self, lid: &Lid) -> Result<()> {
         self.with_conn(|conn| migration::guard(conn, lid))
-    }
-
-    async fn destruction_dependencies(
-        &self,
-        lid: &Lid,
-    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
-        self.destruction_dependency_counts(lid)
     }
 
     async fn claim_destruction(
@@ -278,6 +318,9 @@ impl StorageBackend for SqliteStorage {
         limit: u32,
     ) -> Result<keyrack_core::creation::CreationPage> {
         self.recover_a2(after, limit)
+    }
+    async fn withdraw_creation(&self, operation: uuid::Uuid) -> Result<()> {
+        self.withdraw_a2(operation)
     }
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {

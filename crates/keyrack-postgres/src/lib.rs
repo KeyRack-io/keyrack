@@ -138,6 +138,10 @@ async fn initialize_schema(pool: &PgPool) -> Result<()> {
         .execute(migration::SCHEMA)
         .await
         .map_err(|e| KeyRackError::Storage(format!("migration schema: {e}")))?;
+    (&mut *transaction)
+        .execute(destruction::SCHEMA)
+        .await
+        .map_err(|e| KeyRackError::Storage(format!("deletion schema: {e}")))?;
     transaction
         .commit()
         .await
@@ -155,6 +159,37 @@ fn state_str(state: RotationJobState) -> Result<String> {
 #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[async_trait]
 impl StorageBackend for PostgresStorage {
+    async fn destruction_dependencies(
+        &self,
+        lid: &Lid,
+    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
+        self.destruction_dependency_counts(lid).await
+    }
+    async fn schedule_destruction(
+        &self,
+        lid: &Lid,
+        expected_occ: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        allow: bool,
+    ) -> Result<keyrack_core::destruction::ScheduledDeletion> {
+        self.destruction_schedule(lid, expected_occ, at, allow)
+            .await
+    }
+    async fn cancel_destruction(&self, lid: &Lid, expected_occ: u64) -> Result<KeyRecord> {
+        self.destruction_cancel(lid, expected_occ).await
+    }
+    async fn deletion_intent(
+        &self,
+        lid: &Lid,
+    ) -> Result<Option<keyrack_core::destruction::DeletionIntent>> {
+        self.destruction_intent(lid).await
+    }
+    async fn destroyed_wrapping_parents(
+        &self,
+        lid: &Lid,
+    ) -> Result<Vec<keyrack_core::destruction::DestroyedWrappingParent>> {
+        self.destruction_parent_status(lid).await
+    }
     async fn reserve_migration(
         &self,
         request: &keyrack_core::migration::MigrationRequest,
@@ -220,13 +255,6 @@ impl StorageBackend for PostgresStorage {
             .await
             .map_err(creation::database_error)?;
         migration::guard(&mut connection, lid).await
-    }
-
-    async fn destruction_dependencies(
-        &self,
-        lid: &Lid,
-    ) -> Result<keyrack_core::destruction::DestructionDependencies> {
-        self.destruction_dependency_counts(lid).await
     }
 
     async fn claim_destruction(
@@ -306,6 +334,10 @@ impl StorageBackend for PostgresStorage {
 
     async fn recoverable_creations(&self, after: Option<Uuid>, limit: u32) -> Result<CreationPage> {
         self.creation_recoverable(after, limit).await
+    }
+
+    async fn withdraw_creation(&self, operation: Uuid) -> Result<()> {
+        self.creation_withdraw(operation).await
     }
 
     async fn create_key(&self, record: &KeyRecord) -> Result<()> {

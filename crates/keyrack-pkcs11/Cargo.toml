@@ -1,7 +1,7 @@
 [package]
 name = "keyrack-pkcs11"
 version = "0.5.0"
-description = "KeyRack PKCS#11 provider for hardware HSMs"
+description = "KeyRack provider for PKCS#11 tokens"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,8 +22,12 @@ tokio = { workspace = true }
 cryptoki = "0.12"
 uuid = { workspace = true }
 zeroize = "1"
+sha2 = "0.10"
+blake3 = "1"
 
 [dev-dependencies]
+aes = "0.8"
+aes-kw = "0.2"
 keyrack-test-support = { workspace = true }
 keyrack-sqlite = { workspace = true }
 

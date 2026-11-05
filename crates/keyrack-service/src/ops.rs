@@ -83,6 +83,11 @@ pub struct OpContext {
     re_encrypt_destination: Option<String>,
     // Bound only from a decoded version request, never caller metadata.
     requested_version: Option<u32>,
+    // Only bound from a decoded schedule request, never untrusted metadata.
+    allow_dependent_data_loss: bool,
+    approved_deletion_edges: std::sync::Arc<
+        std::sync::Mutex<Option<Vec<keyrack_core::destruction::DestructionDependent>>>,
+    >,
 }
 
 impl OpContext {
@@ -96,6 +101,28 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
+        }
+    }
+
+    /// Scheduling with dependent data loss requires both the ordinary action
+    /// and a separate permission on the same key, even when no dependents exist.
+    pub fn deletion_schedule(principal: Principal, key_id: &str, allow: bool) -> Self {
+        let mut ctx = Self::key(AuditAction::ScheduleKeyDeletion, principal, key_id);
+        ctx.allow_dependent_data_loss = allow;
+        ctx
+    }
+
+    /// Capture only the exact snapshot returned by committed storage admission.
+    pub fn deletion_snapshot_recorder(
+        &self,
+    ) -> impl FnOnce(Vec<keyrack_core::destruction::DestructionDependent>) + Send + 'static {
+        let captured = self.approved_deletion_edges.clone();
+        move |edges| {
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(edges);
         }
     }
 
@@ -150,6 +177,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -168,6 +197,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 
@@ -181,6 +212,8 @@ impl OpContext {
             request_id: new_request_id(),
             re_encrypt_destination: None,
             requested_version: None,
+            allow_dependent_data_loss: false,
+            approved_deletion_edges: Arc::default(),
         }
     }
 }
@@ -216,17 +249,134 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
+}
 
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
+/// [`execute`] for an operation whose effects must not stop halfway.
+///
+/// Once authorized, the operation and its audit outcome run in a task of their
+/// own: a caller that disconnects stops waiting, not the operation, and the
+/// outcome is still audited. A process crash can still leave the operation
+/// unaudited; what it committed is in storage.
+#[allow(clippy::result_large_err)]
+pub async fn execute_detached<F, Fut, T>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    op: F,
+) -> Result<T, tonic::Status>
+where
+    F: FnOnce(Arc<ServiceState>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>> + Send + 'static,
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
+
+    if let Err(denied) = authorize(state, &ctx).await {
+        emit_authorization_failure(state, &ctx, denied.code()).await;
+        record_authorization_failure(&ctx, denied.code(), start);
+        return Err(denied);
+    }
+
+    let operation = op(Arc::clone(state));
+    run_detached(state, ctx, start, operation, |status| {
+        status.message().to_owned()
+    })
+    .await
+    .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
+}
+
+/// Run an authorized operation and record its outcome in one task. `None` means
+/// the operation panicked, recorded as an error outcome, or the task was
+/// cancelled by runtime shutdown, recording nothing.
+async fn run_detached<T, E, Fut>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    start: Instant,
+    operation: Fut,
+    describe: fn(&E) -> String,
+) -> Option<Result<T, E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::spawn(async move { complete(&state, &ctx, start, operation, Some(describe)).await })
+        .await
+        .map_err(|error| tracing::error!(error = %error, "detached operation task failed"))
+        .ok()
+        .flatten()
+}
+
+/// Drive an authorized operation to its end and record its outcome. A panic
+/// is recorded as an error outcome and yields `None`, so no operation ends
+/// unaudited while the process runs.
+async fn complete<T, E, Fut>(
+    state: &Arc<ServiceState>,
+    ctx: &OpContext,
+    start: Instant,
+    operation: Fut,
+    describe: Option<fn(&E) -> String>,
+) -> Option<Result<T, E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let outcome = CatchUnwind(Box::pin(operation)).await;
+    let (audit_result, result_str) = match &outcome {
+        Ok(Ok(_)) => (AuditResult::Success, "success"),
+        Ok(Err(error)) => {
+            if let Some(describe) = describe {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    action = %ctx.action,
+                    resource = %ctx.resource_id,
+                    error = %describe(error),
+                    "op.failed"
+                );
+            }
+            (AuditResult::Error, "error")
+        }
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            tracing::error!(
+                request_id = %ctx.request_id,
+                action = %ctx.action,
+                resource = %ctx.resource_id,
+                panic = %message,
+                "op.panicked"
+            );
+            (AuditResult::Error, "error")
+        }
     };
-    emit_audit(state, &ctx, audit_result, None, None).await;
+    emit_audit(state, ctx, audit_result, None, None).await;
     crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
+    outcome.ok()
+}
 
-    result
+/// Resolves to `Err` with the payload if polling the inner future panics.
+struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
 }
 
 async fn emit_audit(
@@ -251,6 +401,18 @@ async fn emit_audit(
         result,
     )
     .with_request_id(ctx.request_id.clone());
+
+    if ctx.action == AuditAction::ScheduleKeyDeletion {
+        event.add_metadata("allow_dependent_data_loss", ctx.allow_dependent_data_loss);
+        if let Some(edges) = ctx
+            .approved_deletion_edges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            event.add_metadata("approved_dependents", serde_json::json!(edges));
+        }
+    }
 
     if let Some(code) = authorization_status {
         event.add_metadata("failure_phase", "authorization");
@@ -292,11 +454,10 @@ async fn authorize(state: &Arc<ServiceState>, ctx: &OpContext) -> Result<(), ton
     for (index, request) in authorization_requests(ctx)?.iter().enumerate() {
         if let Err(error) = authorize_request(state, request).await {
             if index == 1 {
-                // The executor also records the overall source operation as
-                // denied. Name the refused destination explicitly, without
-                // inventing a successful standalone Encrypt operation.
+                // Name the actual second permission that was refused. The
+                // executor also records the overall operation as denied.
                 let mut denied = OpContext::key(
-                    AuditAction::ReEncryptTo,
+                    request.action.clone(),
                     ctx.principal.clone(),
                     &request.resource.id,
                 );
@@ -329,6 +490,30 @@ fn authorization_requests(ctx: &OpContext) -> Result<Vec<AuthzRequest>, tonic::S
         },
         context: ctx.authorization_context()?,
     };
+    if ctx.allow_dependent_data_loss {
+        if ctx.action != AuditAction::ScheduleKeyDeletion || ctx.resource_type != "Key" {
+            return Err(tonic::Status::internal(
+                "invalid deletion authorization context",
+            ));
+        }
+        let mut override_request = request.clone();
+        override_request.action = AuditAction::ScheduleKeyDeletionWithDependentDataLoss;
+        override_request.request_id = new_request_id();
+        override_request.context.entries.insert(
+            "operation_request_id".into(),
+            keyrack_core::pdp::AttributeValue::String(ctx.request_id.clone()),
+        );
+        override_request.context.entries.insert(
+            "allow_dependent_data_loss".into(),
+            keyrack_core::pdp::AttributeValue::Bool(true),
+        );
+        return Ok(vec![request, override_request]);
+    }
+    if ctx.action == AuditAction::ScheduleKeyDeletionWithDependentDataLoss {
+        return Err(tonic::Status::internal(
+            "deletion override requires the schedule executor",
+        ));
+    }
     if ctx.action != AuditAction::ReEncryptFrom {
         if ctx.re_encrypt_destination.is_some() || ctx.action == AuditAction::ReEncryptTo {
             return Err(tonic::Status::internal(
@@ -708,17 +893,53 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(rest_operation_failed()))
+}
 
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
-    };
-    emit_audit(state, &ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
+fn rest_operation_failed() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    rest_error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+        "operation failed",
+    )
+}
 
-    result
+/// REST twin of [`execute_detached`].
+pub async fn execute_rest_detached<F, Fut, T>(
+    state: &Arc<ServiceState>,
+    ctx: OpContext,
+    op: F,
+) -> Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+where
+    F: FnOnce(Arc<ServiceState>) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<T, (axum::http::StatusCode, axum::Json<serde_json::Value>)>,
+        > + Send
+        + 'static,
+    T: Send + 'static,
+{
+    let start = Instant::now();
+    tracing::debug!(request_id = %ctx.request_id, action = %ctx.action, resource = %ctx.resource_id, "op.start");
+
+    if let Err(denied) = authorize_rest(state, &ctx).await {
+        let code = if denied.0 == axum::http::StatusCode::FORBIDDEN {
+            tonic::Code::PermissionDenied
+        } else {
+            tonic::Code::Internal
+        };
+        emit_authorization_failure(state, &ctx, code).await;
+        record_authorization_failure(&ctx, code, start);
+        return Err(denied);
+    }
+
+    let operation = op(Arc::clone(state));
+    run_detached(state, ctx, start, operation, |(code, body)| {
+        format!("{code}: {}", body.0)
+    })
+    .await
+    .unwrap_or_else(|| Err(rest_operation_failed()))
 }
 
 async fn authorize_rest(
@@ -762,6 +983,7 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::EnableKey
         | AuditAction::DisableKey
         | AuditAction::ScheduleKeyDeletion
+        | AuditAction::ScheduleKeyDeletionWithDependentDataLoss
         | AuditAction::CancelKeyDeletion
         | AuditAction::UpdateKey => EventType::KeyStateChanged,
         AuditAction::ReportKeyCompromise => EventType::KeyCompromised,
@@ -817,7 +1039,11 @@ fn event_type_for_action(action: &AuditAction) -> keyrack_core::audit::EventType
         | AuditAction::DescribeNamespace => EventType::NamespaceOperation,
 
         AuditAction::CascadeDisable => EventType::CascadeDisable,
-        AuditAction::KeyDestroyed | AuditAction::ProviderDestroyKey => EventType::KeyDeleted,
+        AuditAction::KeyDestroyed
+        | AuditAction::ProviderDestroyKey
+        | AuditAction::KeyDestructionRefused
+        | AuditAction::KeyDestructionRetried
+        | AuditAction::KeyDestructionDeferred => EventType::KeyDeleted,
         AuditAction::AccessSecret | AuditAction::GetKeyMaterial => EventType::SecretAccess,
         AuditAction::ScopeOwnerCheck => EventType::ScopeOwnerCheck,
         AuditAction::MakeKeyExportable | AuditAction::RevokeKeyExportability => {
@@ -849,11 +1075,15 @@ pub async fn authorize_with_resource_attrs(
     // two-key executor; neither a generic nor bound context can bypass it here.
     if matches!(
         ctx.action,
-        AuditAction::ReEncryptFrom | AuditAction::ReEncryptTo | AuditAction::RewrapKey
+        AuditAction::ReEncryptFrom
+            | AuditAction::ReEncryptTo
+            | AuditAction::RewrapKey
+            | AuditAction::ScheduleKeyDeletionWithDependentDataLoss
     ) || ctx.re_encrypt_destination.is_some()
+        || ctx.allow_dependent_data_loss
     {
         return Err(tonic::Status::internal(
-            "ReEncrypt requires the two-key executor",
+            "operation requires its dedicated authorization executor",
         ));
     }
     let request = AuthzRequest {
@@ -921,17 +1151,9 @@ where
         return Err(denied);
     }
 
-    let result = op(Arc::clone(state)).await;
-
-    let (audit_result, result_str) = if result.is_ok() {
-        (AuditResult::Success, "success")
-    } else {
-        (AuditResult::Error, "error")
-    };
-    emit_audit(state, &ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-
-    result
+    complete(state, &ctx, start, op(Arc::clone(state)), None)
+        .await
+        .unwrap_or_else(|| Err(tonic::Status::internal("operation failed")))
 }
 
 /// Extract the authenticated principal from a tonic gRPC request.
@@ -1131,6 +1353,54 @@ mod migration_bound_tests {
                 AuditResult::Attempt,
                 AuditResult::Error
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod deletion_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn dependent_data_loss_requires_a_separate_correlated_permission() {
+        let ctx = OpContext::deletion_schedule(default_principal(), "key-id", true);
+        let requests = authorization_requests(&ctx).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, AuditAction::ScheduleKeyDeletion);
+        assert_eq!(
+            requests[1].action,
+            AuditAction::ScheduleKeyDeletionWithDependentDataLoss
+        );
+        assert_ne!(requests[0].request_id, requests[1].request_id);
+        assert_eq!(requests[0].resource.id, requests[1].resource.id);
+        assert_eq!(
+            requests[1].context.entries["operation_request_id"],
+            keyrack_core::pdp::AttributeValue::String(ctx.request_id)
+        );
+        assert_eq!(
+            requests[1].context.entries["allow_dependent_data_loss"],
+            keyrack_core::pdp::AttributeValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn normal_schedule_does_not_request_data_loss_permission() {
+        let ctx = OpContext::deletion_schedule(default_principal(), "key-id", false);
+        let requests = authorization_requests(&ctx).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, AuditAction::ScheduleKeyDeletion);
+    }
+
+    #[test]
+    fn generic_override_action_cannot_bypass_ordinary_schedule_permission() {
+        let ctx = OpContext::key(
+            AuditAction::ScheduleKeyDeletionWithDependentDataLoss,
+            default_principal(),
+            "key-id",
+        );
+        assert_eq!(
+            authorization_requests(&ctx).unwrap_err().code(),
+            tonic::Code::Internal
         );
     }
 }

@@ -10,6 +10,28 @@ use keyrack_core::destruction::{DestructionClaim, DestructionDependencies};
 use keyrack_core::key::{KeyRecord, KeyState, ProviderRef};
 use keyrack_core::storage::StorageBackend;
 
+// Existing count controls remain independent of the new edge identities.
+macro_rules! assert_dependency_counts {
+    ($actual:expr, $expected:expr $(, $message:expr)? $(,)?) => {{
+        let actual = &$actual;
+        let expected = &$expected;
+        assert_eq!(
+            (
+                actual.own_parent_wrapped_versions,
+                actual.dependent_wrapping_edges,
+                actual.creation_journal_rows,
+                actual.logical_only_children
+            ),
+            (
+                expected.own_parent_wrapped_versions,
+                expected.dependent_wrapping_edges,
+                expected.creation_journal_rows,
+                expected.logical_only_children
+            )
+        );
+    }};
+}
+
 pub fn due(mut record: KeyRecord) -> KeyRecord {
     record.state = KeyState::PendingDeletion;
     record.scheduled_deletion_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
@@ -26,11 +48,15 @@ pub async fn one_shot_and_terminal_fence(store: &dyn StorageBackend) {
         .unwrap();
     assert_eq!(claim.record().occ_version, record.occ_version + 1);
     assert!(same_json(&claim.record().key_versions, &record.key_versions).unwrap());
-    assert!(store
+    assert!(!claim.is_recovered());
+    let recovered = store
         .claim_destruction(&record.lid, claim.record().occ_version, chrono::Utc::now())
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert!(recovered.is_recovered());
+    assert_eq!(recovered.operation(), claim.operation());
+    assert!(same_json(recovered.record(), claim.record()).unwrap());
     let mut stale = record.clone();
     stale.transition_to(KeyState::Disabled).unwrap();
     assert!(store.update_key(&stale).await.is_err());
@@ -57,6 +83,8 @@ pub async fn one_shot_and_terminal_fence(store: &dyn StorageBackend) {
     // Simulate success from every provider at the trusted storage boundary.
     let completed = store.complete_destruction(claim).await.unwrap();
     assert_eq!(completed.state, KeyState::Destroyed);
+    let repeated = store.complete_destruction(recovered).await.unwrap();
+    assert!(same_json(&repeated, &completed).unwrap());
     assert!(store
         .claim_destruction(&record.lid, completed.occ_version, chrono::Utc::now())
         .await
@@ -166,19 +194,19 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                     .unwrap();
             }
         }
-        assert_eq!(
+        assert_dependency_counts!(
             store.destruction_dependencies(&parent.lid).await.unwrap(),
             DestructionDependencies {
                 logical_only_children: 0,
                 own_parent_wrapped_versions: 0,
-                dependent_parent_wrapped_versions: u64::from(phase == 3),
+                dependent_wrapping_edges: u64::from(phase == 3),
                 creation_journal_rows: 1,
-                migration_journal_rows: 0,
+                ..DestructionDependencies::default()
             },
             "creation phase {phase} must retain its journal dependency",
         );
         if phase == 3 {
-            assert_eq!(
+            assert_dependency_counts!(
                 store
                     .destruction_dependencies(&request.record.lid)
                     .await
@@ -186,9 +214,9 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
                 DestructionDependencies {
                     logical_only_children: 0,
                     own_parent_wrapped_versions: 1,
-                    dependent_parent_wrapped_versions: 0,
+                    dependent_wrapping_edges: 0,
                     creation_journal_rows: 1,
-                    migration_journal_rows: 0,
+                    ..DestructionDependencies::default()
                 },
             );
         }
@@ -204,6 +232,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
     let (parent, mut request) = fixture();
     let mut child = unique_test_key_record(KeyState::Enabled);
     child.lid = request.record.lid;
+    child.parent_lid = Some(parent.lid);
     store.create_key(&parent).await.unwrap();
     store.create_key(&child).await.unwrap();
     let mut next = child.clone();
@@ -217,7 +246,7 @@ pub async fn creation_references_fence_destruction(store: &dyn StorageBackend) {
     request.expected_key_occ = Some(child.occ_version);
     request.context_bytes = request.context().unwrap().canonical_bytes().unwrap();
     store.reserve_creation(&request).await.unwrap();
-    assert_eq!(
+    assert_dependency_counts!(
         store.destruction_dependencies(&child.lid).await.unwrap(),
         DestructionDependencies {
             creation_journal_rows: 1,
@@ -276,18 +305,17 @@ pub async fn dependency_counts_cover_all_material_and_kinds(store: &dyn StorageB
     let expected = DestructionDependencies {
         logical_only_children: 1,
         own_parent_wrapped_versions: 2,
-        dependent_parent_wrapped_versions: 3,
+        dependent_wrapping_edges: 3,
         creation_journal_rows: 1,
-        migration_journal_rows: 0,
+        ..DestructionDependencies::default()
     };
     let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
-    assert_eq!(counts, expected);
+    assert_dependency_counts!(counts, expected);
     assert!(!counts.is_empty());
     let summary = counts.summary();
-    assert_eq!(
-        summary,
-        "own_parent_wrapped_versions=2, dependent_parent_wrapped_versions=3, creation_journal_rows=1, migration_journal_rows=0"
-    );
+    assert!(summary.starts_with(
+        "own_parent_wrapped_versions=2, dependent_wrapping_edges=3, creation_journal_rows=1"
+    ));
     for other in [&request.record.lid, &logical_child.lid, &unrelated.lid] {
         assert!(!summary.contains(&other.to_string()));
     }
@@ -365,7 +393,7 @@ pub async fn logical_only_children_are_direct_resident_records(store: &dyn Stora
     store.create_key(&mixed_child).await.unwrap();
     let counts = store.destruction_dependencies(&parent.lid).await.unwrap();
     assert_eq!(counts.logical_only_children, 2);
-    assert_eq!(counts.dependent_parent_wrapped_versions, 1);
+    assert_eq!(counts.dependent_wrapping_edges, 1);
     assert!(!counts.is_empty());
 }
 
@@ -384,10 +412,10 @@ pub async fn dependency_snapshot_is_rechecked_at_claim(store: &dyn StorageBacken
     store.update_key(&pending).await.unwrap();
     store.create_key(&request.record).await.unwrap();
     let expected = DestructionDependencies {
-        dependent_parent_wrapped_versions: 1,
+        dependent_wrapping_edges: 1,
         ..DestructionDependencies::default()
     };
-    assert_eq!(
+    assert_dependency_counts!(
         store.destruction_dependencies(&pending.lid).await.unwrap(),
         expected
     );
@@ -449,12 +477,15 @@ pub async fn raw_wrapped_edges_and_new_references(store: &dyn StorageBackend) {
     historical.is_primary = false;
     unrelated.key_versions.push(historical);
     assert!(store.update_key(&unrelated).await.is_err());
-    drop(claim); // Lost response/process death: no expiry-based second ticket.
-    assert!(store
+    let operation = claim.operation();
+    drop(claim); // Lost response/process death resumes the same frozen operation.
+    let recovered = store
         .claim_destruction(&pending.lid, pending.occ_version + 1, chrono::Utc::now())
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert!(recovered.is_recovered());
+    assert_eq!(recovered.operation(), operation);
 }
 
 // The two storage instances must share a database but use independent handles.
@@ -467,12 +498,15 @@ pub async fn competing_claims(first: &dyn StorageBackend, second: &dyn StorageBa
     );
     let tickets = [a.unwrap(), b.unwrap()];
     assert_eq!(tickets.iter().filter(|v| v.is_some()).count(), 1);
+    let operation = tickets.iter().flatten().next().unwrap().operation();
     drop(tickets);
-    assert!(second
+    let recovered = second
         .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert!(recovered.is_recovered());
+    assert_eq!(recovered.operation(), operation);
 }
 
 #[macro_export]

@@ -63,6 +63,49 @@ fn count(control: &Session, request: &CreationRequest) -> usize {
 }
 
 #[test]
+fn failed_open_preserves_original_error_after_successful_close() {
+    let mut closes = 0;
+    let error = failed_open_error(KeyRackError::EncryptionContextMismatch, || {
+        closes += 1;
+        Ok(())
+    });
+    assert_eq!(closes, 1);
+    assert!(matches!(error, KeyRackError::EncryptionContextMismatch));
+
+    let error = failed_open_error(
+        KeyRackError::ProviderUnavailable("original Open refusal".into()),
+        || Ok(()),
+    );
+    assert!(matches!(
+        error,
+        KeyRackError::ProviderUnavailable(message) if message == "original Open refusal"
+    ));
+}
+
+#[test]
+fn failed_open_reports_failed_close_and_original_error_without_retry() {
+    let mut closes = 0;
+    let error = failed_open_error(
+        KeyRackError::ProviderUnavailable("original Open refusal".into()),
+        || {
+            closes += 1;
+            Err(KeyRackError::Provider(
+                "original-session close refusal".into(),
+            ))
+        },
+    );
+    assert_eq!(closes, 1);
+    let KeyRackError::Provider(message) = error else {
+        panic!("failed cleanup must be returned as an explicit provider error");
+    };
+    assert!(message.contains("Open failed (provider unavailable: original Open refusal)"));
+    assert!(message.contains(
+        "explicit original-session close failed (provider error: original-session close refusal)"
+    ));
+    assert!(message.ends_with("cleanup unconfirmed"));
+}
+
+#[test]
 fn conformance_frame_is_bounded_and_preserves_nonce() {
     let (_, request) = fixture();
     let context = request.context().unwrap();
@@ -217,6 +260,28 @@ pub(crate) fn live(
             .verify_closed_creation(&binding, &wrong_output)
             .await
             .is_err());
+
+        // Valid host framing reaches native Unwrap; its integrity refusal must
+        // close and retain the original owner without issuing a lease/output.
+        let error = adapter
+            .open_wrapped_key(&context, parent, &wrong_output)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("native child unwrap (not retried)"));
+        {
+            let state = adapter.state.lock().unwrap();
+            let failed: Vec<_> = state
+                .entries
+                .values()
+                .filter(|entry| entry.creation.is_none())
+                .collect();
+            assert_eq!(failed.len(), 1, "one retained failed Open owner");
+            assert!(failed[0].envelope.is_none());
+            assert!(failed[0].issued.is_none());
+            assert!(failed[0].owner.as_ref().unwrap().closed_session().is_some());
+        }
 
         // Cold Open carries no CreationBinding. Only the exact issuing adapter
         // accepts its random opaque lease; it never interprets a token handle.

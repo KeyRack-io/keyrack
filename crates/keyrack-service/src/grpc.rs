@@ -32,6 +32,22 @@ use keyrack_core::audit::AuditAction;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+// Loss markers are authoritative storage metadata, not cached KeyRecord fields.
+// Use this for every metadata-bearing response, including lists and mutations.
+// tonic handlers use Status directly at the transport boundary.
+#[allow(clippy::result_large_err)]
+async fn key_metadata(
+    state: &ServiceState,
+    record: &keyrack_core::key::KeyRecord,
+) -> Result<proto::KeyMetadata, Status> {
+    let mut metadata = convert::key_record_to_metadata(record);
+    metadata.wrapping_parent_destroyed_versions =
+        crate::domain::destroyed_wrapping_versions(state, &record.lid)
+            .await
+            .map_err(convert::error_to_status)?;
+    Ok(metadata)
+}
+
 pub struct KeyServiceImpl {
     state: Arc<ServiceState>,
 }
@@ -1290,7 +1306,7 @@ impl KeyService for KeyServiceImpl {
                 }
 
                 Ok(Response::new(proto::CreateKeyResponse {
-                    metadata: Some(convert::key_record_to_metadata(&record)),
+                    metadata: Some(key_metadata(&state, &record).await?),
                 }))
             },
         ).await
@@ -1313,7 +1329,7 @@ impl KeyService for KeyServiceImpl {
                 .await
                 .map_err(convert::error_to_status)?;
             Ok(Response::new(proto::GetKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await
@@ -1335,8 +1351,9 @@ impl KeyService for KeyServiceImpl {
                 .get_key(&lid)
                 .await
                 .map_err(convert::error_to_status)?;
+            let metadata = key_metadata(&state, &record).await?;
             Ok(Response::new(proto::DescribeKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(metadata),
             }))
         })
         .await
@@ -1368,7 +1385,7 @@ impl KeyService for KeyServiceImpl {
                 .await
                 .map_err(convert::error_to_status)?;
             Ok(Response::new(proto::UpdateKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await
@@ -1424,11 +1441,10 @@ impl KeyService for KeyServiceImpl {
                 .list_keys(&filter)
                 .await
                 .map_err(convert::error_to_status)?;
-            let keys = page
-                .items
-                .iter()
-                .map(convert::key_record_to_metadata)
-                .collect();
+            let mut keys = Vec::with_capacity(page.items.len());
+            for record in &page.items {
+                keys.push(key_metadata(&state, record).await?);
+            }
             Ok(Response::new(proto::ListKeysResponse {
                 keys,
                 next_cursor: page.next_cursor.unwrap_or_default(),
@@ -1478,7 +1494,7 @@ impl KeyService for KeyServiceImpl {
                 }
             }
             Ok(Response::new(proto::EnableKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await
@@ -1500,7 +1516,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(convert::error_to_status)?;
 
             Ok(Response::new(proto::DisableKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&outcome.record)),
+                metadata: Some(key_metadata(&state, &outcome.record).await?),
             }))
         })
         .await
@@ -1514,42 +1530,28 @@ impl KeyService for KeyServiceImpl {
         let principal = self.principal(&request).await?;
         let req = request.into_inner();
         let key_id = req.key_id.clone();
-        let mut op_ctx = OpContext::key(AuditAction::ScheduleKeyDeletion, principal, &key_id);
+        let mut op_ctx =
+            OpContext::deletion_schedule(principal, &key_id, req.allow_dependent_data_loss);
         op_ctx.request_id = request_id;
+        let record_snapshot = op_ctx.deletion_snapshot_recorder();
         ops::execute(&self.state, op_ctx, |state| async move {
-            let lid = parse_lid(&key_id)?;
-            let mut record = state
-                .storage
-                .get_key_for_use(&lid)
-                .await
-                .map_err(convert::error_to_status)?;
-            let days = if req.grace_period_days == 0 {
-                7
-            } else {
-                req.grace_period_days
-            };
-            let dependencies = crate::domain::ensure_deletion_can_be_scheduled(&state, &lid)
-                .await
-                .map_err(|error| error.to_grpc_status())?;
-            record
-                .transition_to(keyrack_core::key::KeyState::PendingDeletion)
-                .map_err(|(from, to)| {
-                    Status::failed_precondition(format!("cannot transition from {from} to {to}"))
-                })?;
-            record.scheduled_deletion_at =
-                Some(chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
-            state
-                .storage
-                .update_key(&record)
-                .await
-                .map_err(convert::error_to_status)?;
+            let scheduled = crate::domain::schedule_key_deletion_with_intent(
+                &state,
+                &key_id,
+                req.grace_period_days,
+                req.allow_dependent_data_loss,
+            )
+            .await
+            .map_err(|error| error.to_grpc_status())?;
+            record_snapshot(scheduled.approved_dependents.clone());
             Ok(Response::new(proto::ScheduleKeyDeletionResponse {
-                logical_only_children: dependencies.logical_only_children,
-                metadata: Some(convert::key_record_to_metadata(&record)),
-                deletion_date: record
+                metadata: Some(key_metadata(&state, &scheduled.record).await?),
+                deletion_date: scheduled
+                    .record
                     .scheduled_deletion_at
                     .as_ref()
                     .map(convert::datetime_to_timestamp),
+                logical_only_children: scheduled.logical_only_children,
             }))
         })
         .await
@@ -1565,35 +1567,11 @@ impl KeyService for KeyServiceImpl {
         let mut op_ctx = OpContext::key(AuditAction::CancelKeyDeletion, principal, &key_id);
         op_ctx.request_id = request_id;
         ops::execute(&self.state, op_ctx, |state| async move {
-            let lid = parse_lid(&key_id)?;
-            state
-                .storage
-                .check_migration_fence(&lid)
+            let record = crate::domain::cancel_key_deletion(&state, &key_id)
                 .await
-                .map_err(convert::error_to_status)?;
-            let mut record = state
-                .storage
-                .get_key_for_use(&lid)
-                .await
-                .map_err(convert::error_to_status)?;
-            if record.state != keyrack_core::key::KeyState::PendingDeletion {
-                return Err(Status::failed_precondition(
-                    "can only cancel deletion from PendingDeletion",
-                ));
-            }
-            record
-                .transition_to(keyrack_core::key::KeyState::Disabled)
-                .map_err(|(from, to)| {
-                    Status::failed_precondition(format!("cannot transition from {from} to {to}"))
-                })?;
-            record.scheduled_deletion_at = None;
-            state
-                .storage
-                .update_key(&record)
-                .await
-                .map_err(convert::error_to_status)?;
+                .map_err(|error| error.to_grpc_status())?;
             Ok(Response::new(proto::CancelKeyDeletionResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await
@@ -1635,7 +1613,7 @@ impl KeyService for KeyServiceImpl {
                 }
             }
             Ok(Response::new(proto::ReportKeyCompromiseResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await
@@ -1650,7 +1628,7 @@ impl KeyService for KeyServiceImpl {
         let key_id = request.into_inner().key_id;
         let mut op_ctx = OpContext::key(AuditAction::RotateKey, principal, &key_id);
         op_ctx.request_id = request_id;
-        ops::execute(&self.state, op_ctx, |state| async move {
+        ops::execute_detached(&self.state, op_ctx, |state| async move {
             let lid = parse_lid(&key_id)?;
             let outcome = crate::domain::rotate_key(&state, &lid, &key_id)
                 .await
@@ -1658,7 +1636,7 @@ impl KeyService for KeyServiceImpl {
 
             #[allow(clippy::cast_possible_truncation)]
             Ok(Response::new(proto::RotateKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&outcome.record)),
+                metadata: Some(key_metadata(&state, &outcome.record).await?),
                 new_version: outcome.new_version as u32,
             }))
         })
@@ -1690,7 +1668,7 @@ impl KeyService for KeyServiceImpl {
         .await
         .map_err(|error| error.to_grpc_status())?;
         Ok(Response::new(proto::RewrapKeyResponse {
-            metadata: Some(convert::key_record_to_metadata(&outcome.record)),
+            metadata: Some(key_metadata(&self.state, &outcome.record).await?),
             operation_id: req.operation_id,
             result: Some(proto::WrappedKeyMigrationResult {
                 operation_id: outcome.result.operation_id.to_string(),
@@ -2915,7 +2893,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(convert::error_to_status)?;
 
             Ok(Response::new(proto::MakeKeyExportableResponse {
-                metadata: Some(convert::key_record_to_metadata(&updated)),
+                metadata: Some(key_metadata(&state, &updated).await?),
             }))
         })
         .await
@@ -2989,7 +2967,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(convert::error_to_status)?;
 
             Ok(Response::new(proto::RevokeKeyExportabilityResponse {
-                metadata: Some(convert::key_record_to_metadata(&updated)),
+                metadata: Some(key_metadata(&state, &updated).await?),
             }))
         })
         .await
@@ -3132,7 +3110,7 @@ impl KeyService for KeyServiceImpl {
                 .map_err(convert::error_to_status)?;
 
             Ok(Response::new(proto::ImportKeyResponse {
-                metadata: Some(convert::key_record_to_metadata(&record)),
+                metadata: Some(key_metadata(&state, &record).await?),
             }))
         })
         .await

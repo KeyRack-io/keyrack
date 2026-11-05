@@ -1,7 +1,7 @@
 // Copyright 2026 KeyRack Contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! One-shot storage fencing for resident-key destruction, not authorization,
+//! Durable storage fencing for key-material destruction, not authorization,
 //! provider evidence, subtree erasure, or distributed revocation. A durable
 //! claim is never released by timeout, cancellation, crash, or provider error.
 
@@ -15,43 +15,70 @@ pub fn invalid(message: &str) -> KeyRackError {
     KeyRackError::Storage(format!("destruction: {message}"))
 }
 
-/// Dependency counts without disclosing dependent key identities.
-/// Every stored version and every creation-journal phase counts, including
-/// historical material and completed creations. Nonterminal migrations count
-/// until their atomic commit releases the reservation. Logical-only children
-/// are reported separately and do not block destruction.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Durable identity of a dependency approved for deliberate data loss. Binding
+/// the version, parent version and envelope prevents approval of a new edge on
+/// an already-listed logical key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DestructionDependent {
+    pub lid: Lid,
+    pub version: u64,
+    pub parent_version: u64,
+    pub envelope_ref: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeletionIntent {
+    pub allow_dependent_data_loss: bool,
+    pub approved_dependents: Vec<DestructionDependent>,
+}
+
+/// A committed schedule and the informational count from its fenced admission query.
+#[derive(Debug)]
+pub struct ScheduledDeletion {
+    pub record: KeyRecord,
+    pub logical_only_children: u64,
+    pub approved_dependents: Vec<DestructionDependent>,
+}
+
+/// Durable, version-specific metadata; the dependent's material and state are
+/// left unchanged when its wrapping parent is destroyed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DestroyedWrappingParent {
+    pub version: u64,
+    pub parent_lid: Lid,
+    pub parent_version: u64,
+}
+
+/// A consistent observation shared by scheduling and the fenced claim. Logical
+/// ancestry is not cryptographic dependence. Committed receipts are metadata;
+/// only live envelopes and nonterminal journals prevent ordinary destruction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DestructionDependencies {
-    /// Direct persisted child records with nonempty, entirely provider-resident
-    /// version histories, including terminal records whose metadata link remains.
+    /// Informational; direct persisted children with nonempty all-resident histories.
     pub logical_only_children: u64,
     pub own_parent_wrapped_versions: u64,
-    pub dependent_parent_wrapped_versions: u64,
+    pub dependent_wrapping_edges: u64,
     pub creation_journal_rows: u64,
-    /// Nonterminal migrations naming this key as child, source, or target.
+    pub in_flight_creation_journal_rows: u64,
     pub migration_journal_rows: u64,
+    pub dependents: Vec<DestructionDependent>,
 }
 
 impl DestructionDependencies {
     pub fn is_empty(&self) -> bool {
-        self.own_parent_wrapped_versions == 0
-            && self.dependent_parent_wrapped_versions == 0
-            && self.creation_journal_rows == 0
+        self.dependents.is_empty()
+            && self.in_flight_creation_journal_rows == 0
             && self.migration_journal_rows == 0
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "own_parent_wrapped_versions={}, dependent_parent_wrapped_versions={}, creation_journal_rows={}, migration_journal_rows={}",
-            self.own_parent_wrapped_versions,
-            self.dependent_parent_wrapped_versions,
-            self.creation_journal_rows,
-            self.migration_journal_rows,
+            "own_parent_wrapped_versions={}, dependent_wrapping_edges={}, creation_journal_rows={}, in_flight_creation_journal_rows={}, migration_journal_rows={}",
+            self.own_parent_wrapped_versions, self.dependent_wrapping_edges,
+            self.creation_journal_rows, self.in_flight_creation_journal_rows, self.migration_journal_rows,
         )
     }
 
-    /// Shared material counting for storage implementors scanning a consistent
-    /// snapshot. A version belongs to the own OR other-key category, never both.
     pub fn include_record(&mut self, lid: &Lid, record: &KeyRecord) -> Result<()> {
         if record.lid != *lid
             && record.parent_lid == Some(*lid)
@@ -66,31 +93,77 @@ impl DestructionDependencies {
                 .checked_add(1)
                 .ok_or_else(|| invalid("dependency count overflow"))?;
         }
+        if record.state == KeyState::Destroyed {
+            return Ok(());
+        }
         for version in &record.key_versions {
             if let KeyMaterial::ParentWrapped(material) = &version.material {
-                let count = if record.lid == *lid {
-                    &mut self.own_parent_wrapped_versions
+                if record.lid == *lid {
+                    self.own_parent_wrapped_versions += 1;
                 } else if material.parent().lid == *lid {
-                    &mut self.dependent_parent_wrapped_versions
-                } else {
-                    continue;
-                };
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("dependency count overflow"))?;
+                    self.dependent_wrapping_edges += 1;
+                    self.dependents.push(DestructionDependent {
+                        lid: record.lid,
+                        version: version.version_number,
+                        parent_version: material.parent().version.get(),
+                        envelope_ref: material.wrapped_material_ref().as_str().to_owned(),
+                    });
+                }
             }
+        }
+        self.dependents.sort();
+        self.dependents.dedup();
+        Ok(())
+    }
+
+    /// Never override in-flight work. A subset is allowed so retiring a
+    /// dependency does not invalidate approval; every new edge requires it anew.
+    pub fn validate_intent(&self, intent: &DeletionIntent) -> Result<()> {
+        let reason = if self.in_flight_creation_journal_rows > 0 || self.migration_journal_rows > 0
+        {
+            Some("in_flight_journal")
+        } else if !self.dependents.is_empty() && !intent.allow_dependent_data_loss {
+            Some("dependent_data_loss_not_approved")
+        } else if self
+            .dependents
+            .iter()
+            .any(|edge| !intent.approved_dependents.contains(edge))
+        {
+            Some("dependent_outside_approved_snapshot")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(KeyRackError::DeletionDependencyRefused {
+                reason: reason.into(),
+                counts: self.summary(),
+            });
         }
         Ok(())
     }
+
+    pub fn approval(&self, allow: bool) -> Result<DeletionIntent> {
+        let intent = DeletionIntent {
+            allow_dependent_data_loss: allow,
+            approved_dependents: if allow {
+                self.dependents.clone()
+            } else {
+                Vec::new()
+            },
+        };
+        self.validate_intent(&intent)?;
+        Ok(intent)
+    }
 }
 
-/// Execution ticket issued only after committing a fresh destruction claim.
-/// Deliberately neither Clone nor Deserialize. Reading/retrying a journal must
-/// never mint another ticket. Dropping it leaves the durable fence in place.
+/// Execution authority for a committed destruction operation. A recovered ticket
+/// retains the exact operation and immutable material snapshot from its journal.
+/// Provider deletion is retried idempotently; the durable fence never expires.
 #[derive(Debug)]
 pub struct DestructionClaim {
     operation: Uuid,
     record: KeyRecord,
+    recovered: bool,
 }
 
 impl DestructionClaim {
@@ -100,8 +173,23 @@ impl DestructionClaim {
         if operation.is_nil() || record.state != KeyState::PendingDeletion {
             return Err(invalid("invalid committed claim"));
         }
-        validate_resident_history(&record)?;
-        Ok(Self { operation, record })
+        validate_destruction_history(&record)?;
+        Ok(Self {
+            operation,
+            record,
+            recovered: false,
+        })
+    }
+
+    /// Reissue only after validating the durable journal against the fenced row.
+    pub fn recovered(operation: Uuid, record: KeyRecord) -> Result<Self> {
+        let mut claim = Self::committed(operation, record)?;
+        claim.recovered = true;
+        Ok(claim)
+    }
+
+    pub fn is_recovered(&self) -> bool {
+        self.recovered
     }
 
     pub fn operation(&self) -> Uuid {
@@ -115,20 +203,29 @@ impl DestructionClaim {
 
 /// Validate the entire history, never just the current version. Empty, duplicate
 /// or unsupported material must not become a vacuous successful destruction.
-pub fn validate_resident_history(record: &KeyRecord) -> Result<()> {
+pub fn validate_destruction_history(record: &KeyRecord) -> Result<()> {
     let mut versions = std::collections::HashSet::new();
     if record.key_versions.is_empty() || record.primary_version().is_none() {
-        return Err(invalid("missing resident history"));
+        return Err(invalid("missing material history"));
     }
     for version in &record.key_versions {
-        let handle = version.resident_handle()?;
         if version.version_number == 0
             || !versions.insert(version.version_number)
             || version.is_primary != (version.version_number == record.current_key_version)
-            || handle.key_id.is_empty()
-            || handle.key_spec != record.key_spec
         {
-            return Err(invalid("invalid resident history"));
+            return Err(invalid("invalid material history"));
+        }
+        match &version.material {
+            KeyMaterial::ProviderResident { key_handle, .. } => {
+                if key_handle.key_id.is_empty() || key_handle.key_spec != record.key_spec {
+                    return Err(invalid("invalid resident history"));
+                }
+            }
+            KeyMaterial::ParentWrapped(material) => {
+                if material.parent().lid == record.lid {
+                    return Err(invalid("self-wrapped destruction history"));
+                }
+            }
         }
     }
     Ok(())
@@ -152,7 +249,7 @@ pub fn prepare_claim(
     {
         return Err(invalid("key is not due for destruction"));
     }
-    validate_resident_history(&record)?;
+    validate_destruction_history(&record)?;
     // Reserve room for both the claim and its final completion in SQL BIGINT.
     if expected_occ == 0 || expected_occ > i64::MAX as u64 - 2 {
         return Err(invalid("OCC out of range"));
@@ -178,4 +275,15 @@ pub fn completed_record(claim: &DestructionClaim, current: &KeyRecord) -> Result
     record.state = KeyState::Destroyed;
     record.updated_at = Utc::now();
     Ok(record)
+}
+
+/// Validate a repeat completion without changing the original completion time.
+/// Only the same operation's exact terminal snapshot may be accepted.
+pub fn validate_completed_record(claim: &DestructionClaim, current: &KeyRecord) -> Result<()> {
+    let mut expected = completed_record(claim, claim.record())?;
+    expected.updated_at = current.updated_at;
+    if !crate::creation::same_json(&expected, current)? {
+        return Err(invalid("completed snapshot changed"));
+    }
+    Ok(())
 }

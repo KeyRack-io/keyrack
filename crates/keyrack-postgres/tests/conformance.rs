@@ -69,11 +69,14 @@ async fn destruction_claim_survives_reconnect_and_completion_rollback() {
         .unwrap();
     drop(store);
     let reopened = make_store().await;
-    assert!(reopened
+    let recovered = reopened
         .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert!(recovered.is_recovered());
+    assert_eq!(recovered.operation(), claim.operation());
+    drop(recovered);
     let name = format!("destruction_failure_{}", uuid::Uuid::new_v4().simple());
     let function = format!("{name}_fn");
     sqlx::query(&format!("CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected destruction completion failure'; END; $$"))
@@ -98,8 +101,26 @@ async fn destruction_claim_survives_reconnect_and_completion_rollback() {
     assert_eq!(still_fenced.occ_version, record.occ_version + 1);
     still_fenced.transition_to(KeyState::Disabled).unwrap();
     assert!(reopened.update_key(&still_fenced).await.is_err());
-    assert!(reopened
+    let recovered = reopened
         .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered.is_recovered());
+    let concurrent_recovery = reopened
+        .claim_destruction(&record.lid, record.occ_version + 1, chrono::Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = reopened.complete_destruction(recovered).await.unwrap();
+    let repeated = reopened
+        .complete_destruction(concurrent_recovery)
+        .await
+        .unwrap();
+    assert!(keyrack_core::creation::same_json(&completed, &repeated).unwrap());
+    assert_eq!(completed.state, KeyState::Destroyed);
+    assert!(reopened
+        .claim_destruction(&record.lid, completed.occ_version, chrono::Utc::now())
         .await
         .unwrap()
         .is_none());
@@ -530,5 +551,71 @@ mod migration_postgres {
                 .is_err());
         }
         pool.close().await;
+    }
+}
+
+mod rotation_postgres {
+    use super::*;
+    use keyrack_core::storage::StorageBackend;
+    use std::sync::Arc;
+
+    async fn arc_store() -> Arc<dyn StorageBackend> {
+        Arc::new(make_store().await)
+    }
+
+    #[tokio::test]
+    async fn rotation_old_versions_decrypt_and_new_version_names_parent_current() {
+        keyrack_test_support::rotation_conformance::old_versions_decrypt_and_new_version_names_parent_current(
+            arc_store().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_crash_recovery_each_phase() {
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let reconnect_url = url.clone();
+        keyrack_test_support::rotation_conformance::crash_recovery_each_phase(
+            move || {
+                let url = url.clone();
+                async move {
+                    Arc::new(PostgresStorage::connect(&url).await.unwrap())
+                        as Arc<dyn StorageBackend>
+                }
+            },
+            move |store| {
+                let url = reconnect_url.clone();
+                async move {
+                    drop(store);
+                    Arc::new(PostgresStorage::connect(&url).await.unwrap())
+                        as Arc<dyn StorageBackend>
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_journal_pins_parent_current_version_and_lineage() {
+        keyrack_test_support::rotation_conformance::journal_pins_parent_current_version_and_lineage(
+            arc_store().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rotation_withdraw_semantics() {
+        keyrack_test_support::rotation_conformance::withdraw_semantics(&make_store().await).await;
+    }
+
+    #[tokio::test]
+    async fn rotation_and_migration_fences() {
+        Box::pin(
+            keyrack_test_support::rotation_conformance::rotation_and_migration_fences(
+                arc_store().await,
+                arc_store().await,
+            ),
+        )
+        .await;
     }
 }

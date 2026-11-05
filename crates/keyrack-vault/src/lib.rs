@@ -29,8 +29,8 @@ use base64::Engine;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use reqwest::Client;
@@ -209,6 +209,36 @@ impl VaultTransitProvider {
             ));
         }
         Ok(())
+    }
+
+    // A failed delete can mean a previous attempt already removed the key.
+    // Confirm absence through the authenticated metadata endpoint, never by
+    // matching a provider error string. A missing route/mount is not absence.
+    async fn confirm_key_absent(&self, handle: &KeyHandle) -> Result<bool> {
+        let response = self
+            .client
+            .get(self.url(&format!("keys/{}", handle.key_id)))
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .map_err(|error| transport_error("vault deletion reconciliation failed", error))?;
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let text = response_text(response, false).await?;
+        let empty_errors = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|body| {
+                body.get("errors")
+                    .and_then(|errors| errors.as_array())
+                    .map(Vec::is_empty)
+            })
+            .unwrap_or(false);
+        if !empty_errors {
+            return Ok(false);
+        }
+        self.health_check().await?;
+        Ok(true)
     }
 
     fn url(&self, path: &str) -> String {
@@ -629,19 +659,29 @@ impl CryptoProvider for VaultTransitProvider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
         // Step 1: enable deletion on the key.
         let config = KeyConfigRequest {
             deletion_allowed: true,
         };
-        self.vault_post_no_body(&format!("keys/{}/config", handle.key_id), &config)
-            .await?;
-
-        // Step 2: delete the key.
-        self.vault_delete(&format!("keys/{}", handle.key_id))
-            .await?;
+        let deleted = async {
+            self.vault_post_no_body(&format!("keys/{}/config", handle.key_id), &config)
+                .await?;
+            self.vault_delete(&format!("keys/{}", handle.key_id)).await
+        }
+        .await;
+        if let Err(error) = deleted {
+            if !self.confirm_key_absent(handle).await.unwrap_or(false) {
+                return Err(error);
+            }
+            return Ok(DestroyKeyOutcome::AlreadyAbsent);
+        }
 
         tracing::info!(key_id = %handle.key_id, "vault transit key destroyed");
-        Ok(())
+        Ok(DestroyKeyOutcome::Completed)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -850,6 +890,110 @@ mod tests {
             !caps.supports_atomic_re_encrypt,
             "supports_atomic_re_encrypt must be false without a re_encrypt override"
         );
+    }
+
+    async fn deletion_server(
+        replies: Vec<(&'static str, u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for (expected, status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 2048];
+                    let read = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&bytes[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(expected), "{request}");
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("x-vault-token: test-token"));
+                let response = format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn destroy_recovers_only_confirmed_absence() {
+        for after_delete in [false, true] {
+            let mut replies = vec![(
+                "POST /v1/transit/keys/key/config ",
+                if after_delete { 204 } else { 400 },
+                "",
+            )];
+            if after_delete {
+                replies.push(("DELETE /v1/transit/keys/key ", 500, ""));
+            }
+            replies.extend([
+                ("GET /v1/transit/keys/key ", 404, r#"{"errors":[]}"#),
+                ("GET /v1/sys/mounts/transit/tune ", 200, r#"{"data":{}}"#),
+            ]);
+            let (vault_addr, server) = deletion_server(replies).await;
+            let provider = VaultTransitProvider {
+                client: Client::new(),
+                vault_addr,
+                token: "test-token".into(),
+                mount: "transit".into(),
+            };
+            let outcome = provider
+                .destroy_key_with_outcome(&KeyHandle {
+                    key_id: "key".into(),
+                    key_spec: KeySpec::Aes256,
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome, DestroyKeyOutcome::AlreadyAbsent);
+            server.await.unwrap();
+        }
+        for (status, body, mount_status) in [
+            (200, r#"{"data":{}}"#, None),
+            (403, r#"{"errors":["permission denied"]}"#, None),
+            (500, r#"{"errors":[]}"#, None),
+            (404, r#"{"errors":["no handler for route"]}"#, None),
+            (404, "invalid json", None),
+            (404, r#"{"errors":[]}"#, Some(403)),
+            (404, r#"{"errors":[]}"#, Some(404)),
+        ] {
+            let mut replies = vec![
+                ("POST /v1/transit/keys/key/config ", 400, ""),
+                ("GET /v1/transit/keys/key ", status, body),
+            ];
+            if let Some(status) = mount_status {
+                replies.push((
+                    "GET /v1/sys/mounts/transit/tune ",
+                    status,
+                    r#"{"errors":[]}"#,
+                ));
+            }
+            let (vault_addr, server) = deletion_server(replies).await;
+            let provider = VaultTransitProvider {
+                client: Client::new(),
+                vault_addr,
+                token: "test-token".into(),
+                mount: "transit".into(),
+            };
+            assert!(
+                provider
+                    .destroy_key(&KeyHandle {
+                        key_id: "key".into(),
+                        key_spec: KeySpec::Aes256
+                    })
+                    .await
+                    .is_err(),
+                "{status}/{body}/{mount_status:?}"
+            );
+            server.await.unwrap();
+        }
     }
 
     // ── Live Vault integration tests ───────────────────────────────────

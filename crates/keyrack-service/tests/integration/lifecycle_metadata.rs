@@ -65,6 +65,7 @@ async fn set_state(state: &Arc<ServiceState>, key: &str, live: KeyState, history
     if live == KeyState::Destroyed {
         let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
         svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+            allow_dependent_data_loss: false,
             key_id: key.into(),
             grace_period_days: 7,
         }))
@@ -427,6 +428,7 @@ async fn lifecycle_metadata_survives_cancel_restart_and_completed_destruction() 
             assert_metadata(&state, &key, initial, history).await;
             assert_decrypt_export(&state, &key, &blobs, initial, history).await;
             svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+                allow_dependent_data_loss: false,
                 key_id: key.clone(),
                 grace_period_days: 7,
             }))
@@ -448,6 +450,7 @@ async fn lifecycle_metadata_survives_cancel_restart_and_completed_destruction() 
             assert_decrypt_export(&state, &key, &blobs, KeyState::Disabled, history).await;
             let svc = keyrack_service::grpc::KeyServiceImpl::new(state.clone());
             svc.schedule_key_deletion(Request::new(proto::ScheduleKeyDeletionRequest {
+                allow_dependent_data_loss: false,
                 key_id: key.clone(),
                 grace_period_days: 7,
             }))

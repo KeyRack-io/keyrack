@@ -27,25 +27,27 @@ use cryptoki::mechanism::aead::GcmParams;
 use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
-use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::types::AuthPin;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoOperation, CryptoProvider, EncryptOutput, KeyHandle, KeySpecCapability,
-    ProviderCapabilities, SigningAlgorithm,
+    CryptoOperation, CryptoProvider, DestroyKeyOutcome, EncryptOutput, KeyHandle,
+    KeySpecCapability, ProviderCapabilities, SigningAlgorithm,
 };
 use keyrack_core::sensitive::Sensitive;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 #[cfg(feature = "native-a2-conformance")]
 pub(crate) mod native_a2;
+
+pub(crate) mod context_wrapping;
 
 /// DER-encoded OID for P-256 (secp256r1): 1.2.840.10045.3.1.7
 const P256_OID_DER: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
@@ -298,6 +300,10 @@ impl Gate {
 /// Keeping it here means concurrent failures collapse into one attempt
 /// instead of one per provider.
 struct SharedModule {
+    // Sticky for this process/module lifetime. Ordinary providers are unaffected;
+    // reconstruction and module recovery cannot reopen wrapping admission after
+    // an ambiguous native close. Only process restart clears the registry.
+    wrapping_cleanup_unconfirmed: AtomicBool,
     lib_path: String,
     ctx: Pkcs11,
     /// Advanced by each successful reinitialization. A caller that saw a
@@ -531,6 +537,7 @@ fn shared_module(lib_path: &str) -> Result<Arc<SharedModule>> {
         .map_err(|e| KeyRackError::Provider(format!("C_Initialize: {e}")))?;
 
     let module = Arc::new(SharedModule {
+        wrapping_cleanup_unconfirmed: AtomicBool::new(false),
         lib_path: lib_path.to_owned(),
         ctx,
         generation: AtomicU64::new(0),
@@ -568,6 +575,7 @@ pub struct Pkcs11Provider {
     slot: Arc<RwLock<cryptoki::slot::Slot>>,
     readiness_gate: Arc<tokio::sync::Semaphore>,
     pin: Zeroizing<String>,
+    wrapping: Option<Arc<context_wrapping::ContextWrapping>>,
 }
 
 impl Pkcs11Provider {
@@ -614,7 +622,36 @@ impl Pkcs11Provider {
             slot: Arc::new(RwLock::new(slot)),
             readiness_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pin: Zeroizing::new(config.pin.clone()),
+            wrapping: None,
         })
+    }
+
+    /// Explicit experimental wrapping entry. The native startup self-test and
+    /// its original-session cleanup must pass before capabilities are published.
+    /// Service configuration requires this entry to be distinct from the default.
+    pub fn new_with_wrapping(
+        config: &Pkcs11ProviderConfig,
+        provider_ref: keyrack_core::key::ProviderRef,
+        mechanism: keyrack_core::wrapping::WrappingIdentifier,
+        security_domain: keyrack_core::wrapping::WrappingIdentifier,
+    ) -> Result<Self> {
+        if mechanism.as_str() != context_wrapping::CONTEXT_DERIVED_WRAPPING_MECHANISM {
+            return Err(KeyRackError::Provider(
+                "unsupported explicit PKCS#11 wrapping mechanism".into(),
+            ));
+        }
+        // Refuse a poisoned wrapping module before the ordinary constructor's
+        // readiness/recovery path can touch an unresolved native session.
+        let module = shared_module(&config.lib_path)?;
+        context_wrapping::ensure_cleanup_confirmed(&module)?;
+        let mut provider = Self::new(config)?;
+        provider.wrapping = Some(context_wrapping::ContextWrapping::new(
+            &provider,
+            provider_ref,
+            mechanism,
+            security_domain,
+        )?);
+        Ok(provider)
     }
 
     fn current_slot(&self) -> Result<cryptoki::slot::Slot> {
@@ -761,8 +798,25 @@ fn find_slot_by_label(ctx: &Pkcs11, label: &str) -> Result<cryptoki::slot::Slot>
     )))
 }
 
+fn require_resident_label(label: &str) -> Result<()> {
+    // Session objects are visible across this process's token sessions. Their
+    // labels must never fall back to a resident lookup, even if a token object
+    // happens to carry the same label. Only the issuing owner may use a lease.
+    if label.starts_with(context_wrapping::LEASE_LABEL_PREFIX)
+        || label.starts_with("kr-native-a2-use-")
+    {
+        return Err(KeyRackError::Provider(
+            "wrapped leases must close through their original session owner; not a resident key handle"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn find_object(session: &Session, label: &str, class: ObjectClass) -> Result<ObjectHandle> {
+    require_resident_label(label)?;
     let template = vec![
+        Attribute::Token(true),
         Attribute::Label(label.as_bytes().to_vec()),
         Attribute::Class(class),
     ];
@@ -770,10 +824,19 @@ fn find_object(session: &Session, label: &str, class: ObjectClass) -> Result<Obj
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find_objects", &e))?;
 
-    objects
+    let object = objects
         .into_iter()
         .next()
-        .ok_or_else(|| KeyRackError::Provider(format!("object not found: {label}")))
+        .ok_or_else(|| KeyRackError::Provider(format!("object not found: {label}")))?;
+    let attributes = session
+        .get_attributes(object, &[AttributeType::Token])
+        .map_err(|e| map_pkcs11_error("resident object readback", &e))?;
+    if attributes != [Attribute::Token(true)] {
+        return Err(KeyRackError::Provider(
+            "ordinary key use requires a resident token object".into(),
+        ));
+    }
+    Ok(object)
 }
 
 fn generate_aes_key(session: &Session, label: &str) -> Result<()> {
@@ -1186,22 +1249,126 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn destroy_objects_by_label(session: &Session, label: &str) -> Result<()> {
-    let template = vec![Attribute::Label(label.as_bytes().to_vec())];
+fn destroy_objects_by_label(session: &Session, label: &str) -> Result<DestroyKeyOutcome> {
+    require_resident_label(label)?;
+    let template = vec![
+        Attribute::Token(true),
+        Attribute::Label(label.as_bytes().to_vec()),
+    ];
     let objects = session
         .find_objects(&template)
         .map_err(|e| map_pkcs11_error("find for destroy", &e))?;
 
+    // This is absence in the authenticated session's resident label-search
+    // view, not proof that no object exists outside that view. Lease labels
+    // have already been refused, even if no resident object matches them.
+    if objects.is_empty() {
+        return Ok(DestroyKeyOutcome::AlreadyAbsent);
+    }
+    // Refuse session objects even if a module violates the search template.
+    // Validate the entire result before destroying any resident object.
+    for &obj in &objects {
+        let attributes = session
+            .get_attributes(obj, &[AttributeType::Token])
+            .map_err(|e| map_pkcs11_error("resident object readback for destroy", &e))?;
+        if attributes != [Attribute::Token(true)] {
+            return Err(KeyRackError::Provider(
+                "ordinary key destruction requires a resident token object".into(),
+            ));
+        }
+    }
     for obj in objects {
         session
             .destroy_object(obj)
             .map_err(|e| map_pkcs11_error("destroy_object", &e))?;
     }
-    Ok(())
+    Ok(DestroyKeyOutcome::Completed)
 }
 
 #[async_trait]
 impl CryptoProvider for Pkcs11Provider {
+    fn wrapping_capabilities(&self) -> keyrack_core::wrapping::WrappingCapabilities {
+        self.wrapping
+            .as_ref()
+            .map_or_else(Default::default, |engine| engine.capabilities())
+    }
+
+    fn wrapping_closure_verifier(
+        &self,
+    ) -> Option<Arc<dyn keyrack_core::creation::A2ClosureVerifier>> {
+        self.wrapping
+            .as_ref()
+            .map(|engine| Arc::clone(engine) as Arc<dyn keyrack_core::creation::A2ClosureVerifier>)
+    }
+
+    async fn generate_wrapped_key(
+        &self,
+        context: &keyrack_core::wrapping::WrappingContext,
+        parent: &KeyHandle,
+        creation: &keyrack_core::creation::CreationBinding,
+    ) -> Result<keyrack_core::provider::GeneratedWrappedKey> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .generate(self.clone(), context, parent, creation)
+            .await
+    }
+
+    async fn open_wrapped_key(
+        &self,
+        context: &keyrack_core::wrapping::WrappingContext,
+        parent: &KeyHandle,
+        envelope: &[u8],
+    ) -> Result<keyrack_core::provider::WrappedKeyLease> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .open(self.clone(), context, parent, envelope)
+            .await
+    }
+
+    async fn close_wrapped_key(
+        &self,
+        lease: &keyrack_core::provider::WrappedKeyLease,
+    ) -> Result<keyrack_core::provider::WrappedKeyClosure> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .close(lease)
+            .await
+    }
+
+    fn rewrap_is_retry_safe(&self) -> bool {
+        // Only the startup-qualified profile uses session-only intermediates
+        // without consuming either parent or the source envelope. This durable
+        // semantic promise is not readiness: recording a transient cleanup fence
+        // as false would permanently block journal recovery after process restart.
+        // Every call independently refuses effects/output while that fence is set.
+        self.wrapping.is_some()
+    }
+
+    async fn rewrap_wrapped_key(
+        &self,
+        old_context: &keyrack_core::wrapping::WrappingContext,
+        old_parent: &KeyHandle,
+        envelope: &[u8],
+        new_context: &keyrack_core::wrapping::WrappingContext,
+        new_parent: &KeyHandle,
+    ) -> Result<Vec<u8>> {
+        self.wrapping
+            .as_ref()
+            .ok_or_else(|| KeyRackError::Provider("PKCS#11 wrapping not configured".into()))?
+            .rewrap(
+                self.clone(),
+                old_context,
+                old_parent,
+                envelope,
+                new_context,
+                new_parent,
+            )
+            .await
+    }
+
     async fn check_readiness(&self) -> Result<()> {
         // Cancellation cannot stop a native PKCS#11 call. The task owns the
         // permit until that call actually exits, preventing overlapping probes
@@ -1225,6 +1392,9 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn generate_key(&self, spec: &KeySpec) -> Result<KeyHandle> {
+        if self.wrapping.is_some() {
+            return context_wrapping::ContextWrapping::generate_root(self.clone(), spec).await;
+        }
         let spec_owned = spec.clone();
         let label = uuid::Uuid::new_v4().to_string();
         let label_for_closure = label.clone();
@@ -1263,6 +1433,11 @@ impl CryptoProvider for Pkcs11Provider {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<EncryptOutput> {
+        if let Some(engine) = &self.wrapping {
+            return engine.encrypt(handle, plaintext, aad).await;
+        }
+        // Reject nonresident identities before entering the module recovery path.
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let plaintext = plaintext.to_vec();
         let aad = aad.to_vec();
@@ -1277,6 +1452,10 @@ impl CryptoProvider for Pkcs11Provider {
         ciphertext: &[u8],
         aad: &[u8],
     ) -> Result<Sensitive<Vec<u8>>> {
+        if let Some(engine) = &self.wrapping {
+            return engine.decrypt(handle, ciphertext, aad).await;
+        }
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let ciphertext = ciphertext.to_vec();
         let aad = aad.to_vec();
@@ -1291,6 +1470,7 @@ impl CryptoProvider for Pkcs11Provider {
         algorithm: SigningAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>> {
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let message = message.to_vec();
 
@@ -1305,6 +1485,7 @@ impl CryptoProvider for Pkcs11Provider {
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool> {
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
         let message = message.to_vec();
         let signature = signature.to_vec();
@@ -1326,6 +1507,11 @@ impl CryptoProvider for Pkcs11Provider {
     }
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
+        self.destroy_key_with_outcome(handle).await.map(|_| ())
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
+        require_resident_label(&handle.key_id)?;
         let label = handle.key_id.clone();
 
         self.run(move |session| destroy_objects_by_label(session, &label))
@@ -1347,7 +1533,7 @@ impl CryptoProvider for Pkcs11Provider {
         ];
         let signing_ops = vec![GenerateKey, Sign, Verify, DestroyKey];
 
-        ProviderCapabilities {
+        let mut capabilities = ProviderCapabilities {
             provider_name: "pkcs11".into(),
             key_specs: vec![
                 KeySpecCapability {
@@ -1371,13 +1557,35 @@ impl CryptoProvider for Pkcs11Provider {
             supports_atomic_data_key: false,
             supports_atomic_re_encrypt: false,
             supports_key_import: false,
+        };
+        if self.wrapping.is_some() {
+            capabilities
+                .key_specs
+                .retain(|entry| entry.key_spec == KeySpec::Aes256);
+            capabilities.key_specs.push(KeySpecCapability {
+                key_spec: KeySpec::Aes128,
+                operations: vec![Encrypt, Decrypt, GenerateDataKey, ReEncrypt],
+            });
         }
+        capabilities
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_handles_refuse_reserved_lease_namespaces() {
+        for label in ["kr-cbc-owner-child", "kr-native-a2-use-child"] {
+            assert!(matches!(
+                require_resident_label(label),
+                Err(KeyRackError::Provider(message))
+                    if message.contains("not a resident key handle")
+            ));
+        }
+        assert!(require_resident_label("resident-key").is_ok());
+    }
 
     // If you flip either flag to true you MUST have overridden the
     // corresponding method to keep plaintext in-boundary AND added a
@@ -1881,10 +2089,20 @@ mod concurrent_login_tests {
         drop(anchor);
         let cold_wrong_pin_denied = Pkcs11Provider::new(&wrong_config).is_err();
         let cold_correct_pin_accepted = Pkcs11Provider::new(&config).is_ok();
-        first
-            .destroy_key(&handle)
-            .await
-            .expect("regression key cleanup");
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("regression key cleanup"),
+            DestroyKeyOutcome::Completed
+        );
+        assert_eq!(
+            first
+                .destroy_key_with_outcome(&handle)
+                .await
+                .expect("empty authenticated label search"),
+            DestroyKeyOutcome::AlreadyAbsent
+        );
         assert!(
             ambient_wrong_pin_denied,
             "constructor bypassed credential validation"

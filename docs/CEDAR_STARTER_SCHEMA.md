@@ -80,6 +80,14 @@ namespace KeyRack {
         context: ContextShape,
     };
 
+    // Additional permission required alongside ScheduleKeyDeletion when
+    // allow_dependent_data_loss=true; this does not bypass in-flight journals.
+    action ScheduleKeyDeletionWithDependentDataLoss appliesTo {
+        principal: [User, Service],
+        resource: [Key],
+        context: ContextShape,
+    };
+
     action CancelKeyDeletion appliesTo {
         principal: [User, Service],
         resource: [Key],
@@ -203,6 +211,8 @@ namespace KeyRack {
     // ── Context shape ─────────────────────────────────────
 
     type ContextShape = {
+        "operation_request_id"?: String,
+        "allow_dependent_data_loss"?: Bool,
         "source_ip"?: String,
         "user_agent"?: String,
         "request_time"?: String,

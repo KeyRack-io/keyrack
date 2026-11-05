@@ -18,17 +18,19 @@
 //
 // Alternative commercial licensing is available; contact the Licensor.
 
-//! PKCS#11 cryptographic provider for hardware HSMs.
+//! PKCS#11 cryptographic provider for tokens.
 //!
 //! Wraps the PKCS#11 C API via the [`cryptoki`] crate (safe Rust bindings).
-//! Tested against `SoftHSM2` in Docker; production deployments use real
-//! HSM hardware via the same PKCS#11 shared library interface.
+//! `SoftHSM2` is supported as a software token loaded into this process. Its
+//! explicit experimental context-derived wrapping profile requires a startup
+//! self-test. No hardware token is qualified for that profile.
 
 #![forbid(unsafe_code)]
 
 mod ecdsa_der;
 mod provider;
 
+pub use provider::context_wrapping::CONTEXT_DERIVED_WRAPPING_MECHANISM;
 pub use provider::{Pkcs11Provider, Pkcs11ProviderConfig};
 
 #[cfg(feature = "native-a2-conformance")]

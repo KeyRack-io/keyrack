@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use keyrack_core::error::{KeyRackError, Result};
 use keyrack_core::key::KeySpec;
 use keyrack_core::provider::{
-    CryptoProvider, EncryptOutput, GenerateDataKeyOutput, GeneratedWrappedKey, KeyHandle,
-    MacAlgorithm, ProviderCapabilities, SigningAlgorithm, WrappedKeyClosure, WrappedKeyLease,
+    CryptoProvider, DestroyKeyOutcome, EncryptOutput, GenerateDataKeyOutput, GeneratedWrappedKey,
+    KeyHandle, MacAlgorithm, ProviderCapabilities, SigningAlgorithm, WrappedKeyClosure,
+    WrappedKeyLease,
 };
 use keyrack_core::sensitive::Sensitive;
 use std::future::Future;
@@ -320,6 +321,10 @@ impl CryptoProvider for DeferredProvider {
 
     async fn destroy_key(&self, handle: &KeyHandle) -> Result<()> {
         self.get()?.destroy_key(handle).await
+    }
+
+    async fn destroy_key_with_outcome(&self, handle: &KeyHandle) -> Result<DestroyKeyOutcome> {
+        self.get()?.destroy_key_with_outcome(handle).await
     }
 
     async fn generate_wrapped_key(

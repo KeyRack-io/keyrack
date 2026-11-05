@@ -2803,11 +2803,15 @@ dependencies = [
 name = "keyrack-pkcs11"
 version = "0.5.0"
 dependencies = [
+ "aes",
+ "aes-kw",
  "async-trait",
+ "blake3",
  "cryptoki",
  "keyrack-core",
  "keyrack-sqlite",
  "keyrack-test-support",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2860,6 +2864,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2914,10 +2919,12 @@ dependencies = [
 name = "keyrack-test-support"
 version = "0.5.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "chrono",
  "keyrack-core",
  "keyrack-service",
+ "metrics-exporter-prometheus",
  "proptest",
  "serde_json",
  "tokio",

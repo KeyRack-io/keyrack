@@ -317,6 +317,7 @@ fn attribute(name: &str, value: TtlvValue) -> TtlvItem {
 #[derive(Debug)]
 pub struct KmipResponse {
     pub result_status: u32,
+    pub result_reason: Option<u32>,
     pub result_message: Option<String>,
     pub payload: Option<TtlvItem>,
 }
@@ -341,6 +342,9 @@ pub fn parse_response(msg: &TtlvItem) -> Result<KmipResponse, String> {
 
     Ok(KmipResponse {
         result_status: status,
+        result_reason: batch_item
+            .find(tag::RESULT_REASON)
+            .and_then(super::ttlv::TtlvItem::as_enum),
         result_message: message,
         payload,
     })

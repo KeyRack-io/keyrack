@@ -265,10 +265,12 @@ pub async fn all_writer_fences(store: &dyn StorageBackend) {
         version.is_primary = true;
         update.key_versions.push(version);
         retryable(store.update_key(&update).await);
-        retryable(
-            store
-                .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
-                .await,
+        assert!(
+            matches!(
+                store.claim_destruction(&record.lid, record.occ_version, chrono::Utc::now()).await,
+                Err(KeyRackError::DeletionDependencyRefused { reason, .. }) if reason == "in_flight_journal"
+            ),
+            "destruction must report the in-flight journal refusal"
         );
     }
     let rotate = next_creation(&request.child, &creations[1]);
@@ -909,18 +911,20 @@ pub async fn destruction_dependency_query_tracks_migration(store: &dyn StorageBa
             if record.lid == request.new_parent.lid {
                 assert_eq!(counts.creation_journal_rows, 0);
                 assert_eq!(counts.own_parent_wrapped_versions, 0);
-                assert_eq!(counts.dependent_parent_wrapped_versions, 0);
+                assert_eq!(counts.dependent_wrapping_edges, 0);
             }
             let mut scheduled = record.clone();
             scheduled.state = KeyState::PendingDeletion;
             scheduled.scheduled_deletion_at = Some(chrono::Utc::now());
             scheduled.occ_version += 1;
             retryable(store.update_key(&scheduled).await);
-            retryable(
+            assert!(matches!(
                 store
                     .claim_destruction(&record.lid, record.occ_version, chrono::Utc::now())
                     .await,
-            );
+                Err(KeyRackError::DeletionDependencyRefused { ref reason, .. })
+                    if reason == "in_flight_journal"
+            ));
         }
     }
     store
