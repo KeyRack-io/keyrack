@@ -226,9 +226,11 @@ unpublished examples and fuzz packages remain at 0.0.0.
   the service binary, including concurrent load on another token. Custody-proof
   token initialization now retries and stops on prerequisite failure without
   weakening assertions. (#74)
-- Demo 01 uses independent keys because its Vault profile does not support child
-  wrapping; demo 08 exercises the wrapping hierarchy. Release qualification
-  includes migration, rotation and deletion conformance with deliberate reverted
+- Demos 01 and 02 use independent resident keys because their ordinary Vault
+  and SoftHSM profiles do not enable child wrapping. Demo 02 asserts PKCS#11
+  provider selection and retained-version decryption after rotation; SoftHSM is
+  a software token, not hardware custody. Demo 08 exercises the wrapping hierarchy.
+  Release qualification includes migration, rotation and deletion conformance with deliberate reverted
   controls. See [the 0.5.0 checklist](docs/RELEASE_CHECKLIST_0.5.0.md).
 
 ### Deferred and unsupported

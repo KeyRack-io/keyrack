@@ -142,6 +142,13 @@ SoftHSM persistence image, which does not establish native-profile qualification
 
 ## Validate the release candidate
 
+The first full release E2E run exposed Demo 02's obsolete lineage-only child
+creation. Its ordinary distribution SoftHSM configuration has no wrapping
+profile. The demo now creates independent resident PKCS#11 keys, verifies provider
+selection and rotation, and retains its old-ciphertext round trip. It does not
+activate or qualify the experimental native profile. Require the full E2E gate
+again on the corrected head; the earlier seven-of-eight result is not a pass.
+
 Preparation checks run locally: full locked workspace tests, Format and Clippy.
 The SDK removal controls must reject all four absent methods and accept all four
 restoration controls. The documentation controls deliberately reintroduce retired
