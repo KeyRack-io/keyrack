@@ -324,9 +324,38 @@ async fn complete<T, E, Fut>(
 where
     Fut: std::future::Future<Output = Result<T, E>>,
 {
+    complete_with(
+        ctx,
+        start,
+        operation,
+        describe,
+        |_| AuditResult::Error,
+        |result| async move {
+            emit_audit(state, ctx, result, None, None).await;
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// [`complete`] with the executor's own failure classification and outcome
+/// audit. A failed outcome audit fails the operation.
+async fn complete_with<T, E, Fut, Audit, AuditFut>(
+    ctx: &OpContext,
+    start: Instant,
+    operation: Fut,
+    describe: Option<fn(&E) -> String>,
+    failure: fn(&E) -> AuditResult,
+    audit: Audit,
+) -> Option<Result<T, E>>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+    Audit: FnOnce(AuditResult) -> AuditFut,
+    AuditFut: std::future::Future<Output = Result<(), E>>,
+{
     let outcome = CatchUnwind(Box::pin(operation)).await;
-    let (audit_result, result_str) = match &outcome {
-        Ok(Ok(_)) => (AuditResult::Success, "success"),
+    let audit_result = match &outcome {
+        Ok(Ok(_)) => AuditResult::Success,
         Ok(Err(error)) => {
             if let Some(describe) = describe {
                 tracing::warn!(
@@ -337,7 +366,7 @@ where
                     "op.failed"
                 );
             }
-            (AuditResult::Error, "error")
+            failure(error)
         }
         Err(panic) => {
             let message = panic
@@ -352,12 +381,21 @@ where
                 panic = %message,
                 "op.panicked"
             );
-            (AuditResult::Error, "error")
+            AuditResult::Error
         }
     };
-    emit_audit(state, ctx, audit_result, None, None).await;
-    crate::metrics::record_op(&ctx.action.to_string(), result_str, start.elapsed());
-    outcome.ok()
+    let audited = audit(audit_result).await;
+    let label = match audit_result {
+        AuditResult::Success => "success",
+        AuditResult::Denied => "denied",
+        _ => "error",
+    };
+    crate::metrics::record_op(&ctx.action.to_string(), label, start.elapsed());
+    match (outcome, audited) {
+        (Ok(result), Ok(())) => Some(result),
+        (Ok(_), Err(error)) => Some(Err(error)),
+        (Err(_), _) => None,
+    }
 }
 
 /// Resolves to `Err` with the payload if polling the inner future panics.
@@ -670,15 +708,30 @@ pub async fn execute_rewrap_with_options(
         // This permit stays with the task, never the request future.
         let _slot = slot;
         let start = Instant::now();
-        let result = rewrap_authorized(&state, &ctx, &new_parent_id, &operation_id, options).await;
-        let (outcome, label) = match &result {
-            Ok(_) => (AuditResult::Success, "success"),
-            Err(crate::domain::DomainError::PermissionDenied(_)) => (AuditResult::Denied, "denied"),
-            Err(_) => (AuditResult::Error, "error"),
-        };
-        emit_rewrap_audit(&state, &ctx, &operation_id, outcome).await?;
-        crate::metrics::record_op(&ctx.action.to_string(), label, start.elapsed());
-        result
+        let (state, ctx, operation_id) = (&state, &ctx, operation_id.as_str());
+        complete_with(
+            ctx,
+            start,
+            Box::pin(rewrap_authorized(
+                state,
+                ctx,
+                &new_parent_id,
+                operation_id,
+                options,
+            )),
+            None,
+            |error| match error {
+                crate::domain::DomainError::PermissionDenied(_) => AuditResult::Denied,
+                _ => AuditResult::Error,
+            },
+            |result| emit_rewrap_audit(state, ctx, operation_id, result),
+        )
+        .await
+        .unwrap_or_else(|| {
+            Err(crate::domain::DomainError::Internal(
+                "operation failed".into(),
+            ))
+        })
     })
     .await
     .map_err(|error| {

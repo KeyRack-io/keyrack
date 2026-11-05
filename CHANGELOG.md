@@ -264,9 +264,9 @@ remain at 0.1.0; the unpublished examples and fuzz packages remain at 0.0.0.
   best-effort, and audits the cleanup. If the write's outcome is unknown, the
   key is kept and logged, because the write may have committed.
 
-- **A panicking operation went unaudited.** Every request executor now records
-  the panic as an `Error` audit outcome and in metrics, then answers `INTERNAL`
-  (HTTP 500).
+- **A panicking operation went unaudited.** Every request executor, including
+  the one `RewrapKey` uses, now records the panic as an `Error` audit outcome
+  and in metrics, then answers `INTERNAL` (HTTP 500).
 
 - `GetKeyVersion` authorization is bound to the requested version through the
   integer `key_version` attribute from the decoded request. Version 0 returns

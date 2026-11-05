@@ -395,6 +395,75 @@ impl PolicyDecisionPoint for PausedPdp {
     }
 }
 
+struct PanickingPdp;
+#[async_trait]
+impl PolicyDecisionPoint for PanickingPdp {
+    async fn evaluate(&self, request: &AuthzRequest) -> keyrack_core::error::Result<AuthzResponse> {
+        assert!(
+            request.action != AuditAction::RewrapKey,
+            "policy evaluation panicked"
+        );
+        AlwaysAllow.evaluate(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_rewrap_is_audited_as_an_error() {
+    for surface in ["grpc", "rest", "execute_rewrap"] {
+        let (mut state, _, audit) = state(None, false);
+        let old = create(&state, None).await;
+        let new = create(&state, None).await;
+        let child = create(&state, Some(&old)).await;
+        Arc::get_mut(&mut state).unwrap().pdp = Arc::new(PanickingPdp);
+        let operation = uuid::Uuid::new_v4();
+        if surface == "execute_rewrap" {
+            let error = keyrack_service::ops::execute_rewrap(
+                &state,
+                keyrack_service::ops::default_principal(),
+                "panicking-rewrap".into(),
+                child.lid.to_string(),
+                new.lid.to_string(),
+                operation.to_string(),
+            )
+            .await
+            .expect_err("a panicking rewrap fails");
+            assert!(matches!(error, domain::DomainError::Internal(_)), "{error}");
+        } else {
+            let (code, body) = request(
+                &state,
+                &child,
+                Some(&new),
+                &operation.to_string(),
+                surface == "rest",
+            )
+            .await;
+            assert_eq!(code, 500, "{surface}: {body}");
+        }
+        assert_eq!(
+            audit
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.action == AuditAction::RewrapKey)
+                .map(|e| e.result)
+                .collect::<Vec<_>>(),
+            [AuditResult::Attempt, AuditResult::Error],
+            "{surface}"
+        );
+        assert!(state
+            .storage
+            .get_migration(operation)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state.storage.get_key(&child.lid).await.unwrap().parent_lid,
+            Some(old.lid)
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_cancelled_request_retains_its_migration_outcome() {
     let (mut state, pdp, audit) = state(None, false);
