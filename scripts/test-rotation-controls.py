@@ -21,6 +21,7 @@ SERVICE = "crates/keyrack-service/src/"
 
 SQLITE_ROTATION = ("keyrack-sqlite", (), "rotation_conformance", None)
 SERVICE_ROTATION = ("keyrack-service", (), "wrapped_child_rotation", None)
+SERVICE_REWRAP = ("keyrack-service", (), "rewrap_authorization", None)
 # Repeated runs accumulate keys in one database; unrelated tests in this binary expect a first-page listing.
 POSTGRES_ROTATION = ("keyrack-postgres", ("--features", "live-tests"), "conformance", "rotation_postgres::")
 
@@ -88,6 +89,10 @@ CONTROLS = [
      "Err(panic) => std::task::Poll::Ready(Err(panic)),",
      "Err(panic) => std::panic::resume_unwind(panic),",
      SERVICE_ROTATION, "executors_audit_a_panicking_operation_as_an_error"),
+    ("rewrap_panic_audited", SERVICE + "ops.rs", "fn poll(",
+     "Err(panic) => std::task::Poll::Ready(Err(panic)),",
+     "Err(panic) => std::panic::resume_unwind(panic),",
+     SERVICE_REWRAP, "a_panicking_rewrap_is_audited_as_an_error"),
 ]
 
 POSTGRES_CONTROLS = [

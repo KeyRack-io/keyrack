@@ -20,7 +20,7 @@
     "crates/keyrack-service/src/main.rs": "feae635b8bf99f65ad2e09bb9f551023a0e97d61b6980c8c5cd130f5b81b7507",
     "crates/keyrack-service/src/metrics.rs": "9d79c4655e829685d3d110d1f9c612d54deebf161700e7422a9d809a1d0cbd96",
     "crates/keyrack-service/src/migration.rs": "6aa3b81484b796e5e9c2eeb235bfc47f6b397e3cefe61b6d824b3970c9a298a3",
-    "crates/keyrack-service/src/ops.rs": "5efd18e5c71572d1005554d8d5a177484a0d64114377f4ea9f94c31fbd532a0f",
+    "crates/keyrack-service/src/ops.rs": "c082805692400b39d1daa0874b7df93d97af7b052650f2d5254465cd6523ab26",
     "crates/keyrack-service/src/pdp_grpc.rs": "43714fc761273d1d40569d7265ccc7d23c055baa5db4f1ce90f7591dfbd5248e",
     "crates/keyrack-service/src/pdp_http.rs": "81c7ceec86ce98b917d3120ea925c83623d3df42c347bc00166b81a37b79aeb9",
     "crates/keyrack-service/src/provider_startup.rs": "80b71d6bba6388f0f81b76263461d27669244e79e71b29b113b9d2a683d23d8b",
