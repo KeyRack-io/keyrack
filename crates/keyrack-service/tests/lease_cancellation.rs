@@ -38,6 +38,7 @@ use keyrack_core::sensitive::Sensitive;
 use keyrack_core::wrapping::{WrappingContext, WrappingIdentifier};
 use keyrack_service::domain::{self, CreateKeyInput};
 use keyrack_service::hierarchy::{WrappingProfile, WrappingProfiles};
+use keyrack_service::lease::CleanupCounts;
 use keyrack_service::proto;
 use keyrack_service::proto::key_service_client::KeyServiceClient;
 use keyrack_service::proto::key_service_server::KeyServiceServer;
@@ -51,6 +52,8 @@ use std::time::Duration;
 const DOMAIN: &str = "test-single-process";
 const PROVIDER: &str = "default";
 const PATIENCE: Duration = Duration::from_secs(10);
+/// How long the cleanup owner may take to record a close it has made.
+const OWNER_RECORDS: Duration = Duration::from_secs(1);
 
 type CoreResult<T> = keyrack_core::error::Result<T>;
 
@@ -491,6 +494,56 @@ impl Service {
         );
     }
 
+    /// [`Self::assert_settled`] for a lease whose open outlived the client's
+    /// deadline. Either closer is correct: the server's own deadline can fire
+    /// after the open delivered the lease, and then the request closes it.
+    /// Exactly one close is required either way.
+    async fn assert_settled_by_either(&self, handle: &KeyHandle, object: &str, case: &str) {
+        let closed = tokio::time::timeout(PATIENCE, async {
+            while !self.controls.closed_ok(object) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let closed = closed || self.controls.closed_ok(object);
+        let operable = self.inner.encrypt(handle, b"after", b"aad").await.is_ok();
+        assert!(
+            closed && !operable,
+            "{case}: the lease must end closed and inoperable \
+             (closed: {closed}, still operable: {operable})"
+        );
+        // The owner records its schedule and outcome after the provider close,
+        // so give it a bounded window to reach both before reading the counts.
+        let by_owner = CleanupCounts {
+            scheduled: 1,
+            closed_after_return: 1,
+            ..CleanupCounts::default()
+        };
+        let _ = tokio::time::timeout(OWNER_RECORDS, async {
+            while self.state.lease_cleanup.counts() != by_owner {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let counts = self.state.lease_cleanup.counts();
+        assert!(
+            counts == by_owner || counts == CleanupCounts::default(),
+            "{case}: the close is either the owner's, recorded as scheduled and closed, \
+             or the request's, recording nothing: {counts:?}"
+        );
+        let close_attempts = self
+            .controls
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::Closed { object: o, .. } if o == object))
+            .count();
+        assert_eq!(
+            close_attempts, 1,
+            "{case}: the lease is closed exactly once"
+        );
+    }
+
     /// Hold decrypt, wait until a request is inside it, and return the lease
     /// that request opened.
     async fn hold_decrypt_until_entered(
@@ -688,7 +741,7 @@ async fn cancellation_during_a_blocking_open_closes_the_lease_it_produces() {
     assert!(opened.is_ok(), "the provider finished the open");
     let (handle, object) = service.lease_for(&key, from);
     service
-        .assert_settled(&handle, &object, "cancellation during open")
+        .assert_settled_by_either(&handle, &object, "cancellation during open")
         .await;
 }
 
@@ -980,9 +1033,21 @@ async fn a_burst_of_cancelled_uses_never_exceeds_the_limit() {
 
     service.controls.open_gate.release();
     let settled = tokio::time::timeout(PATIENCE, async {
-        while service.state.lease_cleanup.occupied() > 0
-            || service.state.lease_cleanup.counts().closed_after_return < LIMIT as u64
-        {
+        loop {
+            let events = service.controls.events();
+            let slice = &events[from..];
+            let opened = slice
+                .iter()
+                .filter(|e| matches!(e, Event::Opened { .. }))
+                .count();
+            let closed_ok = slice
+                .iter()
+                .filter(|e| matches!(e, Event::Closed { ok: true, .. }))
+                .count();
+            if service.state.lease_cleanup.occupied() == 0 && opened == LIMIT && closed_ok == LIMIT
+            {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -992,6 +1057,34 @@ async fn a_burst_of_cancelled_uses_never_exceeds_the_limit() {
     assert!(
         settled.is_ok(),
         "every lease of the burst is closed afterwards"
+    );
+    let closes = service.controls.events()[from..]
+        .iter()
+        .filter(|e| matches!(e, Event::Closed { .. }))
+        .count();
+    assert_eq!(
+        closes, LIMIT,
+        "each lease of the burst is closed exactly once"
+    );
+    // Leases the request received are closed there and record nothing; every
+    // close the owner took over must reach a recorded outcome.
+    let _ = tokio::time::timeout(OWNER_RECORDS, async {
+        loop {
+            let counts = service.state.lease_cleanup.counts();
+            if counts.scheduled == counts.closed_after_return {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let cleanup = service.state.lease_cleanup.counts();
+    assert!(
+        cleanup.scheduled == cleanup.closed_after_return
+            && cleanup.scheduled <= LIMIT as u64
+            && cleanup.close_failed == 0
+            && cleanup.abandoned == 0,
+        "every close the owner took over is recorded as closed: {cleanup:?}"
     );
     let peak = peak.load(Ordering::SeqCst);
     let provider_peak = peak_open_leases(&service.controls.events()[from..]);
