@@ -134,7 +134,7 @@ unpublished examples and fuzz packages remain at 0.0.0.
   stored record, with verification documented separately from decrypt/export in
   [SPEC §7.2](docs/SPEC.md#72-valid-transitions). (#67)
 
-### Experimental native wrapping
+### Experimental native wrapping (opt-in)
 
 - The explicit `pkcs11:aes256-cbc-sha256-kw:v1` profile derives a temporary KEK
   from a domain-separated digest of the complete wrapping context and uses
