@@ -1,8 +1,9 @@
 # KeyRack 0.5.0 release checklist
 
 Release preparation on [#75](https://github.com/KeyRack-io/keyrack/pull/75),
-updated 2026-11-05. An unchecked item is work still to verify, not
-evidence of a passing gate. This document does not cut a release, create a tag,
+updated 2026-11-06. Checked preparation items record source review. Execution
+gates require the exact-head results in #75's receipt; an unchecked box alone
+is not evidence of a passing gate. This document does not cut a release, create a tag,
 or qualify an experimental provider profile. Follow [Releasing KeyRack](RELEASING.md)
 for the release workflow.
 
@@ -23,9 +24,11 @@ Later main merges must be tracked separately from that baseline:
 | [#69: dependency-aware deletion](https://github.com/KeyRack-io/keyrack/pull/69) | `07f65ec918a443b3d9cf8ab2e14a78d67bed33b1` | Persisted explicit data-loss approval, claim-time rechecks, destruction recovery and `deletion-refusal-controls`. |
 
 The release branch now includes main at
-[`01347a4f771260bc13322de386e7460fb938325b`](https://github.com/KeyRack-io/keyrack/commit/01347a4f771260bc13322de386e7460fb938325b),
-the merge of [#65](https://github.com/KeyRack-io/keyrack/pull/65). It includes
-#63–#71, #73 and #74. Draft #72 remains excluded and held until after the tag.
+[`978c935ff804d95b74ff9bc0ce3df23ef2491fb5`](https://github.com/KeyRack-io/keyrack/commit/978c935ff804d95b74ff9bc0ce3df23ef2491fb5),
+the merge of [#76](https://github.com/KeyRack-io/keyrack/pull/76). This includes
+[#65](https://github.com/KeyRack-io/keyrack/pull/65) at `01347a4`, #63–#71,
+#73–#74 and #76; #75 is this release preparation. Draft #72 remains excluded
+and held until after the tag.
 The final PR head, tree, check runs and manual receipts are recorded on #75;
 this source document does not claim that its own commit is the eventual tag.
 
@@ -51,6 +54,9 @@ this source document does not claim that its own commit is the eventual tag.
   audits panics and cleans up unpublished keys after a known OCC refusal;
   #74 fixes custody-proof initialization retries and stops on prerequisite
   failure without reducing its assertions. Verify the included merge commits.
+- [x] Include #76's RewrapKey panic-audit fix in the consolidated notes. Retain
+  the Denied classification, operation-ID/migration-phase fields and outcome-audit
+  failure contract; remove the former exclusion of the detached rewrap executor.
 - [x] Keep [draft #72](https://github.com/KeyRack-io/keyrack/pull/72),
   disabled-source wrapped-key maintenance, out of the 0.5.0 changelog's delivered
   features and out of the release commit. It is implemented for the first release
@@ -167,7 +173,9 @@ steps are intentionally unchecked until owner-authorized release work.
   For included #68/#69 changes, also retain rotation PostgreSQL/SQLite/service
   coverage and deletion approval, scheduling and recovery controls. Require each
   deliberate regression to fail for its intended reason and the restored source
-  to pass.
+  to pass. Include #76's `a_panicking_rewrap_is_audited_as_an_error` across
+  gRPC, REST and the direct executor, plus the `rewrap_panic_audited` reverted
+  control in `scripts/test-rotation-controls.py`.
 - [ ] Record the experimental native profile's own qualification and integration
   results on the final candidate. General CI, a pre-#65 mechanism-only probe, software
   migration tests and ordinary-key SoftHSM persistence tests do not substitute

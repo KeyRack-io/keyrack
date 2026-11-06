@@ -195,11 +195,13 @@ unpublished examples and fuzz packages remain at 0.0.0.
   for the unpublished provider key; an unknown write outcome retains it because
   publication may have committed. Descendant job counts reflect successful
   writes, with failures logged separately. (#71)
-- Panics while polling authorized operation futures through the shared
-  `complete` executor produce an Error audit outcome, metrics and an INTERNAL /
-  HTTP 500 response. This covers the ordinary gRPC/REST executors, their detached
-  variants and the resource-attribute executor. The separate detached RewrapKey
-  executor is outside this panic-audit coverage. (#71)
+- Panics while polling operation futures produce an Error audit
+  outcome, metrics and an INTERNAL / HTTP 500 response through the shared
+  completion step. Coverage includes ordinary gRPC/REST executors, their detached
+  variants, the resource-attribute executor and the detached RewrapKey executor.
+  Rewrap retains Denied classification for refused grants, operation-ID and
+  migration-phase audit fields, and failure when its outcome audit cannot be
+  written. Its operation metric is recorded even when that audit fails. (#71, #76)
 
 ### Audit, security and release controls
 
@@ -231,7 +233,7 @@ unpublished examples and fuzz packages remain at 0.0.0.
   provider selection and retained-version decryption after rotation; SoftHSM is
   a software token, not hardware custody. Demo 08 exercises the wrapping hierarchy.
   Release qualification includes migration, rotation and deletion conformance with deliberate reverted
-  controls. See [the 0.5.0 checklist](docs/RELEASE_CHECKLIST_0.5.0.md).
+  controls. See [the 0.5.0 checklist](docs/RELEASE_CHECKLIST_0.5.0.md). (#75)
 
 ### Deferred and unsupported
 
