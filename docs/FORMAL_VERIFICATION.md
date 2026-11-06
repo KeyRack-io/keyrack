@@ -4,6 +4,11 @@ This document explains how to run the formal-methods Tier 0 verification
 suite locally. These tests complement the standard `cargo test` suite with
 property-based testing (proptest) and bounded model checking (Kani).
 
+These checks do not formally verify the experimental 0.5.0 native
+`pkcs11:aes256-cbc-sha256-kw:v1` construction. Its functional and adversarial
+SoftHSM conformance is separate from a cryptographic proof or hardware custody
+qualification. Proof and further qualification work continues after 0.5.0.
+
 ## Proptest (property-based invariants)
 
 Proptest is already a dev-dependency. The invariant tests live in:

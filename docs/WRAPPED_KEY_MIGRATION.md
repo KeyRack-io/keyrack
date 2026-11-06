@@ -96,6 +96,13 @@ binding receipt, not a signature or a proof of token custody.
 
 ## Supported combinations
 
+This table describes current 0.5.0 support, including the experimental native
+profile added after the historical #66 evidence pinned above. Native wrapping
+is explicit opt-in through the
+[operator configuration](OPERATOR.md#experimental-context-derived-wrapping-profile).
+It is not formally verified; proof and further qualification continue after
+0.5.0. SoftHSM is a software token and no hardware token is qualified.
+
 | Combination | Support |
 | --- | --- |
 | Same explicit provider and security domain, software AES-256 parent and AES-256 child | Implemented with `software:aes-256-gcm:v1`. |

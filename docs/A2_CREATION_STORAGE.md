@@ -1,9 +1,10 @@
 # A2 creation storage
 
-This is transactional persistence groundwork, **not an enabled hierarchical KMS
-operation or a qualified custody profile**. The provider capability gate and
-ordinary wrapped-operation refusals remain in place. No worker/A3 format,
-canonical V1 context bytes, or external authority protocol is changed.
+This is the transactional persistence contract used by wrapped-child creation
+and rotation in 0.5.0. Storage correctness alone does not qualify a custody
+profile; providers still need explicit activation, exact capabilities and
+closure verification. No worker/A3 format, canonical V1 context bytes, or
+external authority protocol is changed.
 
 ## Implemented slice
 
@@ -103,11 +104,13 @@ both go through these methods. A rotation withdraws an earlier entry for the
 same child only when that entry is Reserved with no dispatch marker, or
 Resolved; every other unresolved row stays for reconciliation.
 
-Remaining activation work includes a qualified provider adapter and creation
-verifier implementing the [unregistered lifecycle driver](A2_CREATION_LIFECYCLE.md),
-provider-side preflight/cleanup recovery, complete per-version lifecycle,
-recursive dependency resolution, owned operation leases, authority validation,
-cache integration, service orchestration and destructive-operation coordination.
+The service uses the [lifecycle driver](A2_CREATION_LIFECYCLE.md) through
+`WrappingCreationProvider`, with software wrapping or the experimental
+[context-derived PKCS#11 profile](OPERATOR.md#experimental-context-derived-wrapping-profile).
+Wrapped-child rotation, use leases, migration and dependency-aware deletion have
+separate service conformance evidence. Nested wrapping and cross-provider
+migration remain unsupported; storage tests do not qualify a provider or prove
+external authority enforcement.
 Ordinary service/provider side effects are not made atomic by these database
 methods. No parent-loss/erasure or operational A2/A3 claim follows from storage
 tests alone.

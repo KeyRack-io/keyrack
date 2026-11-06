@@ -83,10 +83,11 @@ These are integration steps, not calls to a supplied `KeyRackClient` Java
 builder; the illustrative `.parent(...)` builder is not a supplied Java API.
 Generated bindings expose `CreateKey.parent_key_id`. From 0.5.0 it creates a
 child wrapped under that parent — one level, only under a `wrapping:` profile on
-a platform-custody provider — and is refused without one. The only mechanism in
-0.5.0 is software, which unwraps the child into service memory, so it is not
-custody; native PKCS#11 wrapping is not reachable through the service, for any
-token, SoftHSM included.
+a platform-custody provider — and is refused without one. In 0.5.0 the software
+AES-GCM profile unwraps into service memory; the experimental opt-in
+[context-derived PKCS#11 profile](../OPERATOR.md#experimental-context-derived-wrapping-profile)
+uses temporary token objects and is tested with SoftHSM 2.7.0. This software
+token provides no hardware custody; the construction is not formally verified.
 
 ### Rotation
 

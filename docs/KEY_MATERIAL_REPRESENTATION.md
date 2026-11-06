@@ -1,14 +1,16 @@
 # Key-version material representation
 
-Status: implementation foundation on the hierarchy feature branch. Creating a
-parent-wrapped child is now reachable from `CreateKey`, on a provider the
-deployment explicitly activated, and is refused everywhere else; see
-[Wrapping operations](#wrapping-operations) for the provider contract and
-[Creating a child](#creating-a-child) for the service path. A created child is
-**not yet usable**: the data plane still refuses wrapped versions, so the lease
-path is the next increment and the two ship together. No production wrapping
-profile, rewrap saga, or hierarchical erasure guarantee is implemented, and the
-only implementation of the operations is software, which is not custody.
+Status: implemented in 0.5.0 for explicitly activated wrapping profiles.
+`CreateKey` creates a wrapped child, and the data plane opens it through a
+bounded use lease. Wrapped-child rotation, journaled
+[rewrap/reparent](WRAPPED_KEY_MIGRATION.md) and
+[dependency-aware deletion](DESTRUCTION_FENCING.md) share the storage fences.
+Profiles are software AES-GCM and the experimental opt-in
+[context-derived PKCS#11 profile](OPERATOR.md#experimental-context-derived-wrapping-profile),
+tested with SoftHSM 2.7.0. Neither establishes hardware custody. The native
+construction is not formally verified; proof and qualification work continues
+after 0.5.0. See [Wrapping operations](#wrapping-operations) for the provider
+contract and [Creating a child](#creating-a-child) for the service path.
 
 ## Exclusive representation
 
@@ -22,7 +24,7 @@ and is never passed to an ordinary provider operation as a key handle.
 The descriptor has no resident-handle field. This enforces representation
 exclusivity in the Rust type, **not** the absence of independent provider objects,
 exports or backups. Its metadata is not authenticated merely by parsing it.
-The eventual profile must authenticate the enclosing child's identity, version,
+Each activated profile must authenticate the enclosing child's identity, version,
 specification and purpose together with the descriptor's bindings, and separately
 enforce currentness, authority and lifecycle.
 
@@ -123,10 +125,11 @@ sight. It wraps a child under an AES-256 parent held in the same process heap
 and unwraps it back into that heap for the life of a lease, which is why it
 declares the `SessionObject` lifetime rather than a backend-held one. A
 software-wrapped child is exactly as contained as the parent wrapping it, which
-is not at all. Nothing in this tranche makes a wrapped child provider-contained,
-and no provider with a custody boundary implements these operations yet:
-`keyrack-pkcs11` has no wrap or unwrap at all, and by ADR-0007 D4 Vault's
-hierarchy is worker-mediated rather than provider-native.
+is not at all. The experimental context-derived PKCS#11 profile implements
+these operations with temporary SoftHSM token objects. It remains a software-token
+profile, not hardware custody; see the operator guide for explicit activation and
+qualification limits. Vault Transit does not implement this provider-native
+wrapping path.
 
 ## Creating a child
 
@@ -210,5 +213,9 @@ Re-encrypt that involves a wrapped version holds at most one lease: the source
 is opened, decrypts and is closed before the destination opens, and a failed
 source close fails the call without opening the destination.
 
-Native PKCS#11 wrapping is not reachable through the service in 0.5.0, for any
-token, SoftHSM included.
+Native PKCS#11 wrapping requires the explicit experimental
+`pkcs11:aes256-cbc-sha256-kw:v1` profile, a dedicated non-default platform-custody
+provider and successful startup qualification. It is tested with SoftHSM 2.7.0,
+which is a software token; no hardware token is qualified. See the
+[operator guide](OPERATOR.md#experimental-context-derived-wrapping-profile) for
+the configuration, trusted PIN-holder boundary and cleanup/restart limits.

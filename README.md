@@ -19,10 +19,11 @@ separate capability. Software providers hold key bytes in process memory.
   qualified.
 - **Versioned key lifecycle** — namespace-scoped rules, logical parent/child
   relationships, rotation and cascade operations. Wrapped-child creation needs a
-  `wrapping:` profile, and in this release only the software mechanism serves
-  one: the hierarchy is shape, not a claim of KEK-wrapped custody. Native
-  PKCS#11 wrapping is not reachable through the service, for any token, SoftHSM
-  included.
+  `wrapping:` profile. Supported profiles are in-process software AES-GCM and
+  the experimental opt-in [context-derived PKCS#11 profile](docs/OPERATOR.md#experimental-context-derived-wrapping-profile),
+  tested with SoftHSM 2.7.0. SoftHSM is a software token; neither profile
+  establishes hardware custody. The native construction is not formally
+  verified, and its proof and qualification work continues after 0.5.0.
 - **Authorization and identity** — external HTTP/gRPC PDP integration, JWT and
   certificate-bound identity, and an exact-match SAN allowlist for delegated
   identity. `GetKeyVersion` authorization includes the requested version.

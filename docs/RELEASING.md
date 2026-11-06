@@ -2,6 +2,10 @@
 
 KeyRack uses tag-driven releases with the end-to-end demo suite as a hard gate.
 
+For the pending 0.5.0 release, use the
+[0.5.0 release checklist](RELEASE_CHECKLIST_0.5.0.md) to consolidate the changelog,
+verify the experimental native opt-in documentation and re-pin migration evidence.
+
 ## CI lanes
 
 | Workflow | Trigger | Purpose |
@@ -27,8 +31,9 @@ PRs and on the release tag.
    git push origin main
    git push origin vX.Y.Z      # use `pgit push` in this environment
    ```
-4. `release.yml` runs the E2E suite again as the gate, then builds and pushes
-   the multi-arch image to `ghcr.io/keyrack-io/keyrack-service:X.Y.Z` (+ `:X.Y`).
+4. `release.yml` runs the E2E suite again as the gate, then promotes the existing
+   main-commit multi-arch image to `ghcr.io/keyrack-io/keyrack-service:X.Y.Z`
+   (+ `:X.Y`). It does not rebuild the release image.
    A failed E2E **blocks** the publish.
 
 ## 0.5.0 migration evidence handoff

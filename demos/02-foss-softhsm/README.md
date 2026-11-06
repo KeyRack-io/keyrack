@@ -1,21 +1,25 @@
 # Demo 2 — KeyRack FOSS + SoftHSM2 (PKCS#11)
 
-This demo runs KeyRack with **hardware-security-module-backed cryptography** via the PKCS#11 interface, using [SoftHSM2](https://www.opendnssec.org/softhsm/) as the provider.
+This demo runs KeyRack with ordinary AES keys through the PKCS#11 interface,
+using [SoftHSM2](https://www.opendnssec.org/softhsm/) as the provider.
 
-All key material lives inside the HSM — KeyRack never sees raw symmetric keys.
+SoftHSM2 is a software token loaded into the KeyRack service process. It does
+not provide hardware custody or keep key material outside that process's memory.
+The demo uses independent tenant and data keys: `parent_key_id` requests wrapped
+key material, and this ordinary provider configuration has no wrapping opt-in.
 
 ## What it demonstrates
 
 | Step | Operation | Detail |
 |------|-----------|--------|
-| 1 | Create root key | AES-256 generated inside SoftHSM2 via PKCS#11 |
-| 2 | Create child key | Hierarchical key, also HSM-backed |
-| 3 | Encrypt | AES-256-GCM performed by the HSM |
+| 1 | Create tenant key | Nonempty key ID and `pkcs11` provider asserted |
+| 2 | Create independent data key | Distinct nonempty ID, `pkcs11` provider and initial version 1 asserted |
+| 3 | Encrypt | AES-256-GCM through SoftHSM2; nonempty ciphertext asserted |
 | 4 | Decrypt | Round-trip verified |
-| 5 | Rotate key | New version generated in HSM |
+| 5 | Rotate key | Version 2 asserted after generating new material in SoftHSM2 |
 | 6 | Decrypt (old) | Old ciphertexts still work after rotation |
-| 7 | Encrypt (new) | New data uses the latest key version |
-| 8 | Describe key | Shows PKCS#11 provider class in metadata |
+| 7 | Encrypt and decrypt (new) | Post-rotation payload round-trip verified |
+| 8 | Describe key | PKCS#11 provider class and version 2 asserted |
 
 ## Run
 
@@ -23,7 +27,8 @@ All key material lives inside the HSM — KeyRack never sees raw symmetric keys.
 docker compose up --build
 ```
 
-The demo container runs automatically once KeyRack is healthy and prints results to stdout.
+The demo container runs automatically once KeyRack is healthy, fails on HTTP
+errors or failed assertions, and prints `ALL CHECKS PASSED` on success.
 
 ## Architecture
 
@@ -45,6 +50,13 @@ The demo container runs automatically once KeyRack is healthy and prints results
 └────────────────────────────────────┘
 ```
 
-## Production note
+## Scope and deployment
 
-SoftHSM2 is a **software emulation** of a PKCS#11 HSM, suitable for development and testing. In production, swap the `lib_path` in `config/keyrack.yaml` for a real HSM's PKCS#11 library (e.g., Thales Luna, Utimaco SecurityServer, YubiHSM2, or a cloud provider's PKCS#11 bridge).
+The image uses the distribution's SoftHSM2 package and initializes a disposable
+demo token with public credentials. Its configuration disables authentication and
+authorization for demonstration. Do not deploy it unchanged.
+
+This demo does not qualify the experimental context-derived native wrapping
+profile. That profile requires a dedicated provider, explicit opt-in and its own
+[qualification checks](../../docs/OPERATOR.md#experimental-context-derived-wrapping-profile). Hardware tokens need
+separate provider qualification; success with SoftHSM2 does not qualify them.
